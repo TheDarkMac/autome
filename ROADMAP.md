@@ -17,7 +17,7 @@
 | #  | Domaine                  | Features | Terminées | Statut global |
 |----|--------------------------|----------|-----------|---------------|
 | 1  | Fondations & Architecture| 6        | 6         | ✅ Terminé    |
-| 2  | Moteur de workflows      | 7        | 0         | À faire       |
+| 2  | Moteur de workflows      | 7        | 1         | En cours      |
 | 3  | Triggers & Actions       | 6        | 0         | À faire       |
 | 4  | Connecteurs API          | 5        | 0         | À faire       |
 | 5  | Orchestrateur & Scaling  | 6        | 0         | À faire       |
@@ -29,7 +29,7 @@
 | 11 | Documentation            | 5        | 0         | À faire       |
 | 12 | Exemples de workflows    | 3        | 0         | À faire       |
 
-**Progression totale : 6 / 66 features** (≈ 150 sous-tâches sur les features détaillées)
+**Progression totale : 7 / 66 features** (≈ 150 sous-tâches sur les features détaillées)
 
 > Les features complexes (F1.3, F1.5, F2.*, F4.*, F5.1–F5.4, F6.1–F6.3, F6.5,
 > F8.2–F8.7) sont découpées en sous-tâches `Fx.y.z`. Une feature est `[x]`
@@ -62,11 +62,11 @@
 
 ## 2. Moteur de workflows
 
-- [ ] **F2.1** — Représentation du graphe de workflow (DAG, validation cycles)
-  - [ ] F2.1.a — Structures `Node`, `Edge`, `Graph`
-  - [ ] F2.1.b — Parsing/désérialisation depuis le modèle workflow
-  - [ ] F2.1.c — Validation : détection de cycles
-  - [ ] F2.1.d — Validation : ports/connexions cohérents, node racine unique
+- [x] **F2.1** — Représentation du graphe de workflow (DAG, validation cycles) — _issue #13_
+  - [x] F2.1.a — Structures `Node`, `Edge`, `Graph`
+  - [x] F2.1.b — Parsing/désérialisation depuis le modèle workflow
+  - [x] F2.1.c — Validation : détection de cycles
+  - [x] F2.1.d — Validation : ports/connexions cohérents, node racine unique
 - [ ] **F2.2** — Exécution séquentielle des nodes
   - [ ] F2.2.a — Tri topologique
   - [ ] F2.2.b — Boucle d'exécution + contexte de run
@@ -256,3 +256,4 @@
 | 2026-05-16 | F1.4 | Modèle workflow dans `core` : `WorkflowGraph`/`Node`/`Edge`/`NodeKind`/`WorkflowId`, JSON serde stable + helpers (lookup, adjacence, roots). 6 tests verts. Validation graphe → F2.1. | — |
 | 2026-05-16 | F1.5 | Schéma PostgreSQL : ADR 0002 (sqlx), migrations `0001..0005` (users, workflows+versioning, runs/run_steps, credentials, index/FK différable), seed dev. `scripts/check-migrations.sh` (Postgres jetable) vert. | — |
 | 2026-05-16 | F1.6 | Config centralisée dans `core` : `Config`/`Profile`/`Secret` (env, défauts par profil, secrets redactés, validation fail-fast prod), câblée dans `api`/`worker`, `.env.example`. 12 tests core verts. **Domaine 1 (Fondations) terminé.** | — |
+| 2026-05-16 | F2.1 | `engine::graph` : `Dag::from_workflow` valide unicité nodes, intégrité arêtes, ports par type (if/switch/...), racine unique, **acyclicité** (DFS tricolore). `GraphError` typé. 12 tests engine verts. Tri topo → F2.2. | — |
