@@ -14,7 +14,7 @@
 //! **Hors périmètre F2.1** : le tri topologique d'exécution relève de
 //! **F2.2.a** ; ici on ne fait que construire et valider la structure.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use autome_core::{Edge, Node, NodeId, NodeKind, WorkflowGraph};
 use thiserror::Error;
@@ -62,6 +62,9 @@ pub struct Dag {
     nodes: HashMap<NodeId, Node>,
     /// Arêtes sortantes, indexées par node source.
     out_edges: HashMap<NodeId, Vec<Edge>>,
+    /// Ordre d'insertion des nodes (modèle workflow) : sert de tie-break
+    /// déterministe au tri topologique (F2.2.a).
+    order: Vec<NodeId>,
     root: NodeId,
 }
 
@@ -121,9 +124,11 @@ impl Dag {
         }
         let root = roots[0].clone();
 
+        let order: Vec<NodeId> = wf.nodes.iter().map(|n| n.id.clone()).collect();
         let dag = Self {
             nodes,
             out_edges,
+            order,
             root,
         };
         dag.assert_acyclic()?; // F2.1.c
@@ -154,6 +159,43 @@ impl Dag {
     /// `from_workflow`, qui rejette le graphe vide — utile pour Clippy).
     pub fn is_empty(&self) -> bool {
         self.nodes.is_empty()
+    }
+
+    /// Ordre topologique d'exécution (F2.2.a) — algorithme de Kahn.
+    ///
+    /// Déterministe : à degré entrant nul équivalent, les nodes sortent
+    /// dans l'ordre du modèle workflow (`self.order`). Le DAG étant validé
+    /// acyclique par [`Dag::from_workflow`], tous les nodes sont émis.
+    pub fn topological_order(&self) -> Vec<NodeId> {
+        let mut indeg: HashMap<NodeId, usize> = self.nodes.keys().map(|k| (k.clone(), 0)).collect();
+        for edges in self.out_edges.values() {
+            for e in edges {
+                *indeg.get_mut(&e.to).expect("node indexé") += 1;
+            }
+        }
+
+        let mut out: Vec<NodeId> = Vec::with_capacity(self.order.len());
+        let mut emitted: HashSet<NodeId> = HashSet::with_capacity(self.order.len());
+        loop {
+            let mut progressed = false;
+            for id in &self.order {
+                if emitted.contains(id) || indeg[id] != 0 {
+                    continue;
+                }
+                out.push(id.clone());
+                emitted.insert(id.clone());
+                progressed = true;
+                if let Some(edges) = self.out_edges.get(id) {
+                    for e in edges {
+                        *indeg.get_mut(&e.to).expect("node indexé") -= 1;
+                    }
+                }
+            }
+            if !progressed {
+                break;
+            }
+        }
+        out
     }
 
     /// Détection de cycle par DFS tricolore (blanc/gris/noir).
@@ -286,6 +328,27 @@ mod tests {
         assert_eq!(dag.root().id, NodeId::new("t"));
         assert_eq!(dag.successors(&NodeId::new("t")).len(), 1);
         assert_eq!(dag.successors(&NodeId::new("b")).len(), 0);
+    }
+
+    #[test]
+    fn topological_order_is_deterministic() {
+        // Diamant : t -> a, t -> b, a -> d, b -> d.
+        let g = wf(
+            vec![trig("t"), act("a"), act("b"), act("d")],
+            vec![
+                edge("t", "a", None),
+                edge("t", "b", None),
+                edge("a", "d", None),
+                edge("b", "d", None),
+            ],
+        );
+        let dag = Dag::from_workflow(&g).expect("valide");
+        let order: Vec<String> = dag.topological_order().into_iter().map(|n| n.0).collect();
+        // t avant a et b ; a et b avant d ; tie-break = ordre du modèle.
+        assert_eq!(order, vec!["t", "a", "b", "d"]);
+        // Stable d'un appel à l'autre.
+        let order2: Vec<String> = dag.topological_order().into_iter().map(|n| n.0).collect();
+        assert_eq!(order, order2);
     }
 
     #[test]
