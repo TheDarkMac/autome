@@ -8,17 +8,19 @@
 //! s'exécute (HTTP, Slack, …) — c'est le `NodeRunner` qui le décide. Les
 //! implémentations concrètes relèvent des domaines 3/4.
 //!
-//! **Hors périmètre F2.2** : branches conditionnelles (F2.3), mapping de
-//! données entre nodes (F2.6), retry/timeout (F2.7). Ici : exécution
-//! linéaire **fail-fast** (au premier échec, les nodes restants sont
-//! marqués `Skipped`).
+//! Branch-aware (F2.3) : les nodes `If`/`Switch` sont évalués par le
+//! moteur et n'activent que la branche retenue ; les nodes non atteints
+//! sont `Skipped`. Fail-fast : au premier échec, le reste est `Skipped`.
+//!
+//! **Hors périmètre** : mapping/templating de données (F2.6), boucles
+//! (F2.4), parallélisme (F2.5), retry/timeout (F2.7).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
-use autome_core::{Node, NodeId};
+use autome_core::{Node, NodeId, NodeKind};
 use serde_json::Value;
 
-use crate::{Dag, RunStatus};
+use crate::{condition, Dag, RunStatus};
 
 /// Statut d'un node exécuté dans un run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -62,6 +64,12 @@ impl RunContext {
     fn record(&mut self, id: NodeId, value: Value) {
         self.outputs.insert(id, value);
     }
+
+    /// Injection directe d'une sortie (tests uniquement).
+    #[cfg(test)]
+    pub(crate) fn record_for_test(&mut self, id: NodeId, value: Value) {
+        self.outputs.insert(id, value);
+    }
 }
 
 /// Stratégie d'exécution d'un node, injectée dans le moteur.
@@ -98,27 +106,114 @@ impl RunReport {
     }
 }
 
-/// Exécute le DAG séquentiellement (ordre topologique), fail-fast.
+/// Quelles arêtes sortantes d'un node propagent l'activation.
+enum Outflow {
+    /// Toutes les arêtes (sortie par défaut : trigger/action/loop/while).
+    All,
+    /// Seules les arêtes dont `from_port == Some(port)` (if/switch).
+    Port(String),
+    /// Aucune arête (switch sans branche correspondante ni défaut).
+    None,
+}
+
+/// Issue de l'exécution d'un node : sa sortie et la propagation choisie.
+type NodeResult = Result<(Value, Outflow), String>;
+
+/// Évalue un node `If` : `params.condition` (chaîne) → port `true`/`false`.
+fn eval_if(node: &Node, ctx: &RunContext) -> NodeResult {
+    let cond = node
+        .params
+        .get("condition")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "node `if` : `params.condition` (chaîne) requis".to_string())?;
+    let taken = condition::eval_bool(cond, ctx)?;
+    let port = if taken { "true" } else { "false" };
+    Ok((Value::Bool(taken), Outflow::Port(port.to_string())))
+}
+
+/// Évalue un node `Switch` : `params.selector` comparé à `params.cases`
+/// (`[{ "value": <json>, "port": "<branche>" }]`), `params.default`
+/// optionnel. Sortie = valeur du sélecteur ; propagation = port choisi.
+fn eval_switch(node: &Node, ctx: &RunContext) -> NodeResult {
+    let selector = node
+        .params
+        .get("selector")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "node `switch` : `params.selector` (chaîne) requis".to_string())?;
+    let value = condition::resolve(selector, ctx)?;
+
+    let cases = node
+        .params
+        .get("cases")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "node `switch` : `params.cases` (tableau) requis".to_string())?;
+
+    for case in cases {
+        let cv = case
+            .get("value")
+            .ok_or_else(|| "case `switch` sans champ `value`".to_string())?;
+        let port = case
+            .get("port")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "case `switch` sans `port` (chaîne)".to_string())?;
+        if condition::json_eq(&value, cv) {
+            return Ok((value, Outflow::Port(port.to_string())));
+        }
+    }
+    match node.params.get("default").and_then(Value::as_str) {
+        Some(p) => Ok((value, Outflow::Port(p.to_string()))),
+        None => Ok((value, Outflow::None)),
+    }
+}
+
+/// Exécute le DAG séquentiellement dans l'ordre topologique.
+///
+/// Branch-aware (F2.3) : `If`/`Switch` sont évalués par le moteur (pas le
+/// runner) et n'activent que les nodes du port retenu ; les nodes jamais
+/// activés sont `Skipped`. Fail-fast : au premier échec, le reste est
+/// `Skipped` et le run est `Failed`.
 pub fn run_sequential(dag: &Dag, runner: &dyn NodeRunner) -> RunReport {
     let order = dag.topological_order();
     let mut ctx = RunContext::default();
     let mut steps = Vec::with_capacity(order.len());
+    let mut active: HashSet<NodeId> = HashSet::new();
+    active.insert(dag.root().id.clone());
     let mut failed = false;
 
     for id in &order {
-        if failed {
+        let skip = |steps: &mut Vec<StepOutcome>| {
             steps.push(StepOutcome {
                 node_id: id.clone(),
                 status: StepStatus::Skipped,
                 output: None,
                 error: None,
             });
+        };
+        if failed || !active.contains(id) {
+            skip(&mut steps);
             continue;
         }
+
         let node = dag.node(id).expect("node issu du DAG");
-        match runner.run(node, &ctx) {
-            Ok(out) => {
+        let result: NodeResult = match &node.kind {
+            NodeKind::If => eval_if(node, &ctx),
+            NodeKind::Switch => eval_switch(node, &ctx),
+            _ => runner.run(node, &ctx).map(|out| (out, Outflow::All)),
+        };
+
+        match result {
+            Ok((out, outflow)) => {
                 ctx.record(id.clone(), out.clone());
+                for e in dag.successors(id) {
+                    let take = match &outflow {
+                        Outflow::All => true,
+                        Outflow::Port(p) => e.from_port.as_deref() == Some(p.as_str()),
+                        Outflow::None => false,
+                    };
+                    if take {
+                        active.insert(e.to.clone());
+                    }
+                }
                 steps.push(StepOutcome {
                     node_id: id.clone(),
                     status: StepStatus::Succeeded,
@@ -248,5 +343,125 @@ mod tests {
             report.step(&NodeId::new("b")).unwrap().status,
             StepStatus::Skipped
         );
+    }
+
+    fn ctrl(id: &str, kind: NodeKind, params: Value) -> Node {
+        Node {
+            id: NodeId::new(id),
+            name: id.into(),
+            kind,
+            params,
+        }
+    }
+    fn ep(from: &str, to: &str, port: &str) -> Edge {
+        Edge {
+            from: NodeId::new(from),
+            to: NodeId::new(to),
+            from_port: Some(port.into()),
+        }
+    }
+    fn status(report: &RunReport, id: &str) -> StepStatus {
+        report.step(&NodeId::new(id)).unwrap().status
+    }
+
+    #[test]
+    fn if_takes_true_branch_and_skips_false() {
+        let d = dag(
+            vec![
+                trig("t"),
+                ctrl(
+                    "i",
+                    NodeKind::If,
+                    serde_json::json!({ "condition": "t.ok == true" }),
+                ),
+                n("yes"),
+                n("no"),
+            ],
+            vec![e("t", "i"), ep("i", "yes", "true"), ep("i", "no", "false")],
+        );
+        let runner = |node: &Node, _: &RunContext| {
+            assert_ne!(node.id.0, "i", "le runner ne doit pas voir le node `if`");
+            Ok(serde_json::json!({ "ok": true }))
+        };
+        let report = run_sequential(&d, &runner);
+
+        assert_eq!(report.status, RunStatus::Succeeded);
+        assert_eq!(status(&report, "i"), StepStatus::Succeeded);
+        assert_eq!(
+            report.step(&NodeId::new("i")).unwrap().output,
+            Some(Value::Bool(true))
+        );
+        assert_eq!(status(&report, "yes"), StepStatus::Succeeded);
+        assert_eq!(status(&report, "no"), StepStatus::Skipped);
+    }
+
+    #[test]
+    fn switch_selects_matching_branch_then_default() {
+        let nodes = || {
+            vec![
+                trig("t"),
+                ctrl(
+                    "s",
+                    NodeKind::Switch,
+                    serde_json::json!({
+                        "selector": "t.kind",
+                        "cases": [
+                            { "value": "a", "port": "pa" },
+                            { "value": "b", "port": "pb" }
+                        ],
+                        "default": "pd"
+                    }),
+                ),
+                n("na"),
+                n("nb"),
+                n("nd"),
+            ]
+        };
+        let edges = || {
+            vec![
+                e("t", "s"),
+                ep("s", "na", "pa"),
+                ep("s", "nb", "pb"),
+                ep("s", "nd", "pd"),
+            ]
+        };
+
+        // Cas correspondant : branche `pb`.
+        let d = dag(nodes(), edges());
+        let r = run_sequential(&d, &|_: &Node, _: &RunContext| {
+            Ok(serde_json::json!({ "kind": "b" }))
+        });
+        assert_eq!(r.status, RunStatus::Succeeded);
+        assert_eq!(status(&r, "nb"), StepStatus::Succeeded);
+        assert_eq!(status(&r, "na"), StepStatus::Skipped);
+        assert_eq!(status(&r, "nd"), StepStatus::Skipped);
+
+        // Aucun cas → branche par défaut `pd`.
+        let d = dag(nodes(), edges());
+        let r = run_sequential(&d, &|_: &Node, _: &RunContext| {
+            Ok(serde_json::json!({ "kind": "z" }))
+        });
+        assert_eq!(status(&r, "nd"), StepStatus::Succeeded);
+        assert_eq!(status(&r, "na"), StepStatus::Skipped);
+        assert_eq!(status(&r, "nb"), StepStatus::Skipped);
+    }
+
+    #[test]
+    fn if_with_invalid_params_fails_the_run() {
+        let d = dag(
+            vec![
+                trig("t"),
+                ctrl("i", NodeKind::If, Value::Null), // pas de `condition`
+                n("yes"),
+                n("no"),
+            ],
+            vec![e("t", "i"), ep("i", "yes", "true"), ep("i", "no", "false")],
+        );
+        let report = run_sequential(&d, &|_: &Node, _: &RunContext| Ok(Value::Null));
+
+        assert_eq!(report.status, RunStatus::Failed);
+        assert_eq!(status(&report, "i"), StepStatus::Failed);
+        assert_eq!(status(&report, "yes"), StepStatus::Skipped);
+        assert_eq!(status(&report, "no"), StepStatus::Skipped);
     }
 }
