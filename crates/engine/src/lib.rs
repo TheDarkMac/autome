@@ -5,6 +5,7 @@
 //! par [`graph`] (F2.1) ; l'exécution séquentielle par [`exec`] (F2.2).
 //! Branches/boucles/parallélisme et retry/timeout relèvent de F2.3–F2.7.
 
+pub mod condition;
 pub mod exec;
 pub mod graph;
 
