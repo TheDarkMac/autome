@@ -16,7 +16,7 @@
 
 | #  | Domaine                  | Features | Terminées | Statut global |
 |----|--------------------------|----------|-----------|---------------|
-| 1  | Fondations & Architecture| 6        | 4         | En cours      |
+| 1  | Fondations & Architecture| 6        | 5         | En cours      |
 | 2  | Moteur de workflows      | 7        | 0         | À faire       |
 | 3  | Triggers & Actions       | 6        | 0         | À faire       |
 | 4  | Connecteurs API          | 5        | 0         | À faire       |
@@ -29,7 +29,7 @@
 | 11 | Documentation            | 5        | 0         | À faire       |
 | 12 | Exemples de workflows    | 3        | 0         | À faire       |
 
-**Progression totale : 3 / 66 features** (≈ 150 sous-tâches sur les features détaillées)
+**Progression totale : 5 / 66 features** (≈ 150 sous-tâches sur les features détaillées)
 
 > Les features complexes (F1.3, F1.5, F2.*, F4.*, F5.1–F5.4, F6.1–F6.3, F6.5,
 > F8.2–F8.7) sont découpées en sous-tâches `Fx.y.z`. Une feature est `[x]`
@@ -50,14 +50,14 @@
   - [x] F1.3.f — Crate `worker` (exécuteur de runs)
   - [x] F1.3.g — Lint/format partagés (`rustfmt.toml`, `clippy` en CI-ready)
 - [x] **F1.4** — Modèle de données workflow (schéma JSON/struct : nodes, edges, params) — _issue #7_
-- [ ] **F1.5** — Schéma PostgreSQL initial + migrations (workflows, runs, credentials, users)
-  - [ ] F1.5.a — Choix de l'outil de migration (sqlx-cli / refinery / diesel)
-  - [ ] F1.5.b — Table `users`
-  - [ ] F1.5.c — Table `workflows` (+ versioning)
-  - [ ] F1.5.d — Table `runs` & `run_steps` (état d'exécution)
-  - [ ] F1.5.e — Table `credentials` (secrets chiffrés)
-  - [ ] F1.5.f — Index & contraintes (FK, unicité)
-  - [ ] F1.5.g — Seed de données de dev
+- [x] **F1.5** — Schéma PostgreSQL initial + migrations (workflows, runs, credentials, users) — _issue #9_
+  - [x] F1.5.a — Choix de l'outil de migration (sqlx-cli / refinery / diesel) — _ADR 0002 : sqlx_
+  - [x] F1.5.b — Table `users`
+  - [x] F1.5.c — Table `workflows` (+ versioning)
+  - [x] F1.5.d — Table `runs` & `run_steps` (état d'exécution)
+  - [x] F1.5.e — Table `credentials` (secrets chiffrés)
+  - [x] F1.5.f — Index & contraintes (FK, unicité)
+  - [x] F1.5.g — Seed de données de dev
 - [ ] **F1.6** — Configuration centralisée (env, secrets, profils dev/prod)
 
 ## 2. Moteur de workflows
@@ -254,3 +254,4 @@
 | 2026-05-16 | F1.2 | ADR 0001 : choix du framework backend → **axum** (stack Tokio/`tower` homogène, middlewares mutualisés API↔worker) — `docs/adr/0001-choix-framework-backend.md` | — |
 | 2026-05-16 | F1.3 | Workspace Cargo : crates `core`/`connectors`/`engine`/`api`/`worker` (graphe de deps ARCHITECTURE §9), `rustfmt.toml` + lints workspace (`clippy -D warnings`). `build`+`test`+`clippy` verts. | — |
 | 2026-05-16 | F1.4 | Modèle workflow dans `core` : `WorkflowGraph`/`Node`/`Edge`/`NodeKind`/`WorkflowId`, JSON serde stable + helpers (lookup, adjacence, roots). 6 tests verts. Validation graphe → F2.1. | — |
+| 2026-05-16 | F1.5 | Schéma PostgreSQL : ADR 0002 (sqlx), migrations `0001..0005` (users, workflows+versioning, runs/run_steps, credentials, index/FK différable), seed dev. `scripts/check-migrations.sh` (Postgres jetable) vert. | — |
