@@ -3,7 +3,12 @@
 //! Dépend de `core` et `connectors` (ARCHITECTURE.md §9), jamais de `api`
 //! ni d'un SGBD : le cœur reste agnostique. Le graphe, le tri topologique,
 //! les branches/boucles/parallélisme et la gestion d'erreurs relèvent du
-//! domaine 2 (F2.*). Ici : squelette F1.3.c.
+//! domaine 2 (F2.*). Le graphe validé (DAG) est fourni par le module
+//! [`graph`] (F2.1).
+
+pub mod graph;
+
+pub use graph::{Dag, GraphError};
 
 use autome_core::{NodeId, Result};
 

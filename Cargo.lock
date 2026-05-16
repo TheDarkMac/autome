@@ -51,6 +51,8 @@ version = "0.1.0"
 dependencies = [
  "autome-connectors",
  "autome-core",
+ "serde_json",
+ "thiserror",
 ]
 
 [[package]]
