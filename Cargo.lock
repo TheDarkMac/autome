@@ -61,6 +61,7 @@ version = "0.1.0"
 dependencies = [
  "autome-core",
  "autome-engine",
+ "serde_json",
  "tokio",
 ]
 

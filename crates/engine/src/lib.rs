@@ -1,21 +1,20 @@
 //! `autome-engine` — moteur d'exécution des workflows (DAG).
 //!
 //! Dépend de `core` et `connectors` (ARCHITECTURE.md §9), jamais de `api`
-//! ni d'un SGBD : le cœur reste agnostique. Le graphe, le tri topologique,
-//! les branches/boucles/parallélisme et la gestion d'erreurs relèvent du
-//! domaine 2 (F2.*). Le graphe validé (DAG) est fourni par le module
-//! [`graph`] (F2.1).
+//! ni d'un SGBD : le cœur reste agnostique. Le graphe validé est fourni
+//! par [`graph`] (F2.1) ; l'exécution séquentielle par [`exec`] (F2.2).
+//! Branches/boucles/parallélisme et retry/timeout relèvent de F2.3–F2.7.
 
+pub mod exec;
 pub mod graph;
 
+pub use exec::{run_sequential, NodeRunner, RunContext, RunReport, StepOutcome, StepStatus};
 pub use graph::{Dag, GraphError};
 
-use autome_core::{NodeId, Result};
-
-/// État d'exécution d'un run, vue minimale.
+/// État global d'un run.
 ///
-/// Le modèle complet (RUNS / RUN_STEPS) est posé en F1.5 ; cet enum sert de
-/// point d'ancrage typé pour les premières itérations du moteur.
+/// Les variantes `Queued`/`Running` couvrent le cycle de vie côté worker
+/// (F5.*) ; `run_sequential` ne renvoie que `Succeeded`/`Failed`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RunStatus {
     /// En file, pas encore pris par un worker.
@@ -28,10 +27,7 @@ pub enum RunStatus {
     Failed,
 }
 
-/// Moteur d'exécution (placeholder).
-///
-/// L'exécution réelle du graphe arrive en F2.2 ; on expose pour l'instant
-/// une surface stable pour que `worker` puisse dépendre du moteur.
+/// Moteur d'exécution de workflows.
 #[derive(Debug, Default)]
 pub struct Engine;
 
@@ -41,27 +37,39 @@ impl Engine {
         Self
     }
 
-    /// Point d'entrée d'exécution d'un node (non implémenté — F2.2).
-    ///
-    /// Retourne une erreur explicite tant que le moteur n'est pas câblé,
-    /// pour éviter tout faux positif silencieux.
-    pub fn execute_node(&self, node: &NodeId) -> Result<RunStatus> {
-        Err(autome_core::Error::Invalid(format!(
-            "exécution du node `{}` non implémentée (F2.2)",
-            node.0
-        )))
+    /// Exécute un DAG validé séquentiellement via le `runner` fourni.
+    pub fn run(&self, dag: &Dag, runner: &dyn NodeRunner) -> RunReport {
+        run_sequential(dag, runner)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use autome_core::{Node, NodeId, NodeKind, WorkflowGraph, WorkflowId};
 
     #[test]
-    fn execute_node_is_not_yet_implemented() {
-        let engine = Engine::new();
-        let res = engine.execute_node(&NodeId::new("n1"));
-        assert!(res.is_err());
+    fn engine_run_executes_single_node_workflow() {
+        let dag = Dag::from_workflow(&WorkflowGraph {
+            id: WorkflowId::new("wf"),
+            name: "t".into(),
+            nodes: vec![Node {
+                id: NodeId::new("t"),
+                name: "trigger".into(),
+                kind: NodeKind::Trigger {
+                    trigger_type: "manual".into(),
+                },
+                params: serde_json::Value::Null,
+            }],
+            edges: vec![],
+        })
+        .expect("DAG valide");
+
+        let runner = |_: &Node, _: &RunContext| Ok(serde_json::Value::Null);
+        let report = Engine::new().run(&dag, &runner);
+
+        assert_eq!(report.status, RunStatus::Succeeded);
+        assert_eq!(report.steps.len(), 1);
     }
 
     #[test]
