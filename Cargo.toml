@@ -1,0 +1,47 @@
+# Workspace Cargo — Autome (F1.3.a)
+# Graphe de dépendances entre crates : cf. docs/ARCHITECTURE.md §9.
+[workspace]
+resolver = "2"
+members = [
+    "crates/core",
+    "crates/connectors",
+    "crates/engine",
+    "crates/api",
+    "crates/worker",
+]
+
+# Métadonnées partagées par tous les crates du workspace.
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+license = "MIT"
+repository = "https://github.com/TheDarkMac/autome"
+authors = ["Équipe Autome"]
+
+# Résolution centralisée des versions (F1.3.a) : les crates référencent
+# `xxx = { workspace = true }` pour garantir une version unique partout.
+[workspace.dependencies]
+# Crates internes (préfixe `autome-` pour ne pas masquer le `core` de la std)
+autome-core = { path = "crates/core" }
+autome-engine = { path = "crates/engine" }
+autome-connectors = { path = "crates/connectors" }
+# Dépendances tierces communes
+thiserror = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Lints partagés (F1.3.g) : appliqués via `[lints] workspace = true` dans
+# chaque crate. `clippy -- -D warnings` en CI (cf. CONVENTIONS §4/§5).
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+
+# Profil de release : binaires fins, optimisés.
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true

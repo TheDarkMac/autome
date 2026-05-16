@@ -1,0 +1,23 @@
+[package]
+name = "autome-api"
+description = "Serveur HTTP du backend Autome (axum) — F1.3.d"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "autome-api"
+path = "src/main.rs"
+
+[dependencies]
+autome-core = { workspace = true }
+autome-engine = { workspace = true }
+# axum confiné au crate `api` (décision ADR 0001 / F1.2).
+axum = "0.7"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }

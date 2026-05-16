@@ -1,0 +1,15 @@
+[package]
+name = "autome-connectors"
+description = "Intégrations tierces (Slack, Gmail, Notion, GitHub, HTTP) — F1.3.e"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+autome-core = { workspace = true }
