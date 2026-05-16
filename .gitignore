@@ -1,0 +1,29 @@
+# Rust
+/target/
+**/target/
+*.pdb
+
+# Node / Frontend
+node_modules/
+dist/
+build/
+.vite/
+*.tsbuildinfo
+
+# Env & secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Logs
+*.log
+npm-debug.log*
+
+# OS / Editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
