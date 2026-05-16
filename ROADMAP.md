@@ -16,7 +16,7 @@
 
 | #  | Domaine                  | Features | Terminées | Statut global |
 |----|--------------------------|----------|-----------|---------------|
-| 1  | Fondations & Architecture| 6        | 3         | En cours      |
+| 1  | Fondations & Architecture| 6        | 4         | En cours      |
 | 2  | Moteur de workflows      | 7        | 0         | À faire       |
 | 3  | Triggers & Actions       | 6        | 0         | À faire       |
 | 4  | Connecteurs API          | 5        | 0         | À faire       |
@@ -49,7 +49,7 @@
   - [x] F1.3.e — Crate `connectors` (intégrations tierces)
   - [x] F1.3.f — Crate `worker` (exécuteur de runs)
   - [x] F1.3.g — Lint/format partagés (`rustfmt.toml`, `clippy` en CI-ready)
-- [ ] **F1.4** — Modèle de données workflow (schéma JSON/struct : nodes, edges, params)
+- [x] **F1.4** — Modèle de données workflow (schéma JSON/struct : nodes, edges, params) — _issue #7_
 - [ ] **F1.5** — Schéma PostgreSQL initial + migrations (workflows, runs, credentials, users)
   - [ ] F1.5.a — Choix de l'outil de migration (sqlx-cli / refinery / diesel)
   - [ ] F1.5.b — Table `users`
@@ -253,3 +253,4 @@
 | 2026-05-16 | F1.1 | Document d'architecture (`docs/ARCHITECTURE.md`) — diagrammes composants/flux/déploiement, modèle de données, ADR initial | — |
 | 2026-05-16 | F1.2 | ADR 0001 : choix du framework backend → **axum** (stack Tokio/`tower` homogène, middlewares mutualisés API↔worker) — `docs/adr/0001-choix-framework-backend.md` | — |
 | 2026-05-16 | F1.3 | Workspace Cargo : crates `core`/`connectors`/`engine`/`api`/`worker` (graphe de deps ARCHITECTURE §9), `rustfmt.toml` + lints workspace (`clippy -D warnings`). `build`+`test`+`clippy` verts. | — |
+| 2026-05-16 | F1.4 | Modèle workflow dans `core` : `WorkflowGraph`/`Node`/`Edge`/`NodeKind`/`WorkflowId`, JSON serde stable + helpers (lookup, adjacence, roots). 6 tests verts. Validation graphe → F2.1. | — |
