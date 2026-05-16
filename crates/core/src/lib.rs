@@ -7,8 +7,10 @@
 
 #![doc(html_no_source)]
 
+pub mod config;
 pub mod workflow;
 
+pub use config::{Config, Profile, Secret};
 pub use workflow::{Edge, Node, NodeKind, WorkflowGraph, WorkflowId};
 
 use thiserror::Error;
