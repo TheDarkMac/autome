@@ -16,7 +16,7 @@
 
 | #  | Domaine                  | Features | Terminées | Statut global |
 |----|--------------------------|----------|-----------|---------------|
-| 1  | Fondations & Architecture| 6        | 1         | En cours      |
+| 1  | Fondations & Architecture| 6        | 2         | En cours      |
 | 2  | Moteur de workflows      | 7        | 0         | À faire       |
 | 3  | Triggers & Actions       | 6        | 0         | À faire       |
 | 4  | Connecteurs API          | 5        | 0         | À faire       |
@@ -29,7 +29,7 @@
 | 11 | Documentation            | 5        | 0         | À faire       |
 | 12 | Exemples de workflows    | 3        | 0         | À faire       |
 
-**Progression totale : 1 / 66 features** (≈ 150 sous-tâches sur les features détaillées)
+**Progression totale : 2 / 66 features** (≈ 150 sous-tâches sur les features détaillées)
 
 > Les features complexes (F1.3, F1.5, F2.*, F4.*, F5.1–F5.4, F6.1–F6.3, F6.5,
 > F8.2–F8.7) sont découpées en sous-tâches `Fx.y.z`. Une feature est `[x]`
@@ -40,7 +40,7 @@
 ## 1. Fondations & Architecture
 
 - [x] **F1.1** — Document d'architecture (diagrammes composants, flux de données, déploiement) — _[docs/ARCHITECTURE.md](./docs/ARCHITECTURE.md), issue #1_
-- [ ] **F1.2** — Choix & justification du framework backend (axum vs actix-web)
+- [x] **F1.2** — Choix & justification du framework backend (axum vs actix-web) — _[docs/adr/0001-choix-framework-backend.md](./docs/adr/0001-choix-framework-backend.md), issue #3_
 - [ ] **F1.3** — Mise en place du workspace Cargo (crates : `core`, `engine`, `api`, `connectors`, `worker`)
   - [ ] F1.3.a — `Cargo.toml` workspace racine + résolution des versions
   - [ ] F1.3.b — Crate `core` (types partagés, erreurs, traits)
@@ -251,3 +251,4 @@
 |------|------------|-------------|--------|
 | 2026-05-16 | — | Création du document de roadmap | — |
 | 2026-05-16 | F1.1 | Document d'architecture (`docs/ARCHITECTURE.md`) — diagrammes composants/flux/déploiement, modèle de données, ADR initial | — |
+| 2026-05-16 | F1.2 | ADR 0001 : choix du framework backend → **axum** (stack Tokio/`tower` homogène, middlewares mutualisés API↔worker) — `docs/adr/0001-choix-framework-backend.md` | — |
