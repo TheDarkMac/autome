@@ -5,7 +5,7 @@
 //! (F5.1), le pool de workers (F5.2) et la persistance (F5.4) arrivent au
 //! domaine 5 ; ici : squelette F1.3.f.
 
-use autome_core::NodeId;
+use autome_core::{Config, NodeId};
 use autome_engine::Engine;
 
 /// Traite un run identifié — placeholder.
@@ -22,7 +22,11 @@ fn process_run(run_id: &str) -> autome_core::Result<()> {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    println!("autome-worker démarré (en attente d'une file — F5.1)");
+    let config = Config::from_env()?;
+    println!(
+        "autome-worker ({:?}) démarré (en attente d'une file — F5.1)",
+        config.profile
+    );
     process_run("bootstrap")?;
     Ok(())
 }

@@ -5,10 +5,8 @@
 //! sonde de santé. Le CRUD workflows et le déclenchement de runs relèvent
 //! du domaine 7 (F7.*).
 
+use autome_core::Config;
 use axum::{routing::get, Router};
-
-/// Adresse d'écoute par défaut (la config centralisée arrive en F1.6).
-const DEFAULT_ADDR: &str = "0.0.0.0:8080";
 
 /// Handler de la sonde de santé.
 async fn health() -> &'static str {
@@ -24,9 +22,13 @@ fn build_router() -> Router {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let config = Config::from_env()?;
     let app = build_router();
-    let listener = tokio::net::TcpListener::bind(DEFAULT_ADDR).await?;
-    println!("autome-api en écoute sur http://{DEFAULT_ADDR}");
+    let listener = tokio::net::TcpListener::bind(&config.http_addr).await?;
+    println!(
+        "autome-api ({:?}) en écoute sur http://{}",
+        config.profile, config.http_addr
+    );
     axum::serve(listener, app).await?;
     Ok(())
 }
