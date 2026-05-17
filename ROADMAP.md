@@ -18,7 +18,7 @@
 |----|--------------------------|----------|-----------|---------------|
 | 1  | Fondations & Architecture| 6        | 6         | ✅ Terminé    |
 | 2  | Moteur de workflows      | 7        | 7         | ✅ Terminé    |
-| 3  | Triggers & Actions       | 6        | 2         | En cours      |
+| 3  | Triggers & Actions       | 6        | 3         | En cours      |
 | 4  | Connecteurs API          | 5        | 0         | À faire       |
 | 5  | Orchestrateur & Scaling  | 6        | 0         | À faire       |
 | 6  | Sécurité & Auth          | 6        | 0         | À faire       |
@@ -29,7 +29,7 @@
 | 11 | Documentation            | 5        | 0         | À faire       |
 | 12 | Exemples de workflows    | 3        | 0         | À faire       |
 
-**Progression totale : 15 / 66 features** (≈ 150 sous-tâches sur les features détaillées)
+**Progression totale : 16 / 66 features** (≈ 150 sous-tâches sur les features détaillées)
 
 > Les features complexes (F1.3, F1.5, F2.*, F4.*, F5.1–F5.4, F6.1–F6.3, F6.5,
 > F8.2–F8.7) sont découpées en sous-tâches `Fx.y.z`. Une feature est `[x]`
@@ -97,7 +97,7 @@
 
 - [x] **F3.1** — Trait/abstraction `Trigger` extensible — _issue #27_
 - [x] **F3.2** — Trigger Webhook (HTTP entrant) — _issue #29_
-- [ ] **F3.3** — Trigger Scheduler (cron / intervalle)
+- [x] **F3.3** — Trigger Scheduler (cron / intervalle) — _issue #31_
 - [ ] **F3.4** — Trigger Polling (vérification périodique d'une source)
 - [ ] **F3.5** — Trait/abstraction `Action` extensible
 - [ ] **F3.6** — Action HTTP générique (requête REST configurable)
@@ -265,3 +265,4 @@
 | 2026-05-17 | F2.7 | Gestion d'erreurs : politique `params._error` (retry+backoff, timeout, on_error fail/continue/fallback), port `error`, fail-fast vs échec géré, statut final cohérent — séquentiel **et** parallèle. 44 tests engine verts. **Domaine 2 (Moteur) terminé.** | — |
 | 2026-05-17 | F3.1 | Abstraction `Trigger` : `core::trigger` (`TriggerEvent`, trait `Trigger` pull `kind()`/`poll()`), agnostique réseau/horloge. 14 tests core verts. | — |
 | 2026-05-17 | F3.2 | Trigger Webhook : `connectors::WebhookTrigger` (match de chemin, file FIFO, impl `Trigger`). Ingress HTTP réel câblé plus tard (domaine 7/8). 3 tests connectors verts. | — |
+| 2026-05-17 | F3.3 | Trigger Scheduler : `ScheduleTrigger` (intervalle, horloge injectée) + `CronSchedule` (parseur 5 champs `*`/n/`*/step`/listes + `matches`). 7 tests connectors verts. | — |
