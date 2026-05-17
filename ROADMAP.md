@@ -18,7 +18,7 @@
 |----|--------------------------|----------|-----------|---------------|
 | 1  | Fondations & Architecture| 6        | 6         | ✅ Terminé    |
 | 2  | Moteur de workflows      | 7        | 7         | ✅ Terminé    |
-| 3  | Triggers & Actions       | 6        | 4         | En cours      |
+| 3  | Triggers & Actions       | 6        | 5         | En cours      |
 | 4  | Connecteurs API          | 5        | 0         | À faire       |
 | 5  | Orchestrateur & Scaling  | 6        | 0         | À faire       |
 | 6  | Sécurité & Auth          | 6        | 0         | À faire       |
@@ -29,7 +29,7 @@
 | 11 | Documentation            | 5        | 0         | À faire       |
 | 12 | Exemples de workflows    | 3        | 0         | À faire       |
 
-**Progression totale : 17 / 66 features** (≈ 150 sous-tâches sur les features détaillées)
+**Progression totale : 18 / 66 features** (≈ 150 sous-tâches sur les features détaillées)
 
 > Les features complexes (F1.3, F1.5, F2.*, F4.*, F5.1–F5.4, F6.1–F6.3, F6.5,
 > F8.2–F8.7) sont découpées en sous-tâches `Fx.y.z`. Une feature est `[x]`
@@ -99,7 +99,7 @@
 - [x] **F3.2** — Trigger Webhook (HTTP entrant) — _issue #29_
 - [x] **F3.3** — Trigger Scheduler (cron / intervalle) — _issue #31_
 - [x] **F3.4** — Trigger Polling (vérification périodique d'une source) — _issue #33_
-- [ ] **F3.5** — Trait/abstraction `Action` extensible
+- [x] **F3.5** — Trait/abstraction `Action` extensible — _issue #35_
 - [ ] **F3.6** — Action HTTP générique (requête REST configurable)
 
 ## 4. Connecteurs API
@@ -267,3 +267,4 @@
 | 2026-05-17 | F3.2 | Trigger Webhook : `connectors::WebhookTrigger` (match de chemin, file FIFO, impl `Trigger`). Ingress HTTP réel câblé plus tard (domaine 7/8). 3 tests connectors verts. | — |
 | 2026-05-17 | F3.3 | Trigger Scheduler : `ScheduleTrigger` (intervalle, horloge injectée) + `CronSchedule` (parseur 5 champs `*`/n/`*/step`/listes + `matches`). 7 tests connectors verts. | — |
 | 2026-05-17 | F3.4 | Trigger Polling : `connectors::PollingTrigger` (source injectée, déduplication par champ-clé, émission FIFO des inédits). 9 tests connectors verts. | — |
+| 2026-05-17 | F3.5 | Abstraction `Action` : `core::action` (trait `Action` `kind()`/`execute(params)->Result<Value>`), agnostique. 16 tests core verts. | — |
