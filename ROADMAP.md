@@ -17,7 +17,7 @@
 | #  | Domaine                  | Features | Terminées | Statut global |
 |----|--------------------------|----------|-----------|---------------|
 | 1  | Fondations & Architecture| 6        | 6         | ✅ Terminé    |
-| 2  | Moteur de workflows      | 7        | 4         | En cours      |
+| 2  | Moteur de workflows      | 7        | 5         | En cours      |
 | 3  | Triggers & Actions       | 6        | 0         | À faire       |
 | 4  | Connecteurs API          | 5        | 0         | À faire       |
 | 5  | Orchestrateur & Scaling  | 6        | 0         | À faire       |
@@ -29,7 +29,7 @@
 | 11 | Documentation            | 5        | 0         | À faire       |
 | 12 | Exemples de workflows    | 3        | 0         | À faire       |
 
-**Progression totale : 10 / 66 features** (≈ 150 sous-tâches sur les features détaillées)
+**Progression totale : 11 / 66 features** (≈ 150 sous-tâches sur les features détaillées)
 
 > Les features complexes (F1.3, F1.5, F2.*, F4.*, F5.1–F5.4, F6.1–F6.3, F6.5,
 > F8.2–F8.7) sont découpées en sous-tâches `Fx.y.z`. Une feature est `[x]`
@@ -79,10 +79,10 @@
   - [x] F2.4.a — Node `Loop` (iterate sur collection)
   - [x] F2.4.b — Node `While` (condition + garde anti-boucle infinie)
   - [x] F2.4.c — Agrégation des sorties d'itérations
-- [ ] **F2.5** — Exécution parallèle (fan-out / fan-in)
-  - [ ] F2.5.a — Fan-out (lancement concurrent des branches)
-  - [ ] F2.5.b — Fan-in (synchronisation / jointure des résultats)
-  - [ ] F2.5.c — Limite de concurrence configurable
+- [x] **F2.5** — Exécution parallèle (fan-out / fan-in) — _issue #21_
+  - [x] F2.5.a — Fan-out (lancement concurrent des branches)
+  - [x] F2.5.b — Fan-in (synchronisation / jointure des résultats)
+  - [x] F2.5.c — Limite de concurrence configurable
 - [ ] **F2.6** — Passage & mapping de données entre nodes (expressions / templating)
   - [ ] F2.6.a — Moteur d'expressions (accès aux sorties précédentes)
   - [ ] F2.6.b — Templating de chaînes (`{{ }}`)
@@ -260,3 +260,4 @@
 | 2026-05-16 | F2.2 | `engine::exec` : tri topologique Kahn déterministe, `RunContext` (sorties par node), `NodeRunner` injectable, `run_sequential` fail-fast → `RunReport`. `Engine::run` câblé (worker MAJ). 16 tests engine verts. | — |
 | 2026-05-16 | F2.3 | Branches conditionnelles : `engine::condition` (opérandes, comparaisons, chemins de contexte), nodes `If`/`Switch` évalués par le moteur, `run_sequential` branch-aware (branches non prises → `Skipped`). 23 tests engine verts. | — |
 | 2026-05-17 | F2.4 | Boucles : nodes `Loop` (itère `params.items`) / `While` (`condition` + garde `max_iterations`) évalués par le moteur, corps délégué au runner par itération (item/index exposés au contexte), sortie agrégée en tableau. 28 tests engine verts. | — |
+| 2026-05-17 | F2.5 | Exécution parallèle : `run_parallel` (ordonnanceur ready-queue à threads scoped) — fan-out concurrent, fan-in par comptage d'arêtes, limite `max_concurrency`, sémantique identique au séquentiel, rapport stable. 33 tests engine verts. | — |
