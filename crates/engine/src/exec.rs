@@ -8,12 +8,14 @@
 //! s'exécute (HTTP, Slack, …) — c'est le `NodeRunner` qui le décide. Les
 //! implémentations concrètes relèvent des domaines 3/4.
 //!
-//! Branch-aware (F2.3) : les nodes `If`/`Switch` sont évalués par le
-//! moteur et n'activent que la branche retenue ; les nodes non atteints
-//! sont `Skipped`. Fail-fast : au premier échec, le reste est `Skipped`.
+//! Branch-aware (F2.3) : `If`/`Switch` sont évalués par le moteur et
+//! n'activent que la branche retenue. `Loop`/`While` (F2.4) sont aussi
+//! évalués par le moteur : ils délèguent le corps au runner par itération
+//! (élément/index exposés au contexte) et agrègent les sorties en tableau.
+//! Fail-fast : au premier échec, le reste est `Skipped`.
 //!
-//! **Hors périmètre** : mapping/templating de données (F2.6), boucles
-//! (F2.4), parallélisme (F2.5), retry/timeout (F2.7).
+//! **Hors périmètre** : mapping/templating de données (F2.6),
+//! parallélisme (F2.5), retry/timeout (F2.7).
 
 use std::collections::{HashMap, HashSet};
 
@@ -63,6 +65,10 @@ impl RunContext {
 
     fn record(&mut self, id: NodeId, value: Value) {
         self.outputs.insert(id, value);
+    }
+
+    fn forget(&mut self, id: &NodeId) {
+        self.outputs.remove(id);
     }
 
     /// Injection directe d'une sortie (tests uniquement).
@@ -166,6 +172,115 @@ fn eval_switch(node: &Node, ctx: &RunContext) -> NodeResult {
     }
 }
 
+/// Clé de contexte exposant l'élément courant d'une boucle `Loop`
+/// (`‹loop_id›::item`) — lisible par le runner / les conditions.
+fn item_key(node_id: &str) -> NodeId {
+    NodeId::new(format!("{node_id}::item"))
+}
+
+/// Clé de contexte exposant l'index d'itération courant (`‹id›::index`).
+fn index_key(node_id: &str) -> NodeId {
+    NodeId::new(format!("{node_id}::index"))
+}
+
+/// Évalue un node `Loop` : itère sur la collection `params.items`
+/// (chemin/opérande résolu en tableau). À chaque itération, l'élément et
+/// l'index sont exposés au contexte (`‹id›::item` / `::index`) et le
+/// **corps** est délégué au `runner`. Sortie = tableau des sorties par
+/// itération (F2.4.c). Fail-fast : une itération en échec stoppe la boucle.
+fn eval_loop(node: &Node, ctx: &mut RunContext, runner: &dyn NodeRunner) -> NodeResult {
+    let expr = node
+        .params
+        .get("items")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "node `loop` : `params.items` (chaîne) requis".to_string())?;
+    let items = match condition::resolve(expr, ctx)? {
+        Value::Array(a) => a,
+        other => {
+            return Err(format!(
+                "node `loop` : `items` doit être un tableau (reçu : {other})"
+            ))
+        }
+    };
+
+    let id = node.id.0.clone();
+    let (ik, xk) = (item_key(&id), index_key(&id));
+    let mut results = Vec::with_capacity(items.len());
+    for (i, item) in items.into_iter().enumerate() {
+        ctx.record(ik.clone(), item);
+        ctx.record(xk.clone(), Value::from(i as i64));
+        let outcome = runner.run(node, ctx);
+        match outcome {
+            Ok(out) => results.push(out),
+            Err(e) => {
+                ctx.forget(&ik);
+                ctx.forget(&xk);
+                return Err(format!("itération {i} : {e}"));
+            }
+        }
+    }
+    ctx.forget(&ik);
+    ctx.forget(&xk);
+    Ok((Value::Array(results), Outflow::All))
+}
+
+/// Borne d'itérations par défaut d'un `While` (garde anti-boucle infinie).
+const DEFAULT_MAX_ITERATIONS: u64 = 1000;
+
+/// Évalue un node `While` : tant que `params.condition` est vraie, délègue
+/// le corps au `runner`. `params.max_iterations` (défaut
+/// [`DEFAULT_MAX_ITERATIONS`]) borne l'exécution : si la condition reste
+/// vraie au-delà, c'est une **erreur** (garde anti-boucle infinie, F2.4.b).
+/// L'index d'itération est exposé (`‹id›::index`). Sortie = tableau des
+/// sorties par itération (F2.4.c).
+fn eval_while(node: &Node, ctx: &mut RunContext, runner: &dyn NodeRunner) -> NodeResult {
+    let cond = node
+        .params
+        .get("condition")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "node `while` : `params.condition` (chaîne) requis".to_string())?
+        .to_string();
+    let max = node
+        .params
+        .get("max_iterations")
+        .and_then(Value::as_u64)
+        .unwrap_or(DEFAULT_MAX_ITERATIONS);
+
+    let id = node.id.0.clone();
+    let xk = index_key(&id);
+    let mut results = Vec::new();
+    let mut i: u64 = 0;
+    loop {
+        ctx.record(xk.clone(), Value::from(i as i64));
+        let keep_going = match condition::eval_bool(&cond, ctx) {
+            Ok(b) => b,
+            Err(e) => {
+                ctx.forget(&xk);
+                return Err(e);
+            }
+        };
+        if !keep_going {
+            break;
+        }
+        if i >= max {
+            ctx.forget(&xk);
+            return Err(format!(
+                "garde anti-boucle : `max_iterations` ({max}) atteint, condition encore vraie"
+            ));
+        }
+        match runner.run(node, ctx) {
+            Ok(out) => results.push(out),
+            Err(e) => {
+                ctx.forget(&xk);
+                return Err(format!("itération {i} : {e}"));
+            }
+        }
+        i += 1;
+    }
+    ctx.forget(&xk);
+    Ok((Value::Array(results), Outflow::All))
+}
+
 /// Exécute le DAG séquentiellement dans l'ordre topologique.
 ///
 /// Branch-aware (F2.3) : `If`/`Switch` sont évalués par le moteur (pas le
@@ -198,6 +313,8 @@ pub fn run_sequential(dag: &Dag, runner: &dyn NodeRunner) -> RunReport {
         let result: NodeResult = match &node.kind {
             NodeKind::If => eval_if(node, &ctx),
             NodeKind::Switch => eval_switch(node, &ctx),
+            NodeKind::Loop => eval_loop(node, &mut ctx, runner),
+            NodeKind::While => eval_while(node, &mut ctx, runner),
             _ => runner.run(node, &ctx).map(|out| (out, Outflow::All)),
         };
 
@@ -463,5 +580,134 @@ mod tests {
         assert_eq!(status(&report, "i"), StepStatus::Failed);
         assert_eq!(status(&report, "yes"), StepStatus::Skipped);
         assert_eq!(status(&report, "no"), StepStatus::Skipped);
+    }
+
+    fn output(report: &RunReport, id: &str) -> Value {
+        report
+            .step(&NodeId::new(id))
+            .unwrap()
+            .output
+            .clone()
+            .unwrap()
+    }
+
+    #[test]
+    fn loop_iterates_collection_and_aggregates_outputs() {
+        let d = dag(
+            vec![
+                trig("t"),
+                ctrl(
+                    "L",
+                    NodeKind::Loop,
+                    serde_json::json!({ "items": "t.list" }),
+                ),
+                n("sink"),
+            ],
+            vec![e("t", "L"), e("L", "sink")],
+        );
+        let runner = |node: &Node, ctx: &RunContext| match node.id.0.as_str() {
+            "t" => Ok(serde_json::json!({ "list": [1, 2, 3] })),
+            "L" => {
+                // Le corps lit l'élément courant exposé par le moteur.
+                let item = ctx.output(&NodeId::new("L::item")).expect("item").clone();
+                let v = item.as_i64().unwrap();
+                Ok(Value::from(v * 2))
+            }
+            _ => Ok(Value::Null),
+        };
+        let report = run_sequential(&d, &runner);
+
+        assert_eq!(report.status, RunStatus::Succeeded);
+        assert_eq!(output(&report, "L"), serde_json::json!([2, 4, 6]));
+        assert_eq!(status(&report, "sink"), StepStatus::Succeeded);
+        // Les clés synthétiques de boucle ne fuitent pas.
+        assert!(report.step(&NodeId::new("L::item")).is_none());
+    }
+
+    #[test]
+    fn loop_over_empty_collection_runs_successors_once() {
+        let d = dag(
+            vec![
+                trig("t"),
+                ctrl(
+                    "L",
+                    NodeKind::Loop,
+                    serde_json::json!({ "items": "t.list" }),
+                ),
+                n("sink"),
+            ],
+            vec![e("t", "L"), e("L", "sink")],
+        );
+        let runner = |node: &Node, _: &RunContext| match node.id.0.as_str() {
+            "t" => Ok(serde_json::json!({ "list": [] })),
+            _ => Ok(Value::Null),
+        };
+        let report = run_sequential(&d, &runner);
+
+        assert_eq!(report.status, RunStatus::Succeeded);
+        assert_eq!(output(&report, "L"), serde_json::json!([]));
+        assert_eq!(status(&report, "sink"), StepStatus::Succeeded);
+    }
+
+    #[test]
+    fn loop_rejects_non_array_items() {
+        let d = dag(
+            vec![
+                trig("t"),
+                ctrl("L", NodeKind::Loop, serde_json::json!({ "items": "t.x" })),
+            ],
+            vec![e("t", "L")],
+        );
+        let runner = |node: &Node, _: &RunContext| match node.id.0.as_str() {
+            "t" => Ok(serde_json::json!({ "x": 42 })),
+            _ => Ok(Value::Null),
+        };
+        let report = run_sequential(&d, &runner);
+        assert_eq!(report.status, RunStatus::Failed);
+        assert_eq!(status(&report, "L"), StepStatus::Failed);
+    }
+
+    #[test]
+    fn while_runs_until_condition_false_and_aggregates() {
+        let d = dag(
+            vec![
+                trig("t"),
+                ctrl(
+                    "W",
+                    NodeKind::While,
+                    serde_json::json!({ "condition": "W::index < 3" }),
+                ),
+            ],
+            vec![e("t", "W")],
+        );
+        let runner = |node: &Node, ctx: &RunContext| match node.id.0.as_str() {
+            "W" => Ok(ctx.output(&NodeId::new("W::index")).unwrap().clone()),
+            _ => Ok(Value::Null),
+        };
+        let report = run_sequential(&d, &runner);
+
+        assert_eq!(report.status, RunStatus::Succeeded);
+        assert_eq!(output(&report, "W"), serde_json::json!([0, 1, 2]));
+    }
+
+    #[test]
+    fn while_guard_trips_on_infinite_loop() {
+        let d = dag(
+            vec![
+                trig("t"),
+                ctrl(
+                    "W",
+                    NodeKind::While,
+                    serde_json::json!({ "condition": "true", "max_iterations": 5 }),
+                ),
+            ],
+            vec![e("t", "W")],
+        );
+        let report = run_sequential(&d, &|_: &Node, _: &RunContext| Ok(Value::Null));
+
+        assert_eq!(report.status, RunStatus::Failed);
+        let w = report.step(&NodeId::new("W")).unwrap();
+        assert_eq!(w.status, StepStatus::Failed);
+        assert!(w.error.as_deref().unwrap().contains("max_iterations"));
     }
 }
