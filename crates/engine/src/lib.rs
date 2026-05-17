@@ -8,11 +8,13 @@
 pub mod condition;
 pub mod exec;
 pub mod graph;
+pub mod mapping;
 
 pub use exec::{
     run_parallel, run_sequential, NodeRunner, RunContext, RunReport, StepOutcome, StepStatus,
 };
 pub use graph::{Dag, GraphError};
+pub use mapping::{eval_expression, render_template, resolve_params};
 
 /// État global d'un run.
 ///

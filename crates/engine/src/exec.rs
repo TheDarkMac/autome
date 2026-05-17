@@ -17,8 +17,10 @@
 //! [`run_parallel`] (F2.5) ordonnance le même graphe de façon concurrente
 //! (fan-out/fan-in, concurrence bornée) avec une sémantique identique.
 //!
-//! **Hors périmètre** : mapping/templating de données (F2.6),
-//! retry/timeout (F2.7).
+//! Mapping (F2.6) : les `params` des nodes runner sont résolus/templatés
+//! contre le contexte avant exécution (cf. [`crate::mapping`]).
+//!
+//! **Hors périmètre** : retry/timeout/fallback (F2.7).
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Condvar, Mutex};
@@ -289,11 +291,19 @@ fn eval_while(node: &Node, ctx: &mut RunContext, runner: &dyn NodeRunner) -> Nod
 /// Évalue un node selon son type (commun séquentiel/parallèle).
 fn evaluate_node(node: &Node, ctx: &mut RunContext, runner: &dyn NodeRunner) -> NodeResult {
     match &node.kind {
+        // Les nodes de contrôle évaluent eux-mêmes leurs expressions brutes.
         NodeKind::If => eval_if(node, ctx),
         NodeKind::Switch => eval_switch(node, ctx),
         NodeKind::Loop => eval_loop(node, ctx, runner),
         NodeKind::While => eval_while(node, ctx, runner),
-        _ => runner.run(node, ctx).map(|out| (out, Outflow::All)),
+        // Chemin runner : les `params` sont résolus/templatés (F2.6) avant
+        // d'être passés, pour que le runner reçoive des valeurs concrètes.
+        _ => {
+            let resolved = crate::mapping::resolve_params(node, ctx)?;
+            let mut node = node.clone();
+            node.params = resolved;
+            runner.run(&node, ctx).map(|out| (out, Outflow::All))
+        }
     }
 }
 
@@ -1063,5 +1073,33 @@ mod tests {
         assert_eq!(status(&report, "a"), StepStatus::Failed);
         // Le node de jointure ne s'exécute pas après l'échec.
         assert_eq!(status(&report, "d"), StepStatus::Skipped);
+    }
+
+    #[test]
+    fn runner_receives_resolved_params() {
+        let action = Node {
+            id: NodeId::new("a"),
+            name: "a".into(),
+            kind: NodeKind::Action {
+                action_type: "http".into(),
+            },
+            params: serde_json::json!({
+                "url": "https://api/{{ t.host }}",
+                "n": "{{ t.count }}"
+            }),
+        };
+        let d = dag(vec![trig("t"), action], vec![e("t", "a")]);
+        let runner = |node: &Node, _: &RunContext| match node.id.0.as_str() {
+            "t" => Ok(serde_json::json!({ "host": "example", "count": 5 })),
+            "a" => {
+                // Les `params` doivent arriver résolus (F2.6).
+                assert_eq!(node.params["url"], serde_json::json!("https://api/example"));
+                assert_eq!(node.params["n"], serde_json::json!(5)); // type préservé
+                Ok(Value::Null)
+            }
+            _ => Ok(Value::Null),
+        };
+        let report = run_sequential(&d, &runner);
+        assert_eq!(report.status, RunStatus::Succeeded);
     }
 }
