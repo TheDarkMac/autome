@@ -9,7 +9,9 @@ pub mod condition;
 pub mod exec;
 pub mod graph;
 
-pub use exec::{run_sequential, NodeRunner, RunContext, RunReport, StepOutcome, StepStatus};
+pub use exec::{
+    run_parallel, run_sequential, NodeRunner, RunContext, RunReport, StepOutcome, StepStatus,
+};
 pub use graph::{Dag, GraphError};
 
 /// État global d'un run.
@@ -41,6 +43,17 @@ impl Engine {
     /// Exécute un DAG validé séquentiellement via le `runner` fourni.
     pub fn run(&self, dag: &Dag, runner: &dyn NodeRunner) -> RunReport {
         run_sequential(dag, runner)
+    }
+
+    /// Exécute un DAG validé en parallèle (fan-out/fan-in), avec au plus
+    /// `max_concurrency` nodes exécutés simultanément (F2.5).
+    pub fn run_parallel(
+        &self,
+        dag: &Dag,
+        runner: &(dyn NodeRunner + Sync),
+        max_concurrency: usize,
+    ) -> RunReport {
+        run_parallel(dag, runner, max_concurrency)
     }
 }
 

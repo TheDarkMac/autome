@@ -14,12 +14,17 @@
 //! (élément/index exposés au contexte) et agrègent les sorties en tableau.
 //! Fail-fast : au premier échec, le reste est `Skipped`.
 //!
+//! [`run_parallel`] (F2.5) ordonnance le même graphe de façon concurrente
+//! (fan-out/fan-in, concurrence bornée) avec une sémantique identique.
+//!
 //! **Hors périmètre** : mapping/templating de données (F2.6),
-//! parallélisme (F2.5), retry/timeout (F2.7).
+//! retry/timeout (F2.7).
 
 use std::collections::{HashMap, HashSet};
+use std::sync::{Condvar, Mutex};
+use std::thread;
 
-use autome_core::{Node, NodeId, NodeKind};
+use autome_core::{Edge, Node, NodeId, NodeKind};
 use serde_json::Value;
 
 use crate::{condition, Dag, RunStatus};
@@ -52,7 +57,7 @@ pub struct StepOutcome {
 ///
 /// Un `NodeRunner` peut y lire la sortie d'un prédécesseur. Le *mapping*
 /// fin des champs d'entrée relève de F2.6.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct RunContext {
     outputs: HashMap<NodeId, Value>,
 }
@@ -281,6 +286,26 @@ fn eval_while(node: &Node, ctx: &mut RunContext, runner: &dyn NodeRunner) -> Nod
     Ok((Value::Array(results), Outflow::All))
 }
 
+/// Évalue un node selon son type (commun séquentiel/parallèle).
+fn evaluate_node(node: &Node, ctx: &mut RunContext, runner: &dyn NodeRunner) -> NodeResult {
+    match &node.kind {
+        NodeKind::If => eval_if(node, ctx),
+        NodeKind::Switch => eval_switch(node, ctx),
+        NodeKind::Loop => eval_loop(node, ctx, runner),
+        NodeKind::While => eval_while(node, ctx, runner),
+        _ => runner.run(node, ctx).map(|out| (out, Outflow::All)),
+    }
+}
+
+/// L'arête `e` propage-t-elle l'activation, vu le `outflow` du node source ?
+fn edge_taken(outflow: &Outflow, e: &Edge) -> bool {
+    match outflow {
+        Outflow::All => true,
+        Outflow::Port(p) => e.from_port.as_deref() == Some(p.as_str()),
+        Outflow::None => false,
+    }
+}
+
 /// Exécute le DAG séquentiellement dans l'ordre topologique.
 ///
 /// Branch-aware (F2.3) : `If`/`Switch` sont évalués par le moteur (pas le
@@ -310,24 +335,13 @@ pub fn run_sequential(dag: &Dag, runner: &dyn NodeRunner) -> RunReport {
         }
 
         let node = dag.node(id).expect("node issu du DAG");
-        let result: NodeResult = match &node.kind {
-            NodeKind::If => eval_if(node, &ctx),
-            NodeKind::Switch => eval_switch(node, &ctx),
-            NodeKind::Loop => eval_loop(node, &mut ctx, runner),
-            NodeKind::While => eval_while(node, &mut ctx, runner),
-            _ => runner.run(node, &ctx).map(|out| (out, Outflow::All)),
-        };
+        let result = evaluate_node(node, &mut ctx, runner);
 
         match result {
             Ok((out, outflow)) => {
                 ctx.record(id.clone(), out.clone());
                 for e in dag.successors(id) {
-                    let take = match &outflow {
-                        Outflow::All => true,
-                        Outflow::Port(p) => e.from_port.as_deref() == Some(p.as_str()),
-                        Outflow::None => false,
-                    };
-                    if take {
+                    if edge_taken(&outflow, e) {
                         active.insert(e.to.clone());
                     }
                 }
@@ -351,6 +365,212 @@ pub fn run_sequential(dag: &Dag, runner: &dyn NodeRunner) -> RunReport {
     }
 
     let status = if failed {
+        RunStatus::Failed
+    } else {
+        RunStatus::Succeeded
+    };
+    RunReport { status, steps }
+}
+
+/// État partagé de l'ordonnanceur parallèle (F2.5).
+struct Sched {
+    /// Sorties accumulées (contexte partagé).
+    outputs: HashMap<NodeId, Value>,
+    /// Arêtes entrantes pas encore résolues, par node.
+    pending: HashMap<NodeId, usize>,
+    /// Le node a-t-il été atteint par une arête « prise » ?
+    activated: HashMap<NodeId, bool>,
+    /// Résultat final par node.
+    outcome: HashMap<NodeId, StepOutcome>,
+    /// Nodes prêts à être exécutés.
+    ready: Vec<NodeId>,
+    /// Nodes en cours d'exécution.
+    in_flight: usize,
+    /// Un node a échoué → on n'ordonnance plus rien (fail-fast).
+    aborted: bool,
+}
+
+fn skipped(id: &NodeId) -> StepOutcome {
+    StepOutcome {
+        node_id: id.clone(),
+        status: StepStatus::Skipped,
+        output: None,
+        error: None,
+    }
+}
+
+/// Résout une arête entrante de `target` : décrémente son compteur et,
+/// quand il atteint 0, met le node prêt (s'il est activé) ou le marque
+/// `Skipped` en cascade (branche non prise / fan-in non atteint).
+fn resolve_edge(s: &mut Sched, dag: &Dag, target: &NodeId) {
+    let p = s.pending.get_mut(target).expect("node indexé");
+    *p -= 1;
+    if *p != 0 || s.aborted {
+        return;
+    }
+    if *s.activated.get(target).expect("node indexé") {
+        s.ready.push(target.clone());
+    } else {
+        s.outcome
+            .entry(target.clone())
+            .or_insert_with(|| skipped(target));
+        let succ: Vec<NodeId> = dag
+            .successors(target)
+            .iter()
+            .map(|e| e.to.clone())
+            .collect();
+        for to in succ {
+            resolve_edge(s, dag, &to);
+        }
+    }
+}
+
+/// Acquiert un node prêt (par ordre topologique, déterministe) ou rend
+/// `None` quand il n'y a plus rien à faire.
+fn acquire(
+    sched: &Mutex<Sched>,
+    cv: &Condvar,
+    topo: &HashMap<NodeId, usize>,
+    total: usize,
+) -> Option<(NodeId, RunContext)> {
+    let mut g = sched.lock().expect("mutex");
+    loop {
+        let done = g.outcome.len() == total
+            || (g.aborted && g.in_flight == 0)
+            || (g.ready.is_empty() && g.in_flight == 0);
+        if done {
+            cv.notify_all();
+            return None;
+        }
+        if !g.aborted {
+            if let Some(pos) = g
+                .ready
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, id)| topo[*id])
+                .map(|(i, _)| i)
+            {
+                let id = g.ready.remove(pos);
+                g.in_flight += 1;
+                let ctx = RunContext {
+                    outputs: g.outputs.clone(),
+                };
+                return Some((id, ctx));
+            }
+        }
+        g = cv.wait(g).expect("mutex");
+    }
+}
+
+/// Valide le résultat d'un node et débloque ses successeurs.
+fn commit(sched: &Mutex<Sched>, cv: &Condvar, dag: &Dag, id: &NodeId, res: NodeResult) {
+    let mut g = sched.lock().expect("mutex");
+    match res {
+        Ok((out, outflow)) => {
+            g.outputs.insert(id.clone(), out.clone());
+            g.outcome.insert(
+                id.clone(),
+                StepOutcome {
+                    node_id: id.clone(),
+                    status: StepStatus::Succeeded,
+                    output: Some(out),
+                    error: None,
+                },
+            );
+            let succ: Vec<Edge> = dag.successors(id).to_vec();
+            for e in &succ {
+                if edge_taken(&outflow, e) {
+                    *g.activated.get_mut(&e.to).expect("node indexé") = true;
+                }
+            }
+            for e in &succ {
+                resolve_edge(&mut g, dag, &e.to);
+            }
+        }
+        Err(err) => {
+            g.aborted = true;
+            g.outcome.insert(
+                id.clone(),
+                StepOutcome {
+                    node_id: id.clone(),
+                    status: StepStatus::Failed,
+                    output: None,
+                    error: Some(err),
+                },
+            );
+        }
+    }
+    g.in_flight -= 1;
+    cv.notify_all();
+}
+
+/// Exécute le DAG **en parallèle** : fan-out concurrent des branches
+/// indépendantes (F2.5.a), fan-in implicite via le comptage d'arêtes
+/// entrantes (F2.5.b), concurrence bornée par `max_concurrency` workers
+/// (F2.5.c, min 1). Mêmes sémantiques que [`run_sequential`] (branches,
+/// boucles, fail-fast) ; rapport stable (ordre topologique).
+pub fn run_parallel(
+    dag: &Dag,
+    runner: &(dyn NodeRunner + Sync),
+    max_concurrency: usize,
+) -> RunReport {
+    let order = dag.topological_order();
+    let topo: HashMap<NodeId, usize> = order
+        .iter()
+        .enumerate()
+        .map(|(i, id)| (id.clone(), i))
+        .collect();
+
+    let mut pending: HashMap<NodeId, usize> = order.iter().map(|id| (id.clone(), 0usize)).collect();
+    for id in &order {
+        for e in dag.successors(id) {
+            *pending.get_mut(&e.to).expect("node indexé") += 1;
+        }
+    }
+    let mut activated: HashMap<NodeId, bool> = order.iter().map(|id| (id.clone(), false)).collect();
+    let root = dag.root().id.clone();
+    *activated.get_mut(&root).expect("racine") = true;
+
+    let sched = Mutex::new(Sched {
+        outputs: HashMap::new(),
+        pending,
+        activated,
+        outcome: HashMap::new(),
+        ready: vec![root],
+        in_flight: 0,
+        aborted: false,
+    });
+    let cv = Condvar::new();
+    let total = order.len();
+    let workers = max_concurrency.max(1);
+
+    thread::scope(|scope| {
+        for _ in 0..workers {
+            scope.spawn(|| loop {
+                match acquire(&sched, &cv, &topo, total) {
+                    None => break,
+                    Some((id, mut ctx)) => {
+                        let node = dag.node(&id).expect("node issu du DAG");
+                        let res = evaluate_node(node, &mut ctx, runner);
+                        commit(&sched, &cv, dag, &id, res);
+                    }
+                }
+            });
+        }
+    });
+
+    let sched = sched.into_inner().expect("mutex");
+    let steps: Vec<StepOutcome> = order
+        .iter()
+        .map(|id| {
+            sched
+                .outcome
+                .get(id)
+                .cloned()
+                .unwrap_or_else(|| skipped(id))
+        })
+        .collect();
+    let status = if steps.iter().any(|s| s.status == StepStatus::Failed) {
         RunStatus::Failed
     } else {
         RunStatus::Succeeded
@@ -709,5 +929,139 @@ mod tests {
         let w = report.step(&NodeId::new("W")).unwrap();
         assert_eq!(w.status, StepStatus::Failed);
         assert!(w.error.as_deref().unwrap().contains("max_iterations"));
+    }
+
+    // --- F2.5 : exécution parallèle -------------------------------------
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    /// Runner qui mesure la concurrence maximale observée sur les nodes
+    /// dont l'id commence par `b` (les branches), via une courte pause.
+    struct ConcurrencyProbe {
+        current: AtomicUsize,
+        max: AtomicUsize,
+    }
+    impl NodeRunner for ConcurrencyProbe {
+        fn run(&self, node: &Node, _: &RunContext) -> Result<Value, String> {
+            if node.id.0.starts_with('b') {
+                let c = self.current.fetch_add(1, Ordering::SeqCst) + 1;
+                self.max.fetch_max(c, Ordering::SeqCst);
+                std::thread::sleep(Duration::from_millis(25));
+                self.current.fetch_sub(1, Ordering::SeqCst);
+            }
+            Ok(Value::String(node.id.0.clone()))
+        }
+    }
+
+    #[test]
+    fn fan_out_runs_independent_branches_concurrently() {
+        // Diamant : t -> {a? non} ; ici 4 branches indépendantes b1..b4.
+        let d = dag(
+            vec![trig("t"), n("b1"), n("b2"), n("b3"), n("b4")],
+            vec![e("t", "b1"), e("t", "b2"), e("t", "b3"), e("t", "b4")],
+        );
+        let probe = ConcurrencyProbe {
+            current: AtomicUsize::new(0),
+            max: AtomicUsize::new(0),
+        };
+        let report = run_parallel(&d, &probe, 4);
+
+        assert_eq!(report.status, RunStatus::Succeeded);
+        assert!(report
+            .steps
+            .iter()
+            .all(|s| s.status == StepStatus::Succeeded));
+        // Les 4 branches doivent s'être chevauchées (fan-out réel).
+        assert_eq!(probe.max.load(Ordering::SeqCst), 4);
+    }
+
+    #[test]
+    fn concurrency_limit_is_respected() {
+        let d = dag(
+            vec![trig("t"), n("b1"), n("b2"), n("b3"), n("b4")],
+            vec![e("t", "b1"), e("t", "b2"), e("t", "b3"), e("t", "b4")],
+        );
+        let probe = ConcurrencyProbe {
+            current: AtomicUsize::new(0),
+            max: AtomicUsize::new(0),
+        };
+        let report = run_parallel(&d, &probe, 2);
+
+        assert_eq!(report.status, RunStatus::Succeeded);
+        // Jamais plus de 2 branches simultanées (F2.5.c).
+        assert_eq!(probe.max.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn fan_in_waits_for_all_active_predecessors() {
+        // t -> a, t -> b, a -> d, b -> d : d ne part qu'après a ET b.
+        let d = dag(
+            vec![trig("t"), n("a"), n("b"), n("d")],
+            vec![e("t", "a"), e("t", "b"), e("a", "d"), e("b", "d")],
+        );
+        let runner = |node: &Node, ctx: &RunContext| match node.id.0.as_str() {
+            "d" => {
+                assert!(ctx.output(&NodeId::new("a")).is_some(), "a manquant");
+                assert!(ctx.output(&NodeId::new("b")).is_some(), "b manquant");
+                Ok(Value::String("joined".into()))
+            }
+            other => Ok(Value::String(other.into())),
+        };
+        let report = run_parallel(&d, &runner, 4);
+
+        assert_eq!(report.status, RunStatus::Succeeded);
+        assert_eq!(output(&report, "d"), serde_json::json!("joined"));
+    }
+
+    #[test]
+    fn parallel_matches_sequential_branch_semantics() {
+        let build = || {
+            dag(
+                vec![
+                    trig("t"),
+                    ctrl(
+                        "i",
+                        NodeKind::If,
+                        serde_json::json!({ "condition": "t.ok == true" }),
+                    ),
+                    n("yes"),
+                    n("no"),
+                ],
+                vec![e("t", "i"), ep("i", "yes", "true"), ep("i", "no", "false")],
+            )
+        };
+        let runner = |node: &Node, _: &RunContext| match node.id.0.as_str() {
+            "t" => Ok(serde_json::json!({ "ok": true })),
+            _ => Ok(Value::Null),
+        };
+        let seq = run_sequential(&build(), &runner);
+        let par = run_parallel(&build(), &runner, 3);
+
+        for id in ["t", "i", "yes", "no"] {
+            assert_eq!(status(&seq, id), status(&par, id), "divergence sur {id}");
+        }
+        assert_eq!(par.status, RunStatus::Succeeded);
+        assert_eq!(status(&par, "no"), StepStatus::Skipped);
+    }
+
+    #[test]
+    fn parallel_failure_aborts_and_skips_join() {
+        let d = dag(
+            vec![trig("t"), n("a"), n("b"), n("d")],
+            vec![e("t", "a"), e("t", "b"), e("a", "d"), e("b", "d")],
+        );
+        let runner = |node: &Node, _: &RunContext| {
+            if node.id.0 == "a" {
+                Err("boom".to_string())
+            } else {
+                Ok(Value::Null)
+            }
+        };
+        let report = run_parallel(&d, &runner, 2);
+
+        assert_eq!(report.status, RunStatus::Failed);
+        assert_eq!(status(&report, "a"), StepStatus::Failed);
+        // Le node de jointure ne s'exécute pas après l'échec.
+        assert_eq!(status(&report, "d"), StepStatus::Skipped);
     }
 }
