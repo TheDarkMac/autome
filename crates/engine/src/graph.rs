@@ -260,12 +260,13 @@ fn validate_port(node: &str, kind: &NodeKind, port: Option<&str>) -> Result<(), 
             Some(p) if !p.is_empty() => Ok(()),
             _ => invalid("un node `switch` exige un port de branche non vide".into()),
         },
-        // Sortie par défaut unique : aucun port nommé attendu en F2.1.
+        // Sortie par défaut unique, plus le port réservé `error` pour le
+        // handler d'erreur / fallback (F2.7.c).
         NodeKind::Trigger { .. } | NodeKind::Action { .. } | NodeKind::Loop | NodeKind::While => {
             match port {
-                None => Ok(()),
+                None | Some("error") => Ok(()),
                 Some(p) => invalid(format!(
-                    "ce type de node n'a qu'une sortie par défaut (port `{p}` inattendu)"
+                    "ce type de node n'accepte que la sortie par défaut ou `error` (port `{p}` inattendu)"
                 )),
             }
         }

@@ -17,7 +17,7 @@
 | #  | Domaine                  | Features | Terminées | Statut global |
 |----|--------------------------|----------|-----------|---------------|
 | 1  | Fondations & Architecture| 6        | 6         | ✅ Terminé    |
-| 2  | Moteur de workflows      | 7        | 6         | En cours      |
+| 2  | Moteur de workflows      | 7        | 7         | ✅ Terminé    |
 | 3  | Triggers & Actions       | 6        | 0         | À faire       |
 | 4  | Connecteurs API          | 5        | 0         | À faire       |
 | 5  | Orchestrateur & Scaling  | 6        | 0         | À faire       |
@@ -29,7 +29,7 @@
 | 11 | Documentation            | 5        | 0         | À faire       |
 | 12 | Exemples de workflows    | 3        | 0         | À faire       |
 
-**Progression totale : 12 / 66 features** (≈ 150 sous-tâches sur les features détaillées)
+**Progression totale : 13 / 66 features** (≈ 150 sous-tâches sur les features détaillées)
 
 > Les features complexes (F1.3, F1.5, F2.*, F4.*, F5.1–F5.4, F6.1–F6.3, F6.5,
 > F8.2–F8.7) sont découpées en sous-tâches `Fx.y.z`. Une feature est `[x]`
@@ -87,11 +87,11 @@
   - [x] F2.6.a — Moteur d'expressions (accès aux sorties précédentes)
   - [x] F2.6.b — Templating de chaînes (`{{ }}`)
   - [x] F2.6.c — Mapping/transformation des champs d'entrée
-- [ ] **F2.7** — Gestion d'erreurs : retry, fallback, timeout par node
-  - [ ] F2.7.a — Politique de retry (nb essais, backoff)
-  - [ ] F2.7.b — Timeout par node
-  - [ ] F2.7.c — Branche/handler d'erreur (fallback)
-  - [ ] F2.7.d — Propagation & statut final du run
+- [x] **F2.7** — Gestion d'erreurs : retry, fallback, timeout par node — _issue #25_
+  - [x] F2.7.a — Politique de retry (nb essais, backoff)
+  - [x] F2.7.b — Timeout par node
+  - [x] F2.7.c — Branche/handler d'erreur (fallback)
+  - [x] F2.7.d — Propagation & statut final du run
 
 ## 3. Triggers & Actions
 
@@ -262,3 +262,4 @@
 | 2026-05-17 | F2.4 | Boucles : nodes `Loop` (itère `params.items`) / `While` (`condition` + garde `max_iterations`) évalués par le moteur, corps délégué au runner par itération (item/index exposés au contexte), sortie agrégée en tableau. 28 tests engine verts. | — |
 | 2026-05-17 | F2.5 | Exécution parallèle : `run_parallel` (ordonnanceur ready-queue à threads scoped) — fan-out concurrent, fan-in par comptage d'arêtes, limite `max_concurrency`, sémantique identique au séquentiel, rapport stable. 33 tests engine verts. | — |
 | 2026-05-17 | F2.6 | Mapping de données : `engine::mapping` (expressions via `condition::resolve`, templating `{{ }}` multi-occurrences, type préservé si template unique, résolution récursive des params). Injecté avant le runner (nodes de contrôle inchangés). 38 tests engine verts. | — |
+| 2026-05-17 | F2.7 | Gestion d'erreurs : politique `params._error` (retry+backoff, timeout, on_error fail/continue/fallback), port `error`, fail-fast vs échec géré, statut final cohérent — séquentiel **et** parallèle. 44 tests engine verts. **Domaine 2 (Moteur) terminé.** | — |

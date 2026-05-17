@@ -43,7 +43,7 @@ impl Engine {
     }
 
     /// Exécute un DAG validé séquentiellement via le `runner` fourni.
-    pub fn run(&self, dag: &Dag, runner: &dyn NodeRunner) -> RunReport {
+    pub fn run(&self, dag: &Dag, runner: &(dyn NodeRunner + Sync)) -> RunReport {
         run_sequential(dag, runner)
     }
 
