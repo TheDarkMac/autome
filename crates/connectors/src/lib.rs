@@ -4,6 +4,10 @@
 //! et les implémentations concrètes (Slack, Gmail, Notion, GitHub, HTTP)
 //! sont livrés au domaine 4 du roadmap (F4.*). Squelette : F1.3.e.
 
+pub mod webhook;
+
+pub use webhook::WebhookTrigger;
+
 use autome_core::Result;
 
 /// Contrat minimal d'un connecteur tiers.
