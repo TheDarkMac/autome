@@ -18,7 +18,7 @@
 |----|--------------------------|----------|-----------|---------------|
 | 1  | Fondations & Architecture| 6        | 6         | ✅ Terminé    |
 | 2  | Moteur de workflows      | 7        | 7         | ✅ Terminé    |
-| 3  | Triggers & Actions       | 6        | 0         | À faire       |
+| 3  | Triggers & Actions       | 6        | 1         | En cours      |
 | 4  | Connecteurs API          | 5        | 0         | À faire       |
 | 5  | Orchestrateur & Scaling  | 6        | 0         | À faire       |
 | 6  | Sécurité & Auth          | 6        | 0         | À faire       |
@@ -29,7 +29,7 @@
 | 11 | Documentation            | 5        | 0         | À faire       |
 | 12 | Exemples de workflows    | 3        | 0         | À faire       |
 
-**Progression totale : 13 / 66 features** (≈ 150 sous-tâches sur les features détaillées)
+**Progression totale : 14 / 66 features** (≈ 150 sous-tâches sur les features détaillées)
 
 > Les features complexes (F1.3, F1.5, F2.*, F4.*, F5.1–F5.4, F6.1–F6.3, F6.5,
 > F8.2–F8.7) sont découpées en sous-tâches `Fx.y.z`. Une feature est `[x]`
@@ -95,7 +95,7 @@
 
 ## 3. Triggers & Actions
 
-- [ ] **F3.1** — Trait/abstraction `Trigger` extensible
+- [x] **F3.1** — Trait/abstraction `Trigger` extensible — _issue #27_
 - [ ] **F3.2** — Trigger Webhook (HTTP entrant)
 - [ ] **F3.3** — Trigger Scheduler (cron / intervalle)
 - [ ] **F3.4** — Trigger Polling (vérification périodique d'une source)
@@ -263,3 +263,4 @@
 | 2026-05-17 | F2.5 | Exécution parallèle : `run_parallel` (ordonnanceur ready-queue à threads scoped) — fan-out concurrent, fan-in par comptage d'arêtes, limite `max_concurrency`, sémantique identique au séquentiel, rapport stable. 33 tests engine verts. | — |
 | 2026-05-17 | F2.6 | Mapping de données : `engine::mapping` (expressions via `condition::resolve`, templating `{{ }}` multi-occurrences, type préservé si template unique, résolution récursive des params). Injecté avant le runner (nodes de contrôle inchangés). 38 tests engine verts. | — |
 | 2026-05-17 | F2.7 | Gestion d'erreurs : politique `params._error` (retry+backoff, timeout, on_error fail/continue/fallback), port `error`, fail-fast vs échec géré, statut final cohérent — séquentiel **et** parallèle. 44 tests engine verts. **Domaine 2 (Moteur) terminé.** | — |
+| 2026-05-17 | F3.1 | Abstraction `Trigger` : `core::trigger` (`TriggerEvent`, trait `Trigger` pull `kind()`/`poll()`), agnostique réseau/horloge. 14 tests core verts. | — |
