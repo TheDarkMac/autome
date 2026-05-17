@@ -20,11 +20,16 @@
 //! Mapping (F2.6) : les `params` des nodes runner sont résolus/templatés
 //! contre le contexte avant exécution (cf. [`crate::mapping`]).
 //!
-//! **Hors périmètre** : retry/timeout/fallback (F2.7).
+//! Gestion d'erreurs (F2.7) : politique par node via `params._error`
+//! (retry + backoff, timeout, `on_error` = fail | continue | fallback).
+//! Un échec **géré** (continue/fallback) n'arrête pas le run ; un échec
+//! **non géré** déclenche le fail-fast (downstream `Skipped`). Le statut
+//! final reflète uniquement les échecs non gérés.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::{Condvar, Mutex};
+use std::sync::{mpsc, Condvar, Mutex};
 use std::thread;
+use std::time::Duration;
 
 use autome_core::{Edge, Node, NodeId, NodeKind};
 use serde_json::Value;
@@ -195,7 +200,7 @@ fn index_key(node_id: &str) -> NodeId {
 /// l'index sont exposés au contexte (`‹id›::item` / `::index`) et le
 /// **corps** est délégué au `runner`. Sortie = tableau des sorties par
 /// itération (F2.4.c). Fail-fast : une itération en échec stoppe la boucle.
-fn eval_loop(node: &Node, ctx: &mut RunContext, runner: &dyn NodeRunner) -> NodeResult {
+fn eval_loop(node: &Node, ctx: &mut RunContext, runner: &(dyn NodeRunner + Sync)) -> NodeResult {
     let expr = node
         .params
         .get("items")
@@ -240,7 +245,7 @@ const DEFAULT_MAX_ITERATIONS: u64 = 1000;
 /// vraie au-delà, c'est une **erreur** (garde anti-boucle infinie, F2.4.b).
 /// L'index d'itération est exposé (`‹id›::index`). Sortie = tableau des
 /// sorties par itération (F2.4.c).
-fn eval_while(node: &Node, ctx: &mut RunContext, runner: &dyn NodeRunner) -> NodeResult {
+fn eval_while(node: &Node, ctx: &mut RunContext, runner: &(dyn NodeRunner + Sync)) -> NodeResult {
     let cond = node
         .params
         .get("condition")
@@ -288,21 +293,180 @@ fn eval_while(node: &Node, ctx: &mut RunContext, runner: &dyn NodeRunner) -> Nod
     Ok((Value::Array(results), Outflow::All))
 }
 
+/// Conduite à tenir quand un node runner échoue (F2.7.c).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OnError {
+    /// Échec non géré : le run s'arrête (fail-fast). Défaut.
+    Fail,
+    /// Échec toléré : node `Failed`, mais le run continue (sortie par défaut).
+    Continue,
+    /// Échec routé vers le port `error` (handler/fallback).
+    Fallback,
+}
+
+/// Politique d'erreur d'un node, lue depuis `params._error` (F2.7).
+///
+/// ```json
+/// { "_error": { "max_attempts": 3, "backoff_ms": 50,
+///               "timeout_ms": 2000, "on_error": "fallback" } }
+/// ```
+struct ErrorPolicy {
+    max_attempts: u32,
+    backoff_ms: u64,
+    timeout_ms: Option<u64>,
+    on_error: OnError,
+}
+
+impl ErrorPolicy {
+    fn from_params(params: &Value) -> Self {
+        let e = params.get("_error");
+        let get_u64 = |k: &str| e.and_then(|v| v.get(k)).and_then(Value::as_u64);
+        let on_error = match e.and_then(|v| v.get("on_error")).and_then(Value::as_str) {
+            Some("continue") => OnError::Continue,
+            Some("fallback") => OnError::Fallback,
+            _ => OnError::Fail,
+        };
+        Self {
+            max_attempts: get_u64("max_attempts").unwrap_or(1).max(1) as u32,
+            backoff_ms: get_u64("backoff_ms").unwrap_or(0),
+            timeout_ms: get_u64("timeout_ms"),
+            on_error,
+        }
+    }
+}
+
+/// Évaluation complète d'un node : sortie, propagation, statut, abandon.
+struct NodeEval {
+    output: Value,
+    outflow: Outflow,
+    status: StepStatus,
+    error: Option<String>,
+    /// `true` ⇒ échec non géré : le run s'arrête (fail-fast).
+    abort: bool,
+}
+
+fn eval_ok(output: Value, outflow: Outflow) -> NodeEval {
+    NodeEval {
+        output,
+        outflow,
+        status: StepStatus::Succeeded,
+        error: None,
+        abort: false,
+    }
+}
+
+fn eval_fatal(error: String) -> NodeEval {
+    NodeEval {
+        output: Value::Null,
+        outflow: Outflow::None,
+        status: StepStatus::Failed,
+        error: Some(error),
+        abort: true,
+    }
+}
+
+fn from_control(r: NodeResult) -> NodeEval {
+    match r {
+        Ok((out, outflow)) => eval_ok(out, outflow),
+        Err(e) => eval_fatal(e),
+    }
+}
+
+/// Une tentative d'exécution du runner, éventuellement bornée par un
+/// timeout (F2.7.b).
+///
+/// Limitation assumée : safe Rust ne préempte pas un thread. Le timeout
+/// est une **date-limite d'attente** : passé le délai, l'erreur de
+/// timeout est produite ; le thread du runner est néanmoins joint avant
+/// le retour (un runner non coopératif peut donc dépasser le délai en
+/// temps réel, mais son résultat est ignoré).
+fn run_once(
+    node: &Node,
+    ctx: &RunContext,
+    runner: &(dyn NodeRunner + Sync),
+    timeout_ms: Option<u64>,
+) -> Result<Value, String> {
+    match timeout_ms {
+        None => runner.run(node, ctx),
+        Some(ms) => thread::scope(|s| {
+            let (tx, rx) = mpsc::channel();
+            s.spawn(move || {
+                let _ = tx.send(runner.run(node, ctx));
+            });
+            match rx.recv_timeout(Duration::from_millis(ms)) {
+                Ok(r) => r,
+                Err(_) => Err(format!("timeout : node `{}` a dépassé {ms} ms", node.id.0)),
+            }
+        }),
+    }
+}
+
+/// Exécute le runner avec retry (F2.7.a) + timeout (F2.7.b).
+fn run_with_policy(
+    node: &Node,
+    ctx: &RunContext,
+    runner: &(dyn NodeRunner + Sync),
+    policy: &ErrorPolicy,
+) -> Result<Value, String> {
+    let mut last = String::from("échec");
+    for attempt in 1..=policy.max_attempts {
+        match run_once(node, ctx, runner, policy.timeout_ms) {
+            Ok(v) => return Ok(v),
+            Err(e) => {
+                last = e;
+                if attempt < policy.max_attempts && policy.backoff_ms > 0 {
+                    thread::sleep(Duration::from_millis(policy.backoff_ms));
+                }
+            }
+        }
+    }
+    Err(last)
+}
+
 /// Évalue un node selon son type (commun séquentiel/parallèle).
-fn evaluate_node(node: &Node, ctx: &mut RunContext, runner: &dyn NodeRunner) -> NodeResult {
+fn evaluate_node(node: &Node, ctx: &mut RunContext, runner: &(dyn NodeRunner + Sync)) -> NodeEval {
     match &node.kind {
         // Les nodes de contrôle évaluent eux-mêmes leurs expressions brutes.
-        NodeKind::If => eval_if(node, ctx),
-        NodeKind::Switch => eval_switch(node, ctx),
-        NodeKind::Loop => eval_loop(node, ctx, runner),
-        NodeKind::While => eval_while(node, ctx, runner),
-        // Chemin runner : les `params` sont résolus/templatés (F2.6) avant
-        // d'être passés, pour que le runner reçoive des valeurs concrètes.
+        NodeKind::If => from_control(eval_if(node, ctx)),
+        NodeKind::Switch => from_control(eval_switch(node, ctx)),
+        NodeKind::Loop => from_control(eval_loop(node, ctx, runner)),
+        NodeKind::While => from_control(eval_while(node, ctx, runner)),
+        // Chemin runner : params résolus/templatés (F2.6), puis politique
+        // d'erreur retry/timeout/fallback (F2.7).
         _ => {
-            let resolved = crate::mapping::resolve_params(node, ctx)?;
+            let policy = ErrorPolicy::from_params(&node.params);
+            let resolved = match crate::mapping::resolve_params(node, ctx) {
+                Ok(v) => v,
+                Err(e) => return eval_fatal(format!("mapping des params : {e}")),
+            };
             let mut node = node.clone();
             node.params = resolved;
-            runner.run(&node, ctx).map(|out| (out, Outflow::All))
+            match run_with_policy(&node, ctx, runner, &policy) {
+                Ok(out) => eval_ok(out, Outflow::All),
+                Err(e) => match policy.on_error {
+                    OnError::Fail => NodeEval {
+                        output: Value::Null,
+                        outflow: Outflow::None,
+                        status: StepStatus::Failed,
+                        error: Some(e),
+                        abort: true,
+                    },
+                    OnError::Continue => NodeEval {
+                        output: Value::Null,
+                        outflow: Outflow::All,
+                        status: StepStatus::Failed,
+                        error: Some(e),
+                        abort: false,
+                    },
+                    OnError::Fallback => NodeEval {
+                        output: serde_json::json!({ "error": e.clone() }),
+                        outflow: Outflow::Port("error".to_string()),
+                        status: StepStatus::Failed,
+                        error: Some(e),
+                        abort: false,
+                    },
+                },
+            }
         }
     }
 }
@@ -322,7 +486,7 @@ fn edge_taken(outflow: &Outflow, e: &Edge) -> bool {
 /// runner) et n'activent que les nodes du port retenu ; les nodes jamais
 /// activés sont `Skipped`. Fail-fast : au premier échec, le reste est
 /// `Skipped` et le run est `Failed`.
-pub fn run_sequential(dag: &Dag, runner: &dyn NodeRunner) -> RunReport {
+pub fn run_sequential(dag: &Dag, runner: &(dyn NodeRunner + Sync)) -> RunReport {
     let order = dag.topological_order();
     let mut ctx = RunContext::default();
     let mut steps = Vec::with_capacity(order.len());
@@ -345,31 +509,26 @@ pub fn run_sequential(dag: &Dag, runner: &dyn NodeRunner) -> RunReport {
         }
 
         let node = dag.node(id).expect("node issu du DAG");
-        let result = evaluate_node(node, &mut ctx, runner);
+        let ev = evaluate_node(node, &mut ctx, runner);
 
-        match result {
-            Ok((out, outflow)) => {
-                ctx.record(id.clone(), out.clone());
-                for e in dag.successors(id) {
-                    if edge_taken(&outflow, e) {
-                        active.insert(e.to.clone());
-                    }
+        // La sortie est enregistrée même en cas d'échec géré (un handler
+        // sur le port `error` peut vouloir lire `{ "error": … }`).
+        ctx.record(id.clone(), ev.output.clone());
+        let output = (ev.status == StepStatus::Succeeded).then_some(ev.output);
+        steps.push(StepOutcome {
+            node_id: id.clone(),
+            status: ev.status,
+            output,
+            error: ev.error,
+        });
+
+        if ev.abort {
+            failed = true; // échec non géré → fail-fast (F2.7.d)
+        } else {
+            for e in dag.successors(id) {
+                if edge_taken(&ev.outflow, e) {
+                    active.insert(e.to.clone());
                 }
-                steps.push(StepOutcome {
-                    node_id: id.clone(),
-                    status: StepStatus::Succeeded,
-                    output: Some(out),
-                    error: None,
-                });
-            }
-            Err(e) => {
-                failed = true;
-                steps.push(StepOutcome {
-                    node_id: id.clone(),
-                    status: StepStatus::Failed,
-                    output: None,
-                    error: Some(e),
-                });
             }
         }
     }
@@ -472,42 +631,32 @@ fn acquire(
     }
 }
 
-/// Valide le résultat d'un node et débloque ses successeurs.
-fn commit(sched: &Mutex<Sched>, cv: &Condvar, dag: &Dag, id: &NodeId, res: NodeResult) {
+/// Valide l'évaluation d'un node et débloque ses successeurs.
+fn commit(sched: &Mutex<Sched>, cv: &Condvar, dag: &Dag, id: &NodeId, ev: NodeEval) {
     let mut g = sched.lock().expect("mutex");
-    match res {
-        Ok((out, outflow)) => {
-            g.outputs.insert(id.clone(), out.clone());
-            g.outcome.insert(
-                id.clone(),
-                StepOutcome {
-                    node_id: id.clone(),
-                    status: StepStatus::Succeeded,
-                    output: Some(out),
-                    error: None,
-                },
-            );
-            let succ: Vec<Edge> = dag.successors(id).to_vec();
-            for e in &succ {
-                if edge_taken(&outflow, e) {
-                    *g.activated.get_mut(&e.to).expect("node indexé") = true;
-                }
-            }
-            for e in &succ {
-                resolve_edge(&mut g, dag, &e.to);
+    g.outputs.insert(id.clone(), ev.output.clone());
+    let output = (ev.status == StepStatus::Succeeded).then_some(ev.output);
+    g.outcome.insert(
+        id.clone(),
+        StepOutcome {
+            node_id: id.clone(),
+            status: ev.status,
+            output,
+            error: ev.error,
+        },
+    );
+
+    if ev.abort {
+        g.aborted = true; // échec non géré → fail-fast
+    } else {
+        let succ: Vec<Edge> = dag.successors(id).to_vec();
+        for e in &succ {
+            if edge_taken(&ev.outflow, e) {
+                *g.activated.get_mut(&e.to).expect("node indexé") = true;
             }
         }
-        Err(err) => {
-            g.aborted = true;
-            g.outcome.insert(
-                id.clone(),
-                StepOutcome {
-                    node_id: id.clone(),
-                    status: StepStatus::Failed,
-                    output: None,
-                    error: Some(err),
-                },
-            );
+        for e in &succ {
+            resolve_edge(&mut g, dag, &e.to);
         }
     }
     g.in_flight -= 1;
@@ -561,8 +710,8 @@ pub fn run_parallel(
                     None => break,
                     Some((id, mut ctx)) => {
                         let node = dag.node(&id).expect("node issu du DAG");
-                        let res = evaluate_node(node, &mut ctx, runner);
-                        commit(&sched, &cv, dag, &id, res);
+                        let ev = evaluate_node(node, &mut ctx, runner);
+                        commit(&sched, &cv, dag, &id, ev);
                     }
                 }
             });
@@ -580,7 +729,9 @@ pub fn run_parallel(
                 .unwrap_or_else(|| skipped(id))
         })
         .collect();
-    let status = if steps.iter().any(|s| s.status == StepStatus::Failed) {
+    // Le run échoue seulement sur un échec **non géré** (abandon) ; les
+    // échecs gérés (continue/fallback) laissent le run réussir (F2.7.d).
+    let status = if sched.aborted {
         RunStatus::Failed
     } else {
         RunStatus::Succeeded
@@ -1101,5 +1252,183 @@ mod tests {
         };
         let report = run_sequential(&d, &runner);
         assert_eq!(report.status, RunStatus::Succeeded);
+    }
+
+    // --- F2.7 : gestion d'erreurs ---------------------------------------
+    fn act_p(id: &str, params: Value) -> Node {
+        Node {
+            id: NodeId::new(id),
+            name: id.into(),
+            kind: NodeKind::Action {
+                action_type: "x".into(),
+            },
+            params,
+        }
+    }
+
+    /// Runner qui échoue `fails_before_success` fois sur le node `a`.
+    struct FlakyRunner {
+        fails: usize,
+        calls: AtomicUsize,
+    }
+    impl NodeRunner for FlakyRunner {
+        fn run(&self, node: &Node, _: &RunContext) -> Result<Value, String> {
+            if node.id.0 == "a" {
+                let n = self.calls.fetch_add(1, Ordering::SeqCst);
+                if n < self.fails {
+                    return Err(format!("essai {n} KO"));
+                }
+            }
+            Ok(Value::Null)
+        }
+    }
+
+    #[test]
+    fn retry_succeeds_after_transient_failures() {
+        let d = dag(
+            vec![
+                trig("t"),
+                act_p("a", serde_json::json!({ "_error": { "max_attempts": 3 } })),
+            ],
+            vec![e("t", "a")],
+        );
+        let runner = FlakyRunner {
+            fails: 2,
+            calls: AtomicUsize::new(0),
+        };
+        let report = run_sequential(&d, &runner);
+
+        assert_eq!(report.status, RunStatus::Succeeded);
+        assert_eq!(status(&report, "a"), StepStatus::Succeeded);
+        assert_eq!(runner.calls.load(Ordering::SeqCst), 3); // 2 KO + 1 OK
+    }
+
+    #[test]
+    fn retry_exhausted_then_unhandled_failure_aborts() {
+        let d = dag(
+            vec![
+                trig("t"),
+                act_p("a", serde_json::json!({ "_error": { "max_attempts": 2 } })),
+                n("b"),
+            ],
+            vec![e("t", "a"), e("a", "b")],
+        );
+        let runner = FlakyRunner {
+            fails: 99,
+            calls: AtomicUsize::new(0),
+        };
+        let report = run_sequential(&d, &runner);
+
+        assert_eq!(report.status, RunStatus::Failed);
+        assert_eq!(status(&report, "a"), StepStatus::Failed);
+        assert_eq!(status(&report, "b"), StepStatus::Skipped); // propagation
+        assert_eq!(runner.calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn timeout_marks_node_failed() {
+        let d = dag(
+            vec![
+                trig("t"),
+                act_p("a", serde_json::json!({ "_error": { "timeout_ms": 20 } })),
+            ],
+            vec![e("t", "a")],
+        );
+        let runner = |node: &Node, _: &RunContext| {
+            if node.id.0 == "a" {
+                std::thread::sleep(Duration::from_millis(80));
+            }
+            Ok(Value::Null)
+        };
+        let report = run_sequential(&d, &runner);
+
+        assert_eq!(report.status, RunStatus::Failed);
+        let a = report.step(&NodeId::new("a")).unwrap();
+        assert_eq!(a.status, StepStatus::Failed);
+        assert!(a.error.as_deref().unwrap().contains("timeout"));
+    }
+
+    #[test]
+    fn fallback_routes_error_branch_and_run_succeeds() {
+        let d = dag(
+            vec![
+                trig("t"),
+                act_p(
+                    "a",
+                    serde_json::json!({ "_error": { "on_error": "fallback" } }),
+                ),
+                n("ok"),
+                n("h"),
+            ],
+            vec![e("t", "a"), e("a", "ok"), ep("a", "h", "error")],
+        );
+        let runner = |node: &Node, _: &RunContext| {
+            if node.id.0 == "a" {
+                Err("boom".to_string())
+            } else {
+                Ok(Value::Null)
+            }
+        };
+        let report = run_sequential(&d, &runner);
+
+        assert_eq!(report.status, RunStatus::Succeeded); // échec géré
+        assert_eq!(status(&report, "a"), StepStatus::Failed);
+        assert_eq!(status(&report, "h"), StepStatus::Succeeded); // handler
+        assert_eq!(status(&report, "ok"), StepStatus::Skipped); // pas la sortie défaut
+    }
+
+    #[test]
+    fn continue_tolerates_error_and_run_succeeds() {
+        let d = dag(
+            vec![
+                trig("t"),
+                act_p(
+                    "a",
+                    serde_json::json!({ "_error": { "on_error": "continue" } }),
+                ),
+                n("next"),
+            ],
+            vec![e("t", "a"), e("a", "next")],
+        );
+        let runner = |node: &Node, _: &RunContext| {
+            if node.id.0 == "a" {
+                Err("soft".to_string())
+            } else {
+                Ok(Value::Null)
+            }
+        };
+        let report = run_sequential(&d, &runner);
+
+        assert_eq!(report.status, RunStatus::Succeeded);
+        assert_eq!(status(&report, "a"), StepStatus::Failed);
+        assert_eq!(status(&report, "next"), StepStatus::Succeeded);
+    }
+
+    #[test]
+    fn parallel_honors_fallback_policy() {
+        let d = dag(
+            vec![
+                trig("t"),
+                act_p(
+                    "a",
+                    serde_json::json!({ "_error": { "on_error": "fallback" } }),
+                ),
+                n("ok"),
+                n("h"),
+            ],
+            vec![e("t", "a"), e("a", "ok"), ep("a", "h", "error")],
+        );
+        let runner = |node: &Node, _: &RunContext| {
+            if node.id.0 == "a" {
+                Err("boom".to_string())
+            } else {
+                Ok(Value::Null)
+            }
+        };
+        let report = run_parallel(&d, &runner, 4);
+
+        assert_eq!(report.status, RunStatus::Succeeded);
+        assert_eq!(status(&report, "h"), StepStatus::Succeeded);
+        assert_eq!(status(&report, "ok"), StepStatus::Skipped);
     }
 }
