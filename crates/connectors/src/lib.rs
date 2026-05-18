@@ -4,10 +4,12 @@
 //! et les implémentations concrètes (Slack, Gmail, Notion, GitHub, HTTP)
 //! sont livrés au domaine 4 du roadmap (F4.*). Squelette : F1.3.e.
 
+pub mod http;
 pub mod polling;
 pub mod schedule;
 pub mod webhook;
 
+pub use http::{HttpAction, HttpClient, HttpRequest, HttpResponse};
 pub use polling::PollingTrigger;
 pub use schedule::{CronSchedule, CronTime, ScheduleTrigger};
 pub use webhook::WebhookTrigger;
