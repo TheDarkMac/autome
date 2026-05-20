@@ -36,6 +36,7 @@ dependencies = [
  "autome-core",
  "hex",
  "hmac",
+ "serde",
  "serde_json",
  "sha2",
 ]

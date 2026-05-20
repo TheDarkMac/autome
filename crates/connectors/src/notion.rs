@@ -1,52 +1,19 @@
-//! Connecteur Notion (F4.3) — actions `create_page`, `read_page`,
-//! `query_database` + helpers blocs (F4.3.d).
-//!
-//! Architecture identique à [`crate::slack`] / [`crate::gmail`] : aucune
-//! dépendance réseau — le transport est injecté via [`crate::HttpClient`].
-//! L'authentification se limite ici au **token d'intégration interne**
-//! (`secret_…`, F4.3.a) ; les flows OAuth publics Notion relèvent de F6.2.
-//!
-//! La version d'API (`Notion-Version`) est figée côté connecteur pour
-//! éviter toute régression silencieuse côté schéma : voir
-//! [`NOTION_VERSION`].
-//!
-//! Schéma des `params` (résumé) :
-//! ```json
-//! // create_page (F4.3.b)
-//! { "parent": { "database_id": "…" } | { "page_id": "…" },
-//!   "properties": { "Name": { "title": [ { "text": { "content": "…" } } ] } },
-//!   "children": [ … ], "icon": { … }, "cover": { … } }
-//! // read_page (F4.3.c)
-//! { "id": "…" }
-//! // query_database (F4.3.c)
-//! { "database_id": "…", "filter": { … }, "sorts": [ … ],
-//!   "page_size": 100, "start_cursor": "…" }
-//! ```
-//!
-//! Helpers blocs (F4.3.d) — non-actions, pour composer des `children`
-//! ou extraire du texte côté workflow :
-//! - [`text_block`] : paragraphe simple à partir d'une chaîne ;
-//! - [`heading_block`] : `heading_1`/`heading_2`/`heading_3` (niveau clampé) ;
-//! - [`extract_plain_text`] : concaténation récursive de tous les
-//!   `plain_text` (rich text) trouvés sous une valeur Notion (page, block,
-//!   propriété, tableau de résultats `query_database`).
-//!
-//! NB : helpers HTTP (`percent_encode`, `interpret`) volontairement
-//! dupliqués — facto dans le SDK connecteur (F4.5).
+//! Connecteur Notion (F4.3, refactoré sous le SDK en F4.5).
 
 use std::collections::BTreeMap;
 
 use autome_core::{Action, Error, Result};
 use serde_json::{json, Value};
 
-use crate::http::{HttpClient, HttpRequest, HttpResponse};
+use crate::http::{HttpClient, HttpRequest};
+use crate::sdk::{
+    headers_for, interpret, percent_encode, ActionSchema, Connector, Credentials, ParamSpec,
+    ResponseInterpreter,
+};
 
-/// Racine de l'API Notion (v1).
 const NOTION_API: &str = "https://api.notion.com/v1";
 
-/// Version d'API Notion supportée (`Notion-Version`). Champ obligatoire sur
-/// **toutes** les requêtes ; figée côté connecteur pour ne pas dépendre
-/// d'un défaut côté serveur.
+/// Version d'API Notion supportée (`Notion-Version`).
 pub const NOTION_VERSION: &str = "2022-06-28";
 
 /// Stratégie d'authentification Notion.
@@ -57,78 +24,58 @@ pub enum NotionAuth {
     Integration(String),
 }
 
-impl NotionAuth {
-    fn bearer(&self) -> String {
+impl Credentials for NotionAuth {
+    fn apply(&self, headers: &mut BTreeMap<String, String>) {
         match self {
-            NotionAuth::Integration(t) => format!("Bearer {t}"),
+            NotionAuth::Integration(t) => {
+                headers.insert("Authorization".into(), format!("Bearer {t}"));
+            }
+        }
+        headers.insert("Notion-Version".into(), NOTION_VERSION.into());
+    }
+}
+
+/// Interpréteur Notion (extrait `code`/`message` du body d'erreur).
+pub struct NotionInterpreter;
+
+impl ResponseInterpreter for NotionInterpreter {
+    fn provider(&self) -> &'static str {
+        "notion"
+    }
+    fn extract_error(&self, body: &Value) -> Option<String> {
+        let message = body
+            .get("message")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let code = body.get("code").and_then(Value::as_str).map(str::to_string);
+        match (message, code) {
+            (Some(m), Some(c)) => Some(format!("{m} ({c})")),
+            (Some(m), None) => Some(m),
+            (None, Some(c)) => Some(c),
+            (None, None) => None,
         }
     }
 }
 
-fn auth_headers(auth: &NotionAuth) -> BTreeMap<String, String> {
-    let mut h = BTreeMap::new();
-    h.insert("Authorization".into(), auth.bearer());
-    h.insert("Notion-Version".into(), NOTION_VERSION.into());
-    h.insert(
-        "Content-Type".into(),
-        "application/json; charset=utf-8".into(),
-    );
-    h
-}
+/// Connecteur Notion.
+pub struct NotionConnector;
 
-/// Traduit la réponse Notion en `Result<Value>` (F4.3.d — mapping erreur).
-fn interpret(resp: HttpResponse) -> Result<Value> {
-    if (200..300).contains(&resp.status) {
-        return Ok(resp.body);
+impl Connector for NotionConnector {
+    fn provider(&self) -> &'static str {
+        "notion"
     }
-    // Format d'erreur Notion : { "object": "error", "code": "…", "message": "…", "status": 4xx }
-    let message = resp
-        .body
-        .get("message")
-        .and_then(Value::as_str)
-        .map(str::to_string);
-    let code = resp
-        .body
-        .get("code")
-        .and_then(Value::as_str)
-        .map(str::to_string);
-    let detail = match (message, code) {
-        (Some(m), Some(c)) => format!("{m} ({c})"),
-        (Some(m), None) => m,
-        (None, Some(c)) => c,
-        (None, None) => resp.body.to_string(),
-    };
-    Err(Error::Invalid(format!(
-        "notion: http {} — {}",
-        resp.status, detail
-    )))
-}
-
-/// Encodage URL minimal (RFC 3986 « unreserved »).
-fn percent_encode(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for b in s.bytes() {
-        let c = b as char;
-        if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '~') {
-            out.push(c);
-        } else {
-            out.push_str(&format!("%{b:02X}"));
-        }
+    fn action_schemas(&self) -> Vec<ActionSchema> {
+        vec![
+            create_page_schema(),
+            read_page_schema(),
+            query_database_schema(),
+        ]
     }
-    out
 }
 
-// ──────────────────── Helpers blocs (F4.3.d) ────────────────────
+// ──────────── Helpers blocs (F4.3.d) ────────────
 
 /// Construit un block Notion `paragraph` à partir d'une chaîne plate.
-///
-/// Utilisable comme élément de `children` lors d'un [`NotionCreatePage`] :
-/// ```ignore
-/// let children = serde_json::json!([
-///     autome_connectors::notion::text_block("Bonjour"),
-///     autome_connectors::notion::heading_block("Section", 2),
-/// ]);
-/// ```
 pub fn text_block(text: impl Into<String>) -> Value {
     let text = text.into();
     json!({
@@ -162,16 +109,7 @@ pub fn heading_block(text: impl Into<String>, level: u8) -> Value {
     })
 }
 
-/// Extrait récursivement tous les `plain_text` (rich text Notion) trouvés
-/// sous `value`, concaténés sans séparateur — utile pour passer le contenu
-/// d'une page/réponse Notion à un node aval qui n'a pas besoin du schéma
-/// complet.
-///
-/// Reconnaît à la fois :
-/// - les objets rich text individuels (`{ "plain_text": "…" }`) ;
-/// - les tableaux `rich_text` portés par paragraph / heading_n / title /
-///   rich_text propriétés ;
-/// - les listes `results` (`query_database`, `list children`).
+/// Extrait récursivement tous les `plain_text` sous `value`.
 pub fn extract_plain_text(value: &Value) -> String {
     let mut out = String::new();
     walk(value, &mut out);
@@ -234,7 +172,7 @@ impl<C: HttpClient> NotionCreatePage<C> {
         Ok(HttpRequest {
             method: "POST".into(),
             url: format!("{NOTION_API}/pages"),
-            headers: auth_headers(&self.auth),
+            headers: headers_for(&self.auth, true),
             body: Some(Value::Object(body)),
         })
     }
@@ -244,14 +182,13 @@ impl<C: HttpClient> Action for NotionCreatePage<C> {
     fn kind(&self) -> &'static str {
         "notion.create_page"
     }
-
     fn execute(&self, params: &Value) -> Result<Value> {
         let req = self.build_request(params)?;
         let resp = self
             .client
             .send(&req)
             .map_err(|e| Error::Invalid(format!("notion create_page : {e}")))?;
-        interpret(resp)
+        interpret(resp, &NotionInterpreter)
     }
 }
 
@@ -272,12 +209,10 @@ impl<C: HttpClient> NotionReadPage<C> {
             .get("id")
             .and_then(Value::as_str)
             .ok_or_else(|| Error::Invalid("notion read_page : `id` requis".into()))?;
-        let mut headers = auth_headers(&self.auth);
-        headers.remove("Content-Type"); // GET sans body
         Ok(HttpRequest {
             method: "GET".into(),
             url: format!("{NOTION_API}/pages/{}", percent_encode(id)),
-            headers,
+            headers: headers_for(&self.auth, false),
             body: None,
         })
     }
@@ -287,14 +222,13 @@ impl<C: HttpClient> Action for NotionReadPage<C> {
     fn kind(&self) -> &'static str {
         "notion.read_page"
     }
-
     fn execute(&self, params: &Value) -> Result<Value> {
         let req = self.build_request(params)?;
         let resp = self
             .client
             .send(&req)
             .map_err(|e| Error::Invalid(format!("notion read_page : {e}")))?;
-        interpret(resp)
+        interpret(resp, &NotionInterpreter)
     }
 }
 
@@ -327,7 +261,7 @@ impl<C: HttpClient> NotionQueryDatabase<C> {
                 "{NOTION_API}/databases/{}/query",
                 percent_encode(database_id)
             ),
-            headers: auth_headers(&self.auth),
+            headers: headers_for(&self.auth, true),
             body: Some(Value::Object(body)),
         })
     }
@@ -337,80 +271,82 @@ impl<C: HttpClient> Action for NotionQueryDatabase<C> {
     fn kind(&self) -> &'static str {
         "notion.query_database"
     }
-
     fn execute(&self, params: &Value) -> Result<Value> {
         let req = self.build_request(params)?;
         let resp = self
             .client
             .send(&req)
             .map_err(|e| Error::Invalid(format!("notion query_database : {e}")))?;
-        interpret(resp)
+        interpret(resp, &NotionInterpreter)
+    }
+}
+
+// ───────────────────────── Schémas ─────────────────────────
+
+/// Schéma de l'action `notion.create_page`.
+pub fn create_page_schema() -> ActionSchema {
+    ActionSchema {
+        provider: "notion",
+        kind: "notion.create_page",
+        label: "Notion — Créer une page",
+        description: "Crée une page via `POST /v1/pages`.",
+        params: vec![
+            ParamSpec::opt_obj("parent", "Parent"),
+            ParamSpec::opt_obj("properties", "Properties"),
+            ParamSpec::opt_obj("children", "Children (blocs)"),
+            ParamSpec::opt_obj("icon", "Icon"),
+            ParamSpec::opt_obj("cover", "Cover"),
+        ],
+    }
+}
+
+/// Schéma de l'action `notion.read_page`.
+pub fn read_page_schema() -> ActionSchema {
+    ActionSchema {
+        provider: "notion",
+        kind: "notion.read_page",
+        label: "Notion — Lire une page",
+        description: "Lit une page via `GET /v1/pages/{id}`.",
+        params: vec![ParamSpec::req_str("id", "ID de page")],
+    }
+}
+
+/// Schéma de l'action `notion.query_database`.
+pub fn query_database_schema() -> ActionSchema {
+    ActionSchema {
+        provider: "notion",
+        kind: "notion.query_database",
+        label: "Notion — Query database",
+        description: "Interroge une base via `POST /v1/databases/{id}/query`.",
+        params: vec![
+            ParamSpec::req_str("database_id", "Database ID"),
+            ParamSpec::opt_obj("filter", "Filter"),
+            ParamSpec::opt_obj("sorts", "Sorts"),
+            ParamSpec::opt_int("page_size", "Page size"),
+            ParamSpec::opt_str("start_cursor", "Start cursor"),
+        ],
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::cell::RefCell;
-
-    struct MockClient {
-        last: RefCell<Option<HttpRequest>>,
-        resp: HttpResponse,
-        fail: Option<String>,
-    }
-
-    impl MockClient {
-        fn ok(body: Value) -> Self {
-            Self {
-                last: RefCell::new(None),
-                resp: HttpResponse { status: 200, body },
-                fail: None,
-            }
-        }
-        fn with_status(status: u16, body: Value) -> Self {
-            Self {
-                last: RefCell::new(None),
-                resp: HttpResponse { status, body },
-                fail: None,
-            }
-        }
-        fn failing(msg: &str) -> Self {
-            Self {
-                last: RefCell::new(None),
-                resp: HttpResponse {
-                    status: 200,
-                    body: json!({}),
-                },
-                fail: Some(msg.into()),
-            }
-        }
-    }
-
-    impl HttpClient for MockClient {
-        fn send(&self, req: &HttpRequest) -> std::result::Result<HttpResponse, String> {
-            *self.last.borrow_mut() = Some(req.clone());
-            if let Some(m) = &self.fail {
-                Err(m.clone())
-            } else {
-                Ok(self.resp.clone())
-            }
-        }
-    }
-
-    // ───── F4.3.a (auth + Notion-Version) ─────
+    use crate::sdk::RecordingClient;
+    use serde_json::json;
 
     #[test]
     fn all_actions_inject_bearer_and_notion_version() {
         let auth = NotionAuth::Integration("secret_abc".into());
 
-        let create = NotionCreatePage::new(auth.clone(), MockClient::ok(json!({ "id": "p1" })));
+        let create =
+            NotionCreatePage::new(auth.clone(), RecordingClient::ok(json!({ "id": "p1" })));
         create
             .execute(&json!({
                 "parent": { "database_id": "db" },
                 "properties": {}
             }))
             .unwrap();
-        let sent = create.client.last.borrow().clone().unwrap();
+        let sent = create.client.last().unwrap();
         assert_eq!(
             sent.headers.get("Authorization").map(String::as_str),
             Some("Bearer secret_abc")
@@ -420,9 +356,9 @@ mod tests {
             Some("2022-06-28")
         );
 
-        let read = NotionReadPage::new(auth.clone(), MockClient::ok(json!({ "id": "p" })));
+        let read = NotionReadPage::new(auth.clone(), RecordingClient::ok(json!({ "id": "p" })));
         read.execute(&json!({ "id": "p" })).unwrap();
-        let sent = read.client.last.borrow().clone().unwrap();
+        let sent = read.client.last().unwrap();
         assert_eq!(
             sent.headers.get("Authorization").map(String::as_str),
             Some("Bearer secret_abc")
@@ -431,15 +367,14 @@ mod tests {
             sent.headers.get("Notion-Version").map(String::as_str),
             Some("2022-06-28")
         );
-        // GET → pas de Content-Type
         assert!(!sent.headers.contains_key("Content-Type"));
 
         let query = NotionQueryDatabase::new(
             auth,
-            MockClient::ok(json!({ "results": [], "has_more": false })),
+            RecordingClient::ok(json!({ "results": [], "has_more": false })),
         );
         query.execute(&json!({ "database_id": "db" })).unwrap();
-        let sent = query.client.last.borrow().clone().unwrap();
+        let sent = query.client.last().unwrap();
         assert_eq!(
             sent.headers.get("Authorization").map(String::as_str),
             Some("Bearer secret_abc")
@@ -450,13 +385,11 @@ mod tests {
         );
     }
 
-    // ───── F4.3.b (create_page) ─────
-
     #[test]
     fn create_page_builds_post_with_required_and_optional_fields() {
         let act = NotionCreatePage::new(
             NotionAuth::Integration("t".into()),
-            MockClient::ok(json!({ "id": "p-new", "url": "https://notion.so/p-new" })),
+            RecordingClient::ok(json!({ "id": "p-new", "url": "https://notion.so/p-new" })),
         );
         let children = json!([{ "object": "block", "type": "paragraph",
                                 "paragraph": { "rich_text": [] } }]);
@@ -470,7 +403,7 @@ mod tests {
                 "icon": { "type": "emoji", "emoji": "✅" }
             }))
             .unwrap();
-        let sent = act.client.last.borrow().clone().unwrap();
+        let sent = act.client.last().unwrap();
         assert_eq!(sent.method, "POST");
         assert_eq!(sent.url, "https://api.notion.com/v1/pages");
         let body = sent.body.unwrap();
@@ -481,7 +414,6 @@ mod tests {
         );
         assert_eq!(body["children"], children);
         assert_eq!(body["icon"]["emoji"], json!("✅"));
-        // Pas de `cover` puisqu'on ne l'a pas envoyé
         assert!(body.get("cover").is_none());
         assert_eq!(out["id"], json!("p-new"));
     }
@@ -490,14 +422,14 @@ mod tests {
     fn create_page_requires_parent_and_properties() {
         let act = NotionCreatePage::new(
             NotionAuth::Integration("t".into()),
-            MockClient::ok(json!({ "id": "x" })),
+            RecordingClient::ok(json!({ "id": "x" })),
         );
         let err = act.execute(&json!({ "properties": {} })).unwrap_err();
         assert!(matches!(err, Error::Invalid(ref m) if m.contains("`parent`")));
 
         let act = NotionCreatePage::new(
             NotionAuth::Integration("t".into()),
-            MockClient::ok(json!({ "id": "x" })),
+            RecordingClient::ok(json!({ "id": "x" })),
         );
         let err = act
             .execute(&json!({ "parent": { "database_id": "db" } }))
@@ -505,22 +437,19 @@ mod tests {
         assert!(matches!(err, Error::Invalid(ref m) if m.contains("`properties`")));
     }
 
-    // ───── F4.3.c (read_page + query_database) ─────
-
     #[test]
     fn read_page_builds_get_with_percent_encoded_id() {
         let act = NotionReadPage::new(
             NotionAuth::Integration("t".into()),
-            MockClient::ok(json!({
+            RecordingClient::ok(json!({
                 "object": "page",
                 "id": "a/b",
                 "properties": {}
             })),
         );
         let out = act.execute(&json!({ "id": "a/b" })).unwrap();
-        let sent = act.client.last.borrow().clone().unwrap();
+        let sent = act.client.last().unwrap();
         assert_eq!(sent.method, "GET");
-        // `/` doit être pourcent-encodé dans l'id (sécurité contre l'injection de path)
         assert_eq!(sent.url, "https://api.notion.com/v1/pages/a%2Fb");
         assert!(sent.body.is_none());
         assert_eq!(out["id"], json!("a/b"));
@@ -530,7 +459,7 @@ mod tests {
     fn read_page_requires_id() {
         let act = NotionReadPage::new(
             NotionAuth::Integration("t".into()),
-            MockClient::ok(json!({ "id": "x" })),
+            RecordingClient::ok(json!({ "id": "x" })),
         );
         let err = act.execute(&json!({})).unwrap_err();
         assert!(matches!(err, Error::Invalid(ref m) if m.contains("`id`")));
@@ -540,7 +469,7 @@ mod tests {
     fn query_database_builds_post_with_filter_sorts_pagination() {
         let act = NotionQueryDatabase::new(
             NotionAuth::Integration("t".into()),
-            MockClient::ok(json!({ "results": [], "has_more": false })),
+            RecordingClient::ok(json!({ "results": [], "has_more": false })),
         );
         let filter = json!({ "property": "Status", "select": { "equals": "Done" } });
         let sorts = json!([{ "property": "Created", "direction": "descending" }]);
@@ -552,7 +481,7 @@ mod tests {
             "start_cursor": "cur-1"
         }))
         .unwrap();
-        let sent = act.client.last.borrow().clone().unwrap();
+        let sent = act.client.last().unwrap();
         assert_eq!(sent.method, "POST");
         assert_eq!(sent.url, "https://api.notion.com/v1/databases/db-9/query");
         let body = sent.body.unwrap();
@@ -566,13 +495,12 @@ mod tests {
     fn query_database_works_without_filter_or_sorts() {
         let act = NotionQueryDatabase::new(
             NotionAuth::Integration("t".into()),
-            MockClient::ok(json!({ "results": [], "has_more": false })),
+            RecordingClient::ok(json!({ "results": [], "has_more": false })),
         );
         act.execute(&json!({ "database_id": "db" })).unwrap();
-        let sent = act.client.last.borrow().clone().unwrap();
+        let sent = act.client.last().unwrap();
         assert_eq!(sent.method, "POST");
         assert_eq!(sent.url, "https://api.notion.com/v1/databases/db/query");
-        // body est un objet vide (pas null)
         assert_eq!(sent.body.unwrap(), json!({}));
     }
 
@@ -580,13 +508,13 @@ mod tests {
     fn query_database_requires_database_id() {
         let act = NotionQueryDatabase::new(
             NotionAuth::Integration("t".into()),
-            MockClient::ok(json!({ "results": [] })),
+            RecordingClient::ok(json!({ "results": [] })),
         );
         let err = act.execute(&json!({})).unwrap_err();
         assert!(matches!(err, Error::Invalid(ref m) if m.contains("`database_id`")));
     }
 
-    // ───── F4.3.d (helpers blocs ↔ workflow) ─────
+    // F4.3.d — helpers blocs
 
     #[test]
     fn text_block_produces_paragraph_with_rich_text() {
@@ -612,14 +540,12 @@ mod tests {
         assert_eq!(h2["type"], json!("heading_2"));
         let h3 = heading_block("C", 3);
         assert_eq!(h3["type"], json!("heading_3"));
-        // clamp : 0 → 1, 9 → 3
         assert_eq!(heading_block("X", 0)["type"], json!("heading_1"));
         assert_eq!(heading_block("Y", 9)["type"], json!("heading_3"));
     }
 
     #[test]
     fn extract_plain_text_collects_rich_text_recursively() {
-        // Simule la page renvoyée par read_page avec une propriété `title` rich.
         let page = json!({
             "object": "page",
             "id": "p1",
@@ -633,7 +559,6 @@ mod tests {
             }
         });
         let s = extract_plain_text(&page);
-        // L'ordre des clés d'un Map JSON est préservé en serde_json.
         assert_eq!(s, "Hello world");
     }
 
@@ -659,13 +584,13 @@ mod tests {
         assert_eq!(extract_plain_text(&Value::Null), "");
     }
 
-    // ───── mapping erreurs ─────
+    // Mapping erreurs
 
     #[test]
     fn notion_error_extracts_code_and_message() {
         let act = NotionReadPage::new(
             NotionAuth::Integration("t".into()),
-            MockClient::with_status(
+            RecordingClient::with_status(
                 404,
                 json!({
                     "object": "error",
@@ -690,7 +615,7 @@ mod tests {
     fn notion_error_without_known_fields_falls_back_to_body() {
         let act = NotionCreatePage::new(
             NotionAuth::Integration("t".into()),
-            MockClient::with_status(500, json!({ "details": "boom" })),
+            RecordingClient::with_status(500, json!({ "details": "boom" })),
         );
         let err = act
             .execute(&json!({ "parent": {}, "properties": {} }))
@@ -705,7 +630,7 @@ mod tests {
     fn transport_error_is_propagated() {
         let act = NotionCreatePage::new(
             NotionAuth::Integration("t".into()),
-            MockClient::failing("network down"),
+            RecordingClient::failing("network down"),
         );
         let err = act
             .execute(&json!({ "parent": {}, "properties": {} }))
@@ -721,7 +646,7 @@ mod tests {
         assert_eq!(
             NotionCreatePage::new(
                 NotionAuth::Integration("t".into()),
-                MockClient::ok(json!({}))
+                RecordingClient::ok(json!({}))
             )
             .kind(),
             "notion.create_page"
@@ -729,7 +654,7 @@ mod tests {
         assert_eq!(
             NotionReadPage::new(
                 NotionAuth::Integration("t".into()),
-                MockClient::ok(json!({}))
+                RecordingClient::ok(json!({}))
             )
             .kind(),
             "notion.read_page"
@@ -737,10 +662,17 @@ mod tests {
         assert_eq!(
             NotionQueryDatabase::new(
                 NotionAuth::Integration("t".into()),
-                MockClient::ok(json!({}))
+                RecordingClient::ok(json!({}))
             )
             .kind(),
             "notion.query_database"
         );
+    }
+
+    #[test]
+    fn connector_publishes_schemas() {
+        let c = NotionConnector;
+        assert_eq!(c.provider(), "notion");
+        assert_eq!(c.action_schemas().len(), 3);
     }
 }
