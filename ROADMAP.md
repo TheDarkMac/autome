@@ -19,7 +19,7 @@
 | 1  | Fondations & Architecture| 6        | 6         | ✅ Terminé    |
 | 2  | Moteur de workflows      | 7        | 7         | ✅ Terminé    |
 | 3  | Triggers & Actions       | 6        | 6         | ✅ Terminé    |
-| 4  | Connecteurs API          | 5        | 0         | À faire       |
+| 4  | Connecteurs API          | 5        | 1         | En cours      |
 | 5  | Orchestrateur & Scaling  | 6        | 0         | À faire       |
 | 6  | Sécurité & Auth          | 6        | 0         | À faire       |
 | 7  | API publique (REST/gRPC) | 4        | 0         | À faire       |
@@ -29,7 +29,7 @@
 | 11 | Documentation            | 5        | 0         | À faire       |
 | 12 | Exemples de workflows    | 3        | 0         | À faire       |
 
-**Progression totale : 19 / 66 features** (≈ 150 sous-tâches sur les features détaillées)
+**Progression totale : 20 / 66 features** (≈ 150 sous-tâches sur les features détaillées)
 
 > Les features complexes (F1.3, F1.5, F2.*, F4.*, F5.1–F5.4, F6.1–F6.3, F6.5,
 > F8.2–F8.7) sont découpées en sous-tâches `Fx.y.z`. Une feature est `[x]`
@@ -104,11 +104,11 @@
 
 ## 4. Connecteurs API
 
-- [ ] **F4.1** — Connecteur Slack (envoi message, lecture canal)
-  - [ ] F4.1.a — Auth Slack (OAuth / bot token)
-  - [ ] F4.1.b — Action `send_message`
-  - [ ] F4.1.c — Action `read_channel` / lecture historique
-  - [ ] F4.1.d — Mapping erreurs API → erreurs moteur
+- [x] **F4.1** — Connecteur Slack (envoi message, lecture canal) — _issue #39_
+  - [x] F4.1.a — Auth Slack (OAuth / bot token)
+  - [x] F4.1.b — Action `send_message`
+  - [x] F4.1.c — Action `read_channel` / lecture historique
+  - [x] F4.1.d — Mapping erreurs API → erreurs moteur
 - [ ] **F4.2** — Connecteur Gmail (envoi / lecture mail)
   - [ ] F4.2.a — Auth Gmail (OAuth2 Google)
   - [ ] F4.2.b — Action `send_email`
@@ -269,3 +269,4 @@
 | 2026-05-17 | F3.4 | Trigger Polling : `connectors::PollingTrigger` (source injectée, déduplication par champ-clé, émission FIFO des inédits). 9 tests connectors verts. | — |
 | 2026-05-17 | F3.5 | Abstraction `Action` : `core::action` (trait `Action` `kind()`/`execute(params)->Result<Value>`), agnostique. 16 tests core verts. | — |
 | 2026-05-18 | F3.6 | Action HTTP générique : `connectors::HttpAction` (params→`HttpRequest`, client `HttpClient` injecté, réponse→`{status,body}`), impl `core::Action`. 13 tests connectors verts. **Domaine 3 (Triggers & Actions) terminé.** | — |
+| 2026-05-20 | F4.1 | Connecteur Slack : `SlackAuth::Bot` (en-têtes `Authorization: Bearer …` + JSON), actions `SlackSendMessage` (`chat.postMessage` POST) et `SlackReadChannel` (`conversations.history` GET, query pourcent-encodée), mapping `{ok:false,error}`/HTTP non-2xx/transport → `Error::Invalid`. Transport injecté via `HttpClient` (aucune dépendance réseau). 13 tests connectors verts. | — |
