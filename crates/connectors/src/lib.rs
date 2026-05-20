@@ -4,6 +4,7 @@
 //! et les implémentations concrètes (Slack, Gmail, Notion, GitHub, HTTP)
 //! sont livrés au domaine 4 du roadmap (F4.*). Squelette : F1.3.e.
 
+pub mod github;
 pub mod gmail;
 pub mod http;
 pub mod notion;
@@ -12,6 +13,10 @@ pub mod schedule;
 pub mod slack;
 pub mod webhook;
 
+pub use github::{
+    verify_github_signature, GithubAuth, GithubCloseIssue, GithubCommentIssue, GithubCreateIssue,
+    GithubCreatePull, GithubListPulls, GithubMergePull,
+};
 pub use gmail::{
     GmailAuth, GmailGetAttachment, GmailListMessages, GmailReadMessage, GmailSendEmail,
 };
