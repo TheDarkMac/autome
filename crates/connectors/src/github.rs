@@ -1,43 +1,4 @@
-//! Connecteur GitHub (F4.4) — actions issues / PR + vérification de
-//! signature webhook.
-//!
-//! Architecture identique à [`crate::slack`] / [`crate::gmail`] /
-//! [`crate::notion`] : aucune dépendance réseau — le transport est injecté
-//! via [`crate::HttpClient`]. L'authentification se limite ici au **token
-//! statique** (`GithubAuth::Token`) : PAT (`ghp_…`) ou installation token
-//! GitHub App. Le JWT App → installation token relève de F6.2.
-//!
-//! GitHub impose `User-Agent` sur tous les appels REST (sinon 403) ; on
-//! envoie systématiquement aussi `Accept: application/vnd.github+json` et
-//! `X-GitHub-Api-Version: 2022-11-28`.
-//!
-//! Schéma des `params` (résumé) :
-//! ```json
-//! // create_issue (F4.4.b)
-//! { "owner": "ando", "repo": "autome", "title": "Bug X",
-//!   "body": "détails…", "assignees": ["alice"], "labels": ["bug"] }
-//! // comment_issue (F4.4.b)
-//! { "owner": "ando", "repo": "autome", "issue_number": 42, "body": "yo" }
-//! // close_issue (F4.4.b)
-//! { "owner": "ando", "repo": "autome", "issue_number": 42,
-//!   "state_reason": "completed" }
-//! // list_pulls (F4.4.c)
-//! { "owner": "ando", "repo": "autome", "state": "open",
-//!   "head": "ando:feature", "base": "main", "per_page": 30, "page": 1 }
-//! // create_pull (F4.4.c)
-//! { "owner": "ando", "repo": "autome", "title": "T",
-//!   "head": "feature/x", "base": "main", "body": "…", "draft": false }
-//! // merge_pull (F4.4.c)
-//! { "owner": "ando", "repo": "autome", "pull_number": 7,
-//!   "merge_method": "squash", "commit_title": "…" }
-//! ```
-//!
-//! Signature webhook (F4.4.d) : [`verify_github_signature`] valide un
-//! header `X-Hub-Signature-256: sha256=<hex>` contre le HMAC-SHA256 du
-//! body brut. Comparaison constant-time via `hmac::Mac::verify_slice`.
-//!
-//! NB : `percent_encode` et `interpret` sont volontairement dupliqués
-//! depuis les autres connecteurs — facto dans le SDK connecteur (F4.5).
+//! Connecteur GitHub (F4.4, refactoré sous le SDK en F4.5).
 
 use std::collections::BTreeMap;
 
@@ -46,15 +7,18 @@ use hmac::{Hmac, Mac};
 use serde_json::{json, Value};
 use sha2::Sha256;
 
-use crate::http::{HttpClient, HttpRequest, HttpResponse};
+use crate::http::{HttpClient, HttpRequest};
+use crate::sdk::{
+    headers_for, interpret, percent_encode, to_query, ActionSchema, Connector, Credentials,
+    ParamKind, ParamSpec, ResponseInterpreter,
+};
 
 type HmacSha256 = Hmac<Sha256>;
 
-/// Racine de l'API GitHub REST.
 const GITHUB_API: &str = "https://api.github.com";
 /// Version d'API GitHub ciblée (`X-GitHub-Api-Version`).
 pub const GITHUB_API_VERSION: &str = "2022-11-28";
-/// `User-Agent` envoyé à GitHub (obligatoire — sinon 403).
+/// `User-Agent` envoyé à GitHub.
 pub const USER_AGENT: &str = "autome-connectors";
 
 /// Stratégie d'authentification GitHub.
@@ -65,71 +29,50 @@ pub enum GithubAuth {
     Token(String),
 }
 
-impl GithubAuth {
-    fn bearer(&self) -> String {
+impl Credentials for GithubAuth {
+    fn apply(&self, headers: &mut BTreeMap<String, String>) {
         match self {
-            GithubAuth::Token(t) => format!("Bearer {t}"),
+            GithubAuth::Token(t) => {
+                headers.insert("Authorization".into(), format!("Bearer {t}"));
+            }
         }
+        headers.insert("Accept".into(), "application/vnd.github+json".into());
+        headers.insert("X-GitHub-Api-Version".into(), GITHUB_API_VERSION.into());
+        headers.insert("User-Agent".into(), USER_AGENT.into());
     }
 }
 
-fn common_headers(auth: &GithubAuth) -> BTreeMap<String, String> {
-    let mut h = BTreeMap::new();
-    h.insert("Authorization".into(), auth.bearer());
-    h.insert("Accept".into(), "application/vnd.github+json".into());
-    h.insert("X-GitHub-Api-Version".into(), GITHUB_API_VERSION.into());
-    h.insert("User-Agent".into(), USER_AGENT.into());
-    h
-}
+/// Interpréteur GitHub (extrait `message` du body d'erreur).
+pub struct GithubInterpreter;
 
-fn write_headers(auth: &GithubAuth, with_body: bool) -> BTreeMap<String, String> {
-    let mut h = common_headers(auth);
-    if with_body {
-        h.insert(
-            "Content-Type".into(),
-            "application/json; charset=utf-8".into(),
-        );
+impl ResponseInterpreter for GithubInterpreter {
+    fn provider(&self) -> &'static str {
+        "github"
     }
-    h
-}
-
-/// Traduit la réponse GitHub en `Result<Value>`.
-fn interpret(resp: HttpResponse) -> Result<Value> {
-    if (200..300).contains(&resp.status) {
-        return Ok(resp.body);
+    fn extract_error(&self, body: &Value) -> Option<String> {
+        body.get("message")
+            .and_then(Value::as_str)
+            .map(str::to_string)
     }
-    let msg = resp
-        .body
-        .get("message")
-        .and_then(Value::as_str)
-        .map(str::to_string)
-        .unwrap_or_else(|| resp.body.to_string());
-    Err(Error::Invalid(format!(
-        "github: http {} — {}",
-        resp.status, msg
-    )))
 }
 
-/// Encodage URL minimal (RFC 3986 « unreserved »).
-fn percent_encode(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for b in s.bytes() {
-        let c = b as char;
-        if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '~') {
-            out.push(c);
-        } else {
-            out.push_str(&format!("%{b:02X}"));
-        }
+/// Connecteur GitHub.
+pub struct GithubConnector;
+
+impl Connector for GithubConnector {
+    fn provider(&self) -> &'static str {
+        "github"
     }
-    out
-}
-
-fn to_query(pairs: &[(String, String)]) -> String {
-    pairs
-        .iter()
-        .map(|(k, v)| format!("{}={}", percent_encode(k), percent_encode(v)))
-        .collect::<Vec<_>>()
-        .join("&")
+    fn action_schemas(&self) -> Vec<ActionSchema> {
+        vec![
+            create_issue_schema(),
+            comment_issue_schema(),
+            close_issue_schema(),
+            list_pulls_schema(),
+            create_pull_schema(),
+            merge_pull_schema(),
+        ]
+    }
 }
 
 fn require_str<'a>(params: &'a Value, key: &str, ctx: &str) -> Result<&'a str> {
@@ -157,16 +100,7 @@ fn repo_path(owner: &str, repo: &str) -> String {
 // ──────────────────── F4.4.d — Vérif signature webhook ────────────────────
 
 /// Vérifie un header `X-Hub-Signature-256` (`sha256=<hex>`) contre le HMAC
-/// SHA-256 du corps brut.
-///
-/// La comparaison est faite en temps constant par `hmac::Mac::verify_slice`.
-///
-/// Retourne `false` (sans paniquer) si :
-/// - le header n'a pas le préfixe `sha256=` ;
-/// - la partie hex est mal formée ;
-/// - la signature décodée ne fait pas 32 octets ;
-/// - le secret est vide (cas où l'app n'est pas configurée) — bloque toute
-///   réception qui aurait été signée avec un secret partagé valide.
+/// SHA-256 du corps brut. Comparaison constant-time via `Mac::verify_slice`.
 pub fn verify_github_signature(secret: &[u8], body: &[u8], header: &str) -> bool {
     let Some(hex_part) = header.strip_prefix("sha256=") else {
         return false;
@@ -215,7 +149,7 @@ impl<C: HttpClient> GithubCreateIssue<C> {
         Ok(HttpRequest {
             method: "POST".into(),
             url: format!("{}/issues", repo_path(owner, repo)),
-            headers: write_headers(&self.auth, true),
+            headers: headers_for(&self.auth, true),
             body: Some(Value::Object(body)),
         })
     }
@@ -231,7 +165,7 @@ impl<C: HttpClient> Action for GithubCreateIssue<C> {
             .client
             .send(&req)
             .map_err(|e| Error::Invalid(format!("github create_issue : {e}")))?;
-        interpret(resp)
+        interpret(resp, &GithubInterpreter)
     }
 }
 
@@ -255,7 +189,7 @@ impl<C: HttpClient> GithubCommentIssue<C> {
         Ok(HttpRequest {
             method: "POST".into(),
             url: format!("{}/issues/{}/comments", repo_path(owner, repo), issue),
-            headers: write_headers(&self.auth, true),
+            headers: headers_for(&self.auth, true),
             body: Some(json!({ "body": body_text })),
         })
     }
@@ -271,12 +205,11 @@ impl<C: HttpClient> Action for GithubCommentIssue<C> {
             .client
             .send(&req)
             .map_err(|e| Error::Invalid(format!("github comment_issue : {e}")))?;
-        interpret(resp)
+        interpret(resp, &GithubInterpreter)
     }
 }
 
-/// Action `PATCH /repos/{owner}/{repo}/issues/{n}` avec `{state:"closed"}`
-/// (F4.4.b).
+/// Action `PATCH /repos/{owner}/{repo}/issues/{n}` (F4.4.b).
 pub struct GithubCloseIssue<C: HttpClient> {
     auth: GithubAuth,
     client: C,
@@ -300,7 +233,7 @@ impl<C: HttpClient> GithubCloseIssue<C> {
         Ok(HttpRequest {
             method: "PATCH".into(),
             url: format!("{}/issues/{}", repo_path(owner, repo), issue),
-            headers: write_headers(&self.auth, true),
+            headers: headers_for(&self.auth, true),
             body: Some(Value::Object(body)),
         })
     }
@@ -316,7 +249,7 @@ impl<C: HttpClient> Action for GithubCloseIssue<C> {
             .client
             .send(&req)
             .map_err(|e| Error::Invalid(format!("github close_issue : {e}")))?;
-        interpret(resp)
+        interpret(resp, &GithubInterpreter)
     }
 }
 
@@ -361,7 +294,7 @@ impl<C: HttpClient> GithubListPulls<C> {
         Ok(HttpRequest {
             method: "GET".into(),
             url,
-            headers: write_headers(&self.auth, false),
+            headers: headers_for(&self.auth, false),
             body: None,
         })
     }
@@ -377,7 +310,7 @@ impl<C: HttpClient> Action for GithubListPulls<C> {
             .client
             .send(&req)
             .map_err(|e| Error::Invalid(format!("github list_pulls : {e}")))?;
-        interpret(resp)
+        interpret(resp, &GithubInterpreter)
     }
 }
 
@@ -411,7 +344,7 @@ impl<C: HttpClient> GithubCreatePull<C> {
         Ok(HttpRequest {
             method: "POST".into(),
             url: format!("{}/pulls", repo_path(owner, repo)),
-            headers: write_headers(&self.auth, true),
+            headers: headers_for(&self.auth, true),
             body: Some(Value::Object(body)),
         })
     }
@@ -427,7 +360,7 @@ impl<C: HttpClient> Action for GithubCreatePull<C> {
             .client
             .send(&req)
             .map_err(|e| Error::Invalid(format!("github create_pull : {e}")))?;
-        interpret(resp)
+        interpret(resp, &GithubInterpreter)
     }
 }
 
@@ -456,7 +389,7 @@ impl<C: HttpClient> GithubMergePull<C> {
         Ok(HttpRequest {
             method: "PUT".into(),
             url: format!("{}/pulls/{}/merge", repo_path(owner, repo), pr),
-            headers: write_headers(&self.auth, true),
+            headers: headers_for(&self.auth, true),
             body: Some(Value::Object(body)),
         })
     }
@@ -472,58 +405,165 @@ impl<C: HttpClient> Action for GithubMergePull<C> {
             .client
             .send(&req)
             .map_err(|e| Error::Invalid(format!("github merge_pull : {e}")))?;
-        interpret(resp)
+        interpret(resp, &GithubInterpreter)
+    }
+}
+
+// ───────────────────────── Schémas ─────────────────────────
+
+/// Schéma `github.create_issue`.
+pub fn create_issue_schema() -> ActionSchema {
+    ActionSchema {
+        provider: "github",
+        kind: "github.create_issue",
+        label: "GitHub — Créer une issue",
+        description: "Crée une issue via `POST /repos/{owner}/{repo}/issues`.",
+        params: vec![
+            ParamSpec::req_str("owner", "Owner"),
+            ParamSpec::req_str("repo", "Repo"),
+            ParamSpec::req_str("title", "Titre"),
+            ParamSpec::opt_str("body", "Corps"),
+            ParamSpec {
+                key: "labels",
+                label: "Labels",
+                kind: ParamKind::Array {
+                    inner: Box::new(ParamKind::String),
+                },
+                required: false,
+                description: None,
+            },
+            ParamSpec {
+                key: "assignees",
+                label: "Assignees",
+                kind: ParamKind::Array {
+                    inner: Box::new(ParamKind::String),
+                },
+                required: false,
+                description: None,
+            },
+        ],
+    }
+}
+
+/// Schéma `github.comment_issue`.
+pub fn comment_issue_schema() -> ActionSchema {
+    ActionSchema {
+        provider: "github",
+        kind: "github.comment_issue",
+        label: "GitHub — Commenter une issue",
+        description: "Ajoute un commentaire sur une issue.",
+        params: vec![
+            ParamSpec::req_str("owner", "Owner"),
+            ParamSpec::req_str("repo", "Repo"),
+            ParamSpec::opt_int("issue_number", "Issue #"),
+            ParamSpec::req_str("body", "Commentaire"),
+        ],
+    }
+}
+
+/// Schéma `github.close_issue`.
+pub fn close_issue_schema() -> ActionSchema {
+    ActionSchema {
+        provider: "github",
+        kind: "github.close_issue",
+        label: "GitHub — Fermer une issue",
+        description: "Ferme une issue (état `closed`).",
+        params: vec![
+            ParamSpec::req_str("owner", "Owner"),
+            ParamSpec::req_str("repo", "Repo"),
+            ParamSpec::opt_int("issue_number", "Issue #"),
+            ParamSpec {
+                key: "state_reason",
+                label: "Raison",
+                kind: ParamKind::Enum {
+                    variants: vec!["completed", "not_planned", "reopened"],
+                },
+                required: false,
+                description: None,
+            },
+        ],
+    }
+}
+
+/// Schéma `github.list_pulls`.
+pub fn list_pulls_schema() -> ActionSchema {
+    ActionSchema {
+        provider: "github",
+        kind: "github.list_pulls",
+        label: "GitHub — Lister les PR",
+        description: "Liste les PR via `GET /repos/{owner}/{repo}/pulls`.",
+        params: vec![
+            ParamSpec::req_str("owner", "Owner"),
+            ParamSpec::req_str("repo", "Repo"),
+            ParamSpec {
+                key: "state",
+                label: "État",
+                kind: ParamKind::Enum {
+                    variants: vec!["open", "closed", "all"],
+                },
+                required: false,
+                description: None,
+            },
+            ParamSpec::opt_str("head", "Head"),
+            ParamSpec::opt_str("base", "Base"),
+            ParamSpec::opt_str("sort", "Sort"),
+            ParamSpec::opt_str("direction", "Direction"),
+            ParamSpec::opt_int("per_page", "Par page"),
+            ParamSpec::opt_int("page", "Page"),
+        ],
+    }
+}
+
+/// Schéma `github.create_pull`.
+pub fn create_pull_schema() -> ActionSchema {
+    ActionSchema {
+        provider: "github",
+        kind: "github.create_pull",
+        label: "GitHub — Créer une PR",
+        description: "Crée une PR via `POST /repos/{owner}/{repo}/pulls`.",
+        params: vec![
+            ParamSpec::req_str("owner", "Owner"),
+            ParamSpec::req_str("repo", "Repo"),
+            ParamSpec::req_str("title", "Titre"),
+            ParamSpec::req_str("head", "Head"),
+            ParamSpec::req_str("base", "Base"),
+            ParamSpec::opt_str("body", "Description"),
+        ],
+    }
+}
+
+/// Schéma `github.merge_pull`.
+pub fn merge_pull_schema() -> ActionSchema {
+    ActionSchema {
+        provider: "github",
+        kind: "github.merge_pull",
+        label: "GitHub — Merger une PR",
+        description: "Merge une PR via `PUT /repos/{owner}/{repo}/pulls/{n}/merge`.",
+        params: vec![
+            ParamSpec::req_str("owner", "Owner"),
+            ParamSpec::req_str("repo", "Repo"),
+            ParamSpec::opt_int("pull_number", "PR #"),
+            ParamSpec {
+                key: "merge_method",
+                label: "Méthode",
+                kind: ParamKind::Enum {
+                    variants: vec!["merge", "squash", "rebase"],
+                },
+                required: false,
+                description: None,
+            },
+            ParamSpec::opt_str("commit_title", "Commit title"),
+            ParamSpec::opt_str("commit_message", "Commit message"),
+            ParamSpec::opt_str("sha", "SHA attendu"),
+        ],
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::cell::RefCell;
-
-    struct MockClient {
-        last: RefCell<Option<HttpRequest>>,
-        resp: HttpResponse,
-        fail: Option<String>,
-    }
-
-    impl MockClient {
-        fn ok(body: Value) -> Self {
-            Self {
-                last: RefCell::new(None),
-                resp: HttpResponse { status: 200, body },
-                fail: None,
-            }
-        }
-        fn with_status(status: u16, body: Value) -> Self {
-            Self {
-                last: RefCell::new(None),
-                resp: HttpResponse { status, body },
-                fail: None,
-            }
-        }
-        fn failing(msg: &str) -> Self {
-            Self {
-                last: RefCell::new(None),
-                resp: HttpResponse {
-                    status: 200,
-                    body: json!({}),
-                },
-                fail: Some(msg.into()),
-            }
-        }
-    }
-
-    impl HttpClient for MockClient {
-        fn send(&self, req: &HttpRequest) -> std::result::Result<HttpResponse, String> {
-            *self.last.borrow_mut() = Some(req.clone());
-            if let Some(m) = &self.fail {
-                Err(m.clone())
-            } else {
-                Ok(self.resp.clone())
-            }
-        }
-    }
+    use crate::sdk::RecordingClient;
+    use serde_json::json;
 
     fn check_common_headers(headers: &BTreeMap<String, String>, with_body: bool) {
         assert_eq!(
@@ -552,10 +592,8 @@ mod tests {
         }
     }
 
-    // ───── F4.4.d — verify_github_signature ─────
+    // ───── verify_github_signature ─────
 
-    /// HMAC-SHA256 attendu pour `secret=It's a Secret to Everybody`,
-    /// `body=Hello, World!` — vecteur tiré de la doc GitHub Webhooks.
     const GITHUB_VEC_SECRET: &[u8] = b"It's a Secret to Everybody";
     const GITHUB_VEC_BODY: &[u8] = b"Hello, World!";
     const GITHUB_VEC_HMAC_HEX: &str =
@@ -574,7 +612,6 @@ mod tests {
     #[test]
     fn signature_rejects_wrong_hmac() {
         let mut bad = String::from(GITHUB_VEC_HMAC_HEX);
-        // Flip un caractère hex au milieu
         bad.replace_range(10..11, "0");
         let header = format!("sha256={bad}");
         assert!(!verify_github_signature(
@@ -595,7 +632,6 @@ mod tests {
 
     #[test]
     fn signature_rejects_wrong_length() {
-        // 30 octets hex au lieu de 32
         let short = "0".repeat(60);
         assert!(!verify_github_signature(
             GITHUB_VEC_SECRET,
@@ -624,56 +660,58 @@ mod tests {
         let header = format!("sha256={GITHUB_VEC_HMAC_HEX}");
         assert!(!verify_github_signature(
             GITHUB_VEC_SECRET,
-            b"Hello, world!", // minuscule
+            b"Hello, world!",
             &header,
         ));
     }
 
-    // ───── F4.4.a — auth + UA + Accept + API-Version ─────
+    // ───── headers ─────
 
     #[test]
     fn all_actions_inject_required_headers() {
         let auth = GithubAuth::Token("ghp_test".into());
 
-        let c = GithubCreateIssue::new(auth.clone(), MockClient::ok(json!({ "number": 1 })));
+        let c = GithubCreateIssue::new(auth.clone(), RecordingClient::ok(json!({ "number": 1 })));
         c.execute(&json!({ "owner": "o", "repo": "r", "title": "T" }))
             .unwrap();
-        check_common_headers(&c.client.last.borrow().as_ref().unwrap().headers, true);
+        check_common_headers(&c.client.last().unwrap().headers, true);
 
-        let c = GithubCommentIssue::new(auth.clone(), MockClient::ok(json!({ "id": 9 })));
+        let c = GithubCommentIssue::new(auth.clone(), RecordingClient::ok(json!({ "id": 9 })));
         c.execute(&json!({ "owner": "o", "repo": "r", "issue_number": 1, "body": "yo" }))
             .unwrap();
-        check_common_headers(&c.client.last.borrow().as_ref().unwrap().headers, true);
+        check_common_headers(&c.client.last().unwrap().headers, true);
 
-        let c = GithubCloseIssue::new(auth.clone(), MockClient::ok(json!({ "number": 1 })));
+        let c = GithubCloseIssue::new(auth.clone(), RecordingClient::ok(json!({ "number": 1 })));
         c.execute(&json!({ "owner": "o", "repo": "r", "issue_number": 1 }))
             .unwrap();
-        check_common_headers(&c.client.last.borrow().as_ref().unwrap().headers, true);
+        check_common_headers(&c.client.last().unwrap().headers, true);
 
-        let c = GithubListPulls::new(auth.clone(), MockClient::ok(json!([])));
+        let c = GithubListPulls::new(auth.clone(), RecordingClient::ok(json!([])));
         c.execute(&json!({ "owner": "o", "repo": "r" })).unwrap();
-        check_common_headers(&c.client.last.borrow().as_ref().unwrap().headers, false);
+        check_common_headers(&c.client.last().unwrap().headers, false);
 
-        let c = GithubCreatePull::new(auth.clone(), MockClient::ok(json!({ "number": 1 })));
+        let c = GithubCreatePull::new(auth.clone(), RecordingClient::ok(json!({ "number": 1 })));
         c.execute(&json!({
             "owner": "o", "repo": "r", "title": "T", "head": "h", "base": "main"
         }))
         .unwrap();
-        check_common_headers(&c.client.last.borrow().as_ref().unwrap().headers, true);
+        check_common_headers(&c.client.last().unwrap().headers, true);
 
-        let c = GithubMergePull::new(auth, MockClient::ok(json!({ "merged": true })));
+        let c = GithubMergePull::new(auth, RecordingClient::ok(json!({ "merged": true })));
         c.execute(&json!({ "owner": "o", "repo": "r", "pull_number": 1 }))
             .unwrap();
-        check_common_headers(&c.client.last.borrow().as_ref().unwrap().headers, true);
+        check_common_headers(&c.client.last().unwrap().headers, true);
     }
 
-    // ───── F4.4.b — issues ─────
+    // ───── issues ─────
 
     #[test]
     fn create_issue_builds_post_with_owner_repo_title() {
         let act = GithubCreateIssue::new(
             GithubAuth::Token("ghp_test".into()),
-            MockClient::ok(json!({ "number": 7, "html_url": "https://github.com/o/r/issues/7" })),
+            RecordingClient::ok(
+                json!({ "number": 7, "html_url": "https://github.com/o/r/issues/7" }),
+            ),
         );
         let out = act
             .execute(&json!({
@@ -681,7 +719,7 @@ mod tests {
                 "body": "details", "labels": ["bug", "ci"], "assignees": ["alice"]
             }))
             .unwrap();
-        let sent = act.client.last.borrow().clone().unwrap();
+        let sent = act.client.last().unwrap();
         assert_eq!(sent.method, "POST");
         assert_eq!(sent.url, "https://api.github.com/repos/o/r/issues");
         let body = sent.body.unwrap();
@@ -696,7 +734,7 @@ mod tests {
     fn create_issue_requires_owner_repo_title() {
         let act = GithubCreateIssue::new(
             GithubAuth::Token("ghp_test".into()),
-            MockClient::ok(json!({})),
+            RecordingClient::ok(json!({})),
         );
         assert!(matches!(
             act.execute(&json!({ "repo": "r", "title": "T" })).unwrap_err(),
@@ -704,7 +742,7 @@ mod tests {
         ));
         let act = GithubCreateIssue::new(
             GithubAuth::Token("ghp_test".into()),
-            MockClient::ok(json!({})),
+            RecordingClient::ok(json!({})),
         );
         assert!(matches!(
             act.execute(&json!({ "owner": "o", "title": "T" })).unwrap_err(),
@@ -712,7 +750,7 @@ mod tests {
         ));
         let act = GithubCreateIssue::new(
             GithubAuth::Token("ghp_test".into()),
-            MockClient::ok(json!({})),
+            RecordingClient::ok(json!({})),
         );
         assert!(matches!(
             act.execute(&json!({ "owner": "o", "repo": "r" })).unwrap_err(),
@@ -724,13 +762,13 @@ mod tests {
     fn comment_issue_builds_post_to_comments_path() {
         let act = GithubCommentIssue::new(
             GithubAuth::Token("ghp_test".into()),
-            MockClient::ok(json!({ "id": 11 })),
+            RecordingClient::ok(json!({ "id": 11 })),
         );
         act.execute(&json!({
             "owner": "o", "repo": "r", "issue_number": 42, "body": "hi"
         }))
         .unwrap();
-        let sent = act.client.last.borrow().clone().unwrap();
+        let sent = act.client.last().unwrap();
         assert_eq!(sent.method, "POST");
         assert_eq!(
             sent.url,
@@ -743,14 +781,14 @@ mod tests {
     fn close_issue_patches_with_state_closed_and_reason() {
         let act = GithubCloseIssue::new(
             GithubAuth::Token("ghp_test".into()),
-            MockClient::ok(json!({ "number": 42, "state": "closed" })),
+            RecordingClient::ok(json!({ "number": 42, "state": "closed" })),
         );
         act.execute(&json!({
             "owner": "o", "repo": "r", "issue_number": 42,
             "state_reason": "completed"
         }))
         .unwrap();
-        let sent = act.client.last.borrow().clone().unwrap();
+        let sent = act.client.last().unwrap();
         assert_eq!(sent.method, "PATCH");
         assert_eq!(sent.url, "https://api.github.com/repos/o/r/issues/42");
         let body = sent.body.unwrap();
@@ -758,13 +796,13 @@ mod tests {
         assert_eq!(body["state_reason"], json!("completed"));
     }
 
-    // ───── F4.4.c — PR ─────
+    // ───── PR ─────
 
     #[test]
     fn list_pulls_builds_get_with_query() {
         let act = GithubListPulls::new(
             GithubAuth::Token("ghp_test".into()),
-            MockClient::ok(json!([{ "number": 1 }])),
+            RecordingClient::ok(json!([{ "number": 1 }])),
         );
         act.execute(&json!({
             "owner": "o", "repo": "r",
@@ -773,7 +811,7 @@ mod tests {
             "per_page": 30, "page": 2
         }))
         .unwrap();
-        let sent = act.client.last.borrow().clone().unwrap();
+        let sent = act.client.last().unwrap();
         assert_eq!(sent.method, "GET");
         assert!(
             sent.url
@@ -782,7 +820,6 @@ mod tests {
             sent.url
         );
         assert!(sent.url.contains("state=open"));
-        // `:` et `/` doivent être pourcent-encodés dans `head`
         assert!(
             sent.url.contains("head=o%3Afeature%2Fx"),
             "url={}",
@@ -800,10 +837,10 @@ mod tests {
     fn list_pulls_works_without_query() {
         let act = GithubListPulls::new(
             GithubAuth::Token("ghp_test".into()),
-            MockClient::ok(json!([])),
+            RecordingClient::ok(json!([])),
         );
         act.execute(&json!({ "owner": "o", "repo": "r" })).unwrap();
-        let url = act.client.last.borrow().clone().unwrap().url;
+        let url = act.client.last().unwrap().url;
         assert_eq!(url, "https://api.github.com/repos/o/r/pulls");
     }
 
@@ -811,7 +848,9 @@ mod tests {
     fn create_pull_posts_with_required_and_optional_fields() {
         let act = GithubCreatePull::new(
             GithubAuth::Token("ghp_test".into()),
-            MockClient::ok(json!({ "number": 99, "html_url": "https://github.com/o/r/pull/99" })),
+            RecordingClient::ok(
+                json!({ "number": 99, "html_url": "https://github.com/o/r/pull/99" }),
+            ),
         );
         act.execute(&json!({
             "owner": "o", "repo": "r",
@@ -819,7 +858,7 @@ mod tests {
             "body": "details", "draft": true
         }))
         .unwrap();
-        let sent = act.client.last.borrow().clone().unwrap();
+        let sent = act.client.last().unwrap();
         assert_eq!(sent.method, "POST");
         assert_eq!(sent.url, "https://api.github.com/repos/o/r/pulls");
         let body = sent.body.unwrap();
@@ -834,7 +873,7 @@ mod tests {
     fn create_pull_requires_title_head_base() {
         let act = GithubCreatePull::new(
             GithubAuth::Token("ghp_test".into()),
-            MockClient::ok(json!({})),
+            RecordingClient::ok(json!({})),
         );
         assert!(matches!(
             act.execute(&json!({
@@ -848,14 +887,14 @@ mod tests {
     fn merge_pull_puts_with_optional_body() {
         let act = GithubMergePull::new(
             GithubAuth::Token("ghp_test".into()),
-            MockClient::ok(json!({ "merged": true, "message": "Pull Request merged" })),
+            RecordingClient::ok(json!({ "merged": true, "message": "Pull Request merged" })),
         );
         act.execute(&json!({
             "owner": "o", "repo": "r", "pull_number": 5,
             "merge_method": "squash", "commit_title": "squashed"
         }))
         .unwrap();
-        let sent = act.client.last.borrow().clone().unwrap();
+        let sent = act.client.last().unwrap();
         assert_eq!(sent.method, "PUT");
         assert_eq!(sent.url, "https://api.github.com/repos/o/r/pulls/5/merge");
         let body = sent.body.unwrap();
@@ -867,28 +906,26 @@ mod tests {
     fn merge_pull_works_without_optional_body() {
         let act = GithubMergePull::new(
             GithubAuth::Token("ghp_test".into()),
-            MockClient::ok(json!({ "merged": true })),
+            RecordingClient::ok(json!({ "merged": true })),
         );
         act.execute(&json!({ "owner": "o", "repo": "r", "pull_number": 5 }))
             .unwrap();
-        let sent = act.client.last.borrow().clone().unwrap();
+        let sent = act.client.last().unwrap();
         assert_eq!(sent.method, "PUT");
         assert_eq!(sent.body.unwrap(), json!({}));
     }
 
-    // ───── owner / repo pourcent-encodés ─────
+    // ───── pourcent-encodage ─────
 
     #[test]
     fn owner_repo_are_percent_encoded() {
-        // Cas peu probable mais : un owner contenant un `/` ne doit pas
-        // permettre d'injection de path (« octocat/../evil » → « octocat%2F..%2Fevil »).
         let act = GithubCreateIssue::new(
             GithubAuth::Token("ghp_test".into()),
-            MockClient::ok(json!({})),
+            RecordingClient::ok(json!({})),
         );
         act.execute(&json!({ "owner": "a/b", "repo": "r", "title": "T" }))
             .unwrap();
-        let url = act.client.last.borrow().clone().unwrap().url;
+        let url = act.client.last().unwrap().url;
         assert!(url.starts_with("https://api.github.com/repos/a%2Fb/r/issues"));
     }
 
@@ -898,7 +935,7 @@ mod tests {
     fn http_non_2xx_extracts_message() {
         let act = GithubCreateIssue::new(
             GithubAuth::Token("ghp_test".into()),
-            MockClient::with_status(
+            RecordingClient::with_status(
                 404,
                 json!({ "message": "Not Found", "documentation_url": "https://…" }),
             ),
@@ -919,7 +956,7 @@ mod tests {
     fn transport_error_is_propagated() {
         let act = GithubCreateIssue::new(
             GithubAuth::Token("ghp_test".into()),
-            MockClient::failing("timeout"),
+            RecordingClient::failing("timeout"),
         );
         let err = act
             .execute(&json!({ "owner": "o", "repo": "r", "title": "T" }))
@@ -933,7 +970,7 @@ mod tests {
     #[test]
     fn kinds_are_stable() {
         let t = || GithubAuth::Token("ghp_test".into());
-        let m = || MockClient::ok(json!({}));
+        let m = || RecordingClient::ok(json!({}));
         assert_eq!(
             GithubCreateIssue::new(t(), m()).kind(),
             "github.create_issue"
@@ -946,5 +983,12 @@ mod tests {
         assert_eq!(GithubListPulls::new(t(), m()).kind(), "github.list_pulls");
         assert_eq!(GithubCreatePull::new(t(), m()).kind(), "github.create_pull");
         assert_eq!(GithubMergePull::new(t(), m()).kind(), "github.merge_pull");
+    }
+
+    #[test]
+    fn connector_publishes_schemas() {
+        let c = GithubConnector;
+        assert_eq!(c.provider(), "github");
+        assert_eq!(c.action_schemas().len(), 6);
     }
 }

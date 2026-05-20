@@ -1,45 +1,22 @@
-//! Connecteur Gmail (F4.2) — actions `send_email`, `list_messages`,
-//! `read_message`, `get_attachment`.
+//! Connecteur Gmail (F4.2, refactoré sous le SDK en F4.5).
 //!
-//! Architecture identique à [`crate::slack`] : aucune dépendance réseau —
-//! le transport est injecté via [`crate::HttpClient`]. L'authentification
-//! se limite ici au **token OAuth2** courant (`Authorization: Bearer …`,
-//! F4.2.a) ; refresh/rotation déléguée à F6.2.
+//! Construit sur [`crate::sdk`] : auth via `Credentials`, interprétation
+//! des réponses via [`GmailInterpreter`], helpers HTTP partagés.
 //!
-//! Schéma des `params` (résumé) :
-//! ```json
-//! // send_email (F4.2.b + F4.2.d)
-//! { "to": "bob@x" | ["bob@x", "z@x"], "from": "alice@x", "subject": "Hi",
-//!   "body": "…", "cc": [...], "bcc": [...], "user_id": "me",
-//!   "attachments": [{ "filename": "a.pdf",
-//!                     "content_type": "application/pdf",
-//!                     "content_base64": "JVBE…" }] }
-//! // list_messages (F4.2.c)
-//! { "user_id": "me", "q": "…", "max_results": 50,
-//!   "page_token": "…", "label_ids": ["INBOX"] }
-//! // read_message (F4.2.c)
-//! { "user_id": "me", "id": "…", "format": "full" }
-//! // get_attachment (F4.2.d)
-//! { "user_id": "me", "message_id": "…", "attachment_id": "…" }
-//! ```
-//!
-//! Mapping d'erreur : HTTP non-2xx → [`autome_core::Error::Invalid`]
-//! `"gmail: http <status> — <error.message>"` ; échec transport →
-//! `"gmail <action> : <message>"`. Politique retry/fallback déléguée
-//! au moteur (F2.7) à partir du message.
-//!
-//! NB : `percent_encode` et la table base64url sont dupliqués depuis
-//! [`crate::slack`] volontairement — ces helpers seront factorisés dans
-//! le SDK connecteur (F4.5).
+//! Le message est construit en RFC 822 puis encodé en base64url **sans
+//! padding** (Gmail API impose ce format pour le champ `raw`).
 
 use std::collections::BTreeMap;
 
 use autome_core::{Action, Error, Result};
 use serde_json::{json, Value};
 
-use crate::http::{HttpClient, HttpRequest, HttpResponse};
+use crate::http::{HttpClient, HttpRequest};
+use crate::sdk::{
+    headers_for, interpret, percent_encode, to_query, ActionSchema, Connector, Credentials,
+    ParamKind, ParamSpec, ResponseInterpreter,
+};
 
-/// Racine de l'API Gmail (v1).
 const GMAIL_API: &str = "https://gmail.googleapis.com/gmail/v1";
 
 /// Stratégie d'authentification Gmail.
@@ -50,41 +27,49 @@ pub enum GmailAuth {
     OAuth2(String),
 }
 
-impl GmailAuth {
-    fn bearer(&self) -> String {
+impl Credentials for GmailAuth {
+    fn apply(&self, headers: &mut BTreeMap<String, String>) {
         match self {
-            GmailAuth::OAuth2(t) => format!("Bearer {t}"),
+            GmailAuth::OAuth2(t) => {
+                headers.insert("Authorization".into(), format!("Bearer {t}"));
+            }
         }
     }
 }
 
-fn auth_headers(auth: &GmailAuth) -> BTreeMap<String, String> {
-    let mut h = BTreeMap::new();
-    h.insert("Authorization".into(), auth.bearer());
-    h.insert(
-        "Content-Type".into(),
-        "application/json; charset=utf-8".into(),
-    );
-    h
+/// Interpréteur de réponses Gmail (extrait `error.message` Google sur les non-2xx).
+pub struct GmailInterpreter;
+
+impl ResponseInterpreter for GmailInterpreter {
+    fn provider(&self) -> &'static str {
+        "gmail"
+    }
+    fn extract_error(&self, body: &Value) -> Option<String> {
+        body.get("error")
+            .and_then(|e| e.get("message"))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    }
 }
 
-/// Traduit la réponse Gmail en `Result<Value>`.
-fn interpret(resp: HttpResponse) -> Result<Value> {
-    if (200..300).contains(&resp.status) {
-        return Ok(resp.body);
+/// Connecteur Gmail — registre des actions.
+pub struct GmailConnector;
+
+impl Connector for GmailConnector {
+    fn provider(&self) -> &'static str {
+        "gmail"
     }
-    let msg = resp
-        .body
-        .get("error")
-        .and_then(|e| e.get("message"))
-        .and_then(Value::as_str)
-        .map(str::to_string)
-        .unwrap_or_else(|| resp.body.to_string());
-    Err(Error::Invalid(format!(
-        "gmail: http {} — {}",
-        resp.status, msg
-    )))
+    fn action_schemas(&self) -> Vec<ActionSchema> {
+        vec![
+            send_email_schema(),
+            list_messages_schema(),
+            read_message_schema(),
+            get_attachment_schema(),
+        ]
+    }
 }
+
+// ──────────────────── helpers MIME ────────────────────
 
 /// Alphabet base64url (RFC 4648 §5).
 const B64URL: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
@@ -118,30 +103,6 @@ fn base64_url_no_pad(input: &[u8]) -> String {
     out
 }
 
-/// Encodage URL minimal (RFC 3986 « unreserved »).
-fn percent_encode(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for b in s.bytes() {
-        let c = b as char;
-        if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '~') {
-            out.push(c);
-        } else {
-            out.push_str(&format!("%{b:02X}"));
-        }
-    }
-    out
-}
-
-/// Sérialise `pairs` en query string `k=v&k=v…`, valeurs pourcent-encodées.
-fn to_query(pairs: &[(String, String)]) -> String {
-    pairs
-        .iter()
-        .map(|(k, v)| format!("{}={}", percent_encode(k), percent_encode(v)))
-        .collect::<Vec<_>>()
-        .join("&")
-}
-
-/// Liste de destinataires : accepte une string ou un tableau de strings.
 fn collect_addresses(v: &Value) -> Vec<String> {
     if let Some(s) = v.as_str() {
         return vec![s.to_string()];
@@ -155,7 +116,6 @@ fn collect_addresses(v: &Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// Pièce jointe parsée depuis les `params`.
 struct ParsedAttachment {
     filename: String,
     content_type: String,
@@ -192,10 +152,7 @@ fn collect_attachments(params: &Value) -> Result<Vec<ParsedAttachment>> {
         .collect()
 }
 
-/// Construit le message RFC 822 complet (texte + pièces jointes éventuelles).
-///
-/// Les lignes utilisent `\r\n` (RFC 5322 §2.3). Quand il y a des pièces jointes,
-/// le message est `multipart/mixed` ; sinon `text/plain; charset=utf-8`.
+/// Construit le message RFC 822 (texte + pièces jointes éventuelles).
 fn render_rfc822(
     from: Option<&str>,
     to: &[String],
@@ -224,7 +181,7 @@ fn render_rfc822(
     if attachments.is_empty() {
         lines.push("Content-Type: text/plain; charset=utf-8".into());
         lines.push("Content-Transfer-Encoding: 8bit".into());
-        lines.push(String::new()); // séparateur en-têtes/corps
+        lines.push(String::new());
         lines.push(body.into());
         return lines.join("\r\n");
     }
@@ -310,7 +267,7 @@ impl<C: HttpClient> GmailSendEmail<C> {
                 "{GMAIL_API}/users/{}/messages/send",
                 percent_encode(&user_id)
             ),
-            headers: auth_headers(&self.auth),
+            headers: headers_for(&self.auth, true),
             body: Some(json!({ "raw": raw })),
         })
     }
@@ -327,7 +284,7 @@ impl<C: HttpClient> Action for GmailSendEmail<C> {
             .client
             .send(&req)
             .map_err(|e| Error::Invalid(format!("gmail send_email : {e}")))?;
-        interpret(resp)
+        interpret(resp, &GmailInterpreter)
     }
 }
 
@@ -371,12 +328,10 @@ impl<C: HttpClient> GmailListMessages<C> {
             url.push('?');
             url.push_str(&to_query(&pairs));
         }
-        let mut headers = auth_headers(&self.auth);
-        headers.remove("Content-Type"); // GET sans body
         Ok(HttpRequest {
             method: "GET".into(),
             url,
-            headers,
+            headers: headers_for(&self.auth, false),
             body: None,
         })
     }
@@ -393,7 +348,7 @@ impl<C: HttpClient> Action for GmailListMessages<C> {
             .client
             .send(&req)
             .map_err(|e| Error::Invalid(format!("gmail list_messages : {e}")))?;
-        interpret(resp)
+        interpret(resp, &GmailInterpreter)
     }
 }
 
@@ -428,12 +383,10 @@ impl<C: HttpClient> GmailReadMessage<C> {
             url.push('?');
             url.push_str(&to_query(&pairs));
         }
-        let mut headers = auth_headers(&self.auth);
-        headers.remove("Content-Type");
         Ok(HttpRequest {
             method: "GET".into(),
             url,
-            headers,
+            headers: headers_for(&self.auth, false),
             body: None,
         })
     }
@@ -450,7 +403,7 @@ impl<C: HttpClient> Action for GmailReadMessage<C> {
             .client
             .send(&req)
             .map_err(|e| Error::Invalid(format!("gmail read_message : {e}")))?;
-        interpret(resp)
+        interpret(resp, &GmailInterpreter)
     }
 }
 
@@ -484,12 +437,10 @@ impl<C: HttpClient> GmailGetAttachment<C> {
             percent_encode(message_id),
             percent_encode(attachment_id)
         );
-        let mut headers = auth_headers(&self.auth);
-        headers.remove("Content-Type");
         Ok(HttpRequest {
             method: "GET".into(),
             url,
-            headers,
+            headers: headers_for(&self.auth, false),
             body: None,
         })
     }
@@ -506,61 +457,107 @@ impl<C: HttpClient> Action for GmailGetAttachment<C> {
             .client
             .send(&req)
             .map_err(|e| Error::Invalid(format!("gmail get_attachment : {e}")))?;
-        interpret(resp)
+        interpret(resp, &GmailInterpreter)
+    }
+}
+
+// ───────────────────────── Schémas (F4.5.c) ─────────────────────────
+
+/// Schéma de l'action `gmail.send_email`.
+pub fn send_email_schema() -> ActionSchema {
+    ActionSchema {
+        provider: "gmail",
+        kind: "gmail.send_email",
+        label: "Gmail — Envoyer un mail",
+        description: "Envoie un message via `users.messages.send`.",
+        params: vec![
+            ParamSpec {
+                key: "to",
+                label: "Destinataire(s)",
+                kind: ParamKind::Array {
+                    inner: Box::new(ParamKind::String),
+                },
+                required: true,
+                description: None,
+            },
+            ParamSpec::opt_str("from", "From"),
+            ParamSpec::req_str("subject", "Sujet"),
+            ParamSpec::req_str("body", "Corps"),
+            ParamSpec::opt_obj("attachments", "Pièces jointes"),
+            ParamSpec::opt_str("user_id", "User id (défaut: me)"),
+        ],
+    }
+}
+
+/// Schéma de l'action `gmail.list_messages`.
+pub fn list_messages_schema() -> ActionSchema {
+    ActionSchema {
+        provider: "gmail",
+        kind: "gmail.list_messages",
+        label: "Gmail — Lister les messages",
+        description: "Liste les messages via `users.messages.list`.",
+        params: vec![
+            ParamSpec::opt_str("user_id", "User id (défaut: me)"),
+            ParamSpec::opt_str("q", "Recherche (`q`)"),
+            ParamSpec::opt_int("max_results", "Limite"),
+            ParamSpec::opt_str("page_token", "Page token"),
+            ParamSpec {
+                key: "label_ids",
+                label: "Labels",
+                kind: ParamKind::Array {
+                    inner: Box::new(ParamKind::String),
+                },
+                required: false,
+                description: None,
+            },
+        ],
+    }
+}
+
+/// Schéma de l'action `gmail.read_message`.
+pub fn read_message_schema() -> ActionSchema {
+    ActionSchema {
+        provider: "gmail",
+        kind: "gmail.read_message",
+        label: "Gmail — Lire un message",
+        description: "Lit un message via `users.messages.get`.",
+        params: vec![
+            ParamSpec::req_str("id", "ID du message"),
+            ParamSpec::opt_str("user_id", "User id (défaut: me)"),
+            ParamSpec {
+                key: "format",
+                label: "Format",
+                kind: ParamKind::Enum {
+                    variants: vec!["full", "metadata", "minimal", "raw"],
+                },
+                required: false,
+                description: None,
+            },
+        ],
+    }
+}
+
+/// Schéma de l'action `gmail.get_attachment`.
+pub fn get_attachment_schema() -> ActionSchema {
+    ActionSchema {
+        provider: "gmail",
+        kind: "gmail.get_attachment",
+        label: "Gmail — Récupérer une pièce jointe",
+        description: "Récupère une PJ via `users.messages.attachments.get`.",
+        params: vec![
+            ParamSpec::req_str("message_id", "Message ID"),
+            ParamSpec::req_str("attachment_id", "Attachment ID"),
+            ParamSpec::opt_str("user_id", "User id (défaut: me)"),
+        ],
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::cell::RefCell;
+    use crate::sdk::RecordingClient;
+    use serde_json::json;
 
-    struct MockClient {
-        last: RefCell<Option<HttpRequest>>,
-        resp: HttpResponse,
-        fail: Option<String>,
-    }
-
-    impl MockClient {
-        fn ok(body: Value) -> Self {
-            Self {
-                last: RefCell::new(None),
-                resp: HttpResponse { status: 200, body },
-                fail: None,
-            }
-        }
-        fn with_status(status: u16, body: Value) -> Self {
-            Self {
-                last: RefCell::new(None),
-                resp: HttpResponse { status, body },
-                fail: None,
-            }
-        }
-        fn failing(msg: &str) -> Self {
-            Self {
-                last: RefCell::new(None),
-                resp: HttpResponse {
-                    status: 200,
-                    body: json!({}),
-                },
-                fail: Some(msg.into()),
-            }
-        }
-    }
-
-    impl HttpClient for MockClient {
-        fn send(&self, req: &HttpRequest) -> std::result::Result<HttpResponse, String> {
-            *self.last.borrow_mut() = Some(req.clone());
-            if let Some(m) = &self.fail {
-                Err(m.clone())
-            } else {
-                Ok(self.resp.clone())
-            }
-        }
-    }
-
-    /// Décodeur base64url (sans padding) — utile uniquement en tests pour
-    /// vérifier le contenu du champ `raw` envoyé à Gmail.
     fn base64_url_decode(s: &str) -> Vec<u8> {
         let value = |c: u8| -> u32 {
             match c {
@@ -602,11 +599,8 @@ mod tests {
         out
     }
 
-    // ───── base64url (helper interne) ─────
-
     #[test]
     fn base64_url_encodes_known_vectors() {
-        // RFC 4648 §10 vectors (base64 std + URL conversion + no padding)
         assert_eq!(base64_url_no_pad(b""), "");
         assert_eq!(base64_url_no_pad(b"f"), "Zg");
         assert_eq!(base64_url_no_pad(b"fo"), "Zm8");
@@ -614,25 +608,19 @@ mod tests {
         assert_eq!(base64_url_no_pad(b"foob"), "Zm9vYg");
         assert_eq!(base64_url_no_pad(b"fooba"), "Zm9vYmE");
         assert_eq!(base64_url_no_pad(b"foobar"), "Zm9vYmFy");
-        // url-safe alphabet for bytes mapping to + and /
-        // 0xFB 0xEF → "++/" std, "--_" url-safe
         assert_eq!(base64_url_no_pad(&[0xFB, 0xEF, 0xFF]), "--__");
     }
-
-    // ───── F4.2.a (auth) ─────
 
     #[test]
     fn all_actions_inject_bearer() {
         let auth = GmailAuth::OAuth2("tok-1".into());
 
-        let send = GmailSendEmail::new(auth.clone(), MockClient::ok(json!({ "id": "x" })));
+        let send = GmailSendEmail::new(auth.clone(), RecordingClient::ok(json!({ "id": "x" })));
         send.execute(&json!({ "to": "b@x", "subject": "s", "body": "b" }))
             .unwrap();
         assert_eq!(
             send.client
-                .last
-                .borrow()
-                .as_ref()
+                .last()
                 .unwrap()
                 .headers
                 .get("Authorization")
@@ -640,13 +628,12 @@ mod tests {
             Some("Bearer tok-1")
         );
 
-        let list = GmailListMessages::new(auth.clone(), MockClient::ok(json!({ "messages": [] })));
+        let list =
+            GmailListMessages::new(auth.clone(), RecordingClient::ok(json!({ "messages": [] })));
         list.execute(&json!({})).unwrap();
         assert_eq!(
             list.client
-                .last
-                .borrow()
-                .as_ref()
+                .last()
                 .unwrap()
                 .headers
                 .get("Authorization")
@@ -654,13 +641,11 @@ mod tests {
             Some("Bearer tok-1")
         );
 
-        let read = GmailReadMessage::new(auth.clone(), MockClient::ok(json!({ "id": "a" })));
+        let read = GmailReadMessage::new(auth.clone(), RecordingClient::ok(json!({ "id": "a" })));
         read.execute(&json!({ "id": "a" })).unwrap();
         assert_eq!(
             read.client
-                .last
-                .borrow()
-                .as_ref()
+                .last()
                 .unwrap()
                 .headers
                 .get("Authorization")
@@ -668,14 +653,12 @@ mod tests {
             Some("Bearer tok-1")
         );
 
-        let att = GmailGetAttachment::new(auth, MockClient::ok(json!({ "data": "" })));
+        let att = GmailGetAttachment::new(auth, RecordingClient::ok(json!({ "data": "" })));
         att.execute(&json!({ "message_id": "m", "attachment_id": "a" }))
             .unwrap();
         assert_eq!(
             att.client
-                .last
-                .borrow()
-                .as_ref()
+                .last()
                 .unwrap()
                 .headers
                 .get("Authorization")
@@ -684,13 +667,11 @@ mod tests {
         );
     }
 
-    // ───── F4.2.b (send_email) ─────
-
     #[test]
     fn send_email_builds_post_with_base64url_raw() {
         let act = GmailSendEmail::new(
             GmailAuth::OAuth2("t".into()),
-            MockClient::ok(json!({ "id": "msg1", "threadId": "t1" })),
+            RecordingClient::ok(json!({ "id": "msg1", "threadId": "t1" })),
         );
         let out = act
             .execute(&json!({
@@ -700,7 +681,7 @@ mod tests {
                 "body": "Hello!"
             }))
             .unwrap();
-        let sent = act.client.last.borrow().clone().unwrap();
+        let sent = act.client.last().unwrap();
         assert_eq!(sent.method, "POST");
         assert_eq!(
             sent.url,
@@ -712,9 +693,7 @@ mod tests {
         );
         let body = sent.body.unwrap();
         let raw = body["raw"].as_str().expect("raw must be a string");
-        // pas de padding
         assert!(!raw.contains('='), "raw doit être sans padding : {raw}");
-        // pas de caractères non-url-safe
         assert!(!raw.contains('+') && !raw.contains('/'));
         let decoded = String::from_utf8(base64_url_decode(raw)).unwrap();
         assert!(decoded.contains("From: alice@example.com"));
@@ -729,7 +708,7 @@ mod tests {
     fn send_email_accepts_to_as_array_and_renders_cc_bcc() {
         let act = GmailSendEmail::new(
             GmailAuth::OAuth2("t".into()),
-            MockClient::ok(json!({ "id": "x" })),
+            RecordingClient::ok(json!({ "id": "x" })),
         );
         act.execute(&json!({
             "to": ["a@x", "b@x"],
@@ -739,7 +718,7 @@ mod tests {
             "body": "B"
         }))
         .unwrap();
-        let raw = act.client.last.borrow().clone().unwrap().body.unwrap()["raw"]
+        let raw = act.client.last().unwrap().body.unwrap()["raw"]
             .as_str()
             .unwrap()
             .to_string();
@@ -753,15 +732,14 @@ mod tests {
     fn send_email_uses_explicit_user_id() {
         let act = GmailSendEmail::new(
             GmailAuth::OAuth2("t".into()),
-            MockClient::ok(json!({ "id": "x" })),
+            RecordingClient::ok(json!({ "id": "x" })),
         );
         act.execute(&json!({
             "user_id": "alice@example.com",
             "to": "b@x", "subject": "s", "body": "b"
         }))
         .unwrap();
-        let url = act.client.last.borrow().clone().unwrap().url;
-        // l'@ doit être pourcent-encodé
+        let url = act.client.last().unwrap().url;
         assert!(
             url.contains("/users/alice%40example.com/messages/send"),
             "url={url}"
@@ -772,7 +750,7 @@ mod tests {
     fn send_email_requires_to_subject_body() {
         let act = GmailSendEmail::new(
             GmailAuth::OAuth2("t".into()),
-            MockClient::ok(json!({ "id": "x" })),
+            RecordingClient::ok(json!({ "id": "x" })),
         );
         assert!(matches!(
             act.execute(&json!({ "subject": "s", "body": "b" })).unwrap_err(),
@@ -780,7 +758,7 @@ mod tests {
         ));
         let act = GmailSendEmail::new(
             GmailAuth::OAuth2("t".into()),
-            MockClient::ok(json!({ "id": "x" })),
+            RecordingClient::ok(json!({ "id": "x" })),
         );
         assert!(matches!(
             act.execute(&json!({ "to": "b@x", "body": "b" })).unwrap_err(),
@@ -788,7 +766,7 @@ mod tests {
         ));
         let act = GmailSendEmail::new(
             GmailAuth::OAuth2("t".into()),
-            MockClient::ok(json!({ "id": "x" })),
+            RecordingClient::ok(json!({ "id": "x" })),
         );
         assert!(matches!(
             act.execute(&json!({ "to": "b@x", "subject": "s" })).unwrap_err(),
@@ -800,7 +778,7 @@ mod tests {
     fn send_email_empty_to_array_is_an_error() {
         let act = GmailSendEmail::new(
             GmailAuth::OAuth2("t".into()),
-            MockClient::ok(json!({ "id": "x" })),
+            RecordingClient::ok(json!({ "id": "x" })),
         );
         let err = act
             .execute(&json!({ "to": [], "subject": "s", "body": "b" }))
@@ -811,13 +789,11 @@ mod tests {
         }
     }
 
-    // ───── F4.2.c (list/read) ─────
-
     #[test]
     fn list_messages_builds_get_with_query_and_repeated_label_ids() {
         let act = GmailListMessages::new(
             GmailAuth::OAuth2("t".into()),
-            MockClient::ok(json!({ "messages": [{ "id": "a" }] })),
+            RecordingClient::ok(json!({ "messages": [{ "id": "a" }] })),
         );
         act.execute(&json!({
             "q": "from:foo@bar",
@@ -826,7 +802,7 @@ mod tests {
             "label_ids": ["INBOX", "STARRED"]
         }))
         .unwrap();
-        let sent = act.client.last.borrow().clone().unwrap();
+        let sent = act.client.last().unwrap();
         assert_eq!(sent.method, "GET");
         assert!(
             sent.url
@@ -834,15 +810,12 @@ mod tests {
             "url={}",
             sent.url
         );
-        // espace dans `q` → %20, `:` → %3A, `@` → %40
         assert!(sent.url.contains("q=from%3Afoo%40bar"), "url={}", sent.url);
         assert!(sent.url.contains("maxResults=25"));
         assert!(sent.url.contains("pageToken=next-1"));
-        // labelIds répété
         assert!(sent.url.contains("labelIds=INBOX"));
         assert!(sent.url.contains("labelIds=STARRED"));
         assert!(sent.body.is_none());
-        // GET → pas de Content-Type
         assert!(!sent.headers.contains_key("Content-Type"));
     }
 
@@ -850,10 +823,10 @@ mod tests {
     fn list_messages_works_without_query() {
         let act = GmailListMessages::new(
             GmailAuth::OAuth2("t".into()),
-            MockClient::ok(json!({ "messages": [] })),
+            RecordingClient::ok(json!({ "messages": [] })),
         );
         act.execute(&json!({})).unwrap();
-        let url = act.client.last.borrow().clone().unwrap().url;
+        let url = act.client.last().unwrap().url;
         assert_eq!(
             url,
             "https://gmail.googleapis.com/gmail/v1/users/me/messages"
@@ -864,12 +837,12 @@ mod tests {
     fn read_message_builds_get_with_id_and_format() {
         let act = GmailReadMessage::new(
             GmailAuth::OAuth2("t".into()),
-            MockClient::ok(json!({ "id": "abc", "payload": {} })),
+            RecordingClient::ok(json!({ "id": "abc", "payload": {} })),
         );
         let out = act
             .execute(&json!({ "id": "abc", "format": "full" }))
             .unwrap();
-        let sent = act.client.last.borrow().clone().unwrap();
+        let sent = act.client.last().unwrap();
         assert_eq!(sent.method, "GET");
         assert_eq!(
             sent.url,
@@ -883,19 +856,17 @@ mod tests {
     fn read_message_requires_id() {
         let act = GmailReadMessage::new(
             GmailAuth::OAuth2("t".into()),
-            MockClient::ok(json!({ "id": "a" })),
+            RecordingClient::ok(json!({ "id": "a" })),
         );
         let err = act.execute(&json!({})).unwrap_err();
         assert!(matches!(err, Error::Invalid(ref m) if m.contains("`id`")));
     }
 
-    // ───── F4.2.d (pièces jointes) ─────
-
     #[test]
     fn send_email_with_attachment_builds_multipart_mixed() {
         let act = GmailSendEmail::new(
             GmailAuth::OAuth2("t".into()),
-            MockClient::ok(json!({ "id": "x" })),
+            RecordingClient::ok(json!({ "id": "x" })),
         );
         act.execute(&json!({
             "to": "b@x",
@@ -908,7 +879,7 @@ mod tests {
             }]
         }))
         .unwrap();
-        let raw = act.client.last.borrow().clone().unwrap().body.unwrap()["raw"]
+        let raw = act.client.last().unwrap().body.unwrap()["raw"]
             .as_str()
             .unwrap()
             .to_string();
@@ -919,7 +890,6 @@ mod tests {
         assert!(decoded.contains("Content-Transfer-Encoding: base64"));
         assert!(decoded.contains("Content-Disposition: attachment; filename=\"doc.pdf\""));
         assert!(decoded.contains("JVBERi0xLjQK"));
-        // boundary fermante
         assert!(decoded.contains("--\r\n") || decoded.ends_with("--"));
     }
 
@@ -927,14 +897,14 @@ mod tests {
     fn send_email_attachment_defaults_to_octet_stream() {
         let act = GmailSendEmail::new(
             GmailAuth::OAuth2("t".into()),
-            MockClient::ok(json!({ "id": "x" })),
+            RecordingClient::ok(json!({ "id": "x" })),
         );
         act.execute(&json!({
             "to": "b@x", "subject": "S", "body": "B",
             "attachments": [{ "filename": "f.bin", "content_base64": "AAAA" }]
         }))
         .unwrap();
-        let raw = act.client.last.borrow().clone().unwrap().body.unwrap()["raw"]
+        let raw = act.client.last().unwrap().body.unwrap()["raw"]
             .as_str()
             .unwrap()
             .to_string();
@@ -946,7 +916,7 @@ mod tests {
     fn send_email_attachment_missing_fields_errors() {
         let act = GmailSendEmail::new(
             GmailAuth::OAuth2("t".into()),
-            MockClient::ok(json!({ "id": "x" })),
+            RecordingClient::ok(json!({ "id": "x" })),
         );
         let err = act
             .execute(&json!({
@@ -958,7 +928,7 @@ mod tests {
 
         let act = GmailSendEmail::new(
             GmailAuth::OAuth2("t".into()),
-            MockClient::ok(json!({ "id": "x" })),
+            RecordingClient::ok(json!({ "id": "x" })),
         );
         let err = act
             .execute(&json!({
@@ -973,7 +943,7 @@ mod tests {
     fn get_attachment_builds_correct_url() {
         let act = GmailGetAttachment::new(
             GmailAuth::OAuth2("t".into()),
-            MockClient::ok(json!({ "data": "ABCD", "size": 4 })),
+            RecordingClient::ok(json!({ "data": "ABCD", "size": 4 })),
         );
         let out = act
             .execute(&json!({
@@ -981,7 +951,7 @@ mod tests {
                 "attachment_id": "att-1"
             }))
             .unwrap();
-        let sent = act.client.last.borrow().clone().unwrap();
+        let sent = act.client.last().unwrap();
         assert_eq!(sent.method, "GET");
         assert_eq!(
             sent.url,
@@ -995,26 +965,24 @@ mod tests {
     fn get_attachment_requires_message_and_attachment_ids() {
         let act = GmailGetAttachment::new(
             GmailAuth::OAuth2("t".into()),
-            MockClient::ok(json!({ "data": "" })),
+            RecordingClient::ok(json!({ "data": "" })),
         );
         let err = act.execute(&json!({ "attachment_id": "a" })).unwrap_err();
         assert!(matches!(err, Error::Invalid(ref m) if m.contains("message_id")));
 
         let act = GmailGetAttachment::new(
             GmailAuth::OAuth2("t".into()),
-            MockClient::ok(json!({ "data": "" })),
+            RecordingClient::ok(json!({ "data": "" })),
         );
         let err = act.execute(&json!({ "message_id": "m" })).unwrap_err();
         assert!(matches!(err, Error::Invalid(ref m) if m.contains("attachment_id")));
     }
 
-    // ───── mapping erreurs ─────
-
     #[test]
     fn http_non_2xx_extracts_google_error_message() {
         let act = GmailSendEmail::new(
             GmailAuth::OAuth2("t".into()),
-            MockClient::with_status(
+            RecordingClient::with_status(
                 400,
                 json!({ "error": {
                     "code": 400, "message": "Invalid To header", "status": "INVALID_ARGUMENT"
@@ -1037,7 +1005,7 @@ mod tests {
     fn http_non_2xx_falls_back_to_raw_body() {
         let act = GmailSendEmail::new(
             GmailAuth::OAuth2("t".into()),
-            MockClient::with_status(500, json!({ "details": "unknown" })),
+            RecordingClient::with_status(500, json!({ "details": "unknown" })),
         );
         let err = act
             .execute(&json!({ "to": "b@x", "subject": "s", "body": "b" }))
@@ -1052,7 +1020,7 @@ mod tests {
     fn transport_error_is_propagated() {
         let act = GmailSendEmail::new(
             GmailAuth::OAuth2("t".into()),
-            MockClient::failing("dns failure"),
+            RecordingClient::failing("dns failure"),
         );
         let err = act
             .execute(&json!({ "to": "b@x", "subject": "s", "body": "b" }))
@@ -1066,21 +1034,43 @@ mod tests {
     #[test]
     fn kinds_are_stable() {
         assert_eq!(
-            GmailSendEmail::new(GmailAuth::OAuth2("t".into()), MockClient::ok(json!({}))).kind(),
+            GmailSendEmail::new(
+                GmailAuth::OAuth2("t".into()),
+                RecordingClient::ok(json!({}))
+            )
+            .kind(),
             "gmail.send_email"
         );
         assert_eq!(
-            GmailListMessages::new(GmailAuth::OAuth2("t".into()), MockClient::ok(json!({}))).kind(),
+            GmailListMessages::new(
+                GmailAuth::OAuth2("t".into()),
+                RecordingClient::ok(json!({}))
+            )
+            .kind(),
             "gmail.list_messages"
         );
         assert_eq!(
-            GmailReadMessage::new(GmailAuth::OAuth2("t".into()), MockClient::ok(json!({}))).kind(),
+            GmailReadMessage::new(
+                GmailAuth::OAuth2("t".into()),
+                RecordingClient::ok(json!({}))
+            )
+            .kind(),
             "gmail.read_message"
         );
         assert_eq!(
-            GmailGetAttachment::new(GmailAuth::OAuth2("t".into()), MockClient::ok(json!({})))
-                .kind(),
+            GmailGetAttachment::new(
+                GmailAuth::OAuth2("t".into()),
+                RecordingClient::ok(json!({}))
+            )
+            .kind(),
             "gmail.get_attachment"
         );
+    }
+
+    #[test]
+    fn connector_publishes_schemas() {
+        let c = GmailConnector;
+        assert_eq!(c.provider(), "gmail");
+        assert_eq!(c.action_schemas().len(), 4);
     }
 }

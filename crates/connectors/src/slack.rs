@@ -1,90 +1,53 @@
-//! Connecteur Slack (F4.1) — actions `send_message` et `read_channel`.
+//! Connecteur Slack (F4.1, refactoré sous le SDK en F4.5).
 //!
-//! Mêmes principes que [`crate::HttpAction`] : aucune dépendance réseau —
-//! le transport est injecté via [`crate::HttpClient`]. L'authentification
-//! se limite ici au **bot/user token** (`xoxb-…` / `xoxp-…`) injecté en
-//! `Authorization: Bearer …` (F4.1.a) ; le flow OAuth complet relève de
-//! F6.2.
-//!
-//! Schéma des `params` :
-//! ```json
-//! // send_message
-//! { "channel": "C123", "text": "hello",
-//!   "thread_ts": "1700000000.000100", "blocks": [ … ] }
-//! // read_channel
-//! { "channel": "C123", "limit": 50, "cursor": "…",
-//!   "oldest": "…", "latest": "…", "inclusive": true }
-//! ```
-//!
-//! Le mapping d'erreur (F4.1.d) traduit :
-//! - réponse Slack `{ok:false, error}` → [`autome_core::Error::Invalid`]
-//!   `"slack: <code>"` ;
-//! - statut HTTP non-2xx → `"slack: http <status> — …"` ;
-//! - échec transport → `"slack <action> : <message>"`.
-//!
-//! Le moteur (F2.7) décide ensuite retry/fallback à partir du message.
+//! Construit sur [`crate::sdk`] : auth via `Credentials`, interprétation
+//! des réponses via [`SlackInterpreter`], helpers HTTP partagés.
 
 use std::collections::BTreeMap;
 
 use autome_core::{Action, Error, Result};
 use serde_json::{Map, Value};
 
-use crate::http::{HttpClient, HttpRequest, HttpResponse};
+use crate::http::{HttpClient, HttpRequest};
+use crate::sdk::{
+    headers_for, interpret, ActionSchema, Connector, Credentials, ParamKind, ParamSpec,
+    ResponseInterpreter,
+};
 
-/// Racine de l'API Web Slack.
 const SLACK_API: &str = "https://slack.com/api";
 
 /// Stratégie d'authentification Slack.
-///
-/// La variante OAuth (refresh tokens, multi-provider) relève de F6.2 ;
-/// pour F4.1, seul le bot/user token statique est nécessaire.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum SlackAuth {
     /// Bot/User token (`xoxb-…` ou `xoxp-…`).
     Bot(String),
 }
 
-impl SlackAuth {
-    fn bearer(&self) -> String {
+impl Credentials for SlackAuth {
+    fn apply(&self, headers: &mut BTreeMap<String, String>) {
         match self {
-            SlackAuth::Bot(t) => format!("Bearer {t}"),
+            SlackAuth::Bot(t) => {
+                headers.insert("Authorization".into(), format!("Bearer {t}"));
+            }
         }
     }
 }
 
-/// En-têtes communs à toutes les requêtes Slack (auth + JSON).
-fn common_headers(auth: &SlackAuth) -> BTreeMap<String, String> {
-    let mut h = BTreeMap::new();
-    h.insert("Authorization".into(), auth.bearer());
-    h.insert(
-        "Content-Type".into(),
-        "application/json; charset=utf-8".into(),
-    );
-    h
-}
+/// Interpréteur de réponses Slack (réponse `200` avec `{ok:false,error}` →
+/// erreur ; HTTP non-2xx → erreur fallback sur le body).
+pub struct SlackInterpreter;
 
-/// Traduit la réponse Slack en `Result<Value>` (F4.1.d).
-///
-/// Slack répond presque toujours `200 OK` avec un champ `ok` ; un statut
-/// non-2xx est traité comme erreur définitive (4xx) ou retryable (5xx)
-/// par le moteur via le message.
-fn interpret(resp: HttpResponse) -> Result<Value> {
-    if !(200..300).contains(&resp.status) {
-        return Err(Error::Invalid(format!(
-            "slack: http {} — {}",
-            resp.status, resp.body
-        )));
+impl ResponseInterpreter for SlackInterpreter {
+    fn provider(&self) -> &'static str {
+        "slack"
     }
-    let ok = resp
-        .body
-        .get("ok")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    if ok {
-        Ok(resp.body)
-    } else {
-        let code = resp
-            .body
+    fn on_success(&self, body: Value) -> Result<Value> {
+        let ok = body.get("ok").and_then(Value::as_bool).unwrap_or(false);
+        if ok {
+            return Ok(body);
+        }
+        let code = body
             .get("error")
             .and_then(Value::as_str)
             .unwrap_or("unknown_error");
@@ -92,25 +55,62 @@ fn interpret(resp: HttpResponse) -> Result<Value> {
     }
 }
 
-/// Encodage URL minimal (RFC 3986 « unreserved »).
-fn percent_encode(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for b in s.bytes() {
-        let c = b as char;
-        if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '~') {
-            out.push(c);
-        } else {
-            out.push_str(&format!("%{b:02X}"));
-        }
+/// Connecteur Slack — registre des actions exposées.
+pub struct SlackConnector;
+
+impl Connector for SlackConnector {
+    fn provider(&self) -> &'static str {
+        "slack"
     }
-    out
+    fn action_schemas(&self) -> Vec<ActionSchema> {
+        vec![send_message_schema(), read_channel_schema()]
+    }
 }
 
-/// Action `chat.postMessage` (F4.1.b).
-///
-/// Params requis : `channel`, `text`. Champs additionnels propagés tels
-/// quels au body JSON : `thread_ts`, `blocks`, `attachments`, `username`,
-/// `icon_emoji`.
+/// Schéma de l'action `slack.send_message` (F4.5.c).
+pub fn send_message_schema() -> ActionSchema {
+    ActionSchema {
+        provider: "slack",
+        kind: "slack.send_message",
+        label: "Slack — Envoyer un message",
+        description: "Publie un message dans un canal Slack via `chat.postMessage`.",
+        params: vec![
+            ParamSpec::req_str("channel", "Canal"),
+            ParamSpec::req_str("text", "Texte"),
+            ParamSpec::opt_str("thread_ts", "Thread (parent ts)"),
+            ParamSpec {
+                key: "blocks",
+                label: "Blocs (Block Kit)",
+                kind: ParamKind::Array {
+                    inner: Box::new(ParamKind::Object),
+                },
+                required: false,
+                description: None,
+            },
+        ],
+    }
+}
+
+/// Schéma de l'action `slack.read_channel` (F4.5.c).
+pub fn read_channel_schema() -> ActionSchema {
+    ActionSchema {
+        provider: "slack",
+        kind: "slack.read_channel",
+        label: "Slack — Lire l'historique",
+        description: "Récupère l'historique d'un canal via `conversations.history`.",
+        params: vec![
+            ParamSpec::req_str("channel", "Canal"),
+            ParamSpec::opt_int("limit", "Limite"),
+            ParamSpec::opt_str("cursor", "Curseur"),
+            ParamSpec::opt_str("oldest", "Depuis (ts)"),
+            ParamSpec::opt_str("latest", "Jusqu'à (ts)"),
+        ],
+    }
+}
+
+// ────────── send_message (F4.1.b) ──────────
+
+/// Action `chat.postMessage`.
 pub struct SlackSendMessage<C: HttpClient> {
     auth: SlackAuth,
     client: C,
@@ -148,7 +148,7 @@ impl<C: HttpClient> SlackSendMessage<C> {
         Ok(HttpRequest {
             method: "POST".into(),
             url: format!("{SLACK_API}/chat.postMessage"),
-            headers: common_headers(&self.auth),
+            headers: headers_for(&self.auth, true),
             body: Some(Value::Object(body)),
         })
     }
@@ -165,14 +165,13 @@ impl<C: HttpClient> Action for SlackSendMessage<C> {
             .client
             .send(&req)
             .map_err(|e| Error::Invalid(format!("slack send_message : {e}")))?;
-        interpret(resp)
+        interpret(resp, &SlackInterpreter)
     }
 }
 
-/// Action `conversations.history` (F4.1.c).
-///
-/// Params requis : `channel`. Champs propagés en query string :
-/// `limit`, `cursor`, `oldest`, `latest`, `inclusive`.
+// ────────── read_channel (F4.1.c) ──────────
+
+/// Action `conversations.history`.
 pub struct SlackReadChannel<C: HttpClient> {
     auth: SlackAuth,
     client: C,
@@ -189,7 +188,6 @@ impl<C: HttpClient> SlackReadChannel<C> {
             .get("channel")
             .and_then(Value::as_str)
             .ok_or_else(|| Error::Invalid("slack read_channel : `channel` requis".into()))?;
-        // Liste fixe pour un ordre déterministe dans l'URL (utile en tests).
         let mut pairs: Vec<(String, String)> = vec![("channel".into(), channel.into())];
         for key in ["limit", "cursor", "oldest", "latest", "inclusive"] {
             if let Some(v) = params.get(key) {
@@ -200,15 +198,11 @@ impl<C: HttpClient> SlackReadChannel<C> {
                 pairs.push((key.into(), s));
             }
         }
-        let query = pairs
-            .into_iter()
-            .map(|(k, v)| format!("{}={}", percent_encode(&k), percent_encode(&v)))
-            .collect::<Vec<_>>()
-            .join("&");
+        let query = crate::sdk::to_query(&pairs);
         Ok(HttpRequest {
             method: "GET".into(),
             url: format!("{SLACK_API}/conversations.history?{query}"),
-            headers: common_headers(&self.auth),
+            headers: headers_for(&self.auth, false),
             body: None,
         })
     }
@@ -225,72 +219,27 @@ impl<C: HttpClient> Action for SlackReadChannel<C> {
             .client
             .send(&req)
             .map_err(|e| Error::Invalid(format!("slack read_channel : {e}")))?;
-        interpret(resp)
+        interpret(resp, &SlackInterpreter)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sdk::RecordingClient;
     use serde_json::json;
-    use std::cell::RefCell;
 
-    /// Transport factice : enregistre la dernière requête, renvoie une
-    /// réponse canned (ou une erreur de transport si `fail`).
-    struct MockClient {
-        last: RefCell<Option<HttpRequest>>,
-        resp: HttpResponse,
-        fail: Option<String>,
-    }
+    // ───── auth ─────
 
-    impl MockClient {
-        fn ok(body: Value) -> Self {
-            Self {
-                last: RefCell::new(None),
-                resp: HttpResponse { status: 200, body },
-                fail: None,
-            }
-        }
-        fn with_status(status: u16, body: Value) -> Self {
-            Self {
-                last: RefCell::new(None),
-                resp: HttpResponse { status, body },
-                fail: None,
-            }
-        }
-        fn failing(msg: &str) -> Self {
-            Self {
-                last: RefCell::new(None),
-                resp: HttpResponse {
-                    status: 200,
-                    body: json!({}),
-                },
-                fail: Some(msg.into()),
-            }
-        }
-    }
-
-    impl HttpClient for MockClient {
-        fn send(&self, req: &HttpRequest) -> std::result::Result<HttpResponse, String> {
-            *self.last.borrow_mut() = Some(req.clone());
-            if let Some(m) = &self.fail {
-                Err(m.clone())
-            } else {
-                Ok(self.resp.clone())
-            }
-        }
-    }
-
-    // F4.1.a — auth : injection systématique des en-têtes
     #[test]
     fn send_message_injects_bearer_and_json_content_type() {
         let act = SlackSendMessage::new(
             SlackAuth::Bot("xoxb-abc".into()),
-            MockClient::ok(json!({ "ok": true, "ts": "1.0" })),
+            RecordingClient::ok(json!({ "ok": true, "ts": "1.0" })),
         );
         act.execute(&json!({ "channel": "C1", "text": "hi" }))
             .unwrap();
-        let sent = act.client.last.borrow().clone().unwrap();
+        let sent = act.client.last().unwrap();
         assert_eq!(
             sent.headers.get("Authorization").map(String::as_str),
             Some("Bearer xoxb-abc")
@@ -305,22 +254,25 @@ mod tests {
     fn read_channel_injects_bearer() {
         let act = SlackReadChannel::new(
             SlackAuth::Bot("xoxb-z".into()),
-            MockClient::ok(json!({ "ok": true, "messages": [] })),
+            RecordingClient::ok(json!({ "ok": true, "messages": [] })),
         );
         act.execute(&json!({ "channel": "C1" })).unwrap();
-        let sent = act.client.last.borrow().clone().unwrap();
+        let sent = act.client.last().unwrap();
         assert_eq!(
             sent.headers.get("Authorization").map(String::as_str),
             Some("Bearer xoxb-z")
         );
+        // GET → pas de Content-Type avec le SDK
+        assert!(!sent.headers.contains_key("Content-Type"));
     }
 
-    // F4.1.b — chat.postMessage : POST + body JSON + champs optionnels
+    // ───── send_message ─────
+
     #[test]
     fn send_message_builds_post_to_chat_postmessage() {
         let act = SlackSendMessage::new(
             SlackAuth::Bot("t".into()),
-            MockClient::ok(json!({ "ok": true, "channel": "C1", "ts": "1.0" })),
+            RecordingClient::ok(json!({ "ok": true, "channel": "C1", "ts": "1.0" })),
         );
         let out = act
             .execute(&json!({
@@ -330,7 +282,7 @@ mod tests {
                 "blocks": [{ "type": "section" }],
             }))
             .unwrap();
-        let sent = act.client.last.borrow().clone().unwrap();
+        let sent = act.client.last().unwrap();
         assert_eq!(sent.method, "POST");
         assert_eq!(sent.url, "https://slack.com/api/chat.postMessage");
         let body = sent.body.expect("body present");
@@ -346,11 +298,11 @@ mod tests {
     fn send_message_ignores_unknown_optional_fields() {
         let act = SlackSendMessage::new(
             SlackAuth::Bot("t".into()),
-            MockClient::ok(json!({ "ok": true })),
+            RecordingClient::ok(json!({ "ok": true })),
         );
         act.execute(&json!({ "channel": "C1", "text": "hi", "lol": 42 }))
             .unwrap();
-        let sent = act.client.last.borrow().clone().unwrap();
+        let sent = act.client.last().unwrap();
         let body = sent.body.unwrap();
         assert!(body.get("lol").is_none());
     }
@@ -359,25 +311,26 @@ mod tests {
     fn send_message_requires_channel_and_text() {
         let act = SlackSendMessage::new(
             SlackAuth::Bot("t".into()),
-            MockClient::ok(json!({ "ok": true })),
+            RecordingClient::ok(json!({ "ok": true })),
         );
         let err = act.execute(&json!({ "text": "hi" })).unwrap_err();
         assert!(matches!(err, Error::Invalid(ref m) if m.contains("channel")));
 
         let act = SlackSendMessage::new(
             SlackAuth::Bot("t".into()),
-            MockClient::ok(json!({ "ok": true })),
+            RecordingClient::ok(json!({ "ok": true })),
         );
         let err = act.execute(&json!({ "channel": "C1" })).unwrap_err();
         assert!(matches!(err, Error::Invalid(ref m) if m.contains("text")));
     }
 
-    // F4.1.c — conversations.history : GET + query encodée
+    // ───── read_channel ─────
+
     #[test]
     fn read_channel_builds_get_with_query_string() {
         let act = SlackReadChannel::new(
             SlackAuth::Bot("t".into()),
-            MockClient::ok(json!({ "ok": true, "messages": [], "has_more": false })),
+            RecordingClient::ok(json!({ "ok": true, "messages": [], "has_more": false })),
         );
         act.execute(&json!({
             "channel": "C1",
@@ -386,7 +339,7 @@ mod tests {
             "inclusive": true,
         }))
         .unwrap();
-        let sent = act.client.last.borrow().clone().unwrap();
+        let sent = act.client.last().unwrap();
         assert_eq!(sent.method, "GET");
         assert!(
             sent.url
@@ -396,7 +349,6 @@ mod tests {
         );
         assert!(sent.url.contains("channel=C1"));
         assert!(sent.url.contains("limit=50"));
-        // `=` (0x3D) doit être pourcent-encodé dans la valeur.
         assert!(sent.url.contains("cursor=dXNlcjpVMDYxTkZUVDI%3D"));
         assert!(sent.url.contains("inclusive=true"));
         assert!(sent.body.is_none());
@@ -406,7 +358,7 @@ mod tests {
     fn read_channel_returns_full_body_on_success() {
         let act = SlackReadChannel::new(
             SlackAuth::Bot("t".into()),
-            MockClient::ok(json!({
+            RecordingClient::ok(json!({
                 "ok": true,
                 "messages": [{ "ts": "1.0", "text": "hi" }],
                 "has_more": false,
@@ -422,18 +374,19 @@ mod tests {
     fn read_channel_requires_channel() {
         let act = SlackReadChannel::new(
             SlackAuth::Bot("t".into()),
-            MockClient::ok(json!({ "ok": true })),
+            RecordingClient::ok(json!({ "ok": true })),
         );
         let err = act.execute(&json!({})).unwrap_err();
         assert!(matches!(err, Error::Invalid(ref m) if m.contains("channel")));
     }
 
-    // F4.1.d — mapping erreurs
+    // ───── mapping erreurs ─────
+
     #[test]
     fn slack_logical_error_maps_to_invalid_with_code() {
         let act = SlackSendMessage::new(
             SlackAuth::Bot("t".into()),
-            MockClient::ok(json!({ "ok": false, "error": "channel_not_found" })),
+            RecordingClient::ok(json!({ "ok": false, "error": "channel_not_found" })),
         );
         let err = act
             .execute(&json!({ "channel": "C1", "text": "x" }))
@@ -448,7 +401,7 @@ mod tests {
     fn slack_logical_error_without_code_uses_fallback() {
         let act = SlackSendMessage::new(
             SlackAuth::Bot("t".into()),
-            MockClient::ok(json!({ "ok": false })),
+            RecordingClient::ok(json!({ "ok": false })),
         );
         let err = act
             .execute(&json!({ "channel": "C1", "text": "x" }))
@@ -463,7 +416,7 @@ mod tests {
     fn http_non_2xx_maps_to_invalid() {
         let act = SlackSendMessage::new(
             SlackAuth::Bot("t".into()),
-            MockClient::with_status(500, json!({ "error": "boom" })),
+            RecordingClient::with_status(500, json!({ "error": "boom" })),
         );
         let err = act
             .execute(&json!({ "channel": "C1", "text": "x" }))
@@ -478,22 +431,33 @@ mod tests {
     fn transport_error_is_propagated() {
         let act = SlackSendMessage::new(
             SlackAuth::Bot("t".into()),
-            MockClient::failing("connection refused"),
+            RecordingClient::failing("connexion refusée"),
         );
         let err = act
             .execute(&json!({ "channel": "C1", "text": "x" }))
             .unwrap_err();
         match err {
-            Error::Invalid(msg) => assert!(msg.contains("connection refused"), "msg={msg}"),
+            Error::Invalid(msg) => assert!(msg.contains("connexion refusée"), "msg={msg}"),
             other => panic!("expected Invalid, got {other:?}"),
         }
     }
 
     #[test]
     fn kinds_are_stable() {
-        let s = SlackSendMessage::new(SlackAuth::Bot("t".into()), MockClient::ok(json!({})));
-        let r = SlackReadChannel::new(SlackAuth::Bot("t".into()), MockClient::ok(json!({})));
+        let s = SlackSendMessage::new(SlackAuth::Bot("t".into()), RecordingClient::ok(json!({})));
+        let r = SlackReadChannel::new(SlackAuth::Bot("t".into()), RecordingClient::ok(json!({})));
         assert_eq!(s.kind(), "slack.send_message");
         assert_eq!(r.kind(), "slack.read_channel");
+    }
+
+    #[test]
+    fn connector_publishes_schemas() {
+        let c = SlackConnector;
+        assert_eq!(c.provider(), "slack");
+        let schemas = c.action_schemas();
+        assert_eq!(schemas.len(), 2);
+        let kinds: Vec<&str> = schemas.iter().map(|s| s.kind).collect();
+        assert!(kinds.contains(&"slack.send_message"));
+        assert!(kinds.contains(&"slack.read_channel"));
     }
 }
