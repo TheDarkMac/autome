@@ -6,6 +6,7 @@
 
 pub mod gmail;
 pub mod http;
+pub mod notion;
 pub mod polling;
 pub mod schedule;
 pub mod slack;
@@ -15,6 +16,10 @@ pub use gmail::{
     GmailAuth, GmailGetAttachment, GmailListMessages, GmailReadMessage, GmailSendEmail,
 };
 pub use http::{HttpAction, HttpClient, HttpRequest, HttpResponse};
+pub use notion::{
+    extract_plain_text, heading_block, text_block, NotionAuth, NotionCreatePage,
+    NotionQueryDatabase, NotionReadPage,
+};
 pub use polling::PollingTrigger;
 pub use schedule::{CronSchedule, CronTime, ScheduleTrigger};
 pub use slack::{SlackAuth, SlackReadChannel, SlackSendMessage};
