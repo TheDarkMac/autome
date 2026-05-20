@@ -19,7 +19,7 @@
 | 1  | Fondations & Architecture| 6        | 6         | ✅ Terminé    |
 | 2  | Moteur de workflows      | 7        | 7         | ✅ Terminé    |
 | 3  | Triggers & Actions       | 6        | 6         | ✅ Terminé    |
-| 4  | Connecteurs API          | 5        | 3         | En cours      |
+| 4  | Connecteurs API          | 5        | 4         | En cours      |
 | 5  | Orchestrateur & Scaling  | 6        | 0         | À faire       |
 | 6  | Sécurité & Auth          | 6        | 0         | À faire       |
 | 7  | API publique (REST/gRPC) | 4        | 0         | À faire       |
@@ -29,7 +29,7 @@
 | 11 | Documentation            | 5        | 0         | À faire       |
 | 12 | Exemples de workflows    | 3        | 0         | À faire       |
 
-**Progression totale : 22 / 66 features** (≈ 150 sous-tâches sur les features détaillées)
+**Progression totale : 23 / 66 features** (≈ 150 sous-tâches sur les features détaillées)
 
 > Les features complexes (F1.3, F1.5, F2.*, F4.*, F5.1–F5.4, F6.1–F6.3, F6.5,
 > F8.2–F8.7) sont découpées en sous-tâches `Fx.y.z`. Une feature est `[x]`
@@ -119,11 +119,11 @@
   - [x] F4.3.b — Action `create_page`
   - [x] F4.3.c — Action `read_page` / query database
   - [x] F4.3.d — Conversion blocs Notion ↔ données workflow
-- [ ] **F4.4** — Connecteur GitHub (issues, PR, webhooks)
-  - [ ] F4.4.a — Auth GitHub (PAT / GitHub App)
-  - [ ] F4.4.b — Actions issues (créer, commenter, fermer)
-  - [ ] F4.4.c — Actions PR (lister, créer, merger)
-  - [ ] F4.4.d — Réception webhooks GitHub (vérif signature)
+- [x] **F4.4** — Connecteur GitHub (issues, PR, webhooks) — _issue #45_
+  - [x] F4.4.a — Auth GitHub (PAT / GitHub App)
+  - [x] F4.4.b — Actions issues (créer, commenter, fermer)
+  - [x] F4.4.c — Actions PR (lister, créer, merger)
+  - [x] F4.4.d — Réception webhooks GitHub (vérif signature)
 - [ ] **F4.5** — SDK interne pour créer un connecteur (doc + template)
   - [ ] F4.5.a — Trait `Connector` + cycle de vie auth
   - [ ] F4.5.b — Helpers HTTP (rate-limit, retry, pagination)
@@ -272,3 +272,4 @@
 | 2026-05-20 | F4.1 | Connecteur Slack : `SlackAuth::Bot` (en-têtes `Authorization: Bearer …` + JSON), actions `SlackSendMessage` (`chat.postMessage` POST) et `SlackReadChannel` (`conversations.history` GET, query pourcent-encodée), mapping `{ok:false,error}`/HTTP non-2xx/transport → `Error::Invalid`. Transport injecté via `HttpClient` (aucune dépendance réseau). 13 tests connectors verts. | — |
 | 2026-05-20 | F4.2 | Connecteur Gmail : `GmailAuth::OAuth2`, actions `GmailSendEmail` (`users.messages.send` POST, RFC 822 → base64url sans padding, pièces jointes en `multipart/mixed`), `GmailListMessages` (`users.messages.list` GET, query `q`/`maxResults`/`pageToken`/`labelIds` répété), `GmailReadMessage` (`users.messages.get`) et `GmailGetAttachment` (`users.messages.attachments.get`). Mapping HTTP non-2xx → `Error::Invalid` avec `error.message` Google extrait. Transport via `HttpClient` (aucune dépendance réseau ajoutée). 20 nouveaux tests connectors (46 au total). | — |
 | 2026-05-20 | F4.3 | Connecteur Notion : `NotionAuth::Integration` + `Notion-Version: 2022-06-28` figée. Actions `NotionCreatePage` (`POST /v1/pages`, `parent`/`properties` requis, `children`/`icon`/`cover` optionnels), `NotionReadPage` (`GET /v1/pages/{id}`, id pourcent-encodé), `NotionQueryDatabase` (`POST /v1/databases/{id}/query`, `filter`/`sorts`/`page_size`/`start_cursor`). Helpers blocs (F4.3.d) : `text_block`, `heading_block` (niveau clampé 1..=3), `extract_plain_text` (walk récursif des `plain_text` rich text). Mapping HTTP non-2xx → `Error::Invalid("notion: http <status> — <message> (<code>)")`. 17 nouveaux tests connectors (63 au total). | — |
+| 2026-05-20 | F4.4 | Connecteur GitHub : `GithubAuth::Token` (PAT / installation token) + en-têtes obligatoires (`User-Agent`, `Accept: application/vnd.github+json`, `X-GitHub-Api-Version: 2022-11-28`). 6 actions issues+PR : `GithubCreateIssue`/`CommentIssue`/`CloseIssue` (POST/POST/PATCH) et `GithubListPulls`/`CreatePull`/`MergePull` (GET/POST/PUT, owner/repo pourcent-encodés). F4.4.d `verify_github_signature(secret, body, header)` HMAC-SHA256 (`hmac`+`sha2`+`hex` ajoutés au workspace), comparaison constant-time via `Mac::verify_slice`, rejette préfixe absent / hex invalide / longueur ≠ 32 / secret vide / body altéré (vecteur officiel GitHub Webhooks vérifié). 22 nouveaux tests connectors (85 au total). | — |
