@@ -7,11 +7,13 @@
 pub mod http;
 pub mod polling;
 pub mod schedule;
+pub mod slack;
 pub mod webhook;
 
 pub use http::{HttpAction, HttpClient, HttpRequest, HttpResponse};
 pub use polling::PollingTrigger;
 pub use schedule::{CronSchedule, CronTime, ScheduleTrigger};
+pub use slack::{SlackAuth, SlackReadChannel, SlackSendMessage};
 pub use webhook::WebhookTrigger;
 
 use autome_core::Result;
