@@ -10,6 +10,7 @@
 pub mod action;
 pub mod config;
 pub mod queue;
+pub mod run_state;
 pub mod scheduler;
 pub mod trigger;
 pub mod workflow;
@@ -17,6 +18,7 @@ pub mod workflow;
 pub use action::Action;
 pub use config::{Config, Profile, Secret};
 pub use queue::{dlq_of, Delivery, DeliveryId, InMemoryQueue, Message, Nack, Queue};
+pub use run_state::{InMemoryRunStateStore, RunCheckpoint, RunStateStore, RunStatus};
 pub use scheduler::{
     default_dedup_key, DedupKeyFn, DedupLock, InMemoryDedupLock, RunningScheduler, Scheduler,
 };

@@ -16,21 +16,10 @@ pub use exec::{
 pub use graph::{Dag, GraphError};
 pub use mapping::{eval_expression, render_template, resolve_params};
 
-/// État global d'un run.
-///
-/// Les variantes `Queued`/`Running` couvrent le cycle de vie côté worker
-/// (F5.*) ; `run_sequential` ne renvoie que `Succeeded`/`Failed`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RunStatus {
-    /// En file, pas encore pris par un worker.
-    Queued,
-    /// En cours d'exécution.
-    Running,
-    /// Terminé avec succès.
-    Succeeded,
-    /// Terminé en échec.
-    Failed,
-}
+// `RunStatus` est désormais défini dans `autome_core::run_state` (F5.4) —
+// type partagé entre l'engine et le store de persistance d'état. Le
+// re-export ci-dessous garde la rétrocompatibilité (`use autome_engine::RunStatus`).
+pub use autome_core::RunStatus;
 
 /// Moteur d'exécution de workflows.
 #[derive(Debug, Default)]
