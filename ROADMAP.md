@@ -20,7 +20,7 @@
 | 2  | Moteur de workflows      | 7        | 7         | ✅ Terminé    |
 | 3  | Triggers & Actions       | 6        | 6         | ✅ Terminé    |
 | 4  | Connecteurs API          | 5        | 5         | ✅ Terminé    |
-| 5  | Orchestrateur & Scaling  | 6        | 3         | En cours      |
+| 5  | Orchestrateur & Scaling  | 6        | 4         | En cours      |
 | 6  | Sécurité & Auth          | 6        | 0         | À faire       |
 | 7  | API publique (REST/gRPC) | 4        | 0         | À faire       |
 | 8  | Frontend & Éditeur visuel| 7        | 0         | À faire       |
@@ -29,7 +29,7 @@
 | 11 | Documentation            | 5        | 0         | À faire       |
 | 12 | Exemples de workflows    | 3        | 0         | À faire       |
 
-**Progression totale : 27 / 66 features** (≈ 150 sous-tâches sur les features détaillées)
+**Progression totale : 28 / 66 features** (≈ 150 sous-tâches sur les features détaillées)
 
 > Les features complexes (F1.3, F1.5, F2.*, F4.*, F5.1–F5.4, F6.1–F6.3, F6.5,
 > F8.2–F8.7) sont découpées en sous-tâches `Fx.y.z`. Une feature est `[x]`
@@ -145,10 +145,10 @@
   - [x] F5.3.a — Scheduler cron/intervalle
   - [x] F5.3.b — Dispatch trigger → message de run
   - [x] F5.3.c — Anti-double-déclenchement (lock distribué)
-- [ ] **F5.4** — Persistance de l'état d'exécution (reprise après crash)
-  - [ ] F5.4.a — Checkpoint de l'état du run en base
-  - [ ] F5.4.b — Reprise d'un run interrompu
-  - [ ] F5.4.c — Nettoyage des runs orphelins
+- [x] **F5.4** — Persistance de l'état d'exécution (reprise après crash) — _issue #55_
+  - [x] F5.4.a — Checkpoint de l'état du run en base
+  - [x] F5.4.b — Reprise d'un run interrompu
+  - [x] F5.4.c — Nettoyage des runs orphelins
 - [ ] **F5.5** — Backpressure & limites de concurrence
 - [ ] **F5.6** — Test de charge (objectif : milliers de workflows simultanés)
 
@@ -277,3 +277,4 @@
 | 2026-05-21 | F5.1 | File de messages : ADR 0003 (RabbitMQ vs Kafka vs NATS → **RabbitMQ**, alignement task-queue, ops, throughput cible). `core::queue` agnostique du broker : trait `Queue` (`publish`/`poll`/`ack`/`nack`/`depth`), types `Message`/`Delivery`/`DeliveryId`/`Nack { Requeue, DeadLetter }`. `InMemoryQueue` thread-safe (Mutex+VecDeque, in-flight tracking, redeliveries++ sur requeue). DLQ : convention `dlq_of(q) = "{q}.dlq"`, `Nack::DeadLetter` republie en préservant `redeliveries`. Client `lapin` réel branché plus tard avec F5.2. 15 nouveaux tests core (31 au total, 199 workspace). | — |
 | 2026-05-21 | F5.2 | Worker pool : `worker::lib` (nouveau) — trait `Handler` (`handle(&Delivery) -> HandlerVerdict { Ok/Retry/DeadLetter }`, impl blanket pour les closures), trait `IdempotencyStore` + `InMemoryIdempotencyStore` (HashSet sous Mutex, dédup via header `idempotency-key`), `WorkerPool::process_one()` (unité atomique : poll → handler → ack/nack selon verdict), `WorkerPool::start()` spawne N threads (`std::thread` + `Arc<AtomicBool>` pour le shutdown, pas de tokio), `RunningPool::stop()` signale + join. Drop safety (warning si oubli). 12 nouveaux tests worker (211 workspace). Le client `lapin` réel viendra dans une couche d'adaptation quand on aura besoin d'un vrai broker. | — |
 | 2026-05-21 | F5.3 | Planificateur de jobs : `core::scheduler` — `Scheduler::tick()` (poll tous les triggers, dispatche les events neufs sur la queue) ; `Scheduler::start(interval)` spawne un thread de fond, `RunningScheduler::stop()` signale + join. Dispatch (F5.3.b) : `TriggerEvent` → `Message { source, payload }` avec headers `idempotency-key` + `trigger-source` — s'aligne avec la dédup côté worker (F5.2.c). Anti-double-déclenchement (F5.3.c) : trait `DedupLock` + `InMemoryDedupLock` (HashSet/Mutex), fonction de clé pluggable (`with_dedup_key`, défaut `"<source>::<json(payload)>"`). La vraie version cross-instance (Redis SETNX / PG advisory lock) arrive avec F5.4. **Chaîne trigger → queue → worker bouclée**. 11 nouveaux tests core (42 au total, 222 workspace). | — |
+| 2026-05-21 | F5.4 | Persistance d'état d'exécution : `core::run_state` — `RunCheckpoint { run_id, workflow_id, version, status, started_at_ms, finished_at_ms, outputs (node→Value), next_node, error }`, trait `RunStateStore` (`checkpoint`/`load`/`list_orphans`/`mark_failed`), impl `InMemoryRunStateStore` thread-safe (Mutex+HashMap). F5.4.b reprise : `load(run_id)` renvoie le snapshot complet pour qu'un worker recrée son `RunContext` et continue à partir de `next_node`. F5.4.c orphelins : `list_orphans(older_than_ms)` filtre `status=Running` AND `started_at < cutoff` (strict), `mark_failed` idempotent. **`RunStatus` déplacé depuis `engine` vers `core`** (+ serde derives) ; `autome_engine::RunStatus` re-exporté pour rétrocompat — 0 régression sur les 44 tests engine. Le store PostgreSQL/sqlx contre les tables F1.5 (`runs`/`run_steps`) sera branché dans une PR suivante. 14 nouveaux tests core (56 au total, 236 workspace). | — |
