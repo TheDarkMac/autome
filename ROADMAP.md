@@ -20,7 +20,7 @@
 | 2  | Moteur de workflows      | 7        | 7         | ✅ Terminé    |
 | 3  | Triggers & Actions       | 6        | 6         | ✅ Terminé    |
 | 4  | Connecteurs API          | 5        | 5         | ✅ Terminé    |
-| 5  | Orchestrateur & Scaling  | 6        | 1         | En cours      |
+| 5  | Orchestrateur & Scaling  | 6        | 2         | En cours      |
 | 6  | Sécurité & Auth          | 6        | 0         | À faire       |
 | 7  | API publique (REST/gRPC) | 4        | 0         | À faire       |
 | 8  | Frontend & Éditeur visuel| 7        | 0         | À faire       |
@@ -29,7 +29,7 @@
 | 11 | Documentation            | 5        | 0         | À faire       |
 | 12 | Exemples de workflows    | 3        | 0         | À faire       |
 
-**Progression totale : 25 / 66 features** (≈ 150 sous-tâches sur les features détaillées)
+**Progression totale : 26 / 66 features** (≈ 150 sous-tâches sur les features détaillées)
 
 > Les features complexes (F1.3, F1.5, F2.*, F4.*, F5.1–F5.4, F6.1–F6.3, F6.5,
 > F8.2–F8.7) sont découpées en sous-tâches `Fx.y.z`. Une feature est `[x]`
@@ -137,10 +137,10 @@
   - [x] F5.1.b — Abstraction `Queue` (publish/consume)
   - [x] F5.1.c — Implémentation concrète + config connexion
   - [x] F5.1.d — Dead-letter queue
-- [ ] **F5.2** — Worker pool pour exécution distribuée des runs
-  - [ ] F5.2.a — Consumer worker (pull depuis la file)
-  - [ ] F5.2.b — Pool de tâches concurrentes + arrêt propre
-  - [ ] F5.2.c — Ack/nack & idempotence
+- [x] **F5.2** — Worker pool pour exécution distribuée des runs — _issue #51_
+  - [x] F5.2.a — Consumer worker (pull depuis la file)
+  - [x] F5.2.b — Pool de tâches concurrentes + arrêt propre
+  - [x] F5.2.c — Ack/nack & idempotence
 - [ ] **F5.3** — Planificateur de jobs (dispatch triggers → file)
   - [ ] F5.3.a — Scheduler cron/intervalle
   - [ ] F5.3.b — Dispatch trigger → message de run
@@ -275,3 +275,4 @@
 | 2026-05-20 | F4.4 | Connecteur GitHub : `GithubAuth::Token` (PAT / installation token) + en-têtes obligatoires (`User-Agent`, `Accept: application/vnd.github+json`, `X-GitHub-Api-Version: 2022-11-28`). 6 actions issues+PR : `GithubCreateIssue`/`CommentIssue`/`CloseIssue` (POST/POST/PATCH) et `GithubListPulls`/`CreatePull`/`MergePull` (GET/POST/PUT, owner/repo pourcent-encodés). F4.4.d `verify_github_signature(secret, body, header)` HMAC-SHA256 (`hmac`+`sha2`+`hex` ajoutés au workspace), comparaison constant-time via `Mac::verify_slice`, rejette préfixe absent / hex invalide / longueur ≠ 32 / secret vide / body altéré (vecteur officiel GitHub Webhooks vérifié). 22 nouveaux tests connectors (85 au total). | — |
 | 2026-05-20 | F4.5 | SDK interne connecteur (`crate::sdk`) : `Credentials` (apply en-têtes), `ResponseInterpreter`+`interpret` (mutualise HTTP→`Error::Invalid`), `percent_encode`/`to_query`, `RetryingClient`+`RetryPolicy`+`Clock` injectable (backoff exponentiel plafonné, statuts retryables), `paginate_all` via closure « next », `ActionSchema`/`ParamSpec`/`ParamKind` sérialisables, `Connector` (provider+schemas), `RecordingClient` (factice partagé, mode sticky ou queue FIFO). **Refactor des 4 connecteurs** Slack/Gmail/Notion/GitHub sous le SDK — zéro duplication restante. Template `crate::template` (connecteur `echo` ~120 l. tests inclus) prouve l'usage de bout en bout. `serde` ajouté à connectors pour serializer les schémas. 184 tests verts au total (+35 vs F4.4). **Domaine 4 (Connecteurs API) terminé.** | — |
 | 2026-05-21 | F5.1 | File de messages : ADR 0003 (RabbitMQ vs Kafka vs NATS → **RabbitMQ**, alignement task-queue, ops, throughput cible). `core::queue` agnostique du broker : trait `Queue` (`publish`/`poll`/`ack`/`nack`/`depth`), types `Message`/`Delivery`/`DeliveryId`/`Nack { Requeue, DeadLetter }`. `InMemoryQueue` thread-safe (Mutex+VecDeque, in-flight tracking, redeliveries++ sur requeue). DLQ : convention `dlq_of(q) = "{q}.dlq"`, `Nack::DeadLetter` republie en préservant `redeliveries`. Client `lapin` réel branché plus tard avec F5.2. 15 nouveaux tests core (31 au total, 199 workspace). | — |
+| 2026-05-21 | F5.2 | Worker pool : `worker::lib` (nouveau) — trait `Handler` (`handle(&Delivery) -> HandlerVerdict { Ok/Retry/DeadLetter }`, impl blanket pour les closures), trait `IdempotencyStore` + `InMemoryIdempotencyStore` (HashSet sous Mutex, dédup via header `idempotency-key`), `WorkerPool::process_one()` (unité atomique : poll → handler → ack/nack selon verdict), `WorkerPool::start()` spawne N threads (`std::thread` + `Arc<AtomicBool>` pour le shutdown, pas de tokio), `RunningPool::stop()` signale + join. Drop safety (warning si oubli). 12 nouveaux tests worker (212 workspace). Le client `lapin` réel viendra dans une couche d'adaptation quand on aura besoin d'un vrai broker. | — |
