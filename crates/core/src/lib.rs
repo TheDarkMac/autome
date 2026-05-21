@@ -17,7 +17,7 @@ pub mod workflow;
 
 pub use action::Action;
 pub use config::{Config, Profile, Secret};
-pub use queue::{dlq_of, Delivery, DeliveryId, InMemoryQueue, Message, Nack, Queue};
+pub use queue::{dlq_of, BoundedQueue, Delivery, DeliveryId, InMemoryQueue, Message, Nack, Queue};
 pub use run_state::{InMemoryRunStateStore, RunCheckpoint, RunStateStore, RunStatus};
 pub use scheduler::{
     default_dedup_key, DedupKeyFn, DedupLock, InMemoryDedupLock, RunningScheduler, Scheduler,
@@ -44,6 +44,19 @@ pub enum Error {
     /// Échec de (dé)sérialisation d'un modèle workflow / payload.
     #[error("erreur de sérialisation : {0}")]
     Serialization(#[from] serde_json::Error),
+
+    /// File saturée — un producteur tente de publier sur une queue qui a
+    /// atteint sa limite (F5.5). Le caller est invité à ralentir ou retenter
+    /// plus tard, **pas** à transformer ça en `Failed` côté run.
+    #[error("backpressure : queue '{queue}' pleine ({depth}/{max})")]
+    Backpressure {
+        /// Nom de la queue saturée.
+        queue: String,
+        /// Profondeur observée.
+        depth: usize,
+        /// Limite configurée.
+        max: usize,
+    },
 }
 
 /// Identifiant logique d'un node dans un graphe de workflow.
