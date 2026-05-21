@@ -21,7 +21,7 @@
 | 3  | Triggers & Actions       | 6        | 6         | ✅ Terminé    |
 | 4  | Connecteurs API          | 5        | 5         | ✅ Terminé    |
 | 5  | Orchestrateur & Scaling  | 6        | 6         | ✅ Terminé    |
-| 6  | Sécurité & Auth          | 6        | 2         | En cours      |
+| 6  | Sécurité & Auth          | 6        | 3         | En cours      |
 | 7  | API publique (REST/gRPC) | 4        | 0         | À faire       |
 | 8  | Frontend & Éditeur visuel| 7        | 0         | À faire       |
 | 9  | Tests (TDD)              | 5        | 0         | À faire       |
@@ -29,7 +29,7 @@
 | 11 | Documentation            | 5        | 0         | À faire       |
 | 12 | Exemples de workflows    | 3        | 0         | À faire       |
 
-**Progression totale : 32 / 66 features** (≈ 150 sous-tâches sur les features détaillées)
+**Progression totale : 33 / 66 features** (≈ 150 sous-tâches sur les features détaillées)
 
 > Les features complexes (F1.3, F1.5, F2.*, F4.*, F5.1–F5.4, F6.1–F6.3, F6.5,
 > F8.2–F8.7) sont découpées en sous-tâches `Fx.y.z`. Une feature est `[x]`
@@ -168,9 +168,9 @@
   - [x] F6.3.b — Chiffrement/déchiffrement transparent en base
   - [x] F6.3.c — Rotation de clé
 - [ ] **F6.4** — TLS sur tous les services
-- [ ] **F6.5** — RBAC (rôles & permissions)
-  - [ ] F6.5.a — Modèle rôles/permissions
-  - [ ] F6.5.b — Enforcement au niveau API (guards)
+- [x] **F6.5** — RBAC (rôles & permissions) — _issue #65_
+  - [x] F6.5.a — Modèle rôles/permissions
+  - [x] F6.5.b — Enforcement au niveau API (guards)
 - [ ] **F6.6** — Audit log des actions sensibles
 
 ## 7. API publique (REST / gRPC)
@@ -282,3 +282,4 @@
 | 2026-05-21 | F5.6 | Test de charge end-to-end : `crates/worker/tests/load.rs` — 3 tests qui valident l'assemblage F5.1↔F5.5 sur la stack in-memory. (a) Smoke (run par défaut) — Scheduler+BoundedQueue+WorkerPool 2t sur 100 events, vérifie 0 perte / 0 DLQ / ≥ 500 msg/s. (b) Load (run sur `--ignored --nocapture`) — 10 000 events, 8 workers, mesure publish + consume throughput, assertion ≥ 1 000/s (mesure dev locale **97k publish / 54k consume**). (c) Garde-fou backpressure : burst 1 000 events sur queue limitée à 100 → exactement 100 acceptés + 900 `Error::Backpressure`. Documentation méthode + commande + ordres de grandeur in-source. **Domaine 5 (Orchestrateur & Scaling) terminé.** | — |
 | 2026-05-21 | F6.1 | Authentification utilisateur (JWT) : module `core::auth` — F6.1.a `PasswordHasher` trait + `Argon2PasswordHasher` (Argon2id via crates `argon2` + `password-hash` + `rand`, format PHC, sel généré par OsRng, paramètres par défaut). F6.1.b/d `TokenService` HS256 (crate `jsonwebtoken`) + `Claims { sub, iat, exp, jti, kind: Access\|Refresh }` + `issue_access`/`issue_refresh`/`verify`/`rotate` (horloge `now` injectée, déterministe). F6.1.d `RevocationStore` trait + `InMemoryRevocationStore` (HashMap<jti, exp_ms> sous Mutex, GC opportuniste, idempotent sur max(exp)). F6.1.c `api::auth` (nouveau `api::lib`) — extractor axum `AuthenticatedUser`, état `AuthState` (token_service + revocation + Clock injectable), `AuthError` typé mappé vers 401 ; `protected_router("/whoami")` câblé via `Router::nest("/auth", …)` dans `main`. 22 nouveaux tests core (hash/verify, JWT roundtrip, tampering, expired, rotation, revocation) + 7 tests api (200 valide, 401 missing/malformed/expired/tampered/revoked, helper `user_id`). 277 tests workspace. Nouvelles deps : `jsonwebtoken`, `argon2`, `password-hash`, `rand` (+ `tower` et `http-body-util` en dev-deps `api`). | — |
 | 2026-05-21 | F6.3 | Chiffrement des credentials/secrets au repos : ADR 0004 (AES-256-GCM + `KeyProvider` versionné). `core::secrets` — F6.3.b trait `KeyProvider` (`get(key_id)`/`current()`) + impl `InMemoryKeyProvider` (HashMap sous Mutex, `add_key/set_current/remove_key`, anti-collision de `key_id`). `EnvelopeCipher::encrypt(plaintext)/decrypt(envelope)` AES-256-GCM via crate `aes-gcm` (RustCrypto), nonces 96 bits aléatoires (OsRng), tag GCM 128 bits, format envelope versionné `v1:<key_id>:<nonce_b64>:<ct+tag_b64>` (parse strict, rejet de `v2` non supporté). F6.3.c rotation : `add_key(id, key, make_current=true)` ajoute une nouvelle clé tout en gardant les anciennes accessibles ; `EnvelopeCipher::reencrypt(env)` décode avec la clé d'origine et ré-encode avec `current()`, no-op si déjà à jour. Suppression d'une clé refusée si c'est la courante. 25 nouveaux tests core (roundtrip/binary/empty, nonces différents par appel, tampering détecté par tag GCM, mauvaise clé rejetée, envelope mal formée, key_id avec `:` refusé, rotation lit ancien et écrit nouveau, reencrypt déplace puis no-op puis fail après remove, Send+Sync). 302 tests workspace. Nouvelles deps : `aes-gcm`, `base64`. | — |
+| 2026-05-21 | F6.5 | RBAC : `core::rbac` (F6.5.a) — `Permission` newtype + constantes (`PERM_WORKFLOWS_READ`/`WRITE`, `PERM_RUNS_EXECUTE`/`READ`, `PERM_CREDENTIALS_MANAGE`, `PERM_USERS_ADMIN`, `PERM_WILDCARD`), `Role` (nom + permissions, builders `super_admin`/`editor`/`viewer`), trait `PermissionStore::permissions_for(user_id)`, impl `InMemoryPermissionStore` (HashMap sous Mutex, `assign_role`/`grant`/`revoke`). `has_permission(set, needed)` honore le wildcard `"*"`. (F6.5.b) Extension `api::auth` : `AuthState` reçoit un `Arc<dyn PermissionStore>` ; méthode `AuthState::require_permission(user, perm) -> Result<(), AuthError>` ; nouveau variant `AuthError::Forbidden(perm)` → **403** (corps `"forbidden: missing '<perm>'"`). Route démo `/auth/admin` protégée par `PERM_USERS_ADMIN`. 14 nouveaux tests core (Permission roundtrip, has_permission positive/négative/wildcard, role builders, store assign/grant/revoke/idempotent/empty) + 5 nouveaux tests api (admin OK avec super_admin, **403 avec viewer**, 403 sans aucun rôle, 401 si token absent avant check perm, OK avec grant individuel). 321 tests workspace. | — |

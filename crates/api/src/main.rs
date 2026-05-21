@@ -9,7 +9,10 @@
 use std::sync::Arc;
 
 use autome_api::auth::{protected_router, AuthState};
-use autome_core::{Config, InMemoryRevocationStore, RevocationStore, TokenService};
+use autome_core::{
+    Config, InMemoryPermissionStore, InMemoryRevocationStore, PermissionStore, RevocationStore,
+    TokenService,
+};
 use axum::{routing::get, Router};
 
 /// Handler de la sonde de santé.
@@ -36,7 +39,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let jwt_secret = b"DEV-ONLY-replace-with-config-secret-please-32";
     let revocation: Arc<dyn RevocationStore + Send + Sync> =
         Arc::new(InMemoryRevocationStore::new());
-    let auth = AuthState::new(TokenService::new(jwt_secret), revocation);
+    let permissions: Arc<dyn PermissionStore + Send + Sync> =
+        Arc::new(InMemoryPermissionStore::new());
+    let auth = AuthState::new(TokenService::new(jwt_secret), revocation, permissions);
 
     let app = build_router(auth);
     let listener = tokio::net::TcpListener::bind(&config.http_addr).await?;
@@ -62,7 +67,9 @@ mod tests {
         // Le routeur se construit sans panique (route /health + /auth/*).
         let revocation: Arc<dyn RevocationStore + Send + Sync> =
             Arc::new(InMemoryRevocationStore::new());
-        let auth = AuthState::new(TokenService::new(b"x"), revocation);
+        let permissions: Arc<dyn PermissionStore + Send + Sync> =
+            Arc::new(InMemoryPermissionStore::new());
+        let auth = AuthState::new(TokenService::new(b"x"), revocation, permissions);
         let _app: Router = build_router(auth);
     }
 }

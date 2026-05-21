@@ -11,6 +11,7 @@ pub mod action;
 pub mod auth;
 pub mod config;
 pub mod queue;
+pub mod rbac;
 pub mod run_state;
 pub mod scheduler;
 pub mod secrets;
@@ -24,6 +25,11 @@ pub use auth::{
 };
 pub use config::{Config, Profile, Secret};
 pub use queue::{dlq_of, BoundedQueue, Delivery, DeliveryId, InMemoryQueue, Message, Nack, Queue};
+pub use rbac::{
+    has_permission, InMemoryPermissionStore, Permission, PermissionStore, Role,
+    PERM_CREDENTIALS_MANAGE, PERM_RUNS_EXECUTE, PERM_RUNS_READ, PERM_USERS_ADMIN, PERM_WILDCARD,
+    PERM_WORKFLOWS_READ, PERM_WORKFLOWS_WRITE,
+};
 pub use run_state::{InMemoryRunStateStore, RunCheckpoint, RunStateStore, RunStatus};
 pub use scheduler::{
     default_dedup_key, DedupKeyFn, DedupLock, InMemoryDedupLock, RunningScheduler, Scheduler,
