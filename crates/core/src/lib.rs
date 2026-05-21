@@ -10,12 +10,16 @@
 pub mod action;
 pub mod config;
 pub mod queue;
+pub mod scheduler;
 pub mod trigger;
 pub mod workflow;
 
 pub use action::Action;
 pub use config::{Config, Profile, Secret};
 pub use queue::{dlq_of, Delivery, DeliveryId, InMemoryQueue, Message, Nack, Queue};
+pub use scheduler::{
+    default_dedup_key, DedupKeyFn, DedupLock, InMemoryDedupLock, RunningScheduler, Scheduler,
+};
 pub use trigger::{Trigger, TriggerEvent};
 pub use workflow::{Edge, Node, NodeKind, WorkflowGraph, WorkflowId};
 
