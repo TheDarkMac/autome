@@ -39,6 +39,9 @@ jsonwebtoken = "9"
 argon2 = "0.5"
 password-hash = { version = "0.5", features = ["alloc", "rand_core"] }
 rand = "0.8"
+# Chiffrement secrets au repos (F6.3)
+aes-gcm = "0.10"
+base64 = "0.22"
 
 # Lints partagés (F1.3.g) : appliqués via `[lints] workspace = true` dans
 # chaque crate. `clippy -- -D warnings` en CI (cf. CONVENTIONS §4/§5).
