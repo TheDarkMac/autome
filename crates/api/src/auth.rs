@@ -25,7 +25,7 @@
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use autome_core::{Claims, RevocationStore, TokenService};
+use autome_core::{has_permission, Claims, PermissionStore, RevocationStore, TokenService};
 use axum::{
     extract::FromRequestParts,
     http::{request::Parts, StatusCode},
@@ -60,19 +60,23 @@ pub struct AuthState {
     pub token_service: Arc<TokenService>,
     /// Store de révocation par `jti`.
     pub revocation: Arc<dyn RevocationStore + Send + Sync>,
+    /// Store de permissions par `user_id` (F6.5).
+    pub permissions: Arc<dyn PermissionStore + Send + Sync>,
     /// Horloge injectable (par défaut `SystemClock`).
     pub clock: Arc<dyn Clock>,
 }
 
 impl AuthState {
-    /// Construit l'état avec [`SystemClock`].
+    /// Construit l'état avec [`SystemClock`] et un store de permissions vide.
     pub fn new(
         token_service: TokenService,
         revocation: Arc<dyn RevocationStore + Send + Sync>,
+        permissions: Arc<dyn PermissionStore + Send + Sync>,
     ) -> Self {
         Self {
             token_service: Arc::new(token_service),
             revocation,
+            permissions,
             clock: Arc::new(SystemClock),
         }
     }
@@ -81,6 +85,31 @@ impl AuthState {
     pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
         self.clock = clock;
         self
+    }
+
+    /// Vérifie que `user` possède la permission `needed`. À appeler depuis
+    /// un handler axum après extraction de [`AuthenticatedUser`] (F6.5.b).
+    ///
+    /// ```ignore
+    /// async fn admin_only(user: AuthenticatedUser, State(state): State<AuthState>) -> Result<String, AuthError> {
+    ///     state.require_permission(&user, autome_core::PERM_USERS_ADMIN)?;
+    ///     Ok(format!("hi {}", user.user_id()))
+    /// }
+    /// ```
+    pub fn require_permission(
+        &self,
+        user: &AuthenticatedUser,
+        needed: &str,
+    ) -> Result<(), AuthError> {
+        let perms = self
+            .permissions
+            .permissions_for(user.user_id())
+            .map_err(|e| AuthError::Internal(e.to_string()))?;
+        if has_permission(&perms, needed) {
+            Ok(())
+        } else {
+            Err(AuthError::Forbidden(needed.to_string()))
+        }
     }
 }
 
@@ -95,6 +124,9 @@ pub enum AuthError {
     Invalid(String),
     /// Token révoqué (jti dans `RevocationStore`).
     Revoked,
+    /// User authentifié, mais permission manquante (F6.5) — porte la
+    /// permission attendue pour faciliter le debug côté UI.
+    Forbidden(String),
     /// Erreur interne (lock empoisonné, etc.). Plus rare.
     Internal(String),
 }
@@ -102,11 +134,24 @@ pub enum AuthError {
 impl IntoResponse for AuthError {
     fn into_response(self) -> Response {
         let (status, msg) = match self {
-            AuthError::Missing => (StatusCode::UNAUTHORIZED, "missing authorization"),
-            AuthError::Malformed => (StatusCode::UNAUTHORIZED, "malformed authorization"),
-            AuthError::Invalid(_) => (StatusCode::UNAUTHORIZED, "invalid token"),
-            AuthError::Revoked => (StatusCode::UNAUTHORIZED, "token revoked"),
-            AuthError::Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR, "auth internal error"),
+            AuthError::Missing => (
+                StatusCode::UNAUTHORIZED,
+                "missing authorization".to_string(),
+            ),
+            AuthError::Malformed => (
+                StatusCode::UNAUTHORIZED,
+                "malformed authorization".to_string(),
+            ),
+            AuthError::Invalid(_) => (StatusCode::UNAUTHORIZED, "invalid token".to_string()),
+            AuthError::Revoked => (StatusCode::UNAUTHORIZED, "token revoked".to_string()),
+            AuthError::Forbidden(perm) => (
+                StatusCode::FORBIDDEN,
+                format!("forbidden: missing '{perm}'"),
+            ),
+            AuthError::Internal(_) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "auth internal error".to_string(),
+            ),
         };
         (status, msg).into_response()
     }
@@ -167,18 +212,32 @@ pub async fn whoami(user: AuthenticatedUser) -> String {
     format!("hello {}", user.user_id())
 }
 
-/// Construit un sous-router protégé sur `/whoami` (démo). À assembler avec
-/// le router racine via `Router::nest` côté `main`.
+/// Handler admin de démonstration (F6.5.b) : exige la permission
+/// [`autome_core::PERM_USERS_ADMIN`].
+pub async fn admin_only(
+    user: AuthenticatedUser,
+    axum::extract::State(state): axum::extract::State<AuthState>,
+) -> Result<String, AuthError> {
+    state.require_permission(&user, autome_core::PERM_USERS_ADMIN)?;
+    Ok(format!("admin ok for {}", user.user_id()))
+}
+
+/// Construit un sous-router protégé sur `/whoami` (auth seul) + `/admin`
+/// (auth + permission `users.admin`). À assembler avec le router racine
+/// via `Router::nest` côté `main`.
 pub fn protected_router(state: AuthState) -> Router {
     Router::new()
         .route("/whoami", get(whoami))
+        .route("/admin", get(admin_only))
         .with_state(state)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use autome_core::{InMemoryRevocationStore, TokenService};
+    use autome_core::{
+        InMemoryPermissionStore, InMemoryRevocationStore, Role, TokenService, PERM_USERS_ADMIN,
+    };
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
     use http_body_util::BodyExt;
@@ -213,13 +272,18 @@ mod tests {
         }
     }
 
-    fn make_state() -> (AuthState, TokenService) {
+    fn make_state() -> (AuthState, TokenService, Arc<InMemoryPermissionStore>) {
         let revocation: Arc<dyn RevocationStore + Send + Sync> =
             Arc::new(InMemoryRevocationStore::new());
+        let perms = Arc::new(InMemoryPermissionStore::new());
         let svc = TokenService::new(SECRET);
-        let state = AuthState::new(TokenService::new(SECRET), revocation)
-            .with_clock(Arc::new(FixedClock(FIXED_NOW)));
-        (state, svc)
+        let state = AuthState::new(
+            TokenService::new(SECRET),
+            revocation,
+            Arc::clone(&perms) as Arc<dyn PermissionStore + Send + Sync>,
+        )
+        .with_clock(Arc::new(FixedClock(FIXED_NOW)));
+        (state, svc, perms)
     }
 
     async fn body_string(response: Response) -> String {
@@ -239,7 +303,7 @@ mod tests {
 
     #[tokio::test]
     async fn valid_token_returns_200_with_user_id() {
-        let (state, svc) = make_state();
+        let (state, svc, _) = make_state();
         let token = svc.issue_access("alice", 900, FIXED_NOW).unwrap();
         let app = protected_router(state);
         let response = app.oneshot(req_with_auth(&token)).await.unwrap();
@@ -251,7 +315,7 @@ mod tests {
 
     #[tokio::test]
     async fn missing_authorization_returns_401() {
-        let (state, _) = make_state();
+        let (state, _, _) = make_state();
         let app = protected_router(state);
         let req = Request::builder()
             .uri("/whoami")
@@ -264,7 +328,7 @@ mod tests {
 
     #[tokio::test]
     async fn malformed_header_returns_401() {
-        let (state, _) = make_state();
+        let (state, _, _) = make_state();
         let app = protected_router(state);
         let req = Request::builder()
             .uri("/whoami")
@@ -281,9 +345,12 @@ mod tests {
         // Horloge mobile : émet à FIXED_NOW, avance au-delà de exp avant la requête.
         let revocation: Arc<dyn RevocationStore + Send + Sync> =
             Arc::new(InMemoryRevocationStore::new());
+        let perms: Arc<dyn PermissionStore + Send + Sync> =
+            Arc::new(InMemoryPermissionStore::new());
         let clock = Arc::new(MovableClock::new(FIXED_NOW));
         let svc = TokenService::new(SECRET);
-        let state = AuthState::new(TokenService::new(SECRET), revocation).with_clock(clock.clone());
+        let state =
+            AuthState::new(TokenService::new(SECRET), revocation, perms).with_clock(clock.clone());
         let token = svc.issue_access("u", 60, FIXED_NOW).unwrap();
 
         // Avance dans le futur, au-delà de l'expiration
@@ -297,7 +364,7 @@ mod tests {
 
     #[tokio::test]
     async fn tampered_token_returns_401_invalid() {
-        let (state, svc) = make_state();
+        let (state, svc, _) = make_state();
         let mut token = svc.issue_access("alice", 900, FIXED_NOW).unwrap();
         token.pop();
         token.push('X');
@@ -311,6 +378,8 @@ mod tests {
     async fn revoked_token_returns_401_revoked() {
         let revocation: Arc<dyn RevocationStore + Send + Sync> =
             Arc::new(InMemoryRevocationStore::new());
+        let perms: Arc<dyn PermissionStore + Send + Sync> =
+            Arc::new(InMemoryPermissionStore::new());
         let svc = TokenService::new(SECRET);
         let token = svc.issue_access("u", 900, FIXED_NOW).unwrap();
         // Récupère le jti pour le révoquer manuellement
@@ -319,12 +388,81 @@ mod tests {
             .revoke(&claims.jti, (claims.exp + 100) * 1_000)
             .unwrap();
 
-        let state = AuthState::new(TokenService::new(SECRET), revocation)
+        let state = AuthState::new(TokenService::new(SECRET), revocation, perms)
             .with_clock(Arc::new(FixedClock(FIXED_NOW)));
         let app = protected_router(state);
         let response = app.oneshot(req_with_auth(&token)).await.unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
         assert_eq!(body_string(response).await, "token revoked");
+    }
+
+    // ───── F6.5.b — Enforcement permission ─────
+
+    fn admin_req(token: &str) -> Request<Body> {
+        Request::builder()
+            .uri("/admin")
+            .header("Authorization", format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn admin_route_requires_users_admin_permission() {
+        let (state, svc, perms) = make_state();
+        perms.assign_role("alice", &Role::super_admin()).unwrap();
+        let token = svc.issue_access("alice", 900, FIXED_NOW).unwrap();
+        let app = protected_router(state);
+        let response = app.oneshot(admin_req(&token)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(body_string(response).await, "admin ok for alice");
+    }
+
+    #[tokio::test]
+    async fn admin_route_returns_403_when_permission_missing() {
+        let (state, svc, perms) = make_state();
+        // alice est viewer seul (pas d'admin)
+        perms.assign_role("alice", &Role::viewer()).unwrap();
+        let token = svc.issue_access("alice", 900, FIXED_NOW).unwrap();
+        let app = protected_router(state);
+        let response = app.oneshot(admin_req(&token)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let body = body_string(response).await;
+        assert!(body.contains("forbidden"), "body={body}");
+        assert!(body.contains(PERM_USERS_ADMIN), "body={body}");
+    }
+
+    #[tokio::test]
+    async fn admin_route_returns_403_when_no_permissions_at_all() {
+        let (state, svc, _) = make_state();
+        // Aucun rôle attribué → set vide
+        let token = svc.issue_access("bob", 900, FIXED_NOW).unwrap();
+        let app = protected_router(state);
+        let response = app.oneshot(admin_req(&token)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn admin_route_returns_401_when_token_missing_before_perm_check() {
+        // Sans token → 401 (la chaîne s'arrête avant le check permission)
+        let (state, _, _) = make_state();
+        let app = protected_router(state);
+        let req = Request::builder()
+            .uri("/admin")
+            .body(Body::empty())
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn admin_route_succeeds_with_exact_permission_not_role() {
+        // Pas de rôle, juste la permission individuelle
+        let (state, svc, perms) = make_state();
+        perms.grant("carol", PERM_USERS_ADMIN).unwrap();
+        let token = svc.issue_access("carol", 900, FIXED_NOW).unwrap();
+        let app = protected_router(state);
+        let response = app.oneshot(admin_req(&token)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[tokio::test]
