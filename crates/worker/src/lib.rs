@@ -25,6 +25,20 @@
 //! - [`WorkerPool::start`] : spawne `concurrency` threads qui appellent
 //!   `process_one` en boucle. Renvoie un [`RunningPool`] dont `stop()`
 //!   signale l'arrêt et `join()` proprement les threads.
+//!
+//! ## Concurrence & backpressure (F5.5)
+//!
+//! - `concurrency` (paramètre de [`WorkerPool::new`]) est le **cap
+//!   d'exécution concurrente par queue** : N threads consomment cette queue
+//!   en parallèle. Augmenter `concurrency` augmente le débit jusqu'à
+//!   saturation du handler (CPU local, latence externe, etc.).
+//! - La **backpressure côté producteur** est portée par
+//!   [`autome_core::BoundedQueue`] (F5.5) : le scheduler/API se voit
+//!   refuser une publication par `Error::Backpressure` quand la queue est
+//!   pleine, et peut alors retenter / dégrader gracieusement plutôt que
+//!   de faire enfler la mémoire.
+//! - Limites par workflow (sémaphore inter-runs d'une même définition) et
+//!   rate limits par tenant relèveront de F6.5 (RBAC) — non couverts ici.
 
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};

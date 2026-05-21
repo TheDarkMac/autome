@@ -253,6 +253,101 @@ impl Queue for InMemoryQueue {
     }
 }
 
+// ────────────────────── BoundedQueue (F5.5) ──────────────────────
+
+/// Wrapper qui plafonne la profondeur d'une queue à `publish` — applique
+/// la *backpressure* sur les producteurs (scheduler, API) quand les
+/// consommateurs (worker pool) n'arrivent plus à suivre.
+///
+/// Construction builder :
+/// ```ignore
+/// let q = BoundedQueue::new(InMemoryQueue::new())
+///     .with_default_limit(10_000)
+///     .with_limit("runs", 1_000)
+///     .with_limit("runs.dlq", 100);
+/// ```
+///
+/// Sémantique de bound *soft* : la vérification se fait via
+/// `inner.depth(name)` puis `inner.publish(name, msg)` — un autre
+/// producteur peut s'intercaler. En pratique le dépassement est borné
+/// par le nombre de publishers concurrents, ce qui est acceptable pour
+/// un seuil de protection (pas un quota strict).
+///
+/// Les opérations `poll` / `ack` / `nack` / `depth` sont des
+/// pass-through pour préserver le contrat de [`Queue`].
+pub struct BoundedQueue<Q: Queue> {
+    inner: Q,
+    limits: HashMap<String, usize>,
+    default_limit: Option<usize>,
+}
+
+impl<Q: Queue> BoundedQueue<Q> {
+    /// Construit le wrapper. Sans aucun `with_limit` ni `with_default_limit`,
+    /// se comporte comme `inner` (aucune borne — pass-through pur).
+    pub fn new(inner: Q) -> Self {
+        Self {
+            inner,
+            limits: HashMap::new(),
+            default_limit: None,
+        }
+    }
+
+    /// Builder : fixe la limite **par queue** (override le default).
+    pub fn with_limit(mut self, name: impl Into<String>, max: usize) -> Self {
+        self.limits.insert(name.into(), max);
+        self
+    }
+
+    /// Builder : fixe la limite par défaut, appliquée aux queues sans
+    /// limite explicite.
+    pub fn with_default_limit(mut self, max: usize) -> Self {
+        self.default_limit = Some(max);
+        self
+    }
+
+    /// Limite effective pour `name` (clé explicite, sinon default, sinon `None`).
+    pub fn limit_for(&self, name: &str) -> Option<usize> {
+        self.limits.get(name).copied().or(self.default_limit)
+    }
+
+    /// Référence vers la queue wrappée (utile pour les tests).
+    pub fn inner(&self) -> &Q {
+        &self.inner
+    }
+}
+
+impl<Q: Queue> Queue for BoundedQueue<Q> {
+    fn publish(&self, name: &str, msg: Message) -> Result<()> {
+        if let Some(max) = self.limit_for(name) {
+            let depth = self.inner.depth(name)?;
+            if depth >= max {
+                return Err(Error::Backpressure {
+                    queue: name.to_string(),
+                    depth,
+                    max,
+                });
+            }
+        }
+        self.inner.publish(name, msg)
+    }
+
+    fn poll(&self, name: &str) -> Result<Option<Delivery>> {
+        self.inner.poll(name)
+    }
+
+    fn ack(&self, id: &DeliveryId) -> Result<()> {
+        self.inner.ack(id)
+    }
+
+    fn nack(&self, id: &DeliveryId, verdict: Nack) -> Result<()> {
+        self.inner.nack(id, verdict)
+    }
+
+    fn depth(&self, name: &str) -> Result<usize> {
+        self.inner.depth(name)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -432,5 +527,150 @@ mod tests {
     fn in_memory_queue_is_send_sync() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<InMemoryQueue>();
+    }
+
+    // ───── F5.5 — BoundedQueue ─────
+
+    #[test]
+    fn bounded_without_limits_passes_through() {
+        let q = BoundedQueue::new(InMemoryQueue::new());
+        for i in 0..100 {
+            q.publish("runs", msg(json!({ "n": i }))).unwrap();
+        }
+        assert_eq!(q.depth("runs").unwrap(), 100);
+    }
+
+    #[test]
+    fn bounded_rejects_when_limit_reached() {
+        let q = BoundedQueue::new(InMemoryQueue::new()).with_limit("runs", 3);
+        q.publish("runs", msg(json!({ "n": 1 }))).unwrap();
+        q.publish("runs", msg(json!({ "n": 2 }))).unwrap();
+        q.publish("runs", msg(json!({ "n": 3 }))).unwrap();
+        let err = q.publish("runs", msg(json!({ "n": 4 }))).unwrap_err();
+        match err {
+            Error::Backpressure { queue, depth, max } => {
+                assert_eq!(queue, "runs");
+                assert_eq!(depth, 3);
+                assert_eq!(max, 3);
+            }
+            other => panic!("expected Backpressure, got {other:?}"),
+        }
+        // Le message rejeté n'a pas été ajouté
+        assert_eq!(q.depth("runs").unwrap(), 3);
+    }
+
+    #[test]
+    fn bounded_allows_publish_after_poll_drains() {
+        let q = BoundedQueue::new(InMemoryQueue::new()).with_limit("runs", 2);
+        q.publish("runs", msg(json!({ "n": 1 }))).unwrap();
+        q.publish("runs", msg(json!({ "n": 2 }))).unwrap();
+        // À la limite → rejeté
+        assert!(matches!(
+            q.publish("runs", msg(json!({}))),
+            Err(Error::Backpressure { .. })
+        ));
+        // Drain : poll récupère 1 message → depth=1, publish à nouveau OK
+        let d = q.poll("runs").unwrap().unwrap();
+        assert_eq!(q.depth("runs").unwrap(), 1);
+        q.publish("runs", msg(json!({ "n": 3 }))).unwrap();
+        assert_eq!(q.depth("runs").unwrap(), 2);
+        // Ack ne change pas la depth (le message était déjà retiré de la
+        // file principale par poll).
+        q.ack(&d.id).unwrap();
+        assert_eq!(q.depth("runs").unwrap(), 2);
+    }
+
+    #[test]
+    fn bounded_per_queue_limits_are_isolated() {
+        let q = BoundedQueue::new(InMemoryQueue::new())
+            .with_limit("small", 1)
+            .with_limit("large", 100);
+        q.publish("small", msg(json!({}))).unwrap();
+        assert!(matches!(
+            q.publish("small", msg(json!({}))),
+            Err(Error::Backpressure { .. })
+        ));
+        // Pas affecté
+        for _ in 0..50 {
+            q.publish("large", msg(json!({}))).unwrap();
+        }
+        assert_eq!(q.depth("large").unwrap(), 50);
+    }
+
+    #[test]
+    fn bounded_default_limit_covers_unspecified_queues() {
+        let q = BoundedQueue::new(InMemoryQueue::new())
+            .with_default_limit(2)
+            .with_limit("special", 10);
+        // Queue arbitraire → cap par défaut
+        q.publish("a", msg(json!({}))).unwrap();
+        q.publish("a", msg(json!({}))).unwrap();
+        assert!(matches!(
+            q.publish("a", msg(json!({}))),
+            Err(Error::Backpressure { .. })
+        ));
+        // Queue avec override → cap explicite
+        for _ in 0..10 {
+            q.publish("special", msg(json!({}))).unwrap();
+        }
+        assert!(matches!(
+            q.publish("special", msg(json!({}))),
+            Err(Error::Backpressure { .. })
+        ));
+    }
+
+    #[test]
+    fn bounded_explicit_limit_overrides_default() {
+        let q = BoundedQueue::new(InMemoryQueue::new())
+            .with_default_limit(100)
+            .with_limit("tight", 1);
+        q.publish("tight", msg(json!({}))).unwrap();
+        assert!(matches!(
+            q.publish("tight", msg(json!({}))),
+            Err(Error::Backpressure { .. })
+        ));
+    }
+
+    #[test]
+    fn bounded_nack_requeue_does_not_violate_limit() {
+        let q = BoundedQueue::new(InMemoryQueue::new()).with_limit("runs", 1);
+        q.publish("runs", msg(json!({ "n": 1 }))).unwrap();
+        let d = q.poll("runs").unwrap().unwrap();
+        // Après poll, depth=0 → on peut re-publish
+        q.publish("runs", msg(json!({ "n": 2 }))).unwrap();
+        assert_eq!(q.depth("runs").unwrap(), 1);
+        // nack(Requeue) remet en tête → depth=2 (dépasse la limite, mais c'est
+        // un nack interne, pas un publish — donc accepté).
+        q.nack(&d.id, Nack::Requeue).unwrap();
+        assert_eq!(q.depth("runs").unwrap(), 2);
+    }
+
+    #[test]
+    fn bounded_limit_for_returns_effective_value() {
+        let q = BoundedQueue::new(InMemoryQueue::new())
+            .with_default_limit(10)
+            .with_limit("explicit", 1);
+        assert_eq!(q.limit_for("explicit"), Some(1));
+        assert_eq!(q.limit_for("default"), Some(10));
+
+        let q_none = BoundedQueue::new(InMemoryQueue::new());
+        assert_eq!(q_none.limit_for("anything"), None);
+    }
+
+    #[test]
+    fn bounded_is_send_sync_when_inner_is() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<BoundedQueue<InMemoryQueue>>();
+    }
+
+    #[test]
+    fn backpressure_error_message_is_explicit() {
+        let q = BoundedQueue::new(InMemoryQueue::new()).with_limit("q", 1);
+        q.publish("q", msg(json!({}))).unwrap();
+        let err = q.publish("q", msg(json!({}))).unwrap_err();
+        let display = format!("{err}");
+        assert!(display.contains("backpressure"), "msg={display}");
+        assert!(display.contains("q"), "msg={display}");
+        assert!(display.contains("1/1"), "msg={display}");
     }
 }
