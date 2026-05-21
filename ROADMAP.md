@@ -20,7 +20,7 @@
 | 2  | Moteur de workflows      | 7        | 7         | ✅ Terminé    |
 | 3  | Triggers & Actions       | 6        | 6         | ✅ Terminé    |
 | 4  | Connecteurs API          | 5        | 5         | ✅ Terminé    |
-| 5  | Orchestrateur & Scaling  | 6        | 5         | En cours      |
+| 5  | Orchestrateur & Scaling  | 6        | 6         | ✅ Terminé    |
 | 6  | Sécurité & Auth          | 6        | 0         | À faire       |
 | 7  | API publique (REST/gRPC) | 4        | 0         | À faire       |
 | 8  | Frontend & Éditeur visuel| 7        | 0         | À faire       |
@@ -29,7 +29,7 @@
 | 11 | Documentation            | 5        | 0         | À faire       |
 | 12 | Exemples de workflows    | 3        | 0         | À faire       |
 
-**Progression totale : 29 / 66 features** (≈ 150 sous-tâches sur les features détaillées)
+**Progression totale : 30 / 66 features** (≈ 150 sous-tâches sur les features détaillées)
 
 > Les features complexes (F1.3, F1.5, F2.*, F4.*, F5.1–F5.4, F6.1–F6.3, F6.5,
 > F8.2–F8.7) sont découpées en sous-tâches `Fx.y.z`. Une feature est `[x]`
@@ -150,7 +150,7 @@
   - [x] F5.4.b — Reprise d'un run interrompu
   - [x] F5.4.c — Nettoyage des runs orphelins
 - [x] **F5.5** — Backpressure & limites de concurrence — _issue #57_
-- [ ] **F5.6** — Test de charge (objectif : milliers de workflows simultanés)
+- [x] **F5.6** — Test de charge (objectif : milliers de workflows simultanés) — _issue #59_
 
 ## 6. Sécurité & Auth
 
@@ -279,3 +279,4 @@
 | 2026-05-21 | F5.3 | Planificateur de jobs : `core::scheduler` — `Scheduler::tick()` (poll tous les triggers, dispatche les events neufs sur la queue) ; `Scheduler::start(interval)` spawne un thread de fond, `RunningScheduler::stop()` signale + join. Dispatch (F5.3.b) : `TriggerEvent` → `Message { source, payload }` avec headers `idempotency-key` + `trigger-source` — s'aligne avec la dédup côté worker (F5.2.c). Anti-double-déclenchement (F5.3.c) : trait `DedupLock` + `InMemoryDedupLock` (HashSet/Mutex), fonction de clé pluggable (`with_dedup_key`, défaut `"<source>::<json(payload)>"`). La vraie version cross-instance (Redis SETNX / PG advisory lock) arrive avec F5.4. **Chaîne trigger → queue → worker bouclée**. 11 nouveaux tests core (42 au total, 222 workspace). | — |
 | 2026-05-21 | F5.4 | Persistance d'état d'exécution : `core::run_state` — `RunCheckpoint { run_id, workflow_id, version, status, started_at_ms, finished_at_ms, outputs (node→Value), next_node, error }`, trait `RunStateStore` (`checkpoint`/`load`/`list_orphans`/`mark_failed`), impl `InMemoryRunStateStore` thread-safe (Mutex+HashMap). F5.4.b reprise : `load(run_id)` renvoie le snapshot complet pour qu'un worker recrée son `RunContext` et continue à partir de `next_node`. F5.4.c orphelins : `list_orphans(older_than_ms)` filtre `status=Running` AND `started_at < cutoff` (strict), `mark_failed` idempotent. **`RunStatus` déplacé depuis `engine` vers `core`** (+ serde derives) ; `autome_engine::RunStatus` re-exporté pour rétrocompat — 0 régression sur les 44 tests engine. Le store PostgreSQL/sqlx contre les tables F1.5 (`runs`/`run_steps`) sera branché dans une PR suivante. 14 nouveaux tests core (56 au total, 236 workspace). | — |
 | 2026-05-21 | F5.5 | Backpressure & limites de concurrence : nouveau variant `Error::Backpressure { queue, depth, max }` typé (F5.5.a) — distinct de `Invalid` pour que le caller puisse réagir (backoff, dégrader). `BoundedQueue<Q: Queue>` wrapper (F5.5.b) avec `with_limit(name, max)` (par queue) et `with_default_limit(max)` (fallback) ; `publish` rejette à la limite, `poll`/`ack`/`nack`/`depth` pass-through. Sémantique soft-bound (race depth/publish acceptable pour un seuil de protection ; `nack(Requeue)` interne n'est pas plafonné). Documentation worker (F5.5.c) : `WorkerPool.concurrency` = cap d'exécution concurrente par queue ; limites par workflow/tenant reportées à F6.5 RBAC. 10 nouveaux tests core (66 au total, 246 workspace). | — |
+| 2026-05-21 | F5.6 | Test de charge end-to-end : `crates/worker/tests/load.rs` — 3 tests qui valident l'assemblage F5.1↔F5.5 sur la stack in-memory. (a) Smoke (run par défaut) — Scheduler+BoundedQueue+WorkerPool 2t sur 100 events, vérifie 0 perte / 0 DLQ / ≥ 500 msg/s. (b) Load (run sur `--ignored --nocapture`) — 10 000 events, 8 workers, mesure publish + consume throughput, assertion ≥ 1 000/s (mesure dev locale **97k publish / 54k consume**). (c) Garde-fou backpressure : burst 1 000 events sur queue limitée à 100 → exactement 100 acceptés + 900 `Error::Backpressure`. Documentation méthode + commande + ordres de grandeur in-source. **Domaine 5 (Orchestrateur & Scaling) terminé.** | — |
