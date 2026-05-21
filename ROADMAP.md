@@ -21,7 +21,7 @@
 | 3  | Triggers & Actions       | 6        | 6         | ✅ Terminé    |
 | 4  | Connecteurs API          | 5        | 5         | ✅ Terminé    |
 | 5  | Orchestrateur & Scaling  | 6        | 6         | ✅ Terminé    |
-| 6  | Sécurité & Auth          | 6        | 0         | À faire       |
+| 6  | Sécurité & Auth          | 6        | 1         | En cours      |
 | 7  | API publique (REST/gRPC) | 4        | 0         | À faire       |
 | 8  | Frontend & Éditeur visuel| 7        | 0         | À faire       |
 | 9  | Tests (TDD)              | 5        | 0         | À faire       |
@@ -29,7 +29,7 @@
 | 11 | Documentation            | 5        | 0         | À faire       |
 | 12 | Exemples de workflows    | 3        | 0         | À faire       |
 
-**Progression totale : 30 / 66 features** (≈ 150 sous-tâches sur les features détaillées)
+**Progression totale : 31 / 66 features** (≈ 150 sous-tâches sur les features détaillées)
 
 > Les features complexes (F1.3, F1.5, F2.*, F4.*, F5.1–F5.4, F6.1–F6.3, F6.5,
 > F8.2–F8.7) sont découpées en sous-tâches `Fx.y.z`. Une feature est `[x]`
@@ -154,11 +154,11 @@
 
 ## 6. Sécurité & Auth
 
-- [ ] **F6.1** — Authentification utilisateur (JWT)
-  - [ ] F6.1.a — Signup / hash mot de passe (argon2)
-  - [ ] F6.1.b — Login → émission JWT (access + refresh)
-  - [ ] F6.1.c — Middleware de vérification du token
-  - [ ] F6.1.d — Révocation / rotation des tokens
+- [x] **F6.1** — Authentification utilisateur (JWT) — _issue #61_
+  - [x] F6.1.a — Signup / hash mot de passe (argon2)
+  - [x] F6.1.b — Login → émission JWT (access + refresh)
+  - [x] F6.1.c — Middleware de vérification du token
+  - [x] F6.1.d — Révocation / rotation des tokens
 - [ ] **F6.2** — OAuth2 (login + autorisation connecteurs tiers)
   - [ ] F6.2.a — Flow Authorization Code (login)
   - [ ] F6.2.b — Stockage & refresh des tokens connecteurs
@@ -280,3 +280,4 @@
 | 2026-05-21 | F5.4 | Persistance d'état d'exécution : `core::run_state` — `RunCheckpoint { run_id, workflow_id, version, status, started_at_ms, finished_at_ms, outputs (node→Value), next_node, error }`, trait `RunStateStore` (`checkpoint`/`load`/`list_orphans`/`mark_failed`), impl `InMemoryRunStateStore` thread-safe (Mutex+HashMap). F5.4.b reprise : `load(run_id)` renvoie le snapshot complet pour qu'un worker recrée son `RunContext` et continue à partir de `next_node`. F5.4.c orphelins : `list_orphans(older_than_ms)` filtre `status=Running` AND `started_at < cutoff` (strict), `mark_failed` idempotent. **`RunStatus` déplacé depuis `engine` vers `core`** (+ serde derives) ; `autome_engine::RunStatus` re-exporté pour rétrocompat — 0 régression sur les 44 tests engine. Le store PostgreSQL/sqlx contre les tables F1.5 (`runs`/`run_steps`) sera branché dans une PR suivante. 14 nouveaux tests core (56 au total, 236 workspace). | — |
 | 2026-05-21 | F5.5 | Backpressure & limites de concurrence : nouveau variant `Error::Backpressure { queue, depth, max }` typé (F5.5.a) — distinct de `Invalid` pour que le caller puisse réagir (backoff, dégrader). `BoundedQueue<Q: Queue>` wrapper (F5.5.b) avec `with_limit(name, max)` (par queue) et `with_default_limit(max)` (fallback) ; `publish` rejette à la limite, `poll`/`ack`/`nack`/`depth` pass-through. Sémantique soft-bound (race depth/publish acceptable pour un seuil de protection ; `nack(Requeue)` interne n'est pas plafonné). Documentation worker (F5.5.c) : `WorkerPool.concurrency` = cap d'exécution concurrente par queue ; limites par workflow/tenant reportées à F6.5 RBAC. 10 nouveaux tests core (66 au total, 246 workspace). | — |
 | 2026-05-21 | F5.6 | Test de charge end-to-end : `crates/worker/tests/load.rs` — 3 tests qui valident l'assemblage F5.1↔F5.5 sur la stack in-memory. (a) Smoke (run par défaut) — Scheduler+BoundedQueue+WorkerPool 2t sur 100 events, vérifie 0 perte / 0 DLQ / ≥ 500 msg/s. (b) Load (run sur `--ignored --nocapture`) — 10 000 events, 8 workers, mesure publish + consume throughput, assertion ≥ 1 000/s (mesure dev locale **97k publish / 54k consume**). (c) Garde-fou backpressure : burst 1 000 events sur queue limitée à 100 → exactement 100 acceptés + 900 `Error::Backpressure`. Documentation méthode + commande + ordres de grandeur in-source. **Domaine 5 (Orchestrateur & Scaling) terminé.** | — |
+| 2026-05-21 | F6.1 | Authentification utilisateur (JWT) : module `core::auth` — F6.1.a `PasswordHasher` trait + `Argon2PasswordHasher` (Argon2id via crates `argon2` + `password-hash` + `rand`, format PHC, sel généré par OsRng, paramètres par défaut). F6.1.b/d `TokenService` HS256 (crate `jsonwebtoken`) + `Claims { sub, iat, exp, jti, kind: Access\|Refresh }` + `issue_access`/`issue_refresh`/`verify`/`rotate` (horloge `now` injectée, déterministe). F6.1.d `RevocationStore` trait + `InMemoryRevocationStore` (HashMap<jti, exp_ms> sous Mutex, GC opportuniste, idempotent sur max(exp)). F6.1.c `api::auth` (nouveau `api::lib`) — extractor axum `AuthenticatedUser`, état `AuthState` (token_service + revocation + Clock injectable), `AuthError` typé mappé vers 401 ; `protected_router("/whoami")` câblé via `Router::nest("/auth", …)` dans `main`. 22 nouveaux tests core (hash/verify, JWT roundtrip, tampering, expired, rotation, revocation) + 7 tests api (200 valide, 401 missing/malformed/expired/tampered/revoked, helper `user_id`). 277 tests workspace. Nouvelles deps : `jsonwebtoken`, `argon2`, `password-hash`, `rand` (+ `tower` et `http-body-util` en dev-deps `api`). | — |

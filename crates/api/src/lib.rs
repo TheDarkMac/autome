@@ -1,0 +1,11 @@
+//! `autome-api` — bibliothèque du serveur HTTP.
+//!
+//! Le binaire (`src/main.rs`) reste un thin wrapper ; la logique réutilisable
+//! (middleware auth, routers de domaine) vit ici pour être testable et
+//! consommable depuis des tests d'intégration.
+//!
+//! Modules :
+//! - [`auth`] (F6.1.c) : extractor axum `AuthenticatedUser` qui consomme
+//!   les primitives `core::auth` (TokenService, RevocationStore).
+
+pub mod auth;

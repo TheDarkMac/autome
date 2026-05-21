@@ -8,6 +8,7 @@
 #![doc(html_no_source)]
 
 pub mod action;
+pub mod auth;
 pub mod config;
 pub mod queue;
 pub mod run_state;
@@ -16,6 +17,10 @@ pub mod trigger;
 pub mod workflow;
 
 pub use action::Action;
+pub use auth::{
+    Argon2PasswordHasher, Claims, InMemoryRevocationStore, PasswordHasher, RevocationStore,
+    TokenKind, TokenService,
+};
 pub use config::{Config, Profile, Secret};
 pub use queue::{dlq_of, BoundedQueue, Delivery, DeliveryId, InMemoryQueue, Message, Nack, Queue};
 pub use run_state::{InMemoryRunStateStore, RunCheckpoint, RunStateStore, RunStatus};

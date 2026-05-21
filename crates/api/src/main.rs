@@ -1,11 +1,15 @@
-//! `autome-api` — serveur HTTP (axum).
+//! `autome-api` — binaire du serveur HTTP (axum).
 //!
 //! Conformément à l'ADR 0001, axum est confiné à ce crate ; `core` et
 //! `engine` n'en dépendent pas. Squelette F1.3.d : un routeur avec une
 //! sonde de santé. Le CRUD workflows et le déclenchement de runs relèvent
-//! du domaine 7 (F7.*).
+//! du domaine 7 (F7.*). Le middleware d'authentification (F6.1.c) vit dans
+//! [`autome_api::auth`].
 
-use autome_core::Config;
+use std::sync::Arc;
+
+use autome_api::auth::{protected_router, AuthState};
+use autome_core::{Config, InMemoryRevocationStore, RevocationStore, TokenService};
 use axum::{routing::get, Router};
 
 /// Handler de la sonde de santé.
@@ -13,17 +17,28 @@ async fn health() -> &'static str {
     "ok"
 }
 
-/// Construit le routeur de l'API.
+/// Construit le routeur racine — `/health` public + `/auth/*` protégé par JWT.
 ///
 /// Isolé de `main` pour être testable sans démarrer de serveur.
-fn build_router() -> Router {
-    Router::new().route("/health", get(health))
+fn build_router(auth: AuthState) -> Router {
+    Router::new()
+        .route("/health", get(health))
+        .nest("/auth", protected_router(auth))
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = Config::from_env()?;
-    let app = build_router();
+
+    // Secret JWT depuis la config (F1.6) — à remplacer par une vraie clé
+    // dérivée d'env quand on aura `config.jwt_secret`. Pour le squelette
+    // on prend un secret dev déterministe ; **ne pas livrer en prod**.
+    let jwt_secret = b"DEV-ONLY-replace-with-config-secret-please-32";
+    let revocation: Arc<dyn RevocationStore + Send + Sync> =
+        Arc::new(InMemoryRevocationStore::new());
+    let auth = AuthState::new(TokenService::new(jwt_secret), revocation);
+
+    let app = build_router(auth);
     let listener = tokio::net::TcpListener::bind(&config.http_addr).await?;
     println!(
         "autome-api ({:?}) en écoute sur http://{}",
@@ -44,7 +59,10 @@ mod tests {
 
     #[test]
     fn router_builds() {
-        // Le routeur se construit sans panique (route /health enregistrée).
-        let _app: Router = build_router();
+        // Le routeur se construit sans panique (route /health + /auth/*).
+        let revocation: Arc<dyn RevocationStore + Send + Sync> =
+            Arc::new(InMemoryRevocationStore::new());
+        let auth = AuthState::new(TokenService::new(b"x"), revocation);
+        let _app: Router = build_router(auth);
     }
 }
