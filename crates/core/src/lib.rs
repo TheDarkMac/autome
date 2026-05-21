@@ -13,6 +13,7 @@ pub mod config;
 pub mod queue;
 pub mod run_state;
 pub mod scheduler;
+pub mod secrets;
 pub mod trigger;
 pub mod workflow;
 
@@ -27,6 +28,7 @@ pub use run_state::{InMemoryRunStateStore, RunCheckpoint, RunStateStore, RunStat
 pub use scheduler::{
     default_dedup_key, DedupKeyFn, DedupLock, InMemoryDedupLock, RunningScheduler, Scheduler,
 };
+pub use secrets::{EnvelopeCipher, InMemoryKeyProvider, KeyProvider};
 pub use trigger::{Trigger, TriggerEvent};
 pub use workflow::{Edge, Node, NodeKind, WorkflowGraph, WorkflowId};
 

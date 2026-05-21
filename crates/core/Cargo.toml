@@ -20,3 +20,6 @@ jsonwebtoken = { workspace = true }
 argon2 = { workspace = true }
 password-hash = { workspace = true }
 rand = { workspace = true }
+# Chiffrement secrets (F6.3)
+aes-gcm = { workspace = true }
+base64 = { workspace = true }
