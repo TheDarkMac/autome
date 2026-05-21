@@ -25,7 +25,10 @@
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use autome_core::{has_permission, Claims, PermissionStore, RevocationStore, TokenService};
+use autome_core::{
+    has_permission, AuditEvent, AuditOutcome, AuditSink, Claims, PermissionStore, RevocationStore,
+    TokenService,
+};
 use axum::{
     extract::FromRequestParts,
     http::{request::Parts, StatusCode},
@@ -33,6 +36,7 @@ use axum::{
     routing::get,
     Router,
 };
+use serde_json::json;
 
 /// Horloge injectable (seconds Unix). Permet aux tests d'épingler `now`.
 pub trait Clock: Send + Sync {
@@ -62,6 +66,9 @@ pub struct AuthState {
     pub revocation: Arc<dyn RevocationStore + Send + Sync>,
     /// Store de permissions par `user_id` (F6.5).
     pub permissions: Arc<dyn PermissionStore + Send + Sync>,
+    /// Sink d'audit pour les décisions d'autorisation (F6.6). Toujours
+    /// présent — passer `Arc::new(NoopAuditSink)` pour désactiver.
+    pub audit: Arc<dyn AuditSink + Send + Sync>,
     /// Horloge injectable (par défaut `SystemClock`).
     pub clock: Arc<dyn Clock>,
 }
@@ -72,11 +79,13 @@ impl AuthState {
         token_service: TokenService,
         revocation: Arc<dyn RevocationStore + Send + Sync>,
         permissions: Arc<dyn PermissionStore + Send + Sync>,
+        audit: Arc<dyn AuditSink + Send + Sync>,
     ) -> Self {
         Self {
             token_service: Arc::new(token_service),
             revocation,
             permissions,
+            audit,
             clock: Arc::new(SystemClock),
         }
     }
@@ -90,6 +99,12 @@ impl AuthState {
     /// Vérifie que `user` possède la permission `needed`. À appeler depuis
     /// un handler axum après extraction de [`AuthenticatedUser`] (F6.5.b).
     ///
+    /// Enregistre **systématiquement** un event audit
+    /// `"auth.permission_check"` (F6.6) :
+    /// - actor = `user_id`,
+    /// - resource = `needed` (la permission demandée),
+    /// - outcome = `Success` ou `Denied` (ou `Failure` si erreur interne).
+    ///
     /// ```ignore
     /// async fn admin_only(user: AuthenticatedUser, State(state): State<AuthState>) -> Result<String, AuthError> {
     ///     state.require_permission(&user, autome_core::PERM_USERS_ADMIN)?;
@@ -101,11 +116,39 @@ impl AuthState {
         user: &AuthenticatedUser,
         needed: &str,
     ) -> Result<(), AuthError> {
-        let perms = self
-            .permissions
-            .permissions_for(user.user_id())
-            .map_err(|e| AuthError::Internal(e.to_string()))?;
-        if has_permission(&perms, needed) {
+        let now_ms = self.clock.now_unix_seconds().saturating_mul(1_000);
+        let perms = match self.permissions.permissions_for(user.user_id()) {
+            Ok(p) => p,
+            Err(e) => {
+                let _ = self.audit.record(
+                    AuditEvent::new(
+                        now_ms,
+                        user.user_id(),
+                        "auth.permission_check",
+                        AuditOutcome::Failure,
+                    )
+                    .with_resource(needed)
+                    .with_metadata(json!({ "error": e.to_string() })),
+                );
+                return Err(AuthError::Internal(e.to_string()));
+            }
+        };
+        let allowed = has_permission(&perms, needed);
+        let outcome = if allowed {
+            AuditOutcome::Success
+        } else {
+            AuditOutcome::Denied
+        };
+        // L'erreur d'audit n'invalide pas la décision : si le sink échoue
+        // on log côté stderr et on continue (refuser un accès légitime à
+        // cause d'un audit cassé serait pire que de manquer un event).
+        if let Err(e) = self.audit.record(
+            AuditEvent::new(now_ms, user.user_id(), "auth.permission_check", outcome)
+                .with_resource(needed),
+        ) {
+            eprintln!("[auth] audit record failed: {e}");
+        }
+        if allowed {
             Ok(())
         } else {
             Err(AuthError::Forbidden(needed.to_string()))
@@ -236,7 +279,8 @@ pub fn protected_router(state: AuthState) -> Router {
 mod tests {
     use super::*;
     use autome_core::{
-        InMemoryPermissionStore, InMemoryRevocationStore, Role, TokenService, PERM_USERS_ADMIN,
+        InMemoryAuditSink, InMemoryPermissionStore, InMemoryRevocationStore, Role, TokenService,
+        PERM_USERS_ADMIN,
     };
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
@@ -272,18 +316,25 @@ mod tests {
         }
     }
 
-    fn make_state() -> (AuthState, TokenService, Arc<InMemoryPermissionStore>) {
+    fn make_state() -> (
+        AuthState,
+        TokenService,
+        Arc<InMemoryPermissionStore>,
+        Arc<InMemoryAuditSink>,
+    ) {
         let revocation: Arc<dyn RevocationStore + Send + Sync> =
             Arc::new(InMemoryRevocationStore::new());
         let perms = Arc::new(InMemoryPermissionStore::new());
+        let audit = Arc::new(InMemoryAuditSink::new());
         let svc = TokenService::new(SECRET);
         let state = AuthState::new(
             TokenService::new(SECRET),
             revocation,
             Arc::clone(&perms) as Arc<dyn PermissionStore + Send + Sync>,
+            Arc::clone(&audit) as Arc<dyn AuditSink + Send + Sync>,
         )
         .with_clock(Arc::new(FixedClock(FIXED_NOW)));
-        (state, svc, perms)
+        (state, svc, perms, audit)
     }
 
     async fn body_string(response: Response) -> String {
@@ -303,7 +354,7 @@ mod tests {
 
     #[tokio::test]
     async fn valid_token_returns_200_with_user_id() {
-        let (state, svc, _) = make_state();
+        let (state, svc, _, _) = make_state();
         let token = svc.issue_access("alice", 900, FIXED_NOW).unwrap();
         let app = protected_router(state);
         let response = app.oneshot(req_with_auth(&token)).await.unwrap();
@@ -315,7 +366,7 @@ mod tests {
 
     #[tokio::test]
     async fn missing_authorization_returns_401() {
-        let (state, _, _) = make_state();
+        let (state, _, _, _) = make_state();
         let app = protected_router(state);
         let req = Request::builder()
             .uri("/whoami")
@@ -328,7 +379,7 @@ mod tests {
 
     #[tokio::test]
     async fn malformed_header_returns_401() {
-        let (state, _, _) = make_state();
+        let (state, _, _, _) = make_state();
         let app = protected_router(state);
         let req = Request::builder()
             .uri("/whoami")
@@ -347,10 +398,11 @@ mod tests {
             Arc::new(InMemoryRevocationStore::new());
         let perms: Arc<dyn PermissionStore + Send + Sync> =
             Arc::new(InMemoryPermissionStore::new());
+        let audit: Arc<dyn AuditSink + Send + Sync> = Arc::new(InMemoryAuditSink::new());
         let clock = Arc::new(MovableClock::new(FIXED_NOW));
         let svc = TokenService::new(SECRET);
-        let state =
-            AuthState::new(TokenService::new(SECRET), revocation, perms).with_clock(clock.clone());
+        let state = AuthState::new(TokenService::new(SECRET), revocation, perms, audit)
+            .with_clock(clock.clone());
         let token = svc.issue_access("u", 60, FIXED_NOW).unwrap();
 
         // Avance dans le futur, au-delà de l'expiration
@@ -364,7 +416,7 @@ mod tests {
 
     #[tokio::test]
     async fn tampered_token_returns_401_invalid() {
-        let (state, svc, _) = make_state();
+        let (state, svc, _, _) = make_state();
         let mut token = svc.issue_access("alice", 900, FIXED_NOW).unwrap();
         token.pop();
         token.push('X');
@@ -380,6 +432,7 @@ mod tests {
             Arc::new(InMemoryRevocationStore::new());
         let perms: Arc<dyn PermissionStore + Send + Sync> =
             Arc::new(InMemoryPermissionStore::new());
+        let audit: Arc<dyn AuditSink + Send + Sync> = Arc::new(InMemoryAuditSink::new());
         let svc = TokenService::new(SECRET);
         let token = svc.issue_access("u", 900, FIXED_NOW).unwrap();
         // Récupère le jti pour le révoquer manuellement
@@ -388,7 +441,7 @@ mod tests {
             .revoke(&claims.jti, (claims.exp + 100) * 1_000)
             .unwrap();
 
-        let state = AuthState::new(TokenService::new(SECRET), revocation, perms)
+        let state = AuthState::new(TokenService::new(SECRET), revocation, perms, audit)
             .with_clock(Arc::new(FixedClock(FIXED_NOW)));
         let app = protected_router(state);
         let response = app.oneshot(req_with_auth(&token)).await.unwrap();
@@ -408,7 +461,7 @@ mod tests {
 
     #[tokio::test]
     async fn admin_route_requires_users_admin_permission() {
-        let (state, svc, perms) = make_state();
+        let (state, svc, perms, _) = make_state();
         perms.assign_role("alice", &Role::super_admin()).unwrap();
         let token = svc.issue_access("alice", 900, FIXED_NOW).unwrap();
         let app = protected_router(state);
@@ -419,7 +472,7 @@ mod tests {
 
     #[tokio::test]
     async fn admin_route_returns_403_when_permission_missing() {
-        let (state, svc, perms) = make_state();
+        let (state, svc, perms, _) = make_state();
         // alice est viewer seul (pas d'admin)
         perms.assign_role("alice", &Role::viewer()).unwrap();
         let token = svc.issue_access("alice", 900, FIXED_NOW).unwrap();
@@ -433,7 +486,7 @@ mod tests {
 
     #[tokio::test]
     async fn admin_route_returns_403_when_no_permissions_at_all() {
-        let (state, svc, _) = make_state();
+        let (state, svc, _, _) = make_state();
         // Aucun rôle attribué → set vide
         let token = svc.issue_access("bob", 900, FIXED_NOW).unwrap();
         let app = protected_router(state);
@@ -444,7 +497,7 @@ mod tests {
     #[tokio::test]
     async fn admin_route_returns_401_when_token_missing_before_perm_check() {
         // Sans token → 401 (la chaîne s'arrête avant le check permission)
-        let (state, _, _) = make_state();
+        let (state, _, _, _) = make_state();
         let app = protected_router(state);
         let req = Request::builder()
             .uri("/admin")
@@ -457,7 +510,7 @@ mod tests {
     #[tokio::test]
     async fn admin_route_succeeds_with_exact_permission_not_role() {
         // Pas de rôle, juste la permission individuelle
-        let (state, svc, perms) = make_state();
+        let (state, svc, perms, _) = make_state();
         perms.grant("carol", PERM_USERS_ADMIN).unwrap();
         let token = svc.issue_access("carol", 900, FIXED_NOW).unwrap();
         let app = protected_router(state);
@@ -476,5 +529,70 @@ mod tests {
         };
         let user = AuthenticatedUser { claims };
         assert_eq!(user.user_id(), "bob");
+    }
+
+    // ───── F6.6 — Audit log ─────
+
+    #[tokio::test]
+    async fn permission_grant_records_success_audit_event() {
+        let (state, svc, perms, audit) = make_state();
+        perms.assign_role("alice", &Role::super_admin()).unwrap();
+        let token = svc.issue_access("alice", 900, FIXED_NOW).unwrap();
+        let app = protected_router(state);
+        let _ = app.oneshot(admin_req(&token)).await.unwrap();
+        let events = audit.list().unwrap();
+        assert_eq!(events.len(), 1);
+        let e = &events[0];
+        assert_eq!(e.actor, "alice");
+        assert_eq!(e.action, "auth.permission_check");
+        assert_eq!(e.outcome, AuditOutcome::Success);
+        assert_eq!(e.resource.as_deref(), Some(PERM_USERS_ADMIN));
+        assert_eq!(e.timestamp_ms, FIXED_NOW * 1000);
+    }
+
+    #[tokio::test]
+    async fn permission_denial_records_denied_audit_event() {
+        let (state, svc, perms, audit) = make_state();
+        perms.assign_role("alice", &Role::viewer()).unwrap();
+        let token = svc.issue_access("alice", 900, FIXED_NOW).unwrap();
+        let app = protected_router(state);
+        let _ = app.oneshot(admin_req(&token)).await.unwrap();
+        let events = audit.list().unwrap();
+        assert_eq!(events.len(), 1);
+        let e = &events[0];
+        assert_eq!(e.actor, "alice");
+        assert_eq!(e.outcome, AuditOutcome::Denied);
+        assert_eq!(e.resource.as_deref(), Some(PERM_USERS_ADMIN));
+    }
+
+    #[tokio::test]
+    async fn unauthenticated_calls_record_no_audit_event() {
+        // 401 (token absent) → on n'arrive jamais à require_permission,
+        // donc aucun event audité.
+        let (state, _, _, audit) = make_state();
+        let app = protected_router(state);
+        let req = Request::builder()
+            .uri("/admin")
+            .body(Body::empty())
+            .unwrap();
+        let _ = app.oneshot(req).await.unwrap();
+        assert!(audit.list().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn multiple_calls_accumulate_audit_events_in_order() {
+        let (state, svc, perms, audit) = make_state();
+        perms.assign_role("alice", &Role::super_admin()).unwrap();
+        let token = svc.issue_access("alice", 900, FIXED_NOW).unwrap();
+        let app = protected_router(state);
+        for _ in 0..3 {
+            let _ = app.clone().oneshot(admin_req(&token)).await.unwrap();
+        }
+        let events = audit.list().unwrap();
+        assert_eq!(events.len(), 3);
+        for e in &events {
+            assert_eq!(e.actor, "alice");
+            assert_eq!(e.outcome, AuditOutcome::Success);
+        }
     }
 }

@@ -80,6 +80,7 @@ dependencies = [
  "autome-engine",
  "axum",
  "http-body-util",
+ "serde_json",
  "tokio",
  "tower",
 ]
