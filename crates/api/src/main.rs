@@ -10,8 +10,8 @@ use std::sync::Arc;
 
 use autome_api::auth::{protected_router, AuthState};
 use autome_core::{
-    Config, InMemoryPermissionStore, InMemoryRevocationStore, PermissionStore, RevocationStore,
-    TokenService,
+    AuditSink, Config, InMemoryPermissionStore, InMemoryRevocationStore, NoopAuditSink,
+    PermissionStore, RevocationStore, TokenService,
 };
 use axum::{routing::get, Router};
 
@@ -41,7 +41,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Arc::new(InMemoryRevocationStore::new());
     let permissions: Arc<dyn PermissionStore + Send + Sync> =
         Arc::new(InMemoryPermissionStore::new());
-    let auth = AuthState::new(TokenService::new(jwt_secret), revocation, permissions);
+    let audit: Arc<dyn AuditSink + Send + Sync> = Arc::new(NoopAuditSink);
+    let auth = AuthState::new(
+        TokenService::new(jwt_secret),
+        revocation,
+        permissions,
+        audit,
+    );
 
     let app = build_router(auth);
     let listener = tokio::net::TcpListener::bind(&config.http_addr).await?;
@@ -69,7 +75,8 @@ mod tests {
             Arc::new(InMemoryRevocationStore::new());
         let permissions: Arc<dyn PermissionStore + Send + Sync> =
             Arc::new(InMemoryPermissionStore::new());
-        let auth = AuthState::new(TokenService::new(b"x"), revocation, permissions);
+        let audit: Arc<dyn AuditSink + Send + Sync> = Arc::new(NoopAuditSink);
+        let auth = AuthState::new(TokenService::new(b"x"), revocation, permissions, audit);
         let _app: Router = build_router(auth);
     }
 }

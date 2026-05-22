@@ -8,6 +8,7 @@
 #![doc(html_no_source)]
 
 pub mod action;
+pub mod audit;
 pub mod auth;
 pub mod config;
 pub mod queue;
@@ -19,6 +20,7 @@ pub mod trigger;
 pub mod workflow;
 
 pub use action::Action;
+pub use audit::{AuditEvent, AuditOutcome, AuditSink, InMemoryAuditSink, NoopAuditSink};
 pub use auth::{
     Argon2PasswordHasher, Claims, InMemoryRevocationStore, PasswordHasher, RevocationStore,
     TokenKind, TokenService,
