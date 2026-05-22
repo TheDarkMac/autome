@@ -9,6 +9,7 @@
 use std::sync::Arc;
 
 use autome_api::auth::{protected_router, AuthState};
+use autome_api::tls::load_rustls_config;
 use autome_core::{
     AuditSink, Config, InMemoryPermissionStore, InMemoryRevocationStore, NoopAuditSink,
     PermissionStore, RevocationStore, TokenService,
@@ -50,12 +51,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     let app = build_router(auth);
-    let listener = tokio::net::TcpListener::bind(&config.http_addr).await?;
-    println!(
-        "autome-api ({:?}) en écoute sur http://{}",
-        config.profile, config.http_addr
-    );
-    axum::serve(listener, app).await?;
+
+    // F6.4 — HTTPS via rustls si `AUTOME_TLS_CERT` + `AUTOME_TLS_KEY`
+    // sont positionnées ; sinon HTTP en clair. Décision all-or-nothing
+    // (pas de fallback silencieux qui dégraderait la sécurité).
+    let tls_cert = std::env::var("AUTOME_TLS_CERT").ok();
+    let tls_key = std::env::var("AUTOME_TLS_KEY").ok();
+    match (tls_cert, tls_key) {
+        (Some(cert), Some(key)) => {
+            let tls_config = load_rustls_config(&cert, &key).await?;
+            let addr: std::net::SocketAddr = config.http_addr.parse()?;
+            println!(
+                "autome-api ({:?}) en écoute sur https://{}  (TLS rustls)",
+                config.profile, addr
+            );
+            axum_server::bind_rustls(addr, tls_config)
+                .serve(app.into_make_service())
+                .await?;
+        }
+        (None, None) => {
+            let listener = tokio::net::TcpListener::bind(&config.http_addr).await?;
+            println!(
+                "autome-api ({:?}) en écoute sur http://{}  (sans TLS)",
+                config.profile, config.http_addr
+            );
+            axum::serve(listener, app).await?;
+        }
+        _ => {
+            return Err(
+                "TLS partiellement configuré : positionnez AUTOME_TLS_CERT *et* AUTOME_TLS_KEY"
+                    .into(),
+            );
+        }
+    }
     Ok(())
 }
 

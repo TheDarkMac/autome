@@ -7,5 +7,8 @@
 //! Modules :
 //! - [`auth`] (F6.1.c) : extractor axum `AuthenticatedUser` qui consomme
 //!   les primitives `core::auth` (TokenService, RevocationStore).
+//! - [`tls`] (F6.4) : chargement de la config TLS rustls depuis des
+//!   fichiers PEM (cert chain + clé privée).
 
 pub mod auth;
+pub mod tls;

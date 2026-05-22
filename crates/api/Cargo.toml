@@ -22,7 +22,15 @@ serde_json = { workspace = true }
 # axum confiné au crate `api` (décision ADR 0001 / F1.2).
 axum = "0.7"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
+# TLS (F6.4)
+rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
+axum-server = { version = "0.7", features = ["tls-rustls"] }
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
+# Tests HTTPS round-trip (F6.4)
+rcgen = "0.13"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+tempfile = "3"
