@@ -111,8 +111,10 @@ name = "autome-connectors"
 version = "0.1.0"
 dependencies = [
  "autome-core",
+ "base64",
  "hex",
  "hmac",
+ "rand 0.8.6",
  "serde",
  "serde_json",
  "sha2",

@@ -21,7 +21,7 @@
 | 3  | Triggers & Actions       | 6        | 6         | ✅ Terminé    |
 | 4  | Connecteurs API          | 5        | 5         | ✅ Terminé    |
 | 5  | Orchestrateur & Scaling  | 6        | 6         | ✅ Terminé    |
-| 6  | Sécurité & Auth          | 6        | 5         | En cours      |
+| 6  | Sécurité & Auth          | 6        | 6         | ✅ Terminé    |
 | 7  | API publique (REST/gRPC) | 4        | 0         | À faire       |
 | 8  | Frontend & Éditeur visuel| 7        | 0         | À faire       |
 | 9  | Tests (TDD)              | 5        | 0         | À faire       |
@@ -29,7 +29,7 @@
 | 11 | Documentation            | 5        | 0         | À faire       |
 | 12 | Exemples de workflows    | 3        | 0         | À faire       |
 
-**Progression totale : 35 / 66 features** (≈ 150 sous-tâches sur les features détaillées)
+**Progression totale : 36 / 66 features** (≈ 150 sous-tâches sur les features détaillées)
 
 > Les features complexes (F1.3, F1.5, F2.*, F4.*, F5.1–F5.4, F6.1–F6.3, F6.5,
 > F8.2–F8.7) sont découpées en sous-tâches `Fx.y.z`. Une feature est `[x]`
@@ -159,10 +159,10 @@
   - [x] F6.1.b — Login → émission JWT (access + refresh)
   - [x] F6.1.c — Middleware de vérification du token
   - [x] F6.1.d — Révocation / rotation des tokens
-- [ ] **F6.2** — OAuth2 (login + autorisation connecteurs tiers)
-  - [ ] F6.2.a — Flow Authorization Code (login)
-  - [ ] F6.2.b — Stockage & refresh des tokens connecteurs
-  - [ ] F6.2.c — Gestion multi-provider
+- [x] **F6.2** — OAuth2 (login + autorisation connecteurs tiers) — _issue #71_
+  - [x] F6.2.a — Flow Authorization Code (login)
+  - [x] F6.2.b — Stockage & refresh des tokens connecteurs
+  - [x] F6.2.c — Gestion multi-provider
 - [x] **F6.3** — Chiffrement des credentials/secrets au repos — _issue #63_
   - [x] F6.3.a — Choix de la stratégie (AES-GCM + KMS / env key)
   - [x] F6.3.b — Chiffrement/déchiffrement transparent en base
@@ -285,3 +285,4 @@
 | 2026-05-21 | F6.5 | RBAC : `core::rbac` (F6.5.a) — `Permission` newtype + constantes (`PERM_WORKFLOWS_READ`/`WRITE`, `PERM_RUNS_EXECUTE`/`READ`, `PERM_CREDENTIALS_MANAGE`, `PERM_USERS_ADMIN`, `PERM_WILDCARD`), `Role` (nom + permissions, builders `super_admin`/`editor`/`viewer`), trait `PermissionStore::permissions_for(user_id)`, impl `InMemoryPermissionStore` (HashMap sous Mutex, `assign_role`/`grant`/`revoke`). `has_permission(set, needed)` honore le wildcard `"*"`. (F6.5.b) Extension `api::auth` : `AuthState` reçoit un `Arc<dyn PermissionStore>` ; méthode `AuthState::require_permission(user, perm) -> Result<(), AuthError>` ; nouveau variant `AuthError::Forbidden(perm)` → **403** (corps `"forbidden: missing '<perm>'"`). Route démo `/auth/admin` protégée par `PERM_USERS_ADMIN`. 14 nouveaux tests core (Permission roundtrip, has_permission positive/négative/wildcard, role builders, store assign/grant/revoke/idempotent/empty) + 5 nouveaux tests api (admin OK avec super_admin, **403 avec viewer**, 403 sans aucun rôle, 401 si token absent avant check perm, OK avec grant individuel). 321 tests workspace. | — |
 | 2026-05-21 | F6.6 | Audit log : `core::audit` (F6.6.a/b) — `AuditEvent { timestamp_ms, actor, action, resource, outcome, metadata }` sérialisable JSON (snake_case outcome), `AuditOutcome { Success, Failure, Denied }` (la distinction `Failure`=technique vs `Denied`=refus auth évite de noyer les 403 légitimes dans le bruit des 500), trait `AuditSink` (append-only, `record`/`list`), impl `InMemoryAuditSink` (Mutex+Vec, ordre FIFO d'insertion) + impl `NoopAuditSink` (drops events, pour désactiver). (F6.6.c) Intégration `api::auth` : `AuthState` reçoit un `Arc<dyn AuditSink>` (toujours présent, possiblement `Noop`) ; `AuthState::require_permission` enregistre systématiquement un event `auth.permission_check` (`Success` ou `Denied`, actor=user_id, resource=perm demandée, timestamp issu du `Clock`). Une erreur d'audit n'invalide pas la décision (log stderr + continue). 12 nouveaux tests (8 core : event builder/JSON roundtrip/outcomes serialization, sink FIFO/snapshot/Send+Sync/Noop drop ; 4 api : record success+denied audit, pas d'event si 401 token absent, accumulation en ordre sur plusieurs appels). 333 tests workspace. | — |
 | 2026-05-22 | F6.4 | TLS sur l'API (HTTPS) : F6.4.a `api::tls` — `load_rustls_config(cert_path, key_path) -> RustlsConfig` qui lit cert chain + clé privée PEM (PKCS#1/8/SEC1 acceptés via `rustls-pemfile`), installe le `CryptoProvider` ring de rustls de façon idempotente via `OnceLock` (workspace `rustls` configuré `default-features = false, features = ["ring", "std", "tls12", "logging"]` — pas de C deps via aws-lc-rs). F6.4.b wiring `main` : si `AUTOME_TLS_CERT` + `AUTOME_TLS_KEY` sont positionnées, bind `axum_server::bind_rustls` ; sinon HTTP en clair ; positionnement partiel (un seul des deux) → erreur explicite (pas de fallback silencieux). F6.4.c test d'intégration `tests/tls.rs` : génère cert self-signed via `rcgen`, démarre un mini serveur HTTPS sur port éphémère, GET `/health` via `reqwest` (cert ajouté en root) → 200 OK ; **+** test négatif sans trust → erreur TLS rejet. Nouvelles deps : `rustls` + `rustls-pemfile` (workspace), `axum-server` (api), `rcgen` + `reqwest` + `tempfile` (api dev-deps). 11 nouveaux tests (7 unit loader + 2 integration HTTPS + 2 main bin checks). 344 tests workspace. | — |
+| 2026-05-23 | F6.2 | OAuth2 Authorization Code + PKCE (connecteurs tiers) : `connectors::oauth` — F6.2.c `OAuthProviderConfig` + `OAuthRegistry` (HashMap, `register`/`get`/`list`, écrase OK sur rotation client_secret) ; F6.2.a PKCE S256 (`generate_pkce`: verifier 32 octets aléatoires base64url, challenge = `base64url(sha256(verifier))`, vérifié contre vecteur FIPS SHA-256("abc")) + `generate_state` (CSRF) ; `OAuthClient<C: HttpClient>::start_authorization` construit l'URL d'autorisation (client_id/redirect_uri/response_type=code/scope/state/code_challenge/code_challenge_method=S256, ordre fixe), `exchange_code` POST form-urlencoded `application/x-www-form-urlencoded` au token endpoint (grant_type=authorization_code, parse `TokenSet { access_token, refresh_token?, expires_at_ms (= now+expires_in*1000), token_type (défaut "Bearer"), scope? }`), `refresh` POST grant_type=refresh_token (ne fabrique pas de refresh_token si le provider l'omet). F6.2.b `ConnectorTokenStore` trait + impl `InMemoryConnectorTokenStore<K: KeyProvider>` — sérialise `TokenSet` en JSON puis chiffre via `EnvelopeCipher` (F6.3), test explicite que le token en clair **n'apparaît pas** au repos. Nouvelles deps connectors : `rand` + `base64`. 31 nouveaux tests (6 pkce + 5 provider + 14 client + 7 store). 375 tests workspace. **Domaine 6 (Sécurité & Auth) terminé — 6/6.** | — |

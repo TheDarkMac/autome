@@ -10,6 +10,7 @@ pub mod github;
 pub mod gmail;
 pub mod http;
 pub mod notion;
+pub mod oauth;
 pub mod polling;
 pub mod schedule;
 pub mod sdk;
