@@ -8,6 +8,12 @@
 //! **Hors périmètre F1.4** : la *validation* du graphe (détection de
 //! cycles, cohérence des ports, node racine unique) relève de **F2.1**.
 //! Ici on ne fait que modéliser et offrir des accès en lecture.
+//!
+//! Le sous-module [`repo`] (F7.1.a) expose un trait `WorkflowRepository`
+//! pour persister/lister/charger les workflows — consommé par l'API
+//! publique pour le CRUD HTTP.
+
+pub mod repo;
 
 use serde::{Deserialize, Serialize};
 

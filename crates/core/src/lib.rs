@@ -38,6 +38,9 @@ pub use scheduler::{
 };
 pub use secrets::{EnvelopeCipher, InMemoryKeyProvider, KeyProvider};
 pub use trigger::{Trigger, TriggerEvent};
+pub use workflow::repo::{
+    InMemoryWorkflowRepository, Pagination, WorkflowPage, WorkflowRepository,
+};
 pub use workflow::{Edge, Node, NodeKind, WorkflowGraph, WorkflowId};
 
 use thiserror::Error;

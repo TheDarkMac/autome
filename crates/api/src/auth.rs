@@ -30,7 +30,7 @@ use autome_core::{
     TokenService,
 };
 use axum::{
-    extract::FromRequestParts,
+    extract::{FromRef, FromRequestParts},
     http::{request::Parts, StatusCode},
     response::{IntoResponse, Response},
     routing::get,
@@ -215,13 +215,15 @@ impl AuthenticatedUser {
 }
 
 #[axum::async_trait]
-impl FromRequestParts<AuthState> for AuthenticatedUser {
+impl<S> FromRequestParts<S> for AuthenticatedUser
+where
+    AuthState: FromRef<S>,
+    S: Send + Sync,
+{
     type Rejection = AuthError;
 
-    async fn from_request_parts(
-        parts: &mut Parts,
-        state: &AuthState,
-    ) -> Result<Self, Self::Rejection> {
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+        let auth = AuthState::from_ref(state);
         let header = parts
             .headers
             .get("Authorization")
@@ -230,13 +232,13 @@ impl FromRequestParts<AuthState> for AuthenticatedUser {
             .map_err(|_| AuthError::Malformed)?;
         let token = header.strip_prefix("Bearer ").ok_or(AuthError::Malformed)?;
 
-        let now = state.clock.now_unix_seconds();
-        let claims = state
+        let now = auth.clock.now_unix_seconds();
+        let claims = auth
             .token_service
             .verify(token, now)
             .map_err(|e| AuthError::Invalid(e.to_string()))?;
 
-        let revoked = state
+        let revoked = auth
             .revocation
             .is_revoked(&claims.jti)
             .map_err(|e| AuthError::Internal(e.to_string()))?;
