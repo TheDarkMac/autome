@@ -6,6 +6,7 @@
 //! [`sdk`] (F4.5) ; un connecteur exemple complet est livré dans
 //! [`template`].
 
+pub mod credentials;
 pub mod github;
 pub mod gmail;
 pub mod http;
@@ -17,6 +18,8 @@ pub mod sdk;
 pub mod slack;
 pub mod template;
 pub mod webhook;
+
+pub use credentials::{CredentialService, CredentialSummary, OAuthCredentialService, ProviderInfo};
 
 pub use github::{
     verify_github_signature, GithubAuth, GithubCloseIssue, GithubCommentIssue, GithubConnector,
