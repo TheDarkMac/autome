@@ -11,6 +11,7 @@
 //!   fichiers PEM (cert chain + clé privée).
 
 pub mod auth;
+pub mod credentials;
 pub mod runs;
 pub mod tls;
 pub mod workflows;

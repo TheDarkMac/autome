@@ -65,6 +65,10 @@ pub trait ConnectorTokenStore {
 
     /// Supprime les tokens. No-op si absents.
     fn delete(&self, user_id: &str, provider_id: &str) -> Result<()>;
+
+    /// Liste les `provider_id` pour lesquels `user_id` a au moins un
+    /// credential stocké. Tri lexical ascendant pour stabilité des tests.
+    fn list_by_user(&self, user_id: &str) -> Result<Vec<String>>;
 }
 
 /// Impl in-process : HashMap sous Mutex, valeurs chiffrées via `EnvelopeCipher`.
@@ -129,6 +133,20 @@ impl<K: KeyProvider> ConnectorTokenStore for InMemoryConnectorTokenStore<K> {
             .map_err(|_| Error::Invalid("token store lock empoisonné".into()))?
             .remove(&(user_id.to_string(), provider_id.to_string()));
         Ok(())
+    }
+
+    fn list_by_user(&self, user_id: &str) -> Result<Vec<String>> {
+        let map = self
+            .inner
+            .lock()
+            .map_err(|_| Error::Invalid("token store lock empoisonné".into()))?;
+        let mut providers: Vec<String> = map
+            .keys()
+            .filter(|(u, _)| u == user_id)
+            .map(|(_, p)| p.clone())
+            .collect();
+        providers.sort();
+        Ok(providers)
     }
 }
 
@@ -231,6 +249,28 @@ mod tests {
             "bob@google"
         );
         assert_eq!(store.len(), 3);
+    }
+
+    #[test]
+    fn list_by_user_returns_sorted_provider_ids() {
+        let store = make_store();
+        store.store("alice", "slack", &sample_tokens()).unwrap();
+        store.store("alice", "github", &sample_tokens()).unwrap();
+        store.store("alice", "notion", &sample_tokens()).unwrap();
+        store.store("bob", "google", &sample_tokens()).unwrap();
+
+        let alice = store.list_by_user("alice").unwrap();
+        assert_eq!(alice, vec!["github", "notion", "slack"]);
+        let bob = store.list_by_user("bob").unwrap();
+        assert_eq!(bob, vec!["google"]);
+    }
+
+    #[test]
+    fn list_by_user_returns_empty_for_unknown_user() {
+        let store = make_store();
+        store.store("alice", "google", &sample_tokens()).unwrap();
+        let result = store.list_by_user("charlie").unwrap();
+        assert!(result.is_empty());
     }
 
     #[test]

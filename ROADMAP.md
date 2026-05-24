@@ -185,7 +185,10 @@
   - [x] F7.2.c — `GET /runs/:run_id` (404 si inconnu)
   - [x] F7.2.d — `GET /workflows/:id/runs` (pagination, plus récent d'abord)
   - [x] F7.2.e — RBAC `runs.execute|read` + audit log par route
-- [ ] **F7.3** — Endpoints credentials / connecteurs
+- [~] **F7.3** — Endpoints credentials / connecteurs — _issue #77_
+  - [ ] F7.3.a — `CredentialService` (orchestration `OAuthClient` + `ConnectorTokenStore`)
+  - [ ] F7.3.b — REST `/credentials[/providers|/:provider/(authorize|callback)]`
+  - [ ] F7.3.c — RBAC `credentials.manage` + audit log par appel
 - [ ] **F7.4** — Spec OpenAPI (ou proto gRPC) générée
 
 ## 8. Frontend & Éditeur visuel
