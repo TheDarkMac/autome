@@ -32,6 +32,7 @@ use std::sync::Mutex;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::workflow::repo::Pagination;
 use crate::{Error, Result};
 
 /// État global d'un run.
@@ -130,6 +131,21 @@ pub trait RunStateStore {
     /// Marque un run comme `Failed` avec une raison, et pose `finished_at_ms`.
     /// `Err` si le run est inconnu. Idempotent sur un run déjà `Failed`.
     fn mark_failed(&self, run_id: &str, reason: &str, now_ms: i64) -> Result<()>;
+
+    /// Liste paginée des runs d'un workflow, triés par `created_at_ms`
+    /// décroissant (plus récent d'abord), ordre stabilisé par `run_id` à
+    /// égalité de timestamp. Consommé par l'endpoint API
+    /// `GET /workflows/{id}/runs` (F7.2.d).
+    fn list_by_workflow(&self, workflow_id: &str, paging: Pagination) -> Result<RunListPage>;
+}
+
+/// Résultat paginé de [`RunStateStore::list_by_workflow`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct RunListPage {
+    /// Items de la page (snapshot complet, plus récent d'abord).
+    pub items: Vec<RunCheckpoint>,
+    /// Total **hors pagination** pour le workflow demandé.
+    pub total: usize,
 }
 
 // ────────────────────── InMemoryRunStateStore ──────────────────────
@@ -198,6 +214,33 @@ impl RunStateStore for InMemoryRunStateStore {
         snap.error = Some(reason.to_string());
         snap.finished_at_ms = Some(now_ms);
         Ok(())
+    }
+
+    fn list_by_workflow(&self, workflow_id: &str, paging: Pagination) -> Result<RunListPage> {
+        let map = self
+            .inner
+            .lock()
+            .map_err(|_| Error::Invalid("run_state lock empoisonné".into()))?;
+        let mut all: Vec<RunCheckpoint> = map
+            .values()
+            .filter(|c| c.workflow_id == workflow_id)
+            .cloned()
+            .collect();
+        // Tri : created_at_ms desc, puis run_id asc pour stabiliser à
+        // égalité de timestamp (cas in-memory où plusieurs runs sont
+        // insérés dans la même ms).
+        all.sort_by(|a, b| {
+            b.created_at_ms
+                .cmp(&a.created_at_ms)
+                .then_with(|| a.run_id.cmp(&b.run_id))
+        });
+        let total = all.len();
+        let items = all
+            .into_iter()
+            .skip(paging.offset)
+            .take(paging.limit)
+            .collect();
+        Ok(RunListPage { items, total })
     }
 }
 
@@ -391,5 +434,88 @@ mod tests {
     fn in_memory_store_is_send_sync() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<InMemoryRunStateStore>();
+    }
+
+    // ───── F7.2.d — list_by_workflow ─────
+
+    fn run_with_created(run_id: &str, workflow_id: &str, created_at_ms: i64) -> RunCheckpoint {
+        let mut s = RunCheckpoint::queued(run_id, workflow_id, 1, "manual", created_at_ms);
+        s.status = RunStatus::Queued;
+        s
+    }
+
+    #[test]
+    fn list_by_workflow_filters_by_workflow_id() {
+        let store = InMemoryRunStateStore::new();
+        store
+            .checkpoint(&run_with_created("r1", "wf-a", 100))
+            .unwrap();
+        store
+            .checkpoint(&run_with_created("r2", "wf-b", 200))
+            .unwrap();
+        store
+            .checkpoint(&run_with_created("r3", "wf-a", 300))
+            .unwrap();
+        let page = store
+            .list_by_workflow("wf-a", Pagination::default())
+            .unwrap();
+        assert_eq!(page.total, 2);
+        assert_eq!(page.items.len(), 2);
+        for item in &page.items {
+            assert_eq!(item.workflow_id, "wf-a");
+        }
+    }
+
+    #[test]
+    fn list_by_workflow_orders_by_created_desc() {
+        let store = InMemoryRunStateStore::new();
+        store
+            .checkpoint(&run_with_created("old", "wf", 100))
+            .unwrap();
+        store
+            .checkpoint(&run_with_created("new", "wf", 300))
+            .unwrap();
+        store
+            .checkpoint(&run_with_created("mid", "wf", 200))
+            .unwrap();
+        let page = store.list_by_workflow("wf", Pagination::default()).unwrap();
+        let ids: Vec<&str> = page.items.iter().map(|c| c.run_id.as_str()).collect();
+        assert_eq!(ids, vec!["new", "mid", "old"]);
+    }
+
+    #[test]
+    fn list_by_workflow_paginates() {
+        let store = InMemoryRunStateStore::new();
+        for i in 0..5 {
+            // created_at distinct pour ordre stable
+            store
+                .checkpoint(&run_with_created(&format!("r{i}"), "wf", 1000 - i as i64))
+                .unwrap();
+        }
+        let page = store
+            .list_by_workflow(
+                "wf",
+                Pagination {
+                    offset: 1,
+                    limit: 2,
+                },
+            )
+            .unwrap();
+        assert_eq!(page.total, 5);
+        assert_eq!(page.items.len(), 2);
+        // Ordre desc par created → r0 (1000), r1 (999), r2 (998)...
+        // offset=1, limit=2 → r1, r2
+        let ids: Vec<&str> = page.items.iter().map(|c| c.run_id.as_str()).collect();
+        assert_eq!(ids, vec!["r1", "r2"]);
+    }
+
+    #[test]
+    fn list_by_workflow_returns_empty_when_unknown() {
+        let store = InMemoryRunStateStore::new();
+        let page = store
+            .list_by_workflow("nope", Pagination::default())
+            .unwrap();
+        assert_eq!(page.total, 0);
+        assert!(page.items.is_empty());
     }
 }
