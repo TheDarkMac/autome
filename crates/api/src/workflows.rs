@@ -28,6 +28,7 @@ use axum::{
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
+use utoipa::{IntoParams, ToSchema};
 
 use crate::auth::{AuthError, AuthState, AuthenticatedUser};
 
@@ -56,7 +57,7 @@ impl FromRef<WorkflowsState> for AuthState {
 }
 
 /// Paramètres de query pour la pagination (`?offset=0&limit=50`).
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, IntoParams)]
 pub struct ListQuery {
     /// Offset, défaut 0.
     #[serde(default)]
@@ -67,9 +68,10 @@ pub struct ListQuery {
 }
 
 /// Réponse JSON de [`list_workflows`].
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct ListResponse {
-    /// Items de la page.
+    /// Items de la page (workflows complets — schéma libre côté OpenAPI).
+    #[schema(value_type = Vec<Object>)]
     pub items: Vec<WorkflowGraph>,
     /// Total avant pagination.
     pub total: usize,
@@ -129,6 +131,18 @@ fn audit_event(
 }
 
 /// `GET /workflows?offset=&limit=` — liste paginée (perm `workflows.read`).
+#[utoipa::path(
+    get,
+    path = "/workflows",
+    tag = "workflows",
+    params(ListQuery),
+    responses(
+        (status = 200, description = "Page de workflows", body = ListResponse),
+        (status = 401, description = "Token absent ou invalide"),
+        (status = 403, description = "Manque `workflows.read`")
+    ),
+    security(("bearer" = []))
+)]
 pub async fn list_workflows(
     user: AuthenticatedUser,
     State(state): State<WorkflowsState>,
@@ -159,6 +173,19 @@ pub async fn list_workflows(
 }
 
 /// `POST /workflows` — création (201 Created, perm `workflows.write`).
+#[utoipa::path(
+    post,
+    path = "/workflows",
+    tag = "workflows",
+    request_body(content = serde_json::Value, description = "Workflow graph complet"),
+    responses(
+        (status = 201, description = "Créé", body = serde_json::Value),
+        (status = 401, description = "Token absent ou invalide"),
+        (status = 403, description = "Manque `workflows.write`"),
+        (status = 409, description = "Workflow déjà existant")
+    ),
+    security(("bearer" = []))
+)]
 pub async fn create_workflow(
     user: AuthenticatedUser,
     State(state): State<WorkflowsState>,
@@ -196,6 +223,19 @@ pub async fn create_workflow(
 }
 
 /// `GET /workflows/{id}` — détail (perm `workflows.read`).
+#[utoipa::path(
+    get,
+    path = "/workflows/{id}",
+    tag = "workflows",
+    params(("id" = String, Path, description = "Identifiant du workflow")),
+    responses(
+        (status = 200, description = "Détail", body = serde_json::Value),
+        (status = 401, description = "Token absent ou invalide"),
+        (status = 403, description = "Manque `workflows.read`"),
+        (status = 404, description = "Workflow inconnu")
+    ),
+    security(("bearer" = []))
+)]
 pub async fn get_workflow(
     user: AuthenticatedUser,
     State(state): State<WorkflowsState>,
@@ -232,6 +272,21 @@ pub async fn get_workflow(
 
 /// `PUT /workflows/{id}` — remplacement complet (perm `workflows.write`).
 /// L'`id` du path doit correspondre à celui dans le body.
+#[utoipa::path(
+    put,
+    path = "/workflows/{id}",
+    tag = "workflows",
+    params(("id" = String, Path, description = "Identifiant du workflow")),
+    request_body(content = serde_json::Value, description = "Workflow graph complet"),
+    responses(
+        (status = 200, description = "Remplacé", body = serde_json::Value),
+        (status = 400, description = "id path ≠ id body"),
+        (status = 401, description = "Token absent ou invalide"),
+        (status = 403, description = "Manque `workflows.write`"),
+        (status = 404, description = "Workflow inconnu")
+    ),
+    security(("bearer" = []))
+)]
 pub async fn update_workflow(
     user: AuthenticatedUser,
     State(state): State<WorkflowsState>,
@@ -275,6 +330,18 @@ pub async fn update_workflow(
 }
 
 /// `DELETE /workflows/{id}` — suppression (204, idempotent, perm `workflows.write`).
+#[utoipa::path(
+    delete,
+    path = "/workflows/{id}",
+    tag = "workflows",
+    params(("id" = String, Path, description = "Identifiant du workflow")),
+    responses(
+        (status = 204, description = "Supprimé (idempotent)"),
+        (status = 401, description = "Token absent ou invalide"),
+        (status = 403, description = "Manque `workflows.write`")
+    ),
+    security(("bearer" = []))
+)]
 pub async fn delete_workflow(
     user: AuthenticatedUser,
     State(state): State<WorkflowsState>,

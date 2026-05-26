@@ -32,6 +32,7 @@ use axum::{
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
+use utoipa::ToSchema;
 
 use crate::auth::{AuthError, AuthState, AuthenticatedUser};
 
@@ -60,7 +61,7 @@ impl FromRef<CredentialsState> for AuthState {
 // ───────────────────────── DTO ─────────────────────────
 
 /// Description publique d'un provider — pas de `client_secret`.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct ProviderDto {
     /// Identifiant stable du provider.
     pub provider_id: String,
@@ -69,7 +70,7 @@ pub struct ProviderDto {
 }
 
 /// Réponse de `GET /credentials/providers`.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct ListProvidersResponse {
     /// Providers déclarés, tri lexical par `provider_id`.
     pub items: Vec<ProviderDto>,
@@ -77,7 +78,7 @@ pub struct ListProvidersResponse {
 
 /// Réponse de `POST /credentials/{provider}/authorize` (PKCE côté SPA :
 /// le caller conserve `state` + `code_verifier` jusqu'au callback).
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct AuthorizeResponse {
     /// URL absolue où rediriger l'utilisateur.
     pub authorize_url: String,
@@ -88,7 +89,7 @@ pub struct AuthorizeResponse {
 }
 
 /// Body de `POST /credentials/{provider}/callback`.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct CallbackBody {
     /// `code` retourné par le provider à l'utilisateur.
     pub code: String,
@@ -100,7 +101,7 @@ pub struct CallbackBody {
 }
 
 /// Résumé d'un credential — jamais le token brut.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct CredentialDto {
     /// Provider concerné.
     pub provider_id: String,
@@ -124,7 +125,7 @@ impl From<autome_connectors::CredentialSummary> for CredentialDto {
 }
 
 /// Réponse de `GET /credentials`.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct ListCredentialsResponse {
     /// Credentials du user courant, tri lexical par `provider_id`.
     pub items: Vec<CredentialDto>,
@@ -181,6 +182,17 @@ fn audit_event(
 // ───────────────────────── handlers ─────────────────────────
 
 /// `GET /credentials/providers` — liste les providers OAuth.
+#[utoipa::path(
+    get,
+    path = "/credentials/providers",
+    tag = "credentials",
+    responses(
+        (status = 200, description = "Providers OAuth déclarés (sans `client_secret`)", body = ListProvidersResponse),
+        (status = 401, description = "Token absent ou invalide"),
+        (status = 403, description = "Manque `credentials.manage`")
+    ),
+    security(("bearer" = []))
+)]
 pub async fn list_providers(
     user: AuthenticatedUser,
     State(state): State<CredentialsState>,
@@ -208,6 +220,19 @@ pub async fn list_providers(
 }
 
 /// `POST /credentials/{provider}/authorize` — démarre un flow OAuth.
+#[utoipa::path(
+    post,
+    path = "/credentials/{provider}/authorize",
+    tag = "credentials",
+    params(("provider" = String, Path, description = "Identifiant du provider OAuth")),
+    responses(
+        (status = 200, description = "URL d'autorisation + PKCE", body = AuthorizeResponse),
+        (status = 401, description = "Token absent ou invalide"),
+        (status = 403, description = "Manque `credentials.manage`"),
+        (status = 404, description = "Provider inconnu")
+    ),
+    security(("bearer" = []))
+)]
 pub async fn start_authorize(
     user: AuthenticatedUser,
     State(state): State<CredentialsState>,
@@ -247,6 +272,20 @@ pub async fn start_authorize(
 }
 
 /// `POST /credentials/{provider}/callback` — échange `code` → tokens.
+#[utoipa::path(
+    post,
+    path = "/credentials/{provider}/callback",
+    tag = "credentials",
+    params(("provider" = String, Path, description = "Identifiant du provider OAuth")),
+    request_body(content = CallbackBody, description = "`code` + `state` + `code_verifier` du callback OAuth"),
+    responses(
+        (status = 200, description = "Tokens persistés (chiffrés) — résumé safe", body = CredentialDto),
+        (status = 401, description = "Token absent ou invalide"),
+        (status = 403, description = "Manque `credentials.manage`"),
+        (status = 502, description = "Échec OAuth en amont (rejet du provider)")
+    ),
+    security(("bearer" = []))
+)]
 pub async fn complete_authorize(
     user: AuthenticatedUser,
     State(state): State<CredentialsState>,
@@ -289,6 +328,17 @@ pub async fn complete_authorize(
 }
 
 /// `GET /credentials` — résumé des credentials de l'utilisateur courant.
+#[utoipa::path(
+    get,
+    path = "/credentials",
+    tag = "credentials",
+    responses(
+        (status = 200, description = "Credentials de l'utilisateur (sans tokens bruts)", body = ListCredentialsResponse),
+        (status = 401, description = "Token absent ou invalide"),
+        (status = 403, description = "Manque `credentials.manage`")
+    ),
+    security(("bearer" = []))
+)]
 pub async fn list_credentials(
     user: AuthenticatedUser,
     State(state): State<CredentialsState>,
@@ -314,6 +364,18 @@ pub async fn list_credentials(
 }
 
 /// `DELETE /credentials/{provider}` — révoque un credential.
+#[utoipa::path(
+    delete,
+    path = "/credentials/{provider}",
+    tag = "credentials",
+    params(("provider" = String, Path, description = "Identifiant du provider OAuth")),
+    responses(
+        (status = 204, description = "Révoqué (idempotent)"),
+        (status = 401, description = "Token absent ou invalide"),
+        (status = 403, description = "Manque `credentials.manage`")
+    ),
+    security(("bearer" = []))
+)]
 pub async fn delete_credential(
     user: AuthenticatedUser,
     State(state): State<CredentialsState>,

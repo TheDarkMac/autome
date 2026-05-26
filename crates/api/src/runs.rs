@@ -27,6 +27,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use utoipa::{IntoParams, ToSchema};
 
 use crate::auth::{AuthError, AuthState, AuthenticatedUser};
 
@@ -71,10 +72,11 @@ impl FromRef<RunsState> for AuthState {
 }
 
 /// Body JSON du POST. `payload` est libre (transmis tel quel au worker).
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, ToSchema)]
 pub struct CreateRunBody {
     /// Payload initial du run (entrées du workflow). `null` si absent.
     #[serde(default)]
+    #[schema(value_type = Object)]
     pub payload: Value,
     /// Version du workflow à figer. Si absent, on prend `1` (la base
     /// PostgreSQL gérera l'auto-incrément en F1.5/F7.x).
@@ -83,7 +85,7 @@ pub struct CreateRunBody {
 }
 
 /// Réponse du POST.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct CreateRunResponse {
     /// Identifiant du run créé (string opaque côté API).
     pub run_id: String,
@@ -92,7 +94,7 @@ pub struct CreateRunResponse {
 }
 
 /// Paramètres de query pour la pagination (`?offset=0&limit=50`).
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, IntoParams)]
 pub struct ListQuery {
     /// Offset, défaut 0.
     #[serde(default)]
@@ -103,9 +105,10 @@ pub struct ListQuery {
 }
 
 /// Réponse JSON de la liste paginée.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct ListRunsResponse {
-    /// Items de la page (plus récent en premier).
+    /// Items de la page (plus récent en premier — schéma libre côté OpenAPI).
+    #[schema(value_type = Vec<Object>)]
     pub items: Vec<RunCheckpoint>,
     /// Total avant pagination.
     pub total: usize,
@@ -157,6 +160,20 @@ fn audit_event(
 }
 
 /// `POST /workflows/{id}/runs` — démarre un run (perm `runs.execute`).
+#[utoipa::path(
+    post,
+    path = "/workflows/{id}/runs",
+    tag = "runs",
+    params(("id" = String, Path, description = "Identifiant du workflow à exécuter")),
+    request_body(content = CreateRunBody, description = "Payload initial + version optionnelle"),
+    responses(
+        (status = 202, description = "Run accepté en queue", body = CreateRunResponse),
+        (status = 401, description = "Token absent ou invalide"),
+        (status = 403, description = "Manque `runs.execute`"),
+        (status = 404, description = "Workflow inconnu")
+    ),
+    security(("bearer" = []))
+)]
 pub async fn create_run(
     user: AuthenticatedUser,
     State(state): State<RunsState>,
@@ -217,6 +234,19 @@ pub async fn create_run(
 }
 
 /// `GET /runs/{run_id}` — détail d'un run (perm `runs.read`).
+#[utoipa::path(
+    get,
+    path = "/runs/{run_id}",
+    tag = "runs",
+    params(("run_id" = String, Path, description = "Identifiant du run")),
+    responses(
+        (status = 200, description = "Détail du run", body = serde_json::Value),
+        (status = 401, description = "Token absent ou invalide"),
+        (status = 403, description = "Manque `runs.read`"),
+        (status = 404, description = "Run inconnu")
+    ),
+    security(("bearer" = []))
+)]
 pub async fn get_run(
     user: AuthenticatedUser,
     State(state): State<RunsState>,
@@ -252,6 +282,21 @@ pub async fn get_run(
 }
 
 /// `GET /workflows/{id}/runs?offset=&limit=` — liste paginée (perm `runs.read`).
+#[utoipa::path(
+    get,
+    path = "/workflows/{id}/runs",
+    tag = "runs",
+    params(
+        ("id" = String, Path, description = "Identifiant du workflow"),
+        ListQuery
+    ),
+    responses(
+        (status = 200, description = "Page de runs (plus récent en premier)", body = ListRunsResponse),
+        (status = 401, description = "Token absent ou invalide"),
+        (status = 403, description = "Manque `runs.read`")
+    ),
+    security(("bearer" = []))
+)]
 pub async fn list_runs(
     user: AuthenticatedUser,
     State(state): State<RunsState>,

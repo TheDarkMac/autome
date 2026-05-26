@@ -12,6 +12,7 @@
 
 pub mod auth;
 pub mod credentials;
+pub mod openapi;
 pub mod runs;
 pub mod tls;
 pub mod workflows;
