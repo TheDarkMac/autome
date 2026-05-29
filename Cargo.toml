@@ -45,6 +45,8 @@ base64 = "0.22"
 # TLS (F6.4) — server HTTPS rustls (provider explicite : ring)
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 rustls-pemfile = "2"
+# Spec OpenAPI générée à la compilation (F7.4)
+utoipa = { version = "5", features = ["axum_extras"] }
 
 # Lints partagés (F1.3.g) : appliqués via `[lints] workspace = true` dans
 # chaque crate. `clippy -- -D warnings` en CI (cf. CONVENTIONS §4/§5).

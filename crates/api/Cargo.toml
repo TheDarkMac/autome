@@ -28,6 +28,8 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
 rustls = { workspace = true }
 rustls-pemfile = { workspace = true }
 axum-server = { version = "0.7", features = ["tls-rustls"] }
+# Spec OpenAPI (F7.4)
+utoipa = { workspace = true }
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
