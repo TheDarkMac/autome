@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { apiBaseUrl, fetchOpenApi, type OpenApiSpec } from "./api";
+import { NodeCanvas } from "./NodeCanvas";
 
 type Status =
   | { kind: "idle" }
@@ -7,7 +8,8 @@ type Status =
   | { kind: "ok"; spec: OpenApiSpec }
   | { kind: "error"; message: string };
 
-/** Page d'accueil F8.1 — skeleton qui valide l'intégration backend. */
+/** Page d'accueil F8.1 — skeleton qui valide l'intégration backend.
+ *  F8.2 ajoute le canvas d'édition (drag-and-drop) sous le bandeau. */
 export function App(): JSX.Element {
   const [status, setStatus] = useState<Status>({ kind: "idle" });
 
@@ -27,25 +29,29 @@ export function App(): JSX.Element {
   }, []);
 
   return (
-    <main className="min-h-screen px-6 py-12 sm:px-12">
-      <header className="mx-auto max-w-3xl">
-        <h1 className="text-4xl font-semibold tracking-tight">Autome</h1>
-        <p className="mt-2 text-neutral-600">
-          Éditeur visuel de workflows — frontend en cours d'amorçage (F8.1).
+    <main className="flex min-h-screen flex-col bg-neutral-50">
+      <header className="border-b border-neutral-200 bg-white px-6 py-4 sm:px-10">
+        <h1 className="text-2xl font-semibold tracking-tight">Autome</h1>
+        <p className="mt-1 text-sm text-neutral-500">
+          Éditeur visuel de workflows — F8.2 canvas drag-and-drop.
         </p>
       </header>
 
       <section
         aria-labelledby="backend-status"
-        className="mx-auto mt-10 max-w-3xl rounded-lg border border-neutral-200 bg-white p-6 shadow-sm"
+        className="border-b border-neutral-200 bg-white px-6 py-3 text-sm sm:px-10"
       >
-        <h2 id="backend-status" className="text-lg font-medium">
-          Connexion backend
-        </h2>
-        <p className="mt-1 text-sm text-neutral-500">
-          Cible : <code className="font-mono">{apiBaseUrl()}/openapi.json</code>
-        </p>
+        <span id="backend-status" className="font-medium">
+          Backend
+        </span>{" "}
+        <span className="text-neutral-500">
+          ({apiBaseUrl()}/openapi.json)
+        </span>{" "}
         <BackendStatus status={status} />
+      </section>
+
+      <section className="flex-1">
+        <NodeCanvas />
       </section>
     </main>
   );
@@ -56,25 +62,24 @@ function BackendStatus({ status }: { status: Status }): JSX.Element {
     case "idle":
     case "loading":
       return (
-        <p className="mt-4 text-neutral-700" role="status">
-          Chargement…
-        </p>
+        <span className="text-neutral-700" role="status">
+          chargement…
+        </span>
       );
     case "ok": {
       const paths = Object.keys(status.spec.paths).length;
       return (
-        <p className="mt-4 text-emerald-700" role="status">
-          OK — <strong>{status.spec.info.title}</strong> v
-          {status.spec.info.version} expose {paths} endpoint
-          {paths > 1 ? "s" : ""}.
-        </p>
+        <span className="text-emerald-700" role="status">
+          OK · {status.spec.info.title} v{status.spec.info.version} ({paths}{" "}
+          endpoint{paths > 1 ? "s" : ""})
+        </span>
       );
     }
     case "error":
       return (
-        <p className="mt-4 text-rose-700" role="alert">
-          Erreur : {status.message}
-        </p>
+        <span className="text-rose-700" role="alert">
+          erreur : {status.message}
+        </span>
       );
   }
 }

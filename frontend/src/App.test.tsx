@@ -42,7 +42,7 @@ describe("<App />", () => {
       .mockRejectedValue(new Error("ECONNREFUSED")) as typeof fetch;
     render(<App />);
     await waitFor(() => {
-      expect(screen.getByRole("alert")).toHaveTextContent(/Erreur/);
+      expect(screen.getByRole("alert")).toHaveTextContent(/erreur/i);
     });
   });
 });
