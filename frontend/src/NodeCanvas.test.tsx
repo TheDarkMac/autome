@@ -2,7 +2,22 @@ import { describe, expect, it, vi } from "vitest";
 import { fireEvent, render, screen } from "@testing-library/react";
 
 import { NodeCanvas } from "./NodeCanvas";
+import { DND_MIME, STATIC_CATALOG, type CatalogItem } from "./catalog";
 import { buildCanvasNode, type WireGraph } from "./graph";
+
+/** Construit un DataTransfer compatible jsdom pour `fireEvent.drop`. */
+function makeDataTransfer(item: CatalogItem): DataTransfer {
+  const store = new Map<string, string>();
+  store.set(DND_MIME, JSON.stringify(item));
+  return {
+    getData: (type: string) => store.get(type) ?? "",
+    setData: (type: string, value: string) => {
+      store.set(type, value);
+    },
+    dropEffect: "move",
+    effectAllowed: "move",
+  } as unknown as DataTransfer;
+}
 
 describe("<NodeCanvas />", () => {
   it("starts empty and exposes a serialized graph", () => {
@@ -15,23 +30,51 @@ describe("<NodeCanvas />", () => {
     expect(lastCall?.edges).toHaveLength(0);
   });
 
-  it("appends a node when a palette button is clicked", () => {
+  it("appends a node when a palette item is dropped on the canvas (F8.3.b)", () => {
     const onChange = vi.fn();
+    const item = STATIC_CATALOG.find((it) => it.id === "trigger.webhook")!;
     render(<NodeCanvas onChange={onChange} />);
-    fireEvent.click(screen.getByRole("button", { name: /Trigger · webhook/ }));
+    const target = screen.getByTestId("node-canvas");
+    fireEvent.drop(target, {
+      clientX: 200,
+      clientY: 150,
+      dataTransfer: makeDataTransfer(item),
+    });
     expect(screen.getByTestId("nodes-count")).toHaveTextContent("1 node(s)");
     const wire = onChange.mock.calls.at(-1)?.[0] as WireGraph;
     expect(wire.nodes[0]?.kind).toBe("trigger");
     expect(wire.nodes[0]?.trigger_type).toBe("webhook");
   });
 
-  it("generates unique ids when the same kind is added repeatedly", () => {
+  it("ignores drops without the autome MIME", () => {
     const onChange = vi.fn();
     render(<NodeCanvas onChange={onChange} />);
-    const btn = screen.getByRole("button", { name: /Action · slack.send/ });
-    fireEvent.click(btn);
-    fireEvent.click(btn);
-    fireEvent.click(btn);
+    const target = screen.getByTestId("node-canvas");
+    fireEvent.drop(target, {
+      clientX: 0,
+      clientY: 0,
+      dataTransfer: {
+        getData: () => "",
+        setData: () => undefined,
+        dropEffect: "move",
+        effectAllowed: "move",
+      } as unknown as DataTransfer,
+    });
+    expect(screen.getByTestId("nodes-count")).toHaveTextContent("0 node(s)");
+  });
+
+  it("generates unique ids when the same kind is dropped repeatedly", () => {
+    const onChange = vi.fn();
+    const item = STATIC_CATALOG.find((it) => it.id === "action.slack.send")!;
+    render(<NodeCanvas onChange={onChange} />);
+    const target = screen.getByTestId("node-canvas");
+    for (let i = 0; i < 3; i += 1) {
+      fireEvent.drop(target, {
+        clientX: 100 + i * 10,
+        clientY: 100,
+        dataTransfer: makeDataTransfer(item),
+      });
+    }
     const wire = onChange.mock.calls.at(-1)?.[0] as WireGraph;
     const ids = wire.nodes.map((n) => n.id);
     expect(new Set(ids).size).toBe(3);
@@ -40,7 +83,6 @@ describe("<NodeCanvas />", () => {
 
   it("renders the React Flow viewport with controls + minimap (F8.2.d)", () => {
     render(<NodeCanvas />);
-    // React Flow expose un nœud avec role/aria reconnaissable.
     expect(document.querySelector(".react-flow")).not.toBeNull();
     expect(document.querySelector(".react-flow__controls")).not.toBeNull();
     expect(document.querySelector(".react-flow__minimap")).not.toBeNull();
