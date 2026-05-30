@@ -1,0 +1,5 @@
+# Configuration pnpm pour le frontend Autome (F8.1).
+# pnpm 11+ : esbuild a un script post-install (binaire native) qu'on
+# autorise explicitement (sinon pnpm bloque avec ERR_PNPM_IGNORED_BUILDS).
+allowBuilds:
+  esbuild: true
