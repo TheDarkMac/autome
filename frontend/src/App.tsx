@@ -1,6 +1,8 @@
 import { useEffect, useState } from "react";
 import { apiBaseUrl, fetchOpenApi, type OpenApiSpec } from "./api";
+import { fetchCatalog, STATIC_CATALOG, type CatalogItem } from "./catalog";
 import { NodeCanvas } from "./NodeCanvas";
+import { Palette } from "./Palette";
 
 type Status =
   | { kind: "idle" }
@@ -8,10 +10,10 @@ type Status =
   | { kind: "ok"; spec: OpenApiSpec }
   | { kind: "error"; message: string };
 
-/** Page d'accueil F8.1 — skeleton qui valide l'intégration backend.
- *  F8.2 ajoute le canvas d'édition (drag-and-drop) sous le bandeau. */
 export function App(): JSX.Element {
   const [status, setStatus] = useState<Status>({ kind: "idle" });
+  const [catalog, setCatalog] = useState<readonly CatalogItem[]>(STATIC_CATALOG);
+  const [catalogLoading, setCatalogLoading] = useState(true);
 
   useEffect(() => {
     let cancelled = false;
@@ -28,12 +30,25 @@ export function App(): JSX.Element {
     };
   }, []);
 
+  useEffect(() => {
+    let cancelled = false;
+    setCatalogLoading(true);
+    fetchCatalog().then((items) => {
+      if (cancelled) return;
+      setCatalog(items);
+      setCatalogLoading(false);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
   return (
-    <main className="flex min-h-screen flex-col bg-neutral-50">
+    <main className="flex h-screen flex-col bg-neutral-50">
       <header className="border-b border-neutral-200 bg-white px-6 py-4 sm:px-10">
         <h1 className="text-2xl font-semibold tracking-tight">Autome</h1>
         <p className="mt-1 text-sm text-neutral-500">
-          Éditeur visuel de workflows — F8.2 canvas drag-and-drop.
+          Éditeur visuel de workflows — F8.3 palette + canvas drag-and-drop.
         </p>
       </header>
 
@@ -50,9 +65,12 @@ export function App(): JSX.Element {
         <BackendStatus status={status} />
       </section>
 
-      <section className="flex-1">
-        <NodeCanvas />
-      </section>
+      <div className="flex min-h-0 flex-1">
+        <Palette items={catalog} loading={catalogLoading} />
+        <section className="flex min-h-0 flex-1">
+          <NodeCanvas />
+        </section>
+      </div>
     </main>
   );
 }
