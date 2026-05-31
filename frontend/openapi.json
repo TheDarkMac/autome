@@ -1,0 +1,882 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Autome API",
+    "description": "Backend HTTP du moteur d'automatisation Autome.",
+    "contact": {
+      "name": "Équipe Autome"
+    },
+    "license": {
+      "name": "MIT",
+      "identifier": "MIT"
+    },
+    "version": "0.1.0"
+  },
+  "paths": {
+    "/credentials": {
+      "get": {
+        "tags": [
+          "credentials"
+        ],
+        "summary": "`GET /credentials` — résumé des credentials de l'utilisateur courant.",
+        "operationId": "list_credentials",
+        "responses": {
+          "200": {
+            "description": "Credentials de l'utilisateur (sans tokens bruts)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ListCredentialsResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Token absent ou invalide"
+          },
+          "403": {
+            "description": "Manque `credentials.manage`"
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/credentials/providers": {
+      "get": {
+        "tags": [
+          "credentials"
+        ],
+        "summary": "`GET /credentials/providers` — liste les providers OAuth.",
+        "operationId": "list_providers",
+        "responses": {
+          "200": {
+            "description": "Providers OAuth déclarés (sans `client_secret`)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ListProvidersResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Token absent ou invalide"
+          },
+          "403": {
+            "description": "Manque `credentials.manage`"
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/credentials/{provider}": {
+      "delete": {
+        "tags": [
+          "credentials"
+        ],
+        "summary": "`DELETE /credentials/{provider}` — révoque un credential.",
+        "operationId": "delete_credential",
+        "parameters": [
+          {
+            "name": "provider",
+            "in": "path",
+            "description": "Identifiant du provider OAuth",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Révoqué (idempotent)"
+          },
+          "401": {
+            "description": "Token absent ou invalide"
+          },
+          "403": {
+            "description": "Manque `credentials.manage`"
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/credentials/{provider}/authorize": {
+      "post": {
+        "tags": [
+          "credentials"
+        ],
+        "summary": "`POST /credentials/{provider}/authorize` — démarre un flow OAuth.",
+        "operationId": "start_authorize",
+        "parameters": [
+          {
+            "name": "provider",
+            "in": "path",
+            "description": "Identifiant du provider OAuth",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "URL d'autorisation + PKCE",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AuthorizeResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Token absent ou invalide"
+          },
+          "403": {
+            "description": "Manque `credentials.manage`"
+          },
+          "404": {
+            "description": "Provider inconnu"
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/credentials/{provider}/callback": {
+      "post": {
+        "tags": [
+          "credentials"
+        ],
+        "summary": "`POST /credentials/{provider}/callback` — échange `code` → tokens.",
+        "operationId": "complete_authorize",
+        "parameters": [
+          {
+            "name": "provider",
+            "in": "path",
+            "description": "Identifiant du provider OAuth",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "description": "`code` + `state` + `code_verifier` du callback OAuth",
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CallbackBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Tokens persistés (chiffrés) — résumé safe",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CredentialDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Token absent ou invalide"
+          },
+          "403": {
+            "description": "Manque `credentials.manage`"
+          },
+          "502": {
+            "description": "Échec OAuth en amont (rejet du provider)"
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/runs/{run_id}": {
+      "get": {
+        "tags": [
+          "runs"
+        ],
+        "summary": "`GET /runs/{run_id}` — détail d'un run (perm `runs.read`).",
+        "operationId": "get_run",
+        "parameters": [
+          {
+            "name": "run_id",
+            "in": "path",
+            "description": "Identifiant du run",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Détail du run",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "401": {
+            "description": "Token absent ou invalide"
+          },
+          "403": {
+            "description": "Manque `runs.read`"
+          },
+          "404": {
+            "description": "Run inconnu"
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/workflows": {
+      "get": {
+        "tags": [
+          "workflows"
+        ],
+        "summary": "`GET /workflows?offset=&limit=` — liste paginée (perm `workflows.read`).",
+        "operationId": "list_workflows",
+        "parameters": [
+          {
+            "name": "offset",
+            "in": "query",
+            "description": "Offset, défaut 0.",
+            "required": false,
+            "schema": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 0
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Limite, défaut 50.",
+            "required": false,
+            "schema": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 0
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Page de workflows",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ListResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Token absent ou invalide"
+          },
+          "403": {
+            "description": "Manque `workflows.read`"
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      },
+      "post": {
+        "tags": [
+          "workflows"
+        ],
+        "summary": "`POST /workflows` — création (201 Created, perm `workflows.write`).",
+        "operationId": "create_workflow",
+        "requestBody": {
+          "description": "Workflow graph complet",
+          "content": {
+            "application/json": {
+              "schema": {}
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "Créé",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "401": {
+            "description": "Token absent ou invalide"
+          },
+          "403": {
+            "description": "Manque `workflows.write`"
+          },
+          "409": {
+            "description": "Workflow déjà existant"
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/workflows/{id}": {
+      "get": {
+        "tags": [
+          "workflows"
+        ],
+        "summary": "`GET /workflows/{id}` — détail (perm `workflows.read`).",
+        "operationId": "get_workflow",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Identifiant du workflow",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Détail",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "401": {
+            "description": "Token absent ou invalide"
+          },
+          "403": {
+            "description": "Manque `workflows.read`"
+          },
+          "404": {
+            "description": "Workflow inconnu"
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      },
+      "put": {
+        "tags": [
+          "workflows"
+        ],
+        "summary": "`PUT /workflows/{id}` — remplacement complet (perm `workflows.write`).\nL'`id` du path doit correspondre à celui dans le body.",
+        "operationId": "update_workflow",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Identifiant du workflow",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "description": "Workflow graph complet",
+          "content": {
+            "application/json": {
+              "schema": {}
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Remplacé",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "400": {
+            "description": "id path ≠ id body"
+          },
+          "401": {
+            "description": "Token absent ou invalide"
+          },
+          "403": {
+            "description": "Manque `workflows.write`"
+          },
+          "404": {
+            "description": "Workflow inconnu"
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      },
+      "delete": {
+        "tags": [
+          "workflows"
+        ],
+        "summary": "`DELETE /workflows/{id}` — suppression (204, idempotent, perm `workflows.write`).",
+        "operationId": "delete_workflow",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Identifiant du workflow",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Supprimé (idempotent)"
+          },
+          "401": {
+            "description": "Token absent ou invalide"
+          },
+          "403": {
+            "description": "Manque `workflows.write`"
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/workflows/{id}/runs": {
+      "get": {
+        "tags": [
+          "runs"
+        ],
+        "summary": "`GET /workflows/{id}/runs?offset=&limit=` — liste paginée (perm `runs.read`).",
+        "operationId": "list_runs",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Identifiant du workflow",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "offset",
+            "in": "query",
+            "description": "Offset, défaut 0.",
+            "required": false,
+            "schema": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 0
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Limite, défaut 50.",
+            "required": false,
+            "schema": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 0
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Page de runs (plus récent en premier)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ListRunsResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Token absent ou invalide"
+          },
+          "403": {
+            "description": "Manque `runs.read`"
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      },
+      "post": {
+        "tags": [
+          "runs"
+        ],
+        "summary": "`POST /workflows/{id}/runs` — démarre un run (perm `runs.execute`).",
+        "operationId": "create_run",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Identifiant du workflow à exécuter",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "description": "Payload initial + version optionnelle",
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateRunBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "description": "Run accepté en queue",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CreateRunResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Token absent ou invalide"
+          },
+          "403": {
+            "description": "Manque `runs.execute`"
+          },
+          "404": {
+            "description": "Workflow inconnu"
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "AuthorizeResponse": {
+        "type": "object",
+        "description": "Réponse de `POST /credentials/{provider}/authorize` (PKCE côté SPA :\nle caller conserve `state` + `code_verifier` jusqu'au callback).",
+        "required": [
+          "authorize_url",
+          "state",
+          "code_verifier"
+        ],
+        "properties": {
+          "authorize_url": {
+            "type": "string",
+            "description": "URL absolue où rediriger l'utilisateur."
+          },
+          "code_verifier": {
+            "type": "string",
+            "description": "PKCE verifier — à reposter à `/callback`."
+          },
+          "state": {
+            "type": "string",
+            "description": "Paramètre `state` (anti-CSRF) à comparer dans le callback."
+          }
+        }
+      },
+      "CallbackBody": {
+        "type": "object",
+        "description": "Body de `POST /credentials/{provider}/callback`.",
+        "required": [
+          "code",
+          "state",
+          "code_verifier"
+        ],
+        "properties": {
+          "code": {
+            "type": "string",
+            "description": "`code` retourné par le provider à l'utilisateur."
+          },
+          "code_verifier": {
+            "type": "string",
+            "description": "PKCE verifier que le caller a conservé entre `/authorize` et ici."
+          },
+          "state": {
+            "type": "string",
+            "description": "`state` retourné par le provider — anti-CSRF, identique à\ncelui renvoyé par `/authorize`."
+          }
+        }
+      },
+      "CreateRunBody": {
+        "type": "object",
+        "description": "Body JSON du POST. `payload` est libre (transmis tel quel au worker).",
+        "properties": {
+          "payload": {
+            "type": "object",
+            "description": "Payload initial du run (entrées du workflow). `null` si absent."
+          },
+          "version": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "Version du workflow à figer. Si absent, on prend `1` (la base\nPostgreSQL gérera l'auto-incrément en F1.5/F7.x)."
+          }
+        }
+      },
+      "CreateRunResponse": {
+        "type": "object",
+        "description": "Réponse du POST.",
+        "required": [
+          "run_id",
+          "status"
+        ],
+        "properties": {
+          "run_id": {
+            "type": "string",
+            "description": "Identifiant du run créé (string opaque côté API)."
+          },
+          "status": {
+            "type": "string",
+            "description": "État initial (`\"queued\"`)."
+          }
+        }
+      },
+      "CredentialDto": {
+        "type": "object",
+        "description": "Résumé d'un credential — jamais le token brut.",
+        "required": [
+          "provider_id",
+          "has_refresh_token"
+        ],
+        "properties": {
+          "expires_at_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Timestamp d'expiration de l'access token (Unix ms)."
+          },
+          "has_refresh_token": {
+            "type": "boolean",
+            "description": "`true` si un refresh token est conservé."
+          },
+          "provider_id": {
+            "type": "string",
+            "description": "Provider concerné."
+          },
+          "scope": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Scopes effectivement accordés (verbatim)."
+          }
+        }
+      },
+      "ListCredentialsResponse": {
+        "type": "object",
+        "description": "Réponse de `GET /credentials`.",
+        "required": [
+          "items"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/CredentialDto"
+            },
+            "description": "Credentials du user courant, tri lexical par `provider_id`."
+          }
+        }
+      },
+      "ListProvidersResponse": {
+        "type": "object",
+        "description": "Réponse de `GET /credentials/providers`.",
+        "required": [
+          "items"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ProviderDto"
+            },
+            "description": "Providers déclarés, tri lexical par `provider_id`."
+          }
+        }
+      },
+      "ListResponse": {
+        "type": "object",
+        "description": "Réponse JSON de [`list_workflows`].",
+        "required": [
+          "items",
+          "total",
+          "offset",
+          "limit"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            },
+            "description": "Items de la page (workflows complets — schéma libre côté OpenAPI)."
+          },
+          "limit": {
+            "type": "integer",
+            "description": "Limit effectivement appliquée.",
+            "minimum": 0
+          },
+          "offset": {
+            "type": "integer",
+            "description": "Offset effectivement appliqué.",
+            "minimum": 0
+          },
+          "total": {
+            "type": "integer",
+            "description": "Total avant pagination.",
+            "minimum": 0
+          }
+        }
+      },
+      "ListRunsResponse": {
+        "type": "object",
+        "description": "Réponse JSON de la liste paginée.",
+        "required": [
+          "items",
+          "total",
+          "offset",
+          "limit"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            },
+            "description": "Items de la page (plus récent en premier — schéma libre côté OpenAPI)."
+          },
+          "limit": {
+            "type": "integer",
+            "description": "Limit effectivement appliquée.",
+            "minimum": 0
+          },
+          "offset": {
+            "type": "integer",
+            "description": "Offset effectivement appliqué.",
+            "minimum": 0
+          },
+          "total": {
+            "type": "integer",
+            "description": "Total avant pagination.",
+            "minimum": 0
+          }
+        }
+      },
+      "ProviderDto": {
+        "type": "object",
+        "description": "Description publique d'un provider — pas de `client_secret`.",
+        "required": [
+          "provider_id",
+          "scopes"
+        ],
+        "properties": {
+          "provider_id": {
+            "type": "string",
+            "description": "Identifiant stable du provider."
+          },
+          "scopes": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Scopes demandés."
+          }
+        }
+      }
+    },
+    "securitySchemes": {
+      "bearer": {
+        "type": "http",
+        "scheme": "bearer",
+        "bearerFormat": "JWT",
+        "description": "Token JWT émis par `/auth/login` — header `Authorization: Bearer <token>`."
+      }
+    }
+  },
+  "tags": [
+    {
+      "name": "workflows",
+      "description": "CRUD des workflows."
+    },
+    {
+      "name": "runs",
+      "description": "Déclenchement et suivi des runs."
+    },
+    {
+      "name": "credentials",
+      "description": "OAuth2 connecteurs tiers."
+    }
+  ]
+}
