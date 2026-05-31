@@ -216,7 +216,7 @@
   - [x] F8.4.b — Validation des champs + valeurs par défaut
   - [x] F8.4.c — Éditeur d'expressions / mapping de données
   - [x] F8.4.d — Sélection de credentials/connecteur
-- [ ] **F8.5** — Visualisation des exécutions (statut, logs par node)
+- [~] **F8.5** — Visualisation des exécutions (statut, logs par node) — _issue #89_
   - [ ] F8.5.a — Liste des runs (statut, durée, déclencheur)
   - [ ] F8.5.b — Vue détail : statut par node sur le canvas
   - [ ] F8.5.c — Logs & données d'entrée/sortie par node
