@@ -25,6 +25,7 @@ describe("useSession", () => {
   });
   afterEach(() => {
     vi.useRealTimers();
+    vi.unstubAllGlobals();
   });
 
   it("démarre déconnecté quand le store est vide", () => {
@@ -113,6 +114,71 @@ describe("useSession", () => {
       await vi.advanceTimersByTimeAsync(60_000);
     });
 
+    expect(result.current.session).toBeNull();
+    expect(store.read()).toBeNull();
+  });
+
+  // ─────────────────── authFetch (F8.7.c) ───────────────────
+
+  it("authFetch injecte le Bearer de la session courante", async () => {
+    const pair = mkPair("user-1", 10_000);
+    const store = memorySessionStore(pair);
+    const fetchSpy = vi.fn(async () => new Response("ok", { status: 200 }));
+    vi.stubGlobal("fetch", fetchSpy);
+    const { result } = renderHook(() => useSession({ store }));
+
+    await act(async () => {
+      await result.current.authFetch("/x");
+    });
+
+    const init = fetchSpy.mock.calls[0]![1] as RequestInit;
+    expect(new Headers(init.headers).get("Authorization")).toBe(
+      `Bearer ${pair.accessToken}`,
+    );
+  });
+
+  it("authFetch rafraîchit sur 401, rejoue et met à jour la session", async () => {
+    const store = memorySessionStore(mkPair("user-1", 10_000));
+    const renewed = mkPair("user-1-renewed", 10_000);
+    const refreshImpl = vi.fn().mockResolvedValue(renewed);
+    const fetchSpy = vi
+      .fn()
+      .mockResolvedValueOnce(new Response("unauth", { status: 401 }))
+      .mockResolvedValueOnce(new Response("ok", { status: 200 }));
+    vi.stubGlobal("fetch", fetchSpy);
+    const { result } = renderHook(() => useSession({ store, refreshImpl }));
+
+    let res!: Response;
+    await act(async () => {
+      res = await result.current.authFetch("/x");
+    });
+
+    expect(res.status).toBe(200);
+    expect(refreshImpl).toHaveBeenCalledWith(
+      "refresh-user-1",
+      expect.any(Function),
+    );
+    expect(result.current.session?.userId).toBe("user-1-renewed");
+    expect(store.read()?.accessToken).toBe(renewed.accessToken);
+    const init2 = fetchSpy.mock.calls[1]![1] as RequestInit;
+    expect(new Headers(init2.headers).get("Authorization")).toBe(
+      `Bearer ${renewed.accessToken}`,
+    );
+  });
+
+  it("authFetch déconnecte si le refresh échoue sur 401", async () => {
+    const store = memorySessionStore(mkPair("user-1", 10_000));
+    const refreshImpl = vi.fn().mockRejectedValue(new Error("revoked"));
+    const fetchSpy = vi.fn(async () => new Response("unauth", { status: 401 }));
+    vi.stubGlobal("fetch", fetchSpy);
+    const { result } = renderHook(() => useSession({ store, refreshImpl }));
+
+    let res!: Response;
+    await act(async () => {
+      res = await result.current.authFetch("/x");
+    });
+
+    expect(res.status).toBe(401);
     expect(result.current.session).toBeNull();
     expect(store.read()).toBeNull();
   });

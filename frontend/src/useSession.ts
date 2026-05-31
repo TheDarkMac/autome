@@ -18,6 +18,7 @@ import {
   type Credentials,
   type TokenPair,
 } from "./auth";
+import { createAuthFetch, type AuthFetch } from "./authFetch";
 import {
   msUntilRefresh,
   sessionFromTokens,
@@ -45,6 +46,12 @@ export interface UseSessionResult {
   login: (creds: Credentials) => Promise<void>;
   signup: (creds: Credentials) => Promise<void>;
   logout: () => void;
+  /**
+   * `fetch` authentifié (F8.7.c) : injecte le Bearer courant et, sur 401,
+   * rafraîchit le token puis rejoue la requête. Identité **stable** — sûr à
+   * passer à `useMemo`/`useEffect` ou à `createApiClient`.
+   */
+  authFetch: AuthFetch;
 }
 
 const DEFAULT_SKEW_MS = 60_000; // refresh 1 min avant l'exp
@@ -75,6 +82,32 @@ export function useSession(options: UseSessionOptions = {}): UseSessionResult {
     setSession(next);
   }, []);
 
+  // Réf. synchrone vers la session/refresh courants — lues par `authFetch`
+  // et par l'effet de refresh proactif sans relancer leurs closures.
+  const sessionRef = useRef(session);
+  sessionRef.current = session;
+  const refreshRef = useRef(refreshImpl);
+  useEffect(() => {
+    refreshRef.current = refreshImpl;
+  }, [refreshImpl]);
+
+  // `authFetch` (F8.7.c) — construit une seule fois pour une identité stable.
+  const authFetchRef = useRef<AuthFetch | null>(null);
+  if (authFetchRef.current === null) {
+    authFetchRef.current = createAuthFetch({
+      getTokens: () => {
+        const s = sessionRef.current;
+        return s
+          ? { accessToken: s.accessToken, refreshToken: s.refreshToken }
+          : null;
+      },
+      onTokens: (pair) => apply(pair),
+      onUnauthenticated: () => apply(null),
+      refreshImpl: (rt, fi) => refreshRef.current(rt, fi),
+    });
+  }
+  const authFetch = authFetchRef.current;
+
   // Chargement initial.
   useEffect(() => {
     const stored = storeRef.current.read();
@@ -99,11 +132,6 @@ export function useSession(options: UseSessionOptions = {}): UseSessionResult {
   );
 
   // Refresh proactif. Re-planifié à chaque changement de session.
-  const refreshRef = useRef(refreshImpl);
-  useEffect(() => {
-    refreshRef.current = refreshImpl;
-  }, [refreshImpl]);
-
   useEffect(() => {
     if (!session) return;
     let cancelled = false;
@@ -130,5 +158,6 @@ export function useSession(options: UseSessionOptions = {}): UseSessionResult {
     login,
     signup,
     logout,
+    authFetch,
   };
 }

@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { apiBaseUrl, fetchOpenApi, type OpenApiSpec } from "./api";
+import { createApiClient } from "./apiClient";
 import { fetchCatalog, STATIC_CATALOG, type CatalogItem } from "./catalog";
 import { ConnectorsPanel } from "./ConnectorsPanel";
 import type { CanvasNode, WireGraph } from "./graph";
@@ -37,8 +38,12 @@ export interface AppProps {
 const DRAFT_WORKFLOW_ID = "wf-draft";
 
 export function App({ sessionOptions }: AppProps = {}): JSX.Element {
-  const { session, loading: sessionLoading, login, signup, logout } =
+  const { session, loading: sessionLoading, login, signup, logout, authFetch } =
     useSession(sessionOptions);
+
+  // Client API typé adossé à l'`authFetch` (F8.7) — identité stable car
+  // `authFetch` l'est ; les vues de runs y branchent leurs lectures.
+  const api = useMemo(() => createApiClient(authFetch), [authFetch]);
   const [status, setStatus] = useState<Status>({ kind: "idle" });
   const [catalog, setCatalog] = useState<readonly CatalogItem[]>(STATIC_CATALOG);
   const [catalogLoading, setCatalogLoading] = useState(true);
@@ -51,6 +56,7 @@ export function App({ sessionOptions }: AppProps = {}): JSX.Element {
   // Polling du run sélectionné (F8.5.d). Inactif quand on est en mode édition.
   const { checkpoint, error: pollError } = useRunPolling(
     view === "runs" ? selectedRunId : null,
+    { fetchImpl: api.getRun },
   );
 
   useEffect(() => {
@@ -167,6 +173,7 @@ export function App({ sessionOptions }: AppProps = {}): JSX.Element {
               workflowId={DRAFT_WORKFLOW_ID}
               selectedRunId={selectedRunId}
               onSelectRun={setSelectedRunId}
+              fetchImpl={api.listRuns}
             />
           )}
           <section className="flex min-h-0 flex-1">
