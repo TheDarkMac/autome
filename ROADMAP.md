@@ -221,7 +221,7 @@
   - [x] F8.5.b — Vue détail : statut par node sur le canvas
   - [x] F8.5.c — Logs & données d'entrée/sortie par node
   - [x] F8.5.d — Mise à jour temps réel (WS/SSE ou polling)
-- [ ] **F8.6** — Auth UI (login, gestion connecteurs)
+- [~] **F8.6** — Auth UI (login, gestion connecteurs) — _issue #91_
   - [ ] F8.6.a — Pages login / signup
   - [ ] F8.6.b — Gestion de session (stockage token, refresh)
   - [ ] F8.6.c — Écran connexion/autorisation OAuth des connecteurs
