@@ -211,7 +211,7 @@
   - [x] F8.3.a — Catalogue des nodes (catégories + recherche)
   - [x] F8.3.b — Drag depuis la palette vers le canvas
   - [x] F8.3.c — Chargement dynamique depuis l'API (nodes dispo)
-- [ ] **F8.4** — Panneau de configuration d'un node
+- [~] **F8.4** — Panneau de configuration d'un node — _issue #87_
   - [ ] F8.4.a — Formulaire généré depuis le schéma de params
   - [ ] F8.4.b — Validation des champs + valeurs par défaut
   - [ ] F8.4.c — Éditeur d'expressions / mapping de données
