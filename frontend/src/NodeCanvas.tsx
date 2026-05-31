@@ -42,6 +42,7 @@ import {
   findNodeSchema,
   type ParamValues,
 } from "./paramSchema";
+import { decorateNodesWithExecStatus, type NodeExecStatus } from "./runs";
 
 export interface NodeCanvasProps {
   /** Notifié à chaque mutation du graphe. */
@@ -57,6 +58,11 @@ export interface NodeCanvasProps {
    * mettre à jour les `params` d'un node (depuis le NodePanel, F8.4).
    */
   onReady?: (controller: NodeCanvasController) => void;
+  /**
+   * Overlay de statut d'exécution par node (F8.5.b). Quand fourni, le
+   * canvas applique une bordure colorée à chaque node selon son statut.
+   */
+  executionStatuses?: Readonly<Record<string, NodeExecStatus>> | undefined;
 }
 
 export interface NodeCanvasController {
@@ -80,10 +86,18 @@ function NodeCanvasInner({
   initialEdges = [],
   onSelectionChange,
   onReady,
+  executionStatuses,
 }: NodeCanvasProps): JSX.Element {
   const [nodes, setNodes] = useState<CanvasNode[]>(initialNodes);
   const [edges, setEdges] = useState<CanvasEdge[]>(initialEdges);
   const { screenToFlowPosition } = useReactFlow();
+  const displayedNodes = useMemo(
+    () =>
+      executionStatuses
+        ? decorateNodesWithExecStatus(nodes, executionStatuses)
+        : nodes,
+    [nodes, executionStatuses],
+  );
 
   // Expose un patcher imperatif aux parents (App → NodePanel).
   useEffect(() => {
@@ -189,7 +203,7 @@ function NodeCanvasInner({
     >
       <div className="relative flex-1" style={{ minHeight: 480 }}>
         <ReactFlow
-          nodes={nodes}
+          nodes={displayedNodes}
           edges={edges}
           onNodesChange={onNodesChange}
           onEdgesChange={onEdgesChange}

@@ -113,6 +113,26 @@ describe("<NodeCanvas />", () => {
     expect(wire.nodes[0]?.params).toEqual({ method: "POST" });
   });
 
+  it("applique une bordure colorée selon executionStatuses (F8.5.b)", () => {
+    const node = buildCanvasNode({
+      id: "n-1",
+      kind: "trigger",
+      subtype: "webhook",
+    });
+    render(
+      <NodeCanvas
+        initialNodes={[node]}
+        executionStatuses={{ "n-1": "succeeded" }}
+      />,
+    );
+    const rfNode = document.querySelector(
+      '.react-flow__node[data-id="n-1"]',
+    ) as HTMLElement | null;
+    expect(rfNode).not.toBeNull();
+    // RF applique style.borderColor directement sur le DOM.
+    expect(rfNode!.style.borderColor).toMatch(/rgb\(16, 185, 129\)|#10b981/);
+  });
+
   it("expose un controller patchNodeParams qui met à jour le node ciblé", () => {
     let ctrl: NodeCanvasController | null = null;
     const onChange = vi.fn();
