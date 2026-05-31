@@ -1,5 +1,5 @@
 import { describe, expect, it, vi, beforeEach, afterEach } from "vitest";
-import { render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { App } from "./App";
 
 const sampleSpec = {
@@ -44,5 +44,27 @@ describe("<App />", () => {
     await waitFor(() => {
       expect(screen.getByRole("alert")).toHaveTextContent(/erreur/i);
     });
+  });
+
+  it("bascule vers l'onglet Exécutions et monte la RunsList (F8.5.a)", async () => {
+    globalThis.fetch = vi.fn(async (input) => {
+      const url = typeof input === "string" ? input : (input as Request).url;
+      if (url.includes("/openapi.json")) return jsonResponse(sampleSpec);
+      if (url.includes("/workflows/wf-draft/runs")) {
+        return jsonResponse({ items: [], total: 0, offset: 0, limit: 50 });
+      }
+      return new Response("", { status: 404 });
+    }) as typeof fetch;
+    render(<App />);
+    await waitFor(() =>
+      expect(screen.getByRole("heading", { name: "Autome" })).toBeInTheDocument(),
+    );
+    fireEvent.click(screen.getByRole("tab", { name: /Exécutions/ }));
+    await waitFor(() =>
+      expect(screen.getByTestId("runs-list")).toBeInTheDocument(),
+    );
+    await waitFor(() =>
+      expect(screen.getByText(/Aucun run pour ce workflow/)).toBeInTheDocument(),
+    );
   });
 });
