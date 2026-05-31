@@ -1,8 +1,11 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { apiBaseUrl, fetchOpenApi, type OpenApiSpec } from "./api";
 import { fetchCatalog, STATIC_CATALOG, type CatalogItem } from "./catalog";
-import { NodeCanvas } from "./NodeCanvas";
+import type { CanvasNode } from "./graph";
+import { NodeCanvas, type NodeCanvasController } from "./NodeCanvas";
+import { NodePanel } from "./NodePanel";
 import { Palette } from "./Palette";
+import type { ParamValues } from "./paramSchema";
 
 type Status =
   | { kind: "idle" }
@@ -14,6 +17,8 @@ export function App(): JSX.Element {
   const [status, setStatus] = useState<Status>({ kind: "idle" });
   const [catalog, setCatalog] = useState<readonly CatalogItem[]>(STATIC_CATALOG);
   const [catalogLoading, setCatalogLoading] = useState(true);
+  const [selectedNode, setSelectedNode] = useState<CanvasNode | null>(null);
+  const [controller, setController] = useState<NodeCanvasController | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -43,12 +48,24 @@ export function App(): JSX.Element {
     };
   }, []);
 
+  const handlePanelChange = useCallback(
+    (nodeId: string, params: ParamValues) => {
+      controller?.patchNodeParams(nodeId, params);
+      setSelectedNode((prev) =>
+        prev && prev.id === nodeId
+          ? { ...prev, data: { ...prev.data, params } }
+          : prev,
+      );
+    },
+    [controller],
+  );
+
   return (
     <main className="flex h-screen flex-col bg-neutral-50">
       <header className="border-b border-neutral-200 bg-white px-6 py-4 sm:px-10">
         <h1 className="text-2xl font-semibold tracking-tight">Autome</h1>
         <p className="mt-1 text-sm text-neutral-500">
-          Éditeur visuel de workflows — F8.3 palette + canvas drag-and-drop.
+          Éditeur visuel de workflows — F8.4 panneau de configuration.
         </p>
       </header>
 
@@ -68,8 +85,16 @@ export function App(): JSX.Element {
       <div className="flex min-h-0 flex-1">
         <Palette items={catalog} loading={catalogLoading} />
         <section className="flex min-h-0 flex-1">
-          <NodeCanvas />
+          <NodeCanvas
+            onSelectionChange={setSelectedNode}
+            onReady={setController}
+          />
         </section>
+        <NodePanel
+          node={selectedNode}
+          onChange={handlePanelChange}
+          onClose={() => setSelectedNode(null)}
+        />
       </div>
     </main>
   );

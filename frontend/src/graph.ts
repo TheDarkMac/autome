@@ -97,11 +97,13 @@ export function buildCanvasNode(args: {
   subtype?: string;
   label?: string;
   position?: { x: number; y: number };
+  params?: unknown;
 }): CanvasNode {
   const data: CanvasNodeData = {
     kind: args.kind,
     label: args.label ?? defaultLabel(args.kind, args.subtype),
     ...(args.subtype !== undefined ? { subtype: args.subtype } : {}),
+    ...(args.params !== undefined ? { params: args.params } : {}),
   };
   return {
     id: args.id,
