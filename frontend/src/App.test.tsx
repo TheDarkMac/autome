@@ -1,6 +1,9 @@
 import { describe, expect, it, vi, beforeEach, afterEach } from "vitest";
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { App } from "./App";
+import type { TokenPair } from "./auth";
+import { memorySessionStore } from "./session";
+import type { UseSessionOptions } from "./useSession";
 
 const sampleSpec = {
   openapi: "3.0.3",
@@ -15,6 +18,22 @@ function jsonResponse(body: unknown, status = 200): Response {
   });
 }
 
+function b64url(obj: unknown): string {
+  return btoa(JSON.stringify(obj))
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")
+    .replace(/=+$/, "");
+}
+
+/** Session authentifiée prête à l'emploi (access token longue durée). */
+function authedSession(sub = "user-1"): UseSessionOptions {
+  const pair: TokenPair = {
+    accessToken: `h.${b64url({ sub, exp: 9_999_999_999 })}.s`,
+    refreshToken: "r.e.f",
+  };
+  return { store: memorySessionStore(pair) };
+}
+
 describe("<App />", () => {
   let originalFetch: typeof fetch;
   beforeEach(() => {
@@ -24,11 +43,47 @@ describe("<App />", () => {
     globalThis.fetch = originalFetch;
   });
 
+  it("affiche la page de login si aucune session", async () => {
+    globalThis.fetch = vi.fn().mockResolvedValue(jsonResponse(sampleSpec)) as typeof fetch;
+    render(<App sessionOptions={{ store: memorySessionStore() }} />);
+    expect(screen.getByRole("form", { name: "Connexion" })).toBeInTheDocument();
+    expect(
+      screen.queryByRole("heading", { name: "Autome" }),
+    ).not.toBeInTheDocument();
+    // Laisse le canari openapi (effet monté) se résoudre dans act.
+    await act(async () => undefined);
+  });
+
+  it("connecte l'utilisateur puis affiche l'éditeur", async () => {
+    globalThis.fetch = vi.fn().mockResolvedValue(jsonResponse(sampleSpec)) as typeof fetch;
+    const loginImpl = vi.fn().mockResolvedValue({
+      accessToken: `h.${b64url({ sub: "alice", exp: 9_999_999_999 })}.s`,
+      refreshToken: "r",
+    });
+    render(
+      <App
+        sessionOptions={{ store: memorySessionStore(), loginImpl }}
+      />,
+    );
+    fireEvent.change(screen.getByLabelText("Email"), {
+      target: { value: "a@b.io" },
+    });
+    fireEvent.change(screen.getByLabelText("Mot de passe"), {
+      target: { value: "longenough" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Se connecter" }));
+
+    await waitFor(() =>
+      expect(screen.getByRole("heading", { name: "Autome" })).toBeInTheDocument(),
+    );
+    expect(screen.getByTestId("current-user")).toHaveTextContent("alice");
+  });
+
   it("shows backend ok state with endpoint count", async () => {
     globalThis.fetch = vi
       .fn()
       .mockResolvedValue(jsonResponse(sampleSpec)) as typeof fetch;
-    render(<App />);
+    render(<App sessionOptions={authedSession()} />);
     expect(screen.getByRole("heading", { name: "Autome" })).toBeInTheDocument();
     await waitFor(() => {
       expect(screen.getByRole("status")).toHaveTextContent(/Autome API/);
@@ -40,7 +95,7 @@ describe("<App />", () => {
     globalThis.fetch = vi
       .fn()
       .mockRejectedValue(new Error("ECONNREFUSED")) as typeof fetch;
-    render(<App />);
+    render(<App sessionOptions={authedSession()} />);
     await waitFor(() => {
       expect(screen.getByRole("alert")).toHaveTextContent(/erreur/i);
     });
@@ -55,7 +110,7 @@ describe("<App />", () => {
       }
       return new Response("", { status: 404 });
     }) as typeof fetch;
-    render(<App />);
+    render(<App sessionOptions={authedSession()} />);
     await waitFor(() =>
       expect(screen.getByRole("heading", { name: "Autome" })).toBeInTheDocument(),
     );
@@ -66,5 +121,35 @@ describe("<App />", () => {
     await waitFor(() =>
       expect(screen.getByText(/Aucun run pour ce workflow/)).toBeInTheDocument(),
     );
+  });
+
+  it("bascule vers l'onglet Connecteurs et monte le panneau (F8.6.c)", async () => {
+    globalThis.fetch = vi.fn(async (input) => {
+      const url = typeof input === "string" ? input : (input as Request).url;
+      if (url.includes("/openapi.json")) return jsonResponse(sampleSpec);
+      if (url.endsWith("/credentials/providers")) {
+        return jsonResponse({ items: [{ provider_id: "slack", scopes: [] }] });
+      }
+      if (url.endsWith("/credentials")) return jsonResponse({ items: [] });
+      return new Response("", { status: 404 });
+    }) as typeof fetch;
+    render(<App sessionOptions={authedSession()} />);
+    await waitFor(() =>
+      expect(screen.getByRole("heading", { name: "Autome" })).toBeInTheDocument(),
+    );
+    fireEvent.click(screen.getByRole("tab", { name: /Connecteurs/ }));
+    await waitFor(() =>
+      expect(screen.getByTestId("connectors-panel")).toBeInTheDocument(),
+    );
+    expect(await screen.findByTestId("connector-slack")).toBeInTheDocument();
+  });
+
+  it("se déconnecte et revient à la page de login", async () => {
+    globalThis.fetch = vi.fn().mockResolvedValue(jsonResponse(sampleSpec)) as typeof fetch;
+    render(<App sessionOptions={authedSession()} />);
+    expect(screen.getByRole("heading", { name: "Autome" })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Se déconnecter" }));
+    expect(screen.getByRole("form", { name: "Connexion" })).toBeInTheDocument();
+    await act(async () => undefined);
   });
 });
