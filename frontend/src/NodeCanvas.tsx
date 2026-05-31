@@ -23,6 +23,7 @@ import {
   type Connection,
   type EdgeChange,
   type NodeChange,
+  type OnSelectionChangeParams,
 } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
 import { useCallback, useEffect, useMemo, useState } from "react";
@@ -36,6 +37,11 @@ import {
   type CanvasNode,
   type WireGraph,
 } from "./graph";
+import {
+  defaultParams,
+  findNodeSchema,
+  type ParamValues,
+} from "./paramSchema";
 
 export interface NodeCanvasProps {
   /** Notifié à chaque mutation du graphe. */
@@ -44,6 +50,17 @@ export interface NodeCanvasProps {
   workflowName?: string;
   initialNodes?: CanvasNode[];
   initialEdges?: CanvasEdge[];
+  /** Notifié quand la sélection change (F8.4). */
+  onSelectionChange?: (node: CanvasNode | null) => void;
+  /**
+   * Exposé une fois au mount : un patcher que le parent peut appeler pour
+   * mettre à jour les `params` d'un node (depuis le NodePanel, F8.4).
+   */
+  onReady?: (controller: NodeCanvasController) => void;
+}
+
+export interface NodeCanvasController {
+  patchNodeParams(nodeId: string, params: ParamValues): void;
 }
 
 /** Wrapper qui injecte le `ReactFlowProvider` requis par `useReactFlow`. */
@@ -61,10 +78,37 @@ function NodeCanvasInner({
   workflowName = "Brouillon",
   initialNodes = [],
   initialEdges = [],
+  onSelectionChange,
+  onReady,
 }: NodeCanvasProps): JSX.Element {
   const [nodes, setNodes] = useState<CanvasNode[]>(initialNodes);
   const [edges, setEdges] = useState<CanvasEdge[]>(initialEdges);
   const { screenToFlowPosition } = useReactFlow();
+
+  // Expose un patcher imperatif aux parents (App → NodePanel).
+  useEffect(() => {
+    if (!onReady) return;
+    onReady({
+      patchNodeParams: (nodeId, params) => {
+        setNodes((prev) =>
+          prev.map((n) =>
+            n.id === nodeId
+              ? { ...n, data: { ...n.data, params } }
+              : n,
+          ),
+        );
+      },
+    });
+  }, [onReady]);
+
+  const onSelectionChangeRF = useCallback(
+    (params: OnSelectionChangeParams): void => {
+      if (!onSelectionChange) return;
+      const selected = params.nodes[0];
+      onSelectionChange(selected ? (selected as CanvasNode) : null);
+    },
+    [onSelectionChange],
+  );
 
   const existingIds = useMemo(() => new Set(nodes.map((n) => n.id)), [nodes]);
 
@@ -113,12 +157,15 @@ function NodeCanvasInner({
       setNodes((prev) => {
         const ids = new Set(prev.map((n) => n.id));
         const id = generateNodeId(item.kind, ids);
+        const schema = findNodeSchema(item.kind, item.subtype);
+        const params = schema ? defaultParams(schema) : undefined;
         const node = buildCanvasNode({
           id,
           kind: item.kind,
           ...(item.subtype !== undefined ? { subtype: item.subtype } : {}),
           label: item.label,
           position,
+          ...(params !== undefined ? { params } : {}),
         });
         return [...prev, node];
       });
@@ -147,6 +194,7 @@ function NodeCanvasInner({
           onNodesChange={onNodesChange}
           onEdgesChange={onEdgesChange}
           onConnect={onConnect}
+          onSelectionChange={onSelectionChangeRF}
           fitView
           deleteKeyCode={["Backspace", "Delete"]}
         >

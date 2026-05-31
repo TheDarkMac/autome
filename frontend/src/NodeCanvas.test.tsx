@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
-import { fireEvent, render, screen } from "@testing-library/react";
+import { act, fireEvent, render, screen } from "@testing-library/react";
 
-import { NodeCanvas } from "./NodeCanvas";
+import { NodeCanvas, type NodeCanvasController } from "./NodeCanvas";
 import { DND_MIME, STATIC_CATALOG, type CatalogItem } from "./catalog";
 import { buildCanvasNode, type WireGraph } from "./graph";
 
@@ -97,5 +97,45 @@ describe("<NodeCanvas />", () => {
     });
     render(<NodeCanvas initialNodes={[node]} />);
     expect(screen.getByTestId("nodes-count")).toHaveTextContent("1 node(s)");
+  });
+
+  it("applique les defaultParams du schéma à l'ajout par drop (F8.4.b)", () => {
+    const onChange = vi.fn();
+    const item = STATIC_CATALOG.find((it) => it.id === "trigger.webhook")!;
+    render(<NodeCanvas onChange={onChange} />);
+    fireEvent.drop(screen.getByTestId("node-canvas"), {
+      clientX: 200,
+      clientY: 150,
+      dataTransfer: makeDataTransfer(item),
+    });
+    const wire = onChange.mock.calls.at(-1)?.[0] as WireGraph;
+    // method=POST est dans defaultParams(webhook) — propagé via params sérialisé.
+    expect(wire.nodes[0]?.params).toEqual({ method: "POST" });
+  });
+
+  it("expose un controller patchNodeParams qui met à jour le node ciblé", () => {
+    let ctrl: NodeCanvasController | null = null;
+    const onChange = vi.fn();
+    const initial = buildCanvasNode({
+      id: "n-1",
+      kind: "trigger",
+      subtype: "webhook",
+      params: { method: "POST" },
+    });
+    render(
+      <NodeCanvas
+        initialNodes={[initial]}
+        onChange={onChange}
+        onReady={(c) => {
+          ctrl = c;
+        }}
+      />,
+    );
+    expect(ctrl).not.toBeNull();
+    act(() => {
+      ctrl!.patchNodeParams("n-1", { method: "GET", path: "/x" });
+    });
+    const wire = onChange.mock.calls.at(-1)?.[0] as WireGraph;
+    expect(wire.nodes[0]?.params).toEqual({ method: "GET", path: "/x" });
   });
 });
