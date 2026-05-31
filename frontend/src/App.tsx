@@ -1,7 +1,9 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { apiBaseUrl, fetchOpenApi, type OpenApiSpec } from "./api";
 import { fetchCatalog, STATIC_CATALOG, type CatalogItem } from "./catalog";
+import { ConnectorsPanel } from "./ConnectorsPanel";
 import type { CanvasNode, WireGraph } from "./graph";
+import { LoginPage } from "./LoginPage";
 import { NodeCanvas, type NodeCanvasController } from "./NodeCanvas";
 import { NodePanel } from "./NodePanel";
 import { Palette } from "./Palette";
@@ -14,6 +16,7 @@ import {
   type RunCheckpoint,
 } from "./runs";
 import { useRunPolling } from "./useRunPolling";
+import { useSession, type UseSessionOptions } from "./useSession";
 
 type Status =
   | { kind: "idle" }
@@ -21,14 +24,21 @@ type Status =
   | { kind: "ok"; spec: OpenApiSpec }
   | { kind: "error"; message: string };
 
-type View = "edit" | "runs";
+type View = "edit" | "runs" | "connectors";
+
+export interface AppProps {
+  /** Options de session (store/impls injectables pour les tests). */
+  sessionOptions?: UseSessionOptions;
+}
 
 // Workflow courant : tant que F8.7 (persistence backend) n'est pas en place,
 // on opère sur un brouillon local ; la liste des runs interroge ce même
 // `workflowId` côté backend.
 const DRAFT_WORKFLOW_ID = "wf-draft";
 
-export function App(): JSX.Element {
+export function App({ sessionOptions }: AppProps = {}): JSX.Element {
+  const { session, loading: sessionLoading, login, signup, logout } =
+    useSession(sessionOptions);
   const [status, setStatus] = useState<Status>({ kind: "idle" });
   const [catalog, setCatalog] = useState<readonly CatalogItem[]>(STATIC_CATALOG);
   const [catalogLoading, setCatalogLoading] = useState(true);
@@ -91,13 +101,42 @@ export function App(): JSX.Element {
     [view, checkpoint, graph],
   );
 
+  // Garde d'authentification (F8.6.b) — on attend le chargement du store
+  // avant de décider, pour éviter un flash de la page de login.
+  if (sessionLoading) {
+    return (
+      <main className="flex h-screen items-center justify-center bg-neutral-50">
+        <p role="status" className="text-sm text-neutral-500">
+          Chargement…
+        </p>
+      </main>
+    );
+  }
+  if (!session) {
+    return <LoginPage login={login} signup={signup} />;
+  }
+
   return (
     <main className="flex h-screen flex-col bg-neutral-50">
-      <header className="border-b border-neutral-200 bg-white px-6 py-4 sm:px-10">
-        <h1 className="text-2xl font-semibold tracking-tight">Autome</h1>
-        <p className="mt-1 text-sm text-neutral-500">
-          Éditeur visuel de workflows — F8.5 visualisation des exécutions.
-        </p>
+      <header className="flex items-start justify-between border-b border-neutral-200 bg-white px-6 py-4 sm:px-10">
+        <div>
+          <h1 className="text-2xl font-semibold tracking-tight">Autome</h1>
+          <p className="mt-1 text-sm text-neutral-500">
+            Éditeur visuel de workflows — F8.6 authentification & connecteurs.
+          </p>
+        </div>
+        <div className="flex items-center gap-3 text-sm">
+          <span className="text-neutral-500" data-testid="current-user">
+            {session.userId}
+          </span>
+          <button
+            type="button"
+            onClick={logout}
+            className="rounded-md border border-neutral-200 px-3 py-1.5 text-neutral-700 hover:bg-neutral-50"
+          >
+            Se déconnecter
+          </button>
+        </div>
       </header>
 
       <section
@@ -115,40 +154,46 @@ export function App(): JSX.Element {
 
       <ViewTabs view={view} onChange={setView} />
 
-      <div className="flex min-h-0 flex-1">
-        {view === "edit" ? (
-          <Palette items={catalog} loading={catalogLoading} />
-        ) : (
-          <RunsList
-            workflowId={DRAFT_WORKFLOW_ID}
-            selectedRunId={selectedRunId}
-            onSelectRun={setSelectedRunId}
-          />
-        )}
-        <section className="flex min-h-0 flex-1">
-          <NodeCanvas
-            onChange={setGraph}
-            onSelectionChange={setSelectedNode}
-            onReady={setController}
-            executionStatuses={executionStatuses}
-            workflowId={DRAFT_WORKFLOW_ID}
-          />
-        </section>
-        {view === "edit" ? (
-          <NodePanel
-            node={selectedNode}
-            onChange={handlePanelChange}
-            onClose={() => setSelectedNode(null)}
-          />
-        ) : (
-          <RunExecutionPanel
-            checkpoint={pollError ? null : checkpoint}
-            node={selectedNode}
-            edges={graph?.edges ?? []}
-            onClose={() => setSelectedNode(null)}
-          />
-        )}
-      </div>
+      {view === "connectors" ? (
+        <div className="min-h-0 flex-1 overflow-y-auto">
+          <ConnectorsPanel accessToken={session.accessToken} />
+        </div>
+      ) : (
+        <div className="flex min-h-0 flex-1">
+          {view === "edit" ? (
+            <Palette items={catalog} loading={catalogLoading} />
+          ) : (
+            <RunsList
+              workflowId={DRAFT_WORKFLOW_ID}
+              selectedRunId={selectedRunId}
+              onSelectRun={setSelectedRunId}
+            />
+          )}
+          <section className="flex min-h-0 flex-1">
+            <NodeCanvas
+              onChange={setGraph}
+              onSelectionChange={setSelectedNode}
+              onReady={setController}
+              executionStatuses={executionStatuses}
+              workflowId={DRAFT_WORKFLOW_ID}
+            />
+          </section>
+          {view === "edit" ? (
+            <NodePanel
+              node={selectedNode}
+              onChange={handlePanelChange}
+              onClose={() => setSelectedNode(null)}
+            />
+          ) : (
+            <RunExecutionPanel
+              checkpoint={pollError ? null : checkpoint}
+              node={selectedNode}
+              edges={graph?.edges ?? []}
+              onClose={() => setSelectedNode(null)}
+            />
+          )}
+        </div>
+      )}
     </main>
   );
 }
@@ -187,6 +232,11 @@ function ViewTabs({
         active={view === "runs"}
         label="Exécutions"
         onClick={() => onChange("runs")}
+      />
+      <ViewTab
+        active={view === "connectors"}
+        label="Connecteurs"
+        onClick={() => onChange("connectors")}
       />
     </nav>
   );
