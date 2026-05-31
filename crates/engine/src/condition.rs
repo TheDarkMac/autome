@@ -183,4 +183,47 @@ mod tests {
         assert!(eval_bool("'a' < 1", &ctx).is_err());
         assert!(resolve("", &ctx).is_err());
     }
+
+    #[test]
+    fn json_eq_normalizes_numbers_and_compares_collections() {
+        assert!(json_eq(&json!(1), &json!(1.0)));
+        assert!(json_eq(&json!([1, 2]), &json!([1, 2])));
+        assert!(!json_eq(&json!([1, 2]), &json!([2, 1])));
+        assert!(json_eq(&json!(null), &json!(null)));
+        // String vs number : pas d'égalité (types distincts).
+        assert!(!json_eq(&json!("1"), &json!(1)));
+    }
+
+    #[test]
+    fn paths_index_arrays_and_reject_bad_segments() {
+        let ctx = ctx_with("t", json!({ "list": [10, 20], "scalar": 5 }));
+        assert!(eval_bool("t.list.1 == 20", &ctx).unwrap());
+        // Index hors borne → erreur (pas de panique).
+        assert!(eval_bool("t.list.9 == 1", &ctx).is_err());
+        // Descente dans un scalaire → erreur.
+        assert!(eval_bool("t.scalar.x == 1", &ctx).is_err());
+    }
+
+    #[test]
+    fn more_operators_and_literals() {
+        let ctx = RunContext::default();
+        assert!(eval_bool("3.5 >= 3.5", &ctx).unwrap());
+        assert!(eval_bool("-5 < 0", &ctx).unwrap());
+        assert!(eval_bool("2 != 3", &ctx).unwrap());
+        assert!(!eval_bool("2 != 2", &ctx).unwrap());
+        // Comparaison ordonnée hétérogène → erreur.
+        assert!(eval_bool("1 < 'a'", &ctx).is_err());
+    }
+
+    #[test]
+    fn truthiness_of_collections_and_zero() {
+        let ctx = ctx_with(
+            "t",
+            json!({ "empty_arr": [], "arr": [1], "empty_obj": {}, "zero": 0.0 }),
+        );
+        assert!(!eval_bool("t.empty_arr", &ctx).unwrap());
+        assert!(eval_bool("t.arr", &ctx).unwrap());
+        assert!(!eval_bool("t.empty_obj", &ctx).unwrap());
+        assert!(!eval_bool("t.zero", &ctx).unwrap());
+    }
 }

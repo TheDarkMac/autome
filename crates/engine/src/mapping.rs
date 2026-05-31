@@ -181,4 +181,48 @@ mod tests {
         assert_eq!(r["headers"]["x"], json!("Bob"));
         assert_eq!(r["list"], json!([3, "static"]));
     }
+
+    #[test]
+    fn inline_template_renders_each_scalar_type() {
+        let mut c = RunContext::default();
+        c.record_for_test(
+            NodeId::new("t"),
+            json!({ "flag": true, "nothing": null, "n": 4, "tags": ["a", "b"] }),
+        );
+        assert_eq!(render_template("v={{ t.flag }}", &c).unwrap(), "v=true");
+        // null interpolé → chaîne vide.
+        assert_eq!(render_template("[{{ t.nothing }}]", &c).unwrap(), "[]");
+        assert_eq!(render_template("{{ t.n }}-{{ t.n }}", &c).unwrap(), "4-4");
+        // Tableau interpolé inline → JSON compact.
+        assert_eq!(
+            render_template("x={{ t.tags }}", &c).unwrap(),
+            r#"x=["a","b"]"#
+        );
+    }
+
+    #[test]
+    fn non_string_scalars_pass_through_unchanged() {
+        let c = RunContext::default();
+        assert_eq!(resolve_value(&json!(42), &c).unwrap(), json!(42));
+        assert_eq!(resolve_value(&json!(true), &c).unwrap(), json!(true));
+        assert_eq!(resolve_value(&json!(null), &c).unwrap(), json!(null));
+        // Chaîne sans balise → inchangée.
+        assert_eq!(resolve_value(&json!("plain"), &c).unwrap(), json!("plain"));
+    }
+
+    #[test]
+    fn sole_expression_preserves_type_even_with_surrounding_whitespace() {
+        let mut c = RunContext::default();
+        c.record_for_test(NodeId::new("t"), json!({ "n": 9 }));
+        // Un seul tag (espaces tolérés) → type préservé.
+        assert_eq!(
+            resolve_value(&json!("  {{ t.n }}  "), &c).unwrap(),
+            json!(9)
+        );
+        // Deux tags → templating (chaîne).
+        assert_eq!(
+            resolve_value(&json!("{{ t.n }} et {{ t.n }}"), &c).unwrap(),
+            json!("9 et 9")
+        );
+    }
 }
