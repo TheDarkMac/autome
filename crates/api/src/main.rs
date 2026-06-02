@@ -9,6 +9,7 @@
 use std::sync::Arc;
 
 use autome_api::auth::{protected_router, AuthState};
+use autome_api::metrics::{metrics_router, with_metrics, Metrics};
 use autome_api::tls::load_rustls_config;
 use autome_core::{
     AuditSink, Config, InMemoryPermissionStore, InMemoryRevocationStore, NoopAuditSink,
@@ -21,13 +22,17 @@ async fn health() -> &'static str {
     "ok"
 }
 
-/// Construit le routeur racine — `/health` public + `/auth/*` protégé par JWT.
+/// Construit le routeur racine — `/health` + `/metrics` publics, `/auth/*`
+/// protégé par JWT. Toutes les routes sont instrumentées par le middleware de
+/// métriques (F10.6.a).
 ///
 /// Isolé de `main` pour être testable sans démarrer de serveur.
-fn build_router(auth: AuthState) -> Router {
-    Router::new()
+fn build_router(auth: AuthState, metrics: Arc<Metrics>) -> Router {
+    let router = Router::new()
         .route("/health", get(health))
         .nest("/auth", protected_router(auth))
+        .merge(metrics_router(metrics.clone()));
+    with_metrics(router, metrics)
 }
 
 #[tokio::main]
@@ -50,7 +55,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         audit,
     );
 
-    let app = build_router(auth);
+    let metrics = Arc::new(Metrics::new());
+    let app = build_router(auth, metrics);
 
     // F6.4 — HTTPS via rustls si `AUTOME_TLS_CERT` + `AUTOME_TLS_KEY`
     // sont positionnées ; sinon HTTP en clair. Décision all-or-nothing
@@ -105,6 +111,6 @@ mod tests {
             Arc::new(InMemoryPermissionStore::new());
         let audit: Arc<dyn AuditSink + Send + Sync> = Arc::new(NoopAuditSink);
         let auth = AuthState::new(TokenService::new(b"x"), revocation, permissions, audit);
-        let _app: Router = build_router(auth);
+        let _app: Router = build_router(auth, Arc::new(Metrics::new()));
     }
 }

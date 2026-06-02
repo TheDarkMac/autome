@@ -1,0 +1,22 @@
+# Configuration Prometheus — monitoring Autome (F10.6.b).
+#
+# Scrape l'endpoint /metrics de l'API (registre F10.6.a). En dev (compose),
+# la cible est le nom de service Docker `api:8080` ; en k8s, un ConfigMap
+# équivalent cible le Service `api` (cf. k8s/monitoring.yaml).
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  # Prometheus s'auto-scrape (santé de l'instance).
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]
+
+  # Backend Autome : métriques HTTP (requêtes, latence, in-flight).
+  - job_name: autome-api
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["api:8080"]
+        labels:
+          service: api

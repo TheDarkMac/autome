@@ -1,0 +1,16 @@
+# Provider de dashboards Grafana (F10.6.b) : charge tous les JSON déposés
+# dans le dossier monté, au démarrage et à chaud.
+# https://grafana.com/docs/grafana/latest/administration/provisioning/#dashboards
+apiVersion: 1
+
+providers:
+  - name: autome
+    orgId: 1
+    folder: Autome
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 30
+    allowUiUpdates: true
+    options:
+      path: /var/lib/grafana/dashboards
+      foldersFromFilesStructure: false

@@ -1,0 +1,12 @@
+# Datasource Grafana provisionnée (F10.6.b) — chargée au démarrage.
+# https://grafana.com/docs/grafana/latest/administration/provisioning/#data-sources
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    type: prometheus
+    access: proxy
+    # Nom de service Docker (compose) ; surchargé en k8s par l'URL du Service.
+    url: http://prometheus:9090
+    isDefault: true
+    editable: false
