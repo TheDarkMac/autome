@@ -16,3 +16,7 @@ autome-core = { workspace = true }
 autome-connectors = { workspace = true }
 thiserror = { workspace = true }
 serde_json = { workspace = true }
+
+[dev-dependencies]
+# Décodage du `raw` base64url de Gmail dans l'exemple e2e (F12.1).
+base64 = { workspace = true }

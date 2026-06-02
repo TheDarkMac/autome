@@ -1,0 +1,47 @@
+{
+  "id": "example-slack-gmail-notion",
+  "name": "Slack → Gmail → Notion",
+  "nodes": [
+    {
+      "id": "entry",
+      "name": "Déclencheur manuel",
+      "kind": "trigger",
+      "trigger_type": "manual",
+      "params": null
+    },
+    {
+      "id": "slack_read",
+      "name": "Lire le canal Slack",
+      "kind": "action",
+      "action_type": "slack.read_channel",
+      "params": {
+        "channel": "C123DEPLOYS",
+        "limit": "1"
+      }
+    },
+    {
+      "id": "gmail_send",
+      "name": "Envoyer un email de synthèse",
+      "kind": "action",
+      "action_type": "gmail.send_email",
+      "params": {
+        "to": "ops@example.com",
+        "subject": "Résumé Slack #deploys"
+      }
+    },
+    {
+      "id": "notion_create",
+      "name": "Archiver dans Notion",
+      "kind": "action",
+      "action_type": "notion.create_page",
+      "params": {
+        "parent": { "database_id": "db-archive-0001" }
+      }
+    }
+  ],
+  "edges": [
+    { "from": "entry", "to": "slack_read" },
+    { "from": "slack_read", "to": "gmail_send" },
+    { "from": "gmail_send", "to": "notion_create" }
+  ]
+}
