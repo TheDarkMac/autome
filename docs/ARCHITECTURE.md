@@ -1,7 +1,13 @@
 # 🏛️ Architecture — Autome
 
 > Plateforme d'automatisation type Make / n8n / Zapier. Backend Rust, frontend
-> React/TS. Document de référence pour la feature **F1.1** (cf. [ROADMAP](../ROADMAP.md)).
+> React/TS. Document de référence initié en **F1.1** et mis à jour en **F11.3**
+> pour refléter l'architecture *telle que construite* (cf. [ROADMAP](../ROADMAP.md)).
+>
+> 🔎 **Lecture des diagrammes** : sauf mention « *cible production* », les
+> composants décrits sont **implémentés**. Les éléments d'exploitation encore
+> prospectifs (HPA, élection de leader, réplica de base, cert-manager, KMS)
+> sont explicitement signalés comme cibles. État d'implémentation : voir §10.
 
 ---
 
@@ -46,19 +52,19 @@ flowchart TB
   end
 
   subgraph Backend["Backend Rust (workspace Cargo)"]
-    API["crate api<br/>REST/gRPC, auth, CRUD workflows"]
-    SCHED["Scheduler<br/>(cron / intervalle)"]
-    WHK["Webhook Ingress<br/>(triggers HTTP entrants)"]
-    WK["crate worker<br/>pool d'exécuteurs de runs"]
+    API["binaire api<br/>REST + auth, CRUD workflows, /metrics"]
+    SCHED["module core::scheduler<br/>(cron / intervalle)"]
+    WHK["Webhook trigger<br/>(HTTP entrant)"]
+    WK["binaire worker<br/>pool d'exécuteurs de runs"]
     ENG["crate engine<br/>moteur DAG (séquence, conditions, boucles, //)"]
     CONN["crate connectors<br/>Slack · Gmail · Notion · GitHub · HTTP"]
     CORE["crate core<br/>types, traits, erreurs partagés"]
   end
 
   subgraph Infra
-    Q[("File de messages<br/>Kafka / RabbitMQ")]
+    Q[("File de messages<br/>RabbitMQ (ADR 0003)")]
     DB[("PostgreSQL<br/>workflows · runs · credentials · users")]
-    SEC[("Secret store / KMS<br/>clés de chiffrement")]
+    SEC[("Chiffrement enveloppe<br/>KeyProvider versionné · AES-256-GCM<br/>(KMS = cible production)")]
     OBS["Prometheus + Grafana"]
   end
 
@@ -81,6 +87,12 @@ flowchart TB
   API -.-> CORE
   WK -.-> CORE
 ```
+
+- **Deux binaires** seulement : `api` et `worker`. Le **scheduler** (F5.3) et
+  l'**ingress webhook** ne sont pas des services séparés : ce sont des modules
+  (`core::scheduler`, trigger webhook) hébergés par ces binaires.
+- **engine** est agnostique : il dépend de **traits** de `core` (queue, stores,
+  connecteurs) et ne connaît ni RabbitMQ ni PostgreSQL ni Slack directement.
 
 ---
 
@@ -117,32 +129,29 @@ sequenceDiagram
 
 ## 5. Diagramme de déploiement (Docker / Kubernetes)
 
+Reflète les manifests réels de `k8s/` (assemblés par **kustomize**, namespace
+`autome`). En pointillés/`cible` : les éléments d'exploitation prévus mais non
+encore livrés (HPA, cert-manager, réplica de base).
+
 ```mermaid
 flowchart TB
-  subgraph K8s["Cluster Kubernetes"]
+  subgraph K8s["Cluster Kubernetes — namespace autome (k8s/)"]
     direction TB
-    ING["Ingress + TLS<br/>(cert-manager)"]
-    subgraph apiD["Deployment: api (N réplicas)"]
-      A1["api pod"]
+    ING["Ingress NGINX<br/>autome.local / api.autome.local<br/>(TLS cert-manager = cible)"]
+    subgraph apiD["Deployment: api (2 réplicas)"]
+      A1["api pod<br/>/health · /metrics"]
     end
-    subgraph schD["Deployment: scheduler (1, leader-elected)"]
-      S1["scheduler pod"]
-    end
-    subgraph wkD["Deployment: worker (HPA, autoscale)"]
+    subgraph wkD["Deployment: worker (HPA = cible)"]
       W1["worker pod"]
-      W2["worker pod"]
     end
-    subgraph feD["Deployment: frontend (static / nginx)"]
+    subgraph feD["Deployment: frontend (nginx, 2 réplicas)"]
       F1["frontend pod"]
     end
-    PROM["Prometheus"]
-    GRAF["Grafana"]
-  end
-
-  subgraph Managed["Services managés / StatefulSets"]
-    PG[("PostgreSQL<br/>(primary + replica)")]
-    MQ[("Kafka / RabbitMQ")]
-    KMS[("Secret store / KMS")]
+    PG[("StatefulSet: postgres<br/>(réplica = cible)")]
+    MQ[("Deployment: rabbitmq")]
+    PROM["Deployment: prometheus"]
+    GRAF["Deployment: grafana"]
+    CM["ConfigMap autome-config<br/>+ Secret autome-secrets"]
   end
 
   Internet((Internet)) --> ING
@@ -150,17 +159,26 @@ flowchart TB
   ING --> A1
   A1 --> PG
   A1 --> MQ
-  A1 --> KMS
-  S1 --> MQ
-  W1 & W2 --> MQ
-  W1 & W2 --> PG
-  W1 & W2 --> KMS
-  apiD & wkD -.scrape.-> PROM --> GRAF
+  W1 --> MQ
+  W1 --> PG
+  CM -.envFrom.-> A1
+  CM -.envFrom.-> W1
+  PROM -.scrape /metrics.-> A1
+  PROM --> GRAF
 ```
 
-- **api / worker / frontend** : sans état, scalables (HPA sur CPU + profondeur de file).
-- **scheduler** : instance unique active (élection de leader) pour éviter les doubles déclenchements.
-- **PostgreSQL & file** : services managés ou StatefulSets avec sauvegardes.
+- **api / worker / frontend** : sans état → scalables. `api` (2 réplicas) et
+  `frontend` (2 réplicas) sont fixés dans les manifests ; l'**HPA** du worker
+  (piloté par la profondeur de file) reste une *cible*.
+- **scheduler** : pas de Deployment dédié — c'est un module (`core::scheduler`).
+  En production multi-réplicas, une **élection de leader** sera nécessaire pour
+  éviter les doubles déclenchements (*cible*).
+- **postgres** : `StatefulSet` (PVC) ; **rabbitmq** : `Deployment` (stockage
+  éphémère en dev). Réplica de lecture / sauvegardes = *cible production*.
+- **prometheus + grafana** : déployés dans le cluster (datasource + dashboard
+  *Autome — Overview* provisionnés). Cf. §9 observabilité.
+- **config & secrets** : `ConfigMap autome-config` (non-sensible) + `Secret
+  autome-secrets` (valeurs `REPLACE_ME` à remplacer — SealedSecrets / Vault).
 
 ---
 
@@ -223,38 +241,51 @@ erDiagram
 
 ---
 
-## 7. Choix techniques structurants (ADR initial)
+## 7. Choix techniques structurants (décisions tranchées)
 
-| Sujet | Décision | Justification |
+| Sujet | Décision | Référence |
 |---|---|---|
-| Framework backend | **axum** (à confirmer F1.2) | Écosystème Tokio, modulaire, `tower` middlewares, typé. |
-| Découplage exécution | File de messages + workers | Scalabilité horizontale, backpressure, isolation des pannes. |
-| Persistance | PostgreSQL + `sqlx` | Transactions, `jsonb` pour les graphes, migrations versionnées. |
-| File de messages | Kafka **ou** RabbitMQ (tranché F5.1) | Kafka = débit/replay ; RabbitMQ = routage/simplicité. |
-| Auth | JWT (session) + OAuth2 (connecteurs) | Standard, stateless côté API, délégation tierce. |
-| Secrets | Chiffrés au repos (AES-GCM + KMS) | Aucune donnée sensible en clair en base. |
-| Frontend | React + TS + Tailwind + React Flow | Éditeur drag-and-drop éprouvé, typage strict. |
-| Comm. interne | REST sécurisé (gRPC en option) | Simplicité d'abord ; gRPC si besoin de perf inter-services. |
+| Framework backend | **axum** (Tokio, `tower`, typé) | [ADR 0001](adr/0001-choix-framework-backend.md) |
+| Outil de migration | SQL versionné `migrations/` (ordre lexicographique) | [ADR 0002](adr/0002-outil-de-migration.md) |
+| File de messages | **RabbitMQ** (routage/ack, simplicité opérationnelle) | [ADR 0003](adr/0003-choix-broker-messages.md) |
+| Chiffrement des secrets | **AES-256-GCM** en enveloppe + `KeyProvider` versionné (rotation) | [ADR 0004](adr/0004-chiffrement-secrets-repos.md) |
+| Découplage exécution | File de messages + workers stateless | §2, §5 |
+| Persistance | PostgreSQL (`jsonb` pour les graphes, migrations versionnées) | §6 |
+| Auth | JWT (session) + OAuth2 Authorization Code + PKCE (connecteurs) | F6.1 / F6.2 |
+| Frontend | React + TS + Tailwind + **@xyflow/react** (React Flow) | §1, F8.* |
+| Comm. interne | **REST** (axum) ; OpenAPI généré. gRPC non retenu pour l'instant | F7.4 |
 
-> Les décisions « à trancher » sont des features dédiées du roadmap (F1.2, F5.1).
-> Chaque décision majeure ultérieure → un ADR court dans `docs/adr/`.
+> Chaque décision majeure ultérieure → un ADR court dans [`docs/adr/`](adr/).
+> KMS managé pour les clés de chiffrement : *cible production* (aujourd'hui
+> `KeyProvider` in-process, cf. ADR 0004).
 
 ---
 
 ## 8. Scalabilité & sécurité (synthèse)
 
 **Scalabilité**
-- Workers stateless + HPA piloté par la profondeur de la file.
-- Lectures DB déchargées sur réplica ; index ciblés (F1.5).
-- Limite de concurrence par node et globale (F2.5, F5.5).
+- Workers stateless (jetables/scalables) ; HPA piloté par la profondeur de la
+  file = *cible*.
+- Index ciblés en base (F1.5) ; lectures déchargées sur réplica = *cible*.
+- Limite de concurrence par node et globale, backpressure (F2.5, F5.5).
 - Idempotence des messages (ack/nack) pour rejouer sans effet de bord (F5.2).
 
 **Sécurité**
-- TLS de bout en bout (ingress + service-to-service).
-- JWT court + refresh ; RBAC au niveau API (F6.1, F6.5).
-- Credentials chiffrés (KMS), jamais loggués ni renvoyés en clair (F6.3).
+- TLS côté API (rustls, *all-or-nothing*) ; TLS d'ingress = cible (F6.4).
+- JWT + RBAC au niveau API (F6.1, F6.5) ; OAuth2 PKCE pour les connecteurs (F6.2).
+- Credentials chiffrés au repos (AES-256-GCM en enveloppe, F6.3), jamais
+  loggués ni renvoyés en clair ; KMS managé = cible.
 - Vérification de signature des webhooks entrants (ex. GitHub, F4.4).
 - Audit log des actions sensibles (F6.6).
+
+**Observabilité & livraison**
+- Métriques **Prometheus** exposées par l'API sur `/metrics` (requêtes,
+  latence, in-flight ; label `path` = template de route → cardinalité bornée),
+  scrapées par Prometheus, visualisées dans Grafana (dashboard provisionné) — F10.6.
+- **CI** GitHub Actions (fmt + clippy `-D warnings` + tests workspace + build ;
+  typecheck/lint/test frontend) — F10.4.
+- **CD** : build & push des images sur GHCR + déploiement Kubernetes gardé
+  (kustomize + `kubectl apply`, conditionné à un kubeconfig) — F10.5.
 
 ---
 
@@ -265,16 +296,42 @@ flowchart LR
   core["core<br/>(types, traits, erreurs)"]
   engine["engine<br/>(moteur DAG)"]
   connectors["connectors<br/>(intégrations)"]
-  api["api<br/>(serveur HTTP/gRPC)"]
+  api["api<br/>(serveur HTTP REST + auth)"]
   worker["worker<br/>(exécuteur)"]
 
   engine --> core
   connectors --> core
   api --> core
+  api --> connectors
   worker --> core
   worker --> engine
   engine --> connectors
   api --> engine
 ```
 
-> Mise en place concrète du workspace : feature **F1.3**.
+> Graphe conforme aux `Cargo.toml` du workspace (F1.3) : `core` est la base sans
+> dépendance interne ; `engine` et `api` dépendent de `connectors` ; `worker`
+> orchestre `engine`. Les deux **binaires** sont `api` et `worker`.
+
+---
+
+## 10. État d'implémentation & dette connue
+
+L'architecture *cible* ci-dessus est en place côté **conception et code métier**
+(moteur, connecteurs, sécurité, API, frontend, tests, DevOps : domaines 1→10
+terminés). Quelques points d'exploitation restent à brancher :
+
+- **Stores in-memory** : l'API et le worker utilisent encore des implémentations
+  en mémoire des traits (`InMemory*Store`, queue/stores) ; la connexion réelle à
+  **PostgreSQL** et **RabbitMQ** n'est pas encore câblée dans les binaires. Le
+  schéma SQL, les manifests et la configuration sont prêts pour ce branchement.
+  → **dette suivie : [issue #107](https://github.com/TheDarkMac/autome/issues/107)**.
+- **Secret JWT** : `api` utilise un secret de dev codé en dur plutôt que
+  `config.jwt_secret` (même dette #107).
+- **Cibles production** signalées dans ce document : HPA du worker, élection de
+  leader du scheduler, réplica/sauvegardes PostgreSQL, TLS d'ingress
+  (cert-manager), KMS managé pour les clés de chiffrement.
+
+> Le découpage par **traits** dans `core` est précisément ce qui permettra de
+> remplacer les implémentations in-memory par PostgreSQL/RabbitMQ sans toucher
+> au moteur ni aux connecteurs.
