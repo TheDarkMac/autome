@@ -242,7 +242,7 @@
 
 - [x] **F10.1** — Dockerfiles (backend, worker, frontend) — _issue #105_
 - [x] **F10.2** — docker-compose dev (db, queue, services) — _issue #108_
-- [ ] **F10.3** — Manifests Kubernetes
+- [~] **F10.3** — Manifests Kubernetes — _issue #110_
 - [ ] **F10.4** — Pipeline CI (build, lint, test)
 - [ ] **F10.5** — Pipeline CD (build images, déploiement)
 - [ ] **F10.6** — Monitoring Prometheus + dashboards Grafana
