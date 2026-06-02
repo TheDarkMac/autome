@@ -163,6 +163,7 @@ défaut**. Détail complet, diagrammes et flux dans
 - [ROADMAP.md](ROADMAP.md) — features, sous-tâches et journal d'avancées.
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — architecture détaillée + diagrammes.
 - [docs/CONNECTORS.md](docs/CONNECTORS.md) — guide pour créer un connecteur (SDK + exemple).
+- [docs/CICD.md](docs/CICD.md) — checklist CI/CD & reproductibilité.
 - [docs/adr/](docs/adr/) — décisions d'architecture (framework, broker, migrations, crypto).
 - [CONVENTIONS.md](CONVENTIONS.md) — conventions de code et de contribution.
 - [.env.example](.env.example) — variables de configuration.
