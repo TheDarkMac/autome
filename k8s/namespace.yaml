@@ -1,0 +1,7 @@
+# Namespace dédié à la plateforme Autome (F10.3).
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: autome
+  labels:
+    app.kubernetes.io/part-of: autome

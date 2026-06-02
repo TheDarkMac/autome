@@ -1,0 +1,19 @@
+# Assemblage des manifests Autome (F10.3).
+#   kubectl apply -k k8s/
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: autome
+
+commonLabels:
+  app.kubernetes.io/part-of: autome
+
+resources:
+  - namespace.yaml
+  - config.yaml
+  - postgres.yaml
+  - rabbitmq.yaml
+  - api.yaml
+  - worker.yaml
+  - frontend.yaml
+  - ingress.yaml
