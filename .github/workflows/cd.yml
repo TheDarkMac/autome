@@ -1,0 +1,162 @@
+# Livraison continue Autome (F10.5).
+#
+# Complète la CI (F10.4) : une fois le code intégré sur `main` (ou un tag de
+# version poussé), on construit et publie les trois images de conteneurs sur
+# GHCR, puis on prépare le déploiement Kubernetes à partir des manifests
+# `k8s/` (F10.3).
+#
+#   build-push : matrice api / worker / frontend → ghcr.io/<owner>/autome-*
+#   deploy     : rend les manifests avec les images taggées et applique le
+#                déploiement *si* un kubeconfig est fourni (sinon dry-run).
+#
+# La CD ne s'exécute qu'après une CI verte : déclenchée par `workflow_run`
+# (CI terminée avec succès sur `main`) et par les tags `v*.*.*` (release).
+name: CD
+
+on:
+  # Release : un tag de version déclenche build + déploiement.
+  push:
+    tags: ["v*.*.*"]
+  # Staging : on attend la fin (réussie) de la CI sur `main`.
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+    branches: [main]
+  # Relance manuelle depuis l'onglet Actions.
+  workflow_dispatch:
+
+# Une seule livraison à la fois par réf (évite les push d'images concurrents).
+concurrency:
+  group: cd-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  # ────────────────────────── Build & push ──────────────────────────
+  # Ne s'exécute pas si la CD a été enclenchée par une CI en échec.
+  build-push:
+    name: Build & push (${{ matrix.image }})
+    if: >-
+      github.event_name != 'workflow_run' ||
+      github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # api & worker : contexte = racine du dépôt, Dockerfile dans docker/.
+          - image: api
+            context: .
+            dockerfile: docker/api.Dockerfile
+          - image: worker
+            context: .
+            dockerfile: docker/worker.Dockerfile
+          # frontend : contexte = frontend/, build Vite statique.
+          - image: frontend
+            context: frontend
+            dockerfile: frontend/Dockerfile
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # GHCR : authentification avec le jeton de l'exécution (packages: write).
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Tags & labels : latest (sur main), sha-<court>, vX.Y.Z (sur tag).
+      - name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/autome-${{ matrix.image }}
+          tags: |
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' || github.event_name == 'workflow_run' }}
+            type=sha,prefix=sha-,format=short
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+
+      - name: Build & push
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.context }}
+          file: ${{ matrix.dockerfile }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=${{ matrix.image }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.image }}
+
+  # ──────────────────────────── Deploy ────────────────────────────
+  # Rend les manifests avec l'image taggée (sha-<court>), puis applique sur le
+  # cluster *si* le secret KUBE_CONFIG est présent ; sinon, dry-run client qui
+  # valide le rendu sans cluster (DoD : `kustomize build` sans erreur).
+  deploy:
+    name: Deploy (Kubernetes)
+    needs: build-push
+    runs-on: ubuntu-latest
+    # Environnement protégé : permet d'exiger une approbation manuelle et de
+    # porter les secrets de déploiement (KUBE_CONFIG) côté GitHub.
+    environment: production
+    permissions:
+      contents: read
+    # Le secret est exposé via env : le contexte `secrets` n'est pas
+    # utilisable dans les conditions `if:` des étapes, contrairement à `env`.
+    env:
+      KUBE_CONFIG: ${{ secrets.KUBE_CONFIG }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # kubectl embarque `kubectl kustomize` (rendu des manifests k8s/).
+      - name: Install kubectl
+        uses: azure/setup-kubectl@v4
+
+      # Tag d'image immuable (commit court) + owner en minuscules : GHCR exige
+      # un namespace minuscule, alors que `github.repository_owner` conserve la
+      # casse d'origine (TheDarkMac) — comme les références dans k8s/*.yaml.
+      - name: Compute image coordinates
+        id: img
+        run: |
+          echo "tag=sha-$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+          echo "owner=$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
+
+      # Surcharge les images des manifests par la version qu'on vient de pousser.
+      - name: Pin images in manifests
+        working-directory: k8s
+        run: |
+          owner='${{ steps.img.outputs.owner }}'
+          tag='${{ steps.img.outputs.tag }}'
+          for svc in api worker frontend; do
+            sed -i "s|ghcr.io/${owner}/autome-${svc}:latest|ghcr.io/${owner}/autome-${svc}:${tag}|g" "${svc}.yaml"
+          done
+
+      # Toujours valider le rendu (DoD), même sans cluster.
+      - name: Render manifests
+        run: kubectl kustomize k8s/ | tee /tmp/rendered.yaml
+
+      # Déploiement réel uniquement si un kubeconfig est fourni en secret.
+      - name: Deploy to cluster
+        if: ${{ env.KUBE_CONFIG != '' }}
+        run: |
+          mkdir -p "$HOME/.kube"
+          printf '%s' "$KUBE_CONFIG" | base64 -d > "$HOME/.kube/config"
+          kubectl apply -k k8s/
+          kubectl -n autome rollout status deployment/api --timeout=120s
+          kubectl -n autome rollout status deployment/worker --timeout=120s
+          kubectl -n autome rollout status deployment/frontend --timeout=120s
+
+      - name: Deploy skipped (no kubeconfig)
+        if: ${{ env.KUBE_CONFIG == '' }}
+        run: |
+          echo "::notice::KUBE_CONFIG absent — déploiement réel ignoré." \
+               "Manifests rendus et validés (dry-run). Voir /tmp/rendered.yaml."
