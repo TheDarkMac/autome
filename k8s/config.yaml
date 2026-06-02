@@ -1,0 +1,32 @@
+# Configuration non-sensible (F10.3) — variables d'environnement injectées
+# dans l'API et le worker via `envFrom`.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: autome-config
+  namespace: autome
+  labels:
+    app.kubernetes.io/part-of: autome
+data:
+  APP_PROFILE: "prod"
+  APP_HTTP_ADDR: "0.0.0.0:8080"
+---
+# Secrets (F10.3) — VALEURS DE DÉMONSTRATION, à remplacer impérativement
+# avant tout usage réel (SealedSecrets / External Secrets / Vault…).
+# `DATABASE_URL` et `QUEUE_URL` contiennent des identifiants → ici plutôt
+# que dans le ConfigMap. NB : l'API ne lit pas encore `JWT_SECRET` (dette
+# #107) ; ces clés sont câblées pour quand ce sera le cas.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: autome-secrets
+  namespace: autome
+  labels:
+    app.kubernetes.io/part-of: autome
+type: Opaque
+stringData:
+  JWT_SECRET: "REPLACE_ME_with_a_real_32B_minimum_jwt_secret"
+  ENCRYPTION_KEY: "REPLACE_ME_with_a_real_encryption_key"
+  POSTGRES_PASSWORD: "REPLACE_ME_postgres_password"
+  DATABASE_URL: "postgres://postgres:REPLACE_ME_postgres_password@postgres:5432/autome"
+  QUEUE_URL: "amqp://guest:guest@rabbitmq:5672/"

@@ -1,0 +1,66 @@
+# RabbitMQ (F10.3) — broker AMQP + UI de management.
+# Stockage éphémère ici (suffisant dev/staging) ; en production : PVC ou
+# l'opérateur RabbitMQ pour la durabilité des messages.
+apiVersion: v1
+kind: Service
+metadata:
+  name: rabbitmq
+  namespace: autome
+  labels:
+    app.kubernetes.io/name: rabbitmq
+    app.kubernetes.io/part-of: autome
+spec:
+  selector:
+    app.kubernetes.io/name: rabbitmq
+  ports:
+    - name: amqp
+      port: 5672
+      targetPort: 5672
+    - name: management
+      port: 15672
+      targetPort: 15672
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rabbitmq
+  namespace: autome
+  labels:
+    app.kubernetes.io/name: rabbitmq
+    app.kubernetes.io/part-of: autome
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: rabbitmq
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: rabbitmq
+        app.kubernetes.io/part-of: autome
+    spec:
+      containers:
+        - name: rabbitmq
+          image: rabbitmq:3-management-alpine
+          ports:
+            - name: amqp
+              containerPort: 5672
+            - name: management
+              containerPort: 15672
+          readinessProbe:
+            exec:
+              command: ["rabbitmq-diagnostics", "-q", "ping"]
+            initialDelaySeconds: 15
+            periodSeconds: 15
+          livenessProbe:
+            exec:
+              command: ["rabbitmq-diagnostics", "-q", "ping"]
+            initialDelaySeconds: 30
+            periodSeconds: 30
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi

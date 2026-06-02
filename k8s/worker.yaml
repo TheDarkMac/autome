@@ -1,0 +1,52 @@
+# Exécuteur de runs `autome-worker` (F10.3).
+#
+# ⚠️ État actuel : le binaire est un squelette qui exécute un run bootstrap
+# puis sort (exit 0). En Deployment (restartPolicy Always implicite), le pod
+# sera donc redémarré en boucle (CrashLoopBackOff) tant que la boucle de
+# consommation de la file (F5.1 / dette #107) n'est pas câblée. Le manifeste
+# est livré dès maintenant ; il deviendra un consommateur long-vivant sans
+# changement de structure une fois le worker branché sur la queue.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: worker
+  namespace: autome
+  labels:
+    app.kubernetes.io/name: worker
+    app.kubernetes.io/part-of: autome
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: worker
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: worker
+        app.kubernetes.io/part-of: autome
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        fsGroup: 10001
+      containers:
+        - name: worker
+          image: ghcr.io/thedarkmac/autome-worker:latest
+          imagePullPolicy: IfNotPresent
+          envFrom:
+            - configMapRef:
+                name: autome-config
+            - secretRef:
+                name: autome-secrets
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]

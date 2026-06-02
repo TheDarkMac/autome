@@ -1,0 +1,35 @@
+# Ingress (F10.3) — expose le frontend et l'API sur deux hôtes.
+#   - autome.local      → frontend (SPA)
+#   - api.autome.local  → api (REST)
+# Suppose un contrôleur ingress-nginx installé dans le cluster. Adapter les
+# hôtes au DNS réel ; ajouter TLS (cert-manager) en production.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: autome
+  namespace: autome
+  labels:
+    app.kubernetes.io/part-of: autome
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: autome.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: frontend
+                port:
+                  number: 80
+    - host: api.autome.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: api
+                port:
+                  number: 8080
