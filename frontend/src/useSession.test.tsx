@@ -123,7 +123,10 @@ describe("useSession", () => {
   it("authFetch injecte le Bearer de la session courante", async () => {
     const pair = mkPair("user-1", 10_000);
     const store = memorySessionStore(pair);
-    const fetchSpy = vi.fn(async () => new Response("ok", { status: 200 }));
+    const fetchSpy = vi.fn(
+      async (_input: RequestInfo | URL, _init?: RequestInit) =>
+        new Response("ok", { status: 200 }),
+    );
     vi.stubGlobal("fetch", fetchSpy);
     const { result } = renderHook(() => useSession({ store }));
 
