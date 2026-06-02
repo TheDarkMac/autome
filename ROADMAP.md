@@ -245,7 +245,7 @@
 - [x] **F10.3** — Manifests Kubernetes — _issue #110_
 - [x] **F10.4** — Pipeline CI (build, lint, test) — _issue #112_
 - [x] **F10.5** — Pipeline CD (build images, déploiement) — _issue #114_
-- [ ] **F10.6** — Monitoring Prometheus + dashboards Grafana
+- [~] **F10.6** — Monitoring Prometheus + dashboards Grafana — _issue #116_
 
 ## 11. Documentation
 
