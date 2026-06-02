@@ -252,7 +252,7 @@
 - [x] **F11.1** — README principal — _issue #118_
 - [x] **F11.2** — Guide d'installation / démarrage — _issue #120_
 - [x] **F11.3** — Doc d'architecture (avec diagrammes) — _issue #122_
-- [ ] **F11.4** — Guide création de connecteur
+- [~] **F11.4** — Guide création de connecteur — _issue #124_
 - [ ] **F11.5** — Checklist CI/CD & reproductibilité
 
 ## 12. Exemples de workflows
