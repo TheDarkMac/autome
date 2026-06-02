@@ -240,7 +240,7 @@
 
 ## 10. DevOps & Déploiement
 
-- [ ] **F10.1** — Dockerfiles (backend, worker, frontend)
+- [~] **F10.1** — Dockerfiles (backend, worker, frontend) — _issue #105_
 - [ ] **F10.2** — docker-compose dev (db, queue, services)
 - [ ] **F10.3** — Manifests Kubernetes
 - [ ] **F10.4** — Pipeline CI (build, lint, test)
