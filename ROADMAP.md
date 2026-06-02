@@ -253,7 +253,7 @@
 - [x] **F11.2** — Guide d'installation / démarrage — _issue #120_
 - [x] **F11.3** — Doc d'architecture (avec diagrammes) — _issue #122_
 - [x] **F11.4** — Guide création de connecteur — _issue #124_
-- [ ] **F11.5** — Checklist CI/CD & reproductibilité
+- [~] **F11.5** — Checklist CI/CD & reproductibilité — _issue #126_
 
 ## 12. Exemples de workflows
 
