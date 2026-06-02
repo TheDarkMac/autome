@@ -1,0 +1,97 @@
+# Stack de développement Autome (F10.2).
+#
+# Démarre toute la plateforme en une commande :
+#   docker compose up --build
+#
+# Services :
+#   - db       : PostgreSQL (schéma migrations/ — F1.5)
+#   - queue    : RabbitMQ + UI de management (http://localhost:15672, guest/guest)
+#   - api      : backend HTTP (http://localhost:8080)
+#   - worker   : exécuteur de runs (stateless)
+#   - frontend : SPA servie par nginx (http://localhost:8081)
+#
+# Les hôtes inter-services sont les NOMS de services Docker (`db`, `queue`).
+# NB : l'API/worker n'ouvrent pas encore de connexion réelle à Postgres /
+# RabbitMQ (stores in-memory — cf. dette #107 et câblage file F5.1) ; ce
+# compose provisionne l'infra et injecte la configuration, prêt pour ce
+# branchement. Profil `dev` (secrets de dev tolérés) — ne PAS utiliser tel
+# quel en production.
+
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: autome
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d autome"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  queue:
+    image: rabbitmq:3-management-alpine
+    environment:
+      RABBITMQ_DEFAULT_USER: guest
+      RABBITMQ_DEFAULT_PASS: guest
+    ports:
+      - "5672:5672"    # AMQP
+      - "15672:15672"  # UI de management
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  api:
+    build:
+      context: .
+      dockerfile: docker/api.Dockerfile
+    environment:
+      APP_PROFILE: dev
+      APP_HTTP_ADDR: 0.0.0.0:8080
+      DATABASE_URL: postgres://postgres:postgres@db:5432/autome
+      QUEUE_URL: amqp://guest:guest@queue:5672/
+      JWT_SECRET: dev-insecure-jwt-secret
+      ENCRYPTION_KEY: dev-insecure-encryption-key
+    ports:
+      - "8080:8080"
+    depends_on:
+      db:
+        condition: service_healthy
+      queue:
+        condition: service_healthy
+
+  worker:
+    build:
+      context: .
+      dockerfile: docker/worker.Dockerfile
+    environment:
+      APP_PROFILE: dev
+      DATABASE_URL: postgres://postgres:postgres@db:5432/autome
+      QUEUE_URL: amqp://guest:guest@queue:5672/
+    depends_on:
+      db:
+        condition: service_healthy
+      queue:
+        condition: service_healthy
+
+  frontend:
+    build:
+      context: frontend
+      dockerfile: Dockerfile
+      args:
+        # URL atteinte par le NAVIGATEUR (port publié de l'api), inlinée au build.
+        VITE_API_URL: http://localhost:8080
+    ports:
+      - "8081:80"
+    depends_on:
+      - api
+
+volumes:
+  pgdata:
