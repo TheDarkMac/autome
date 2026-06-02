@@ -1,0 +1,78 @@
+# Intégration continue Autome (F10.4).
+#
+# Reproduit la « definition of done » appliquée à chaque feature :
+#   - backend  : fmt + clippy (zéro warning) + tests workspace + build
+#   - frontend : typecheck + lint + tests Vitest
+#
+# Pas de service externe : les tests backend sont in-process / in-memory
+# (api : reqwest sur serveur local ; worker : queue/stores in-memory) et le
+# frontend tourne sous jsdom.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Annule les exécutions obsolètes sur une même réf (push successifs).
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  backend:
+    name: Backend (Rust)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Toolchain ≥ 1.85 (edition2024) ; on pin 1.90 comme les Dockerfiles.
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.90
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Tests
+        run: cargo test --workspace --locked
+
+      - name: Build (release)
+        run: cargo build --workspace --release --locked
+
+  frontend:
+    name: Frontend (Node)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Tests
+        run: npm run test
