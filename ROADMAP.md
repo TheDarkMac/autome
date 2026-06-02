@@ -234,7 +234,7 @@
 
 - [x] **F9.1** — Tests unitaires moteur de workflows — _issue #95_
 - [x] **F9.2** — Tests d'intégration connecteurs (avec mocks) — _issue #97_
-- [ ] **F9.3** — Tests d'intégration API
+- [~] **F9.3** — Tests d'intégration API — _issue #99_
 - [ ] **F9.4** — Tests end-to-end (workflow complet)
 - [ ] **F9.5** — Tests frontend (composants + e2e)
 
