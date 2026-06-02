@@ -257,7 +257,7 @@
 
 ## 12. Exemples de workflows
 
-- [ ] **F12.1** — Slack → Gmail → Notion
+- [~] **F12.1** — Slack → Gmail → Notion — _issue #128_
 - [ ] **F12.2** — Webhook GitHub → notification Slack
 - [ ] **F12.3** — Scheduler → fetch API → stockage
 
