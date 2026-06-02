@@ -249,7 +249,7 @@
 
 ## 11. Documentation
 
-- [ ] **F11.1** — README principal
+- [~] **F11.1** — README principal — _issue #118_
 - [ ] **F11.2** — Guide d'installation / démarrage
 - [ ] **F11.3** — Doc d'architecture (avec diagrammes)
 - [ ] **F11.4** — Guide création de connecteur
