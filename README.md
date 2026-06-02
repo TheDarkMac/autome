@@ -57,6 +57,9 @@ documentation et les exemples de workflows. Détail dans la
 
 ## 🚀 Quick start
 
+> Guide détaillé (configuration, local, Kubernetes, dépannage) :
+> [`docs/INSTALLATION.md`](docs/INSTALLATION.md).
+
 ### Option A — tout en conteneurs (recommandé)
 
 Pré-requis : **Docker** + **Docker Compose**.
@@ -156,6 +159,7 @@ défaut**. Détail complet, diagrammes et flux dans
 
 ## 📚 Documentation
 
+- [docs/INSTALLATION.md](docs/INSTALLATION.md) — guide d'installation & démarrage détaillé (Compose / local / Kubernetes).
 - [ROADMAP.md](ROADMAP.md) — features, sous-tâches et journal d'avancées.
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — architecture détaillée + diagrammes.
 - [docs/adr/](docs/adr/) — décisions d'architecture (framework, broker, migrations, crypto).
