@@ -236,7 +236,7 @@
 - [x] **F9.2** — Tests d'intégration connecteurs (avec mocks) — _issue #97_
 - [x] **F9.3** — Tests d'intégration API — _issue #99_
 - [x] **F9.4** — Tests end-to-end (workflow complet) — _issue #101_
-- [ ] **F9.5** — Tests frontend (composants + e2e)
+- [~] **F9.5** — Tests frontend (composants + e2e) — _issue #103_
 
 ## 10. DevOps & Déploiement
 
