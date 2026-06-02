@@ -9,6 +9,8 @@
 #   - api      : backend HTTP (http://localhost:8080)
 #   - worker   : exécuteur de runs (stateless)
 #   - frontend : SPA servie par nginx (http://localhost:8081)
+#   - prometheus : scrape /metrics de l'api (http://localhost:9090) — F10.6
+#   - grafana    : dashboards provisionnés (http://localhost:3000, admin/admin)
 #
 # Les hôtes inter-services sont les NOMS de services Docker (`db`, `queue`).
 # NB : l'API/worker n'ouvrent pas encore de connexion réelle à Postgres /
@@ -93,5 +95,38 @@ services:
     depends_on:
       - api
 
+  # ─────────────────────────── Monitoring (F10.6) ───────────────────────────
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - promdata:/prometheus
+    ports:
+      - "9090:9090"
+    depends_on:
+      - api
+
+  grafana:
+    image: grafana/grafana:11.2.0
+    environment:
+      # Identifiants dev (à changer en prod) + accès anonyme désactivé.
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      # Provisioning (datasource + provider de dashboards) et dashboards JSON.
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafanadata:/var/lib/grafana
+    ports:
+      - "3000:3000"
+    depends_on:
+      - prometheus
+
 volumes:
   pgdata:
+  promdata:
+  grafanadata:
