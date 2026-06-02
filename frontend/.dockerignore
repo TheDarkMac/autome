@@ -1,0 +1,8 @@
+# Contexte de build frontend minimal (F10.1).
+node_modules
+dist
+.git
+Dockerfile
+.dockerignore
+*.log
+.DS_Store
