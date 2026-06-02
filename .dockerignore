@@ -1,0 +1,32 @@
+# Contexte de build minimal (F10.1) — on n'envoie au daemon que les
+# sources nécessaires à `cargo build`. Les artefacts et dépendances
+# volumineux sont reconstruits dans l'étape builder.
+
+# Artefacts de compilation Rust
+/target
+**/target
+
+# Frontend : node_modules + build (le frontend a son propre Dockerfile)
+/frontend/node_modules
+/frontend/dist
+
+# Git & métadonnées
+.git
+.gitignore
+.github
+
+# DevOps (pas nécessaire à la compilation des binaires)
+/docker
+docker-compose*.yml
+**/Dockerfile
+.dockerignore
+
+# Éditeurs / OS
+.vscode
+.idea
+**/*.swp
+.DS_Store
+
+# Docs & divers
+*.md
+LICENSE
