@@ -20,3 +20,7 @@ serde_json = { workspace = true }
 [dev-dependencies]
 # Décodage du `raw` base64url de Gmail dans l'exemple e2e (F12.1).
 base64 = { workspace = true }
+# Signature HMAC-SHA256 du webhook GitHub dans l'exemple e2e (F12.2).
+hmac = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }

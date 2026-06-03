@@ -1,0 +1,28 @@
+{
+  "id": "example-github-webhook-to-slack",
+  "name": "Webhook GitHub → notification Slack",
+  "nodes": [
+    {
+      "id": "entry",
+      "name": "Webhook GitHub (issues)",
+      "kind": "trigger",
+      "trigger_type": "webhook",
+      "params": {
+        "path": "/webhooks/github",
+        "event": "issues"
+      }
+    },
+    {
+      "id": "notify",
+      "name": "Notifier Slack",
+      "kind": "action",
+      "action_type": "slack.send_message",
+      "params": {
+        "channel": "C123ISSUES"
+      }
+    }
+  ],
+  "edges": [
+    { "from": "entry", "to": "notify" }
+  ]
+}
