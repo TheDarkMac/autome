@@ -154,7 +154,10 @@ dependencies = [
  "autome-connectors",
  "autome-core",
  "base64",
+ "hex",
+ "hmac",
  "serde_json",
+ "sha2",
  "thiserror 1.0.69",
 ]
 
