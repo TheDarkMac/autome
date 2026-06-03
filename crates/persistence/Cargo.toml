@@ -1,0 +1,21 @@
+[package]
+name = "autome-persistence"
+description = "Backends de persistance PostgreSQL des traits de stockage (dette #107)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+autome-core = { workspace = true }
+# Driver PostgreSQL **bloquant** : les traits stores de `core`
+# (`RevocationStore`, …) sont synchrones, un driver async (sqlx) imposerait
+# un `block_on` dans les handlers axum. Pool via r2d2.
+postgres = { workspace = true }
+r2d2 = { workspace = true }
+r2d2_postgres = { workspace = true }
