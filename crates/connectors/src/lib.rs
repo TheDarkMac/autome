@@ -13,6 +13,7 @@ pub mod http;
 pub mod notion;
 pub mod oauth;
 pub mod polling;
+pub mod reqwest_client;
 pub mod schedule;
 pub mod sdk;
 pub mod slack;
@@ -35,6 +36,7 @@ pub use notion::{
     NotionQueryDatabase, NotionReadPage,
 };
 pub use polling::PollingTrigger;
+pub use reqwest_client::ReqwestHttpClient;
 pub use schedule::{CronSchedule, CronTime, ScheduleTrigger};
 pub use sdk::{
     ActionSchema, Connector, Credentials, ParamKind, ParamSpec, RecordingClient, RetryPolicy,

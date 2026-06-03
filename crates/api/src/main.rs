@@ -9,6 +9,7 @@
 use std::sync::Arc;
 
 use autome_api::auth::protected_router;
+use autome_api::credentials::{credentials_router, CredentialsState};
 use autome_api::metrics::{metrics_router, with_metrics, Metrics};
 use autome_api::runs::{runs_router, RunsState};
 use autome_api::runtime::{
@@ -54,11 +55,15 @@ fn build_router(backends: &Backends, metrics: Arc<Metrics>) -> Router {
         )
         .with_state(wf_state);
 
+    let credentials_state =
+        CredentialsState::new(backends.auth.clone(), backends.credentials.clone());
+
     let router = Router::new()
         .route("/health", get(health))
         .nest("/auth", protected_router(backends.auth.clone()))
         .merge(workflows_routes)
         .merge(runs_router(runs_state))
+        .merge(credentials_router(credentials_state))
         .merge(metrics_router(metrics.clone()));
     with_metrics(router, metrics)
 }
