@@ -259,7 +259,7 @@
 
 - [x] **F12.1** — Slack → Gmail → Notion — _issue #128_
 - [x] **F12.2** — Webhook GitHub → notification Slack — _issue #130_
-- [ ] **F12.3** — Scheduler → fetch API → stockage
+- [~] **F12.3** — Scheduler → fetch API → stockage — _issue #132_
 
 ---
 
