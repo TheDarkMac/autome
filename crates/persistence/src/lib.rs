@@ -11,11 +11,15 @@
 //! une bascule vers des traits async — ou un offload via `spawn_blocking` —
 //! pourra suivre si le profil de charge l'exige.
 //!
-//! Couvert dans cette itération : [`PgRevocationStore`]. Les autres backends
-//! (permissions, audit, runs, queue) suivent dans la même veine.
+//! Couvert : [`PgRevocationStore`], [`PgPermissionStore`], [`PgAuditSink`]
+//! (stores d'authent/RBAC/audit). Les backends runs/workflows/queue suivent.
 
+pub mod audit;
+pub mod permission;
 pub mod pool;
 pub mod revocation;
 
+pub use audit::PgAuditSink;
+pub use permission::PgPermissionStore;
 pub use pool::{connect, PgPool};
 pub use revocation::PgRevocationStore;
