@@ -55,6 +55,10 @@ pub const MIGRATIONS: &[(&str, &str)] = &[
         "0008_audit_events.sql",
         include_str!("../../../migrations/0008_audit_events.sql"),
     ),
+    (
+        "0009_align_ids_text.sql",
+        include_str!("../../../migrations/0009_align_ids_text.sql"),
+    ),
 ];
 
 fn storage_err(context: &str, e: impl std::fmt::Display) -> Error {

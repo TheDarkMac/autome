@@ -15,9 +15,13 @@ pub mod migrations;
 pub mod permission;
 pub mod pool;
 pub mod revocation;
+pub mod run_state;
+pub mod workflow_repo;
 
 pub use audit::PgAuditSink;
 pub use migrations::{run_migrations, MIGRATIONS};
 pub use permission::PgPermissionStore;
 pub use pool::{connect, PgPool};
 pub use revocation::PgRevocationStore;
+pub use run_state::PgRunStateStore;
+pub use workflow_repo::PgWorkflowRepository;

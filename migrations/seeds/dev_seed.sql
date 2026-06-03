@@ -1,11 +1,10 @@
 -- F1.5.g — Seed de données de DÉVELOPPEMENT.
 -- N'est PAS une migration : à appliquer explicitement sur une base de dev
--- (jamais en prod). UUID figés pour des tests reproductibles.
+-- (jamais en prod). IDs figés pour des tests reproductibles.
+-- Schéma aligné sur le domaine (IDs logiques TEXT, *_ms) — cf. migration 0009.
 -- Le graph respecte le schéma F1.4 (autome-core::WorkflowGraph).
 
 BEGIN;
--- La FK workflows.current_version → workflow_versions est différable.
-SET CONSTRAINTS ALL DEFERRED;
 
 INSERT INTO users (id, email, password_hash, role)
 VALUES (
@@ -16,22 +15,15 @@ VALUES (
     'admin'
 );
 
-INSERT INTO workflows (id, owner_id, name, active, current_version)
-VALUES (
-    '00000000-0000-0000-0000-0000000000a1',
-    '00000000-0000-0000-0000-000000000001',
-    'Demo : Webhook -> HTTP',
-    TRUE,
-    1
-);
+INSERT INTO workflows (id, name, active, current_version, created_at_ms, updated_at_ms)
+VALUES ('wf-demo', 'Demo : Webhook -> HTTP', TRUE, 1, 1700000000000, 1700000000000);
 
-INSERT INTO workflow_versions (id, workflow_id, version, graph)
+INSERT INTO workflow_versions (workflow_id, version, graph)
 VALUES (
-    '00000000-0000-0000-0000-0000000000b1',
-    '00000000-0000-0000-0000-0000000000a1',
+    'wf-demo',
     1,
     '{
-      "id": "00000000-0000-0000-0000-0000000000a1",
+      "id": "wf-demo",
       "name": "Demo : Webhook -> HTTP",
       "nodes": [
         { "id": "trigger", "name": "Webhook", "kind": "trigger",
@@ -45,23 +37,14 @@ VALUES (
 );
 
 INSERT INTO runs (id, workflow_id, version, status, trigger_type,
-                  started_at, finished_at)
-VALUES (
-    '00000000-0000-0000-0000-0000000000c1',
-    '00000000-0000-0000-0000-0000000000a1',
-    1,
-    'succeeded',
-    'webhook',
-    now() - INTERVAL '5 minutes',
-    now() - INTERVAL '4 minutes'
-);
+                  started_at_ms, finished_at_ms, created_at_ms)
+VALUES ('run-demo', 'wf-demo', 1, 'succeeded', 'webhook',
+        1700000000000, 1700000060000, 1700000000000);
 
-INSERT INTO run_steps (run_id, node_id, status, input, output)
+INSERT INTO run_steps (run_id, node_id, output)
 VALUES
-    ('00000000-0000-0000-0000-0000000000c1', 'trigger', 'succeeded',
-     '{}'::jsonb, '{"body": {"hello": "world"}}'::jsonb),
-    ('00000000-0000-0000-0000-0000000000c1', 'act', 'succeeded',
-     '{"body": {"hello": "world"}}'::jsonb, '{"status": 200}'::jsonb);
+    ('run-demo', 'trigger', '{"body": {"hello": "world"}}'::jsonb),
+    ('run-demo', 'act', '{"status": 200}'::jsonb);
 
 INSERT INTO credentials (owner_id, provider, name, secret_enc)
 VALUES (
