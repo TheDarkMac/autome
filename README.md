@@ -164,6 +164,7 @@ défaut**. Détail complet, diagrammes et flux dans
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — architecture détaillée + diagrammes.
 - [docs/CONNECTORS.md](docs/CONNECTORS.md) — guide pour créer un connecteur (SDK + exemple).
 - [docs/CICD.md](docs/CICD.md) — checklist CI/CD & reproductibilité.
+- [examples/](examples/) — exemples de workflows exécutables (graphe JSON + test e2e).
 - [docs/adr/](docs/adr/) — décisions d'architecture (framework, broker, migrations, crypto).
 - [CONVENTIONS.md](CONVENTIONS.md) — conventions de code et de contribution.
 - [.env.example](.env.example) — variables de configuration.
