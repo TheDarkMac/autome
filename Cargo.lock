@@ -169,6 +169,7 @@ dependencies = [
  "postgres",
  "r2d2",
  "r2d2_postgres",
+ "serde_json",
 ]
 
 [[package]]
@@ -1330,6 +1331,8 @@ dependencies = [
  "bytes",
  "fallible-iterator",
  "postgres-protocol",
+ "serde_core",
+ "serde_json",
 ]
 
 [[package]]

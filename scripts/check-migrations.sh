@@ -54,7 +54,7 @@ echo "==> Application du seed de dev"
 psql_run -q < "$MIG_DIR/seeds/dev_seed.sql"
 
 echo "==> Vérifications d'invariants"
-EXPECTED_TABLES="credentials revoked_tokens run_steps runs users workflow_versions workflows"
+EXPECTED_TABLES="audit_events credentials revoked_tokens run_steps runs user_permissions users workflow_versions workflows"
 GOT_TABLES=$(psql_run -tA -c \
   "SELECT string_agg(tablename,' ' ORDER BY tablename)
    FROM pg_tables WHERE schemaname='public';")
