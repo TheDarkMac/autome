@@ -159,6 +159,7 @@ pub async fn list_workflows(
     let WorkflowPage { items, total } = state
         .repo
         .list(paging)
+        .await
         .map_err(|e| WorkflowError::Internal(e.to_string()))?;
     audit_event(
         &state,
@@ -200,7 +201,7 @@ pub async fn create_workflow(
         .require_permission(&user, PERM_WORKFLOWS_WRITE)
         .await?;
     let workflow_id = workflow.id.0.clone();
-    match state.repo.create(workflow.clone()) {
+    match state.repo.create(workflow.clone()).await {
         Ok(()) => {
             audit_event(
                 &state,
@@ -257,6 +258,7 @@ pub async fn get_workflow(
     match state
         .repo
         .get(&WorkflowId::new(&id))
+        .await
         .map_err(|e| WorkflowError::Internal(e.to_string()))?
     {
         Some(w) => {
@@ -317,7 +319,7 @@ pub async fn update_workflow(
             workflow.id.0
         )));
     }
-    match state.repo.update(workflow.clone()) {
+    match state.repo.update(workflow.clone()).await {
         Ok(()) => {
             audit_event(
                 &state,
@@ -373,6 +375,7 @@ pub async fn delete_workflow(
     let _existed = state
         .repo
         .delete(&WorkflowId::new(&id))
+        .await
         .map_err(|e| WorkflowError::Internal(e.to_string()))?;
     audit_event(
         &state,
@@ -529,14 +532,14 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::CREATED);
         // Repo a bien stocké
-        assert!(repo.get(&WorkflowId::new("wf-1")).unwrap().is_some());
+        assert!(repo.get(&WorkflowId::new("wf-1")).await.unwrap().is_some());
     }
 
     #[tokio::test]
     async fn get_returns_200_when_workflow_exists() {
         let (state, svc, perms, _, repo) = make_test_state();
         perms.assign_role("alice", &Role::viewer()).unwrap();
-        repo.create(sample_workflow("wf-1")).unwrap();
+        repo.create(sample_workflow("wf-1")).await.unwrap();
         let token = svc.issue_access("alice", 900, FIXED_NOW).unwrap();
         let app = workflows_router(state);
         let response = app
@@ -565,7 +568,7 @@ mod tests {
     async fn update_returns_200_with_updated_workflow() {
         let (state, svc, perms, _, repo) = make_test_state();
         perms.assign_role("alice", &Role::editor()).unwrap();
-        repo.create(sample_workflow("wf-1")).unwrap();
+        repo.create(sample_workflow("wf-1")).await.unwrap();
         let token = svc.issue_access("alice", 900, FIXED_NOW).unwrap();
         let app = workflows_router(state);
         let mut new_payload = sample_workflow_json("wf-1");
@@ -581,7 +584,11 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(
-            repo.get(&WorkflowId::new("wf-1")).unwrap().unwrap().name,
+            repo.get(&WorkflowId::new("wf-1"))
+                .await
+                .unwrap()
+                .unwrap()
+                .name,
             "renamed"
         );
     }
@@ -590,7 +597,7 @@ mod tests {
     async fn delete_returns_204_and_removes_workflow() {
         let (state, svc, perms, _, repo) = make_test_state();
         perms.assign_role("alice", &Role::editor()).unwrap();
-        repo.create(sample_workflow("wf-1")).unwrap();
+        repo.create(sample_workflow("wf-1")).await.unwrap();
         let token = svc.issue_access("alice", 900, FIXED_NOW).unwrap();
         let app = workflows_router(state);
         let response = app
@@ -598,7 +605,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
-        assert!(repo.get(&WorkflowId::new("wf-1")).unwrap().is_none());
+        assert!(repo.get(&WorkflowId::new("wf-1")).await.unwrap().is_none());
     }
 
     // ───── erreurs métier ─────
@@ -607,7 +614,7 @@ mod tests {
     async fn create_duplicate_returns_409() {
         let (state, svc, perms, _, repo) = make_test_state();
         perms.assign_role("alice", &Role::editor()).unwrap();
-        repo.create(sample_workflow("wf-1")).unwrap();
+        repo.create(sample_workflow("wf-1")).await.unwrap();
         let token = svc.issue_access("alice", 900, FIXED_NOW).unwrap();
         let app = workflows_router(state);
         let payload = sample_workflow_json("wf-1").to_string();
@@ -636,7 +643,7 @@ mod tests {
     async fn update_with_mismatched_id_returns_400() {
         let (state, svc, perms, _, repo) = make_test_state();
         perms.assign_role("alice", &Role::editor()).unwrap();
-        repo.create(sample_workflow("wf-1")).unwrap();
+        repo.create(sample_workflow("wf-1")).await.unwrap();
         let token = svc.issue_access("alice", 900, FIXED_NOW).unwrap();
         let app = workflows_router(state);
         // body id != path id
@@ -732,7 +739,9 @@ mod tests {
         let (state, svc, perms, _, repo) = make_test_state();
         perms.assign_role("alice", &Role::editor()).unwrap();
         for i in 0..5 {
-            repo.create(sample_workflow(&format!("wf-{i}"))).unwrap();
+            repo.create(sample_workflow(&format!("wf-{i}")))
+                .await
+                .unwrap();
         }
         let token = svc.issue_access("alice", 900, FIXED_NOW).unwrap();
         let app = workflows_router(state);

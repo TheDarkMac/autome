@@ -36,6 +36,23 @@ use serde_json::{json, Value};
 const QUEUE: &str = "runs";
 const NOW_MS: i64 = 1_700_000_000_000;
 
+/// Pont synchrone → async : le worker est thread-based (sync) mais les stores
+/// sont désormais asynchrones (dette #107). Un runtime tokio dédié, partagé,
+/// permet de `block_on` les appels stores depuis les threads (sync) du pool et
+/// le corps des tests. (La bascule async du worker viendra avec lapin.)
+fn block<F: std::future::Future>(f: F) -> F::Output {
+    use std::sync::OnceLock;
+    static RT: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+    RT.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("runtime de test")
+    })
+    .block_on(f)
+}
+
 /// Workflow réaliste à trois nodes avec **mapping de données** :
 /// `entry` (trigger) → `fetch` (produit `{ value: 21 }`) → `double`
 /// (lit la sortie de `fetch` et produit `{ result: 42 }`).
@@ -124,20 +141,18 @@ impl Handler for RunExecutor {
         let run_id = body["run_id"].as_str().expect("run_id dans le message");
         let workflow_id = body["workflow_id"].as_str().expect("workflow_id");
 
-        let workflow = self
-            .repo
-            .get(&WorkflowId::new(workflow_id))
+        let workflow = block(self.repo.get(&WorkflowId::new(workflow_id)))
             .expect("repo get")
             .expect("workflow connu");
         let dag = Dag::from_workflow(&workflow).expect("DAG valide");
 
         // Transition Queued → Running.
-        let mut checkpoint = self.store.load(run_id).expect("load").expect("run connu");
+        let mut checkpoint = block(self.store.load(run_id))
+            .expect("load")
+            .expect("run connu");
         checkpoint.status = RunStatus::Running;
         checkpoint.started_at_ms = Some(NOW_MS);
-        self.store
-            .checkpoint(&checkpoint)
-            .expect("checkpoint running");
+        block(self.store.checkpoint(&checkpoint)).expect("checkpoint running");
 
         // Exécution du moteur.
         let runner = make_runner(Arc::clone(&self.runs));
@@ -162,9 +177,7 @@ impl Handler for RunExecutor {
                 .find_map(|s| s.error.clone())
                 .or_else(|| Some("run en échec".into()));
         }
-        self.store
-            .checkpoint(&checkpoint)
-            .expect("checkpoint final");
+        block(self.store.checkpoint(&checkpoint)).expect("checkpoint final");
 
         match report.status {
             EngineRunStatus::Succeeded => HandlerVerdict::Ok,
@@ -219,16 +232,15 @@ impl Stack {
 
     /// Dispatche un run pour `workflow_id` (le workflow doit déjà exister).
     fn dispatch(&self, workflow_id: &str) -> String {
-        self.dispatcher
-            .dispatch(DispatchRequest {
-                workflow_id: workflow_id.into(),
-                version: 1,
-                trigger_type: "manual".into(),
-                payload: json!({ "seed": true }),
-                now_ms: NOW_MS,
-            })
-            .expect("dispatch")
-            .run_id
+        block(self.dispatcher.dispatch(DispatchRequest {
+            workflow_id: workflow_id.into(),
+            version: 1,
+            trigger_type: "manual".into(),
+            payload: json!({ "seed": true }),
+            now_ms: NOW_MS,
+        }))
+        .expect("dispatch")
+        .run_id
     }
 }
 
@@ -237,12 +249,12 @@ impl Stack {
 #[test]
 fn dispatched_workflow_runs_to_completion_with_persisted_outputs() {
     let stack = Stack::new();
-    stack.repo.create(pipeline_workflow("wf-pipe")).unwrap();
+    block(stack.repo.create(pipeline_workflow("wf-pipe"))).unwrap();
 
     // À l'instant du dispatch, le run est Queued et la queue contient 1 msg.
     let run_id = stack.dispatch("wf-pipe");
     assert_eq!(
-        stack.store.load(&run_id).unwrap().unwrap().status,
+        block(stack.store.load(&run_id)).unwrap().unwrap().status,
         RunStatus::Queued
     );
     assert_eq!(stack.queue.depth(QUEUE).unwrap(), 1);
@@ -254,7 +266,7 @@ fn dispatched_workflow_runs_to_completion_with_persisted_outputs() {
 
     // État final : Succeeded, sorties des deux actions persistées (la donnée
     // `21` a transité de `fetch` vers `double` via le moteur → `42`).
-    let final_state = stack.store.load(&run_id).unwrap().unwrap();
+    let final_state = block(stack.store.load(&run_id)).unwrap().unwrap();
     assert_eq!(final_state.status, RunStatus::Succeeded);
     assert_eq!(final_state.outputs["fetch"], json!({ "value": 21 }));
     assert_eq!(final_state.outputs["double"], json!({ "result": 42 }));
@@ -274,7 +286,7 @@ fn failing_node_marks_run_failed_and_dead_letters_message() {
     // Workflow dont le second node échoue (`name == "boom"`).
     let mut wf = pipeline_workflow("wf-boom");
     wf.nodes[1].name = "boom".into();
-    stack.repo.create(wf).unwrap();
+    block(stack.repo.create(wf)).unwrap();
 
     let run_id = stack.dispatch("wf-boom");
     let pool = stack.pool(1);
@@ -282,7 +294,7 @@ fn failing_node_marks_run_failed_and_dead_letters_message() {
     assert_eq!(outcome, ProcessOutcome::Handled(HandlerVerdict::DeadLetter));
 
     // Run marqué Failed avec un message d'erreur.
-    let final_state = stack.store.load(&run_id).unwrap().unwrap();
+    let final_state = block(stack.store.load(&run_id)).unwrap().unwrap();
     assert_eq!(final_state.status, RunStatus::Failed);
     assert!(
         final_state.error.is_some(),
@@ -299,7 +311,7 @@ fn failing_node_marks_run_failed_and_dead_letters_message() {
 #[test]
 fn concurrent_pool_drains_all_dispatched_runs_to_success() {
     let stack = Stack::new();
-    stack.repo.create(pipeline_workflow("wf-pipe")).unwrap();
+    block(stack.repo.create(pipeline_workflow("wf-pipe"))).unwrap();
 
     const N: usize = 50;
     let run_ids: Vec<String> = (0..N).map(|_| stack.dispatch("wf-pipe")).collect();
@@ -314,9 +326,7 @@ fn concurrent_pool_drains_all_dispatched_runs_to_success() {
         let done = run_ids
             .iter()
             .filter(|id| {
-                stack
-                    .store
-                    .load(id)
+                block(stack.store.load(id))
                     .unwrap()
                     .map(|c| c.status == RunStatus::Succeeded)
                     .unwrap_or(false)
@@ -341,7 +351,7 @@ fn concurrent_pool_drains_all_dispatched_runs_to_success() {
 #[test]
 fn duplicate_delivery_is_deduplicated_and_executes_once() {
     let stack = Stack::new();
-    stack.repo.create(pipeline_workflow("wf-pipe")).unwrap();
+    block(stack.repo.create(pipeline_workflow("wf-pipe"))).unwrap();
 
     // Deux dispatchs avec le *même* run_id → même `idempotency-key`, deux
     // messages sur la queue (le store est ré-écrit en Queued à l'identique).
@@ -357,8 +367,8 @@ fn duplicate_delivery_is_deduplicated_and_executes_once() {
         payload: Value::Null,
         now_ms: NOW_MS,
     };
-    fixed.dispatch(req()).unwrap();
-    fixed.dispatch(req()).unwrap();
+    block(fixed.dispatch(req())).unwrap();
+    block(fixed.dispatch(req())).unwrap();
     assert_eq!(stack.queue.depth(QUEUE).unwrap(), 2);
 
     let pool = stack.pool(1);
@@ -371,7 +381,7 @@ fn duplicate_delivery_is_deduplicated_and_executes_once() {
     assert_eq!(pool.process_one().unwrap(), ProcessOutcome::Deduplicated);
 
     assert_eq!(
-        stack.store.load("run-dup").unwrap().unwrap().status,
+        block(stack.store.load("run-dup")).unwrap().unwrap().status,
         RunStatus::Succeeded
     );
     assert_eq!(
