@@ -1,0 +1,39 @@
+{
+  "id": "example-scheduler-fetch-store",
+  "name": "Scheduler → fetch API → stockage",
+  "nodes": [
+    {
+      "id": "entry",
+      "name": "Scheduler horaire",
+      "kind": "trigger",
+      "trigger_type": "schedule",
+      "params": {
+        "cron": "0 * * * *"
+      }
+    },
+    {
+      "id": "fetch",
+      "name": "Récupérer la météo",
+      "kind": "action",
+      "action_type": "http_request",
+      "params": {
+        "method": "GET",
+        "url": "https://api.weather.example/v1/current?city=Paris"
+      }
+    },
+    {
+      "id": "store",
+      "name": "Stocker l'enregistrement",
+      "kind": "action",
+      "action_type": "http_request",
+      "params": {
+        "method": "POST",
+        "url": "https://storage.example/v1/records"
+      }
+    }
+  ],
+  "edges": [
+    { "from": "entry", "to": "fetch" },
+    { "from": "fetch", "to": "store" }
+  ]
+}
