@@ -11,10 +11,7 @@ use std::sync::Arc;
 use autome_api::auth::{protected_router, AuthState};
 use autome_api::metrics::{metrics_router, with_metrics, Metrics};
 use autome_api::tls::load_rustls_config;
-use autome_core::{
-    AuditSink, Config, InMemoryPermissionStore, InMemoryRevocationStore, NoopAuditSink,
-    PermissionStore, RevocationStore, TokenService,
-};
+use autome_core::{Config, Profile};
 use axum::{routing::get, Router};
 
 /// Handler de la sonde de santé.
@@ -39,21 +36,23 @@ fn build_router(auth: AuthState, metrics: Arc<Metrics>) -> Router {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = Config::from_env()?;
 
-    // Secret JWT depuis la config (F1.6) — à remplacer par une vraie clé
-    // dérivée d'env quand on aura `config.jwt_secret`. Pour le squelette
-    // on prend un secret dev déterministe ; **ne pas livrer en prod**.
-    let jwt_secret = b"DEV-ONLY-replace-with-config-secret-please-32";
-    let revocation: Arc<dyn RevocationStore + Send + Sync> =
-        Arc::new(InMemoryRevocationStore::new());
-    let permissions: Arc<dyn PermissionStore + Send + Sync> =
-        Arc::new(InMemoryPermissionStore::new());
-    let audit: Arc<dyn AuditSink + Send + Sync> = Arc::new(NoopAuditSink);
-    let auth = AuthState::new(
-        TokenService::new(jwt_secret),
-        revocation,
-        permissions,
-        audit,
-    );
+    // Secret JWT + stores dérivés de la configuration (dette #107, constat 1) :
+    // le `TokenService` signe désormais avec `JWT_SECRET` (`config.jwt_secret`)
+    // et non plus une constante de dev codée en dur.
+    let auth = AuthState::from_config(&config);
+
+    // Garde prod (dette #107, constat 4) : la persistance (révocations /
+    // permissions / audit) est encore in-memory — non partagée entre répliques
+    // et perdue au redémarrage. On le signale fort plutôt que de refuser le
+    // démarrage, sous peine de rendre l'image prod (F10.x) non bootable tant
+    // que les backends PostgreSQL/RabbitMQ (constat 2) ne sont pas livrés.
+    if config.profile == Profile::Prod {
+        eprintln!(
+            "AVERTISSEMENT (prod) : stores in-memory (révocations/permissions/audit \
+             non persistés, état non partagé entre répliques). Backends PostgreSQL/\
+             RabbitMQ à brancher — cf. dette #107."
+        );
+    }
 
     let metrics = Arc::new(Metrics::new());
     let app = build_router(auth, metrics);
@@ -104,13 +103,10 @@ mod tests {
 
     #[test]
     fn router_builds() {
-        // Le routeur se construit sans panique (route /health + /auth/*).
-        let revocation: Arc<dyn RevocationStore + Send + Sync> =
-            Arc::new(InMemoryRevocationStore::new());
-        let permissions: Arc<dyn PermissionStore + Send + Sync> =
-            Arc::new(InMemoryPermissionStore::new());
-        let audit: Arc<dyn AuditSink + Send + Sync> = Arc::new(NoopAuditSink);
-        let auth = AuthState::new(TokenService::new(b"x"), revocation, permissions, audit);
+        // Le routeur se construit sans panique (route /health + /auth/*),
+        // avec un `AuthState` dérivé d'une config de dev.
+        let config = Config::load(|_| None).expect("config dev par défaut");
+        let auth = AuthState::from_config(&config);
         let _app: Router = build_router(auth, Arc::new(Metrics::new()));
     }
 }
