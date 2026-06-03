@@ -10,6 +10,7 @@ use std::sync::Arc;
 
 use autome_api::auth::{protected_router, AuthState};
 use autome_api::metrics::{metrics_router, with_metrics, Metrics};
+use autome_api::runtime::{build_auth_state, PersistenceMode};
 use autome_api::tls::load_rustls_config;
 use autome_core::{Config, Profile};
 use axum::{routing::get, Router};
@@ -36,21 +37,22 @@ fn build_router(auth: AuthState, metrics: Arc<Metrics>) -> Router {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = Config::from_env()?;
 
-    // Secret JWT + stores dérivés de la configuration (dette #107, constat 1) :
-    // le `TokenService` signe désormais avec `JWT_SECRET` (`config.jwt_secret`)
-    // et non plus une constante de dev codée en dur.
-    let auth = AuthState::from_config(&config);
+    // Backend de persistance (dette #107) : `AUTOME_PERSISTENCE=postgres` adosse
+    // les stores d'auth à PostgreSQL ; défaut `memory` (dev/tests/single-node).
+    // Le secret JWT vient toujours de `config.jwt_secret` (constat 1).
+    let mode = PersistenceMode::from_env()?;
+    let auth = build_auth_state(&config, mode)?;
+    println!("autome-api : persistance = {mode:?}");
 
-    // Garde prod (dette #107, constat 4) : la persistance (révocations /
-    // permissions / audit) est encore in-memory — non partagée entre répliques
-    // et perdue au redémarrage. On le signale fort plutôt que de refuser le
-    // démarrage, sous peine de rendre l'image prod (F10.x) non bootable tant
-    // que les backends PostgreSQL/RabbitMQ (constat 2) ne sont pas livrés.
-    if config.profile == Profile::Prod {
+    // Garde prod (dette #107, constat 4) : en in-memory, l'état (révocations/
+    // permissions/audit) n'est ni persisté ni partagé entre répliques. On le
+    // signale fort plutôt que de refuser le démarrage (l'image prod resterait
+    // bootable). En prod, positionner `AUTOME_PERSISTENCE=postgres`.
+    if config.profile == Profile::Prod && mode == PersistenceMode::Memory {
         eprintln!(
-            "AVERTISSEMENT (prod) : stores in-memory (révocations/permissions/audit \
-             non persistés, état non partagé entre répliques). Backends PostgreSQL/\
-             RabbitMQ à brancher — cf. dette #107."
+            "AVERTISSEMENT (prod) : stores in-memory — état non persisté ni \
+             partagé entre répliques. Positionnez AUTOME_PERSISTENCE=postgres \
+             (cf. dette #107)."
         );
     }
 
