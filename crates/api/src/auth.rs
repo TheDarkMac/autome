@@ -26,8 +26,8 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use autome_core::{
-    has_permission, AuditEvent, AuditOutcome, AuditSink, Claims, PermissionStore, RevocationStore,
-    TokenService,
+    has_permission, AuditEvent, AuditOutcome, AuditSink, Claims, Config, InMemoryPermissionStore,
+    InMemoryRevocationStore, NoopAuditSink, PermissionStore, RevocationStore, TokenService,
 };
 use axum::{
     extract::{FromRef, FromRequestParts},
@@ -73,6 +73,12 @@ pub struct AuthState {
     pub clock: Arc<dyn Clock>,
 }
 
+/// Dérive un [`TokenService`] du secret JWT de la configuration
+/// (`config.jwt_secret`). Point d'usage unique du secret en clair.
+pub fn token_service_from_config(config: &Config) -> TokenService {
+    TokenService::new(config.jwt_secret.expose().as_bytes())
+}
+
 impl AuthState {
     /// Construit l'état avec [`SystemClock`] et un store de permissions vide.
     pub fn new(
@@ -94,6 +100,22 @@ impl AuthState {
     pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
         self.clock = clock;
         self
+    }
+
+    /// Construit l'`AuthState` à partir de la configuration applicative
+    /// (dette #107, constat 1) : le `TokenService` est dérivé de
+    /// **`config.jwt_secret`** — fini le secret codé en dur dans `main`.
+    ///
+    /// Les stores de révocation/permissions et le sink d'audit sont encore
+    /// **in-memory** (non persistés, non partagés entre répliques) : leur
+    /// adossement à PostgreSQL relève de la suite de #107 (constat 2).
+    pub fn from_config(config: &Config) -> Self {
+        Self::new(
+            token_service_from_config(config),
+            Arc::new(InMemoryRevocationStore::new()),
+            Arc::new(InMemoryPermissionStore::new()),
+            Arc::new(NoopAuditSink),
+        )
     }
 
     /// Vérifie que `user` possède la permission `needed`. À appeler depuis
@@ -596,5 +618,52 @@ mod tests {
             assert_eq!(e.actor, "alice");
             assert_eq!(e.outcome, AuditOutcome::Success);
         }
+    }
+
+    // ── Dette #107 — le secret JWT vient bien de la config ─────────────────
+
+    /// Constat 1 : `token_service_from_config` signe avec `config.jwt_secret`.
+    /// Un token émis avec ce service se vérifie ; un service construit avec
+    /// l'**ancienne constante codée en dur** rejette ce même token.
+    #[test]
+    fn token_service_uses_config_jwt_secret() {
+        let config = Config::load(|k| match k {
+            "JWT_SECRET" => Some("a-very-real-production-secret-32+chars".into()),
+            _ => None,
+        })
+        .expect("config");
+
+        let svc = token_service_from_config(&config);
+        let token = svc.issue_access("alice", 3600, FIXED_NOW).unwrap();
+        // Le service issu de la config se vérifie lui-même.
+        assert!(svc.verify(&token, FIXED_NOW).is_ok());
+
+        // L'ancien secret de dev codé en dur ne doit PAS valider ce token.
+        let legacy = TokenService::new(b"DEV-ONLY-replace-with-config-secret-please-32");
+        assert!(
+            legacy.verify(&token, FIXED_NOW).is_err(),
+            "régression : le token ne doit pas être validé par l'ancien secret codé en dur"
+        );
+    }
+
+    /// `AuthState::from_config` produit un état dont le `token_service` utilise
+    /// le secret de configuration (cohérent avec `token_service_from_config`).
+    #[test]
+    fn auth_state_from_config_wires_token_service() {
+        let config = Config::load(|k| match k {
+            "JWT_SECRET" => Some("another-distinct-real-secret-32+chars".into()),
+            _ => None,
+        })
+        .expect("config");
+
+        let state = AuthState::from_config(&config);
+        let token = state
+            .token_service
+            .issue_access("bob", 3600, FIXED_NOW)
+            .unwrap();
+        assert!(state.token_service.verify(&token, FIXED_NOW).is_ok());
+
+        let other = TokenService::new(b"some-other-unrelated-secret-32+chars!");
+        assert!(other.verify(&token, FIXED_NOW).is_err());
     }
 }
