@@ -15,5 +15,6 @@ pub mod credentials;
 pub mod metrics;
 pub mod openapi;
 pub mod runs;
+pub mod runtime;
 pub mod tls;
 pub mod workflows;

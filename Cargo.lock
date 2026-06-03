@@ -103,6 +103,7 @@ dependencies = [
  "autome-connectors",
  "autome-core",
  "autome-engine",
+ "autome-persistence",
  "axum",
  "axum-server",
  "http-body-util",
