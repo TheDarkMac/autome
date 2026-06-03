@@ -19,6 +19,7 @@
 
 use std::sync::Mutex;
 
+use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -97,17 +98,17 @@ impl AuditEvent {
 
 /// Sink append-only pour les events audités.
 ///
-/// Volontairement sync (les flushs réseau du sink réel se gèrent dans
-/// l'impl via une queue interne).
-pub trait AuditSink {
+/// **Async** (dette #107) : les sinks réels (PostgreSQL/SIEM) font des I/O.
+#[async_trait]
+pub trait AuditSink: Send + Sync {
     /// Enregistre `event`. Ne doit jamais paniquer ni bloquer
     /// indéfiniment côté impl réelle.
-    fn record(&self, event: AuditEvent) -> Result<()>;
+    async fn record(&self, event: AuditEvent) -> Result<()>;
 
     /// Liste tous les events enregistrés (ordre FIFO d'insertion).
     /// Le filtrage et la pagination sont à la charge du caller — ce trait
     /// reste minimal.
-    fn list(&self) -> Result<Vec<AuditEvent>>;
+    async fn list(&self) -> Result<Vec<AuditEvent>>;
 }
 
 // ────────────────────── InMemoryAuditSink ──────────────────────
@@ -136,8 +137,9 @@ impl InMemoryAuditSink {
     }
 }
 
+#[async_trait]
 impl AuditSink for InMemoryAuditSink {
-    fn record(&self, event: AuditEvent) -> Result<()> {
+    async fn record(&self, event: AuditEvent) -> Result<()> {
         self.events
             .lock()
             .map_err(|_| Error::Invalid("audit lock empoisonné".into()))?
@@ -145,7 +147,7 @@ impl AuditSink for InMemoryAuditSink {
         Ok(())
     }
 
-    fn list(&self) -> Result<Vec<AuditEvent>> {
+    async fn list(&self) -> Result<Vec<AuditEvent>> {
         Ok(self
             .events
             .lock()
@@ -161,12 +163,13 @@ impl AuditSink for InMemoryAuditSink {
 #[derive(Debug, Default, Clone, Copy)]
 pub struct NoopAuditSink;
 
+#[async_trait]
 impl AuditSink for NoopAuditSink {
-    fn record(&self, _event: AuditEvent) -> Result<()> {
+    async fn record(&self, _event: AuditEvent) -> Result<()> {
         Ok(())
     }
 
-    fn list(&self) -> Result<Vec<AuditEvent>> {
+    async fn list(&self) -> Result<Vec<AuditEvent>> {
         Ok(Vec::new())
     }
 }
@@ -218,16 +221,16 @@ mod tests {
 
     // ───── InMemoryAuditSink ─────
 
-    #[test]
-    fn fresh_sink_is_empty() {
+    #[tokio::test]
+    async fn fresh_sink_is_empty() {
         let s = InMemoryAuditSink::new();
         assert!(s.is_empty());
         assert_eq!(s.len(), 0);
-        assert!(s.list().unwrap().is_empty());
+        assert!(s.list().await.unwrap().is_empty());
     }
 
-    #[test]
-    fn record_then_list_preserves_fifo_order() {
+    #[tokio::test]
+    async fn record_then_list_preserves_fifo_order() {
         let s = InMemoryAuditSink::new();
         for i in 0..3 {
             s.record(AuditEvent::new(
@@ -236,9 +239,10 @@ mod tests {
                 "x.y",
                 AuditOutcome::Success,
             ))
+            .await
             .unwrap();
         }
-        let events = s.list().unwrap();
+        let events = s.list().await.unwrap();
         assert_eq!(events.len(), 3);
         assert_eq!(events[0].timestamp_ms, 0);
         assert_eq!(events[1].timestamp_ms, 1000);
@@ -247,17 +251,19 @@ mod tests {
         assert_eq!(events[2].actor, "user-2");
     }
 
-    #[test]
-    fn list_returns_a_clone_not_a_view() {
+    #[tokio::test]
+    async fn list_returns_a_clone_not_a_view() {
         let s = InMemoryAuditSink::new();
         s.record(AuditEvent::new(1, "a", "x", AuditOutcome::Success))
+            .await
             .unwrap();
-        let snapshot = s.list().unwrap();
+        let snapshot = s.list().await.unwrap();
         s.record(AuditEvent::new(2, "b", "x", AuditOutcome::Success))
+            .await
             .unwrap();
         // Le `snapshot` n'a pas changé après le 2ᵉ record
         assert_eq!(snapshot.len(), 1);
-        assert_eq!(s.list().unwrap().len(), 2);
+        assert_eq!(s.list().await.unwrap().len(), 2);
     }
 
     #[test]
@@ -269,13 +275,15 @@ mod tests {
 
     // ───── NoopAuditSink ─────
 
-    #[test]
-    fn noop_drops_events_silently() {
+    #[tokio::test]
+    async fn noop_drops_events_silently() {
         let s = NoopAuditSink;
         s.record(AuditEvent::new(1, "a", "x", AuditOutcome::Success))
+            .await
             .unwrap();
         s.record(AuditEvent::new(2, "b", "y", AuditOutcome::Denied))
+            .await
             .unwrap();
-        assert!(s.list().unwrap().is_empty());
+        assert!(s.list().await.unwrap().is_empty());
     }
 }

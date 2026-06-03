@@ -133,25 +133,28 @@ impl AuthState {
     ///     Ok(format!("hi {}", user.user_id()))
     /// }
     /// ```
-    pub fn require_permission(
+    pub async fn require_permission(
         &self,
         user: &AuthenticatedUser,
         needed: &str,
     ) -> Result<(), AuthError> {
         let now_ms = self.clock.now_unix_seconds().saturating_mul(1_000);
-        let perms = match self.permissions.permissions_for(user.user_id()) {
+        let perms = match self.permissions.permissions_for(user.user_id()).await {
             Ok(p) => p,
             Err(e) => {
-                let _ = self.audit.record(
-                    AuditEvent::new(
-                        now_ms,
-                        user.user_id(),
-                        "auth.permission_check",
-                        AuditOutcome::Failure,
+                let _ = self
+                    .audit
+                    .record(
+                        AuditEvent::new(
+                            now_ms,
+                            user.user_id(),
+                            "auth.permission_check",
+                            AuditOutcome::Failure,
+                        )
+                        .with_resource(needed)
+                        .with_metadata(json!({ "error": e.to_string() })),
                     )
-                    .with_resource(needed)
-                    .with_metadata(json!({ "error": e.to_string() })),
-                );
+                    .await;
                 return Err(AuthError::Internal(e.to_string()));
             }
         };
@@ -164,10 +167,14 @@ impl AuthState {
         // L'erreur d'audit n'invalide pas la décision : si le sink échoue
         // on log côté stderr et on continue (refuser un accès légitime à
         // cause d'un audit cassé serait pire que de manquer un event).
-        if let Err(e) = self.audit.record(
-            AuditEvent::new(now_ms, user.user_id(), "auth.permission_check", outcome)
-                .with_resource(needed),
-        ) {
+        if let Err(e) = self
+            .audit
+            .record(
+                AuditEvent::new(now_ms, user.user_id(), "auth.permission_check", outcome)
+                    .with_resource(needed),
+            )
+            .await
+        {
             eprintln!("[auth] audit record failed: {e}");
         }
         if allowed {
@@ -263,6 +270,7 @@ where
         let revoked = auth
             .revocation
             .is_revoked(&claims.jti)
+            .await
             .map_err(|e| AuthError::Internal(e.to_string()))?;
         if revoked {
             return Err(AuthError::Revoked);
@@ -285,7 +293,9 @@ pub async fn admin_only(
     user: AuthenticatedUser,
     axum::extract::State(state): axum::extract::State<AuthState>,
 ) -> Result<String, AuthError> {
-    state.require_permission(&user, autome_core::PERM_USERS_ADMIN)?;
+    state
+        .require_permission(&user, autome_core::PERM_USERS_ADMIN)
+        .await?;
     Ok(format!("admin ok for {}", user.user_id()))
 }
 
@@ -463,6 +473,7 @@ mod tests {
         let claims = svc.verify(&token, FIXED_NOW + 1).unwrap();
         revocation
             .revoke(&claims.jti, (claims.exp + 100) * 1_000)
+            .await
             .unwrap();
 
         let state = AuthState::new(TokenService::new(SECRET), revocation, perms, audit)
@@ -564,7 +575,7 @@ mod tests {
         let token = svc.issue_access("alice", 900, FIXED_NOW).unwrap();
         let app = protected_router(state);
         let _ = app.oneshot(admin_req(&token)).await.unwrap();
-        let events = audit.list().unwrap();
+        let events = audit.list().await.unwrap();
         assert_eq!(events.len(), 1);
         let e = &events[0];
         assert_eq!(e.actor, "alice");
@@ -581,7 +592,7 @@ mod tests {
         let token = svc.issue_access("alice", 900, FIXED_NOW).unwrap();
         let app = protected_router(state);
         let _ = app.oneshot(admin_req(&token)).await.unwrap();
-        let events = audit.list().unwrap();
+        let events = audit.list().await.unwrap();
         assert_eq!(events.len(), 1);
         let e = &events[0];
         assert_eq!(e.actor, "alice");
@@ -600,7 +611,7 @@ mod tests {
             .body(Body::empty())
             .unwrap();
         let _ = app.oneshot(req).await.unwrap();
-        assert!(audit.list().unwrap().is_empty());
+        assert!(audit.list().await.unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -612,7 +623,7 @@ mod tests {
         for _ in 0..3 {
             let _ = app.clone().oneshot(admin_req(&token)).await.unwrap();
         }
-        let events = audit.list().unwrap();
+        let events = audit.list().await.unwrap();
         assert_eq!(events.len(), 3);
         for e in &events {
             assert_eq!(e.actor, "alice");

@@ -1,26 +1,25 @@
-//! Pool de connexions PostgreSQL (r2d2 + driver bloquant `postgres`).
+//! Pool de connexions PostgreSQL **async** (deadpool + tokio-postgres).
 
 use autome_core::{Error, Result};
-use r2d2_postgres::PostgresConnectionManager;
+use deadpool_postgres::{Config as DeadpoolConfig, Pool, Runtime};
+use tokio_postgres::NoTls;
 
 /// Pool de connexions PostgreSQL partageable (`Clone`, `Send + Sync`).
 ///
 /// `NoTls` : suffisant pour un trafic intra-cluster (services ↔ Postgres dans
-/// le même namespace k8s). Le chiffrement du lien (TLS / sslmode) pourra être
-/// ajouté ultérieurement pour les déploiements multi-réseaux.
-pub type PgPool = r2d2::Pool<PostgresConnectionManager<postgres::NoTls>>;
+/// le même namespace k8s). Le chiffrement du lien pourra être ajouté plus tard.
+pub type PgPool = Pool;
 
-/// Construit un pool à partir d'un DSN PostgreSQL (`postgres://user:pass@host/db`).
+/// Construit un pool à partir d'un DSN (`postgres://user:pass@host/db`).
 ///
-/// La connexion n'est **pas** testée à la construction (`build_unchecked`) :
-/// le démarrage du service ne dépend pas de la disponibilité immédiate de la
-/// base ; les erreurs remontent au premier usage, avec un message clair.
+/// La connexion n'est pas ouverte ici : deadpool établit les connexions à la
+/// demande (`pool.get().await`). Les erreurs de connexion remontent au premier
+/// usage, avec un message clair.
 pub fn connect(database_url: &str) -> Result<PgPool> {
-    let manager = PostgresConnectionManager::new(
-        database_url
-            .parse()
-            .map_err(|e| Error::Invalid(format!("storage: DSN PostgreSQL invalide : {e}")))?,
-        postgres::NoTls,
-    );
-    Ok(r2d2::Pool::builder().build_unchecked(manager))
+    let cfg = DeadpoolConfig {
+        url: Some(database_url.to_string()),
+        ..DeadpoolConfig::new()
+    };
+    cfg.create_pool(Some(Runtime::Tokio1), NoTls)
+        .map_err(|e| Error::Invalid(format!("storage: création du pool PostgreSQL : {e}")))
 }

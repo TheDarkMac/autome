@@ -116,7 +116,7 @@ impl IntoResponse for WorkflowError {
     }
 }
 
-fn audit_event(
+async fn audit_event(
     state: &WorkflowsState,
     actor: &str,
     action: &str,
@@ -125,7 +125,7 @@ fn audit_event(
 ) {
     let now_ms = state.auth.clock.now_unix_seconds().saturating_mul(1_000);
     let event = AuditEvent::new(now_ms, actor, action, outcome).with_resource(resource);
-    if let Err(e) = state.auth.audit.record(event) {
+    if let Err(e) = state.auth.audit.record(event).await {
         eprintln!("[workflows] audit record failed: {e}");
     }
 }
@@ -148,7 +148,10 @@ pub async fn list_workflows(
     State(state): State<WorkflowsState>,
     Query(q): Query<ListQuery>,
 ) -> Result<Json<ListResponse>, WorkflowError> {
-    state.auth.require_permission(&user, PERM_WORKFLOWS_READ)?;
+    state
+        .auth
+        .require_permission(&user, PERM_WORKFLOWS_READ)
+        .await?;
     let paging = Pagination {
         offset: q.offset.unwrap_or(0),
         limit: q.limit.unwrap_or(50),
@@ -163,7 +166,8 @@ pub async fn list_workflows(
         "workflows.list",
         "*",
         AuditOutcome::Success,
-    );
+    )
+    .await;
     Ok(Json(ListResponse {
         items,
         total,
@@ -191,7 +195,10 @@ pub async fn create_workflow(
     State(state): State<WorkflowsState>,
     Json(workflow): Json<WorkflowGraph>,
 ) -> Result<(StatusCode, Json<WorkflowGraph>), WorkflowError> {
-    state.auth.require_permission(&user, PERM_WORKFLOWS_WRITE)?;
+    state
+        .auth
+        .require_permission(&user, PERM_WORKFLOWS_WRITE)
+        .await?;
     let workflow_id = workflow.id.0.clone();
     match state.repo.create(workflow.clone()) {
         Ok(()) => {
@@ -201,7 +208,8 @@ pub async fn create_workflow(
                 "workflows.create",
                 &workflow_id,
                 AuditOutcome::Success,
-            );
+            )
+            .await;
             Ok((StatusCode::CREATED, Json(workflow)))
         }
         Err(e) => {
@@ -212,7 +220,8 @@ pub async fn create_workflow(
                 "workflows.create",
                 &workflow_id,
                 AuditOutcome::Failure,
-            );
+            )
+            .await;
             if msg.contains("déjà") {
                 Err(WorkflowError::Conflict(msg))
             } else {
@@ -241,7 +250,10 @@ pub async fn get_workflow(
     State(state): State<WorkflowsState>,
     Path(id): Path<String>,
 ) -> Result<Json<WorkflowGraph>, WorkflowError> {
-    state.auth.require_permission(&user, PERM_WORKFLOWS_READ)?;
+    state
+        .auth
+        .require_permission(&user, PERM_WORKFLOWS_READ)
+        .await?;
     match state
         .repo
         .get(&WorkflowId::new(&id))
@@ -254,7 +266,8 @@ pub async fn get_workflow(
                 "workflows.get",
                 &id,
                 AuditOutcome::Success,
-            );
+            )
+            .await;
             Ok(Json(w))
         }
         None => {
@@ -264,7 +277,8 @@ pub async fn get_workflow(
                 "workflows.get",
                 &id,
                 AuditOutcome::Failure,
-            );
+            )
+            .await;
             Err(WorkflowError::NotFound(format!("workflow '{id}' inconnu")))
         }
     }
@@ -293,7 +307,10 @@ pub async fn update_workflow(
     Path(id): Path<String>,
     Json(workflow): Json<WorkflowGraph>,
 ) -> Result<Json<WorkflowGraph>, WorkflowError> {
-    state.auth.require_permission(&user, PERM_WORKFLOWS_WRITE)?;
+    state
+        .auth
+        .require_permission(&user, PERM_WORKFLOWS_WRITE)
+        .await?;
     if workflow.id.0 != id {
         return Err(WorkflowError::BadRequest(format!(
             "id du path '{id}' != id du body '{}'",
@@ -308,7 +325,8 @@ pub async fn update_workflow(
                 "workflows.update",
                 &id,
                 AuditOutcome::Success,
-            );
+            )
+            .await;
             Ok(Json(workflow))
         }
         Err(e) => {
@@ -319,7 +337,8 @@ pub async fn update_workflow(
                 "workflows.update",
                 &id,
                 AuditOutcome::Failure,
-            );
+            )
+            .await;
             if msg.contains("inconnu") {
                 Err(WorkflowError::NotFound(msg))
             } else {
@@ -347,7 +366,10 @@ pub async fn delete_workflow(
     State(state): State<WorkflowsState>,
     Path(id): Path<String>,
 ) -> Result<StatusCode, WorkflowError> {
-    state.auth.require_permission(&user, PERM_WORKFLOWS_WRITE)?;
+    state
+        .auth
+        .require_permission(&user, PERM_WORKFLOWS_WRITE)
+        .await?;
     let _existed = state
         .repo
         .delete(&WorkflowId::new(&id))
@@ -358,7 +380,8 @@ pub async fn delete_workflow(
         "workflows.delete",
         &id,
         AuditOutcome::Success,
-    );
+    )
+    .await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -693,7 +716,7 @@ mod tests {
             .oneshot(auth_req("POST", "/", &token, Some(&payload)))
             .await
             .unwrap();
-        let events = audit.list().unwrap();
+        let events = audit.list().await.unwrap();
         // Un event pour permission_check (Success) + un pour workflows.create
         let create_event = events
             .iter()

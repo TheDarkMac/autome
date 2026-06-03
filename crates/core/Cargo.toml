@@ -15,6 +15,8 @@ workspace = true
 thiserror = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+# Traits de stockage asynchrones (dette #107) — `async fn` en trait objet.
+async-trait = { workspace = true }
 # Auth (F6.1)
 jsonwebtoken = { workspace = true }
 argon2 = { workspace = true }
@@ -23,3 +25,7 @@ rand = { workspace = true }
 # Chiffrement secrets (F6.3)
 aes-gcm = { workspace = true }
 base64 = { workspace = true }
+
+[dev-dependencies]
+# Exécuteur pour les tests des stores asynchrones.
+tokio = { workspace = true, features = ["macros", "rt"] }

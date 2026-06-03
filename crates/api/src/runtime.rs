@@ -12,9 +12,31 @@
 use std::sync::Arc;
 
 use autome_core::{Config, Error, Result};
-use autome_persistence::{connect, PgAuditSink, PgPermissionStore, PgRevocationStore};
+use autome_persistence::{
+    connect, run_migrations, PgAuditSink, PgPermissionStore, PgRevocationStore,
+};
 
 use crate::auth::{token_service_from_config, AuthState};
+
+/// `true` si `AUTOME_MIGRATE` demande d'appliquer les migrations au démarrage
+/// (`1`/`true`/`yes`, insensible à la casse).
+pub fn migrate_on_boot_requested() -> bool {
+    matches!(
+        std::env::var("AUTOME_MIGRATE")
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "1" | "true" | "yes"
+    )
+}
+
+/// Applique les migrations sur la base de `config` (mode `postgres`). Renvoie
+/// le nombre de migrations appliquées. Échoue si la base est injoignable.
+pub async fn migrate(config: &Config) -> Result<usize> {
+    let pool = connect(&config.database_url)?;
+    run_migrations(&pool).await
+}
 
 /// Backend de persistance retenu pour cette exécution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -45,8 +67,9 @@ impl PersistenceMode {
 
 /// Construit l'[`AuthState`] selon le `mode` :
 /// - `Memory` : [`AuthState::from_config`] (in-memory) ;
-/// - `Postgres` : pool partagé + stores PG. Le pool est créé sans tester la
-///   connexion (`build_unchecked`) — les erreurs DB remontent au premier usage.
+/// - `Postgres` : pool partagé + stores PG. Le pool n'ouvre pas de connexion à
+///   la construction (deadpool connecte à la demande) — les erreurs DB
+///   remontent au premier usage.
 pub fn build_auth_state(config: &Config, mode: PersistenceMode) -> Result<AuthState> {
     match mode {
         PersistenceMode::Memory => Ok(AuthState::from_config(config)),

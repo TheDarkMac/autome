@@ -154,10 +154,11 @@ impl TestApp {
     }
 
     /// Révoque un token via son `jti` (extrait par vérification).
-    fn revoke(&self, token: &str) {
+    async fn revoke(&self, token: &str) {
         let claims = self.svc.verify(token, FIXED_NOW).unwrap();
         self.revocation
             .revoke(&claims.jti, claims.exp.saturating_mul(1_000))
+            .await
             .unwrap();
     }
 }
@@ -307,7 +308,7 @@ async fn revoked_token_is_rejected_across_the_whole_app() {
         .unwrap();
     assert_eq!(before.status(), 200, "token valide avant révocation");
 
-    app.revoke(&token);
+    app.revoke(&token).await;
 
     for path in ["/workflows", "/auth/whoami"] {
         let resp = app
@@ -438,7 +439,7 @@ async fn audit_trail_spans_workflows_and_runs_for_same_actor() {
         .await
         .unwrap();
 
-    let events = app.audit.list().unwrap();
+    let events = app.audit.list().await.unwrap();
 
     let wf_create = events
         .iter()

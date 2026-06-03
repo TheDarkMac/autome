@@ -14,11 +14,13 @@ workspace = true
 [dependencies]
 autome-core = { workspace = true }
 serde_json = { workspace = true }
-# Driver PostgreSQL **bloquant** : les traits stores de `core`
-# (`RevocationStore`, …) sont synchrones, un driver async (sqlx) imposerait
-# un `block_on` dans les handlers axum. Pool via r2d2.
-# `with-serde_json-1` : mapping `serde_json::Value` ↔ colonne `jsonb`
-# (métadonnées d'audit).
-postgres = { workspace = true, features = ["with-serde_json-1"] }
-r2d2 = { workspace = true }
-r2d2_postgres = { workspace = true }
+async-trait = { workspace = true }
+# Driver PostgreSQL **async** (tokio-postgres) + pool deadpool : compatibles
+# avec le runtime tokio de l'API (les traits stores de `core` sont async).
+# `with-serde_json-1` : mapping `serde_json::Value` ↔ colonne `jsonb`.
+tokio-postgres = { workspace = true }
+deadpool-postgres = { workspace = true }
+
+[dev-dependencies]
+# Exécuteur des tests d'intégration asynchrones.
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
