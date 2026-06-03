@@ -189,6 +189,7 @@ pub async fn create_run(
     let exists = state
         .workflows
         .get(&WorkflowId::new(&workflow_id))
+        .await
         .map_err(|e| RunError::Internal(e.to_string()))?
         .is_some();
     if !exists {
@@ -218,6 +219,7 @@ pub async fn create_run(
     let outcome = state
         .dispatcher
         .dispatch(req)
+        .await
         .map_err(|e| RunError::Internal(e.to_string()))?;
 
     audit_event(
@@ -261,6 +263,7 @@ pub async fn get_run(
     match state
         .runs
         .load(&run_id)
+        .await
         .map_err(|e| RunError::Internal(e.to_string()))?
     {
         Some(snap) => {
@@ -318,6 +321,7 @@ pub async fn list_runs(
     let RunListPage { items, total } = state
         .runs
         .list_by_workflow(&workflow_id, paging)
+        .await
         .map_err(|e| RunError::Internal(e.to_string()))?;
     audit_event(
         &state,
@@ -451,7 +455,7 @@ mod tests {
     async fn create_run_returns_202_and_run_id_when_workflow_exists() {
         let (state, svc, perms, _, workflows, runs_store) = make_test_state();
         perms.assign_role("alice", &Role::editor()).unwrap();
-        workflows.create(sample_workflow("wf-1")).unwrap();
+        workflows.create(sample_workflow("wf-1")).await.unwrap();
         let token = svc.issue_access("alice", 900, FIXED_NOW).unwrap();
         let app = runs_router(state);
         let response = app
@@ -463,7 +467,7 @@ mod tests {
         assert_eq!(body["run_id"], "fixed-run");
         assert_eq!(body["status"], "queued");
         // Le checkpoint a bien été créé en `Queued`.
-        let snap = runs_store.load("fixed-run").unwrap().unwrap();
+        let snap = runs_store.load("fixed-run").await.unwrap().unwrap();
         assert_eq!(snap.workflow_id, "wf-1");
         assert_eq!(snap.status, autome_core::RunStatus::Queued);
         assert_eq!(snap.trigger_type, "manual");
@@ -473,7 +477,7 @@ mod tests {
     async fn create_run_with_no_body_uses_defaults() {
         let (state, svc, perms, _, workflows, _) = make_test_state();
         perms.assign_role("alice", &Role::editor()).unwrap();
-        workflows.create(sample_workflow("wf-1")).unwrap();
+        workflows.create(sample_workflow("wf-1")).await.unwrap();
         let token = svc.issue_access("alice", 900, FIXED_NOW).unwrap();
         let app = runs_router(state);
         let response = app
@@ -505,7 +509,7 @@ mod tests {
     async fn create_run_passes_payload_to_dispatcher() {
         let (state, svc, perms, _, workflows, runs_store) = make_test_state();
         perms.assign_role("alice", &Role::editor()).unwrap();
-        workflows.create(sample_workflow("wf-1")).unwrap();
+        workflows.create(sample_workflow("wf-1")).await.unwrap();
         let token = svc.issue_access("alice", 900, FIXED_NOW).unwrap();
         let app = runs_router(state);
         let _ = app
@@ -517,7 +521,7 @@ mod tests {
             ))
             .await
             .unwrap();
-        let snap = runs_store.load("fixed-run").unwrap().unwrap();
+        let snap = runs_store.load("fixed-run").await.unwrap().unwrap();
         assert_eq!(snap.version, 7);
         // created_at_ms = FIXED_NOW * 1000
         assert_eq!(snap.created_at_ms, FIXED_NOW * 1000);
@@ -530,7 +534,7 @@ mod tests {
         let (state, svc, perms, _, _, runs_store) = make_test_state();
         perms.assign_role("alice", &Role::viewer()).unwrap();
         let snap = autome_core::RunCheckpoint::queued("r-1", "wf-1", 1, "manual", 1000);
-        runs_store.checkpoint(&snap).unwrap();
+        runs_store.checkpoint(&snap).await.unwrap();
         let token = svc.issue_access("alice", 900, FIXED_NOW).unwrap();
         let app = runs_router(state);
         let response = app
@@ -564,11 +568,11 @@ mod tests {
         perms.assign_role("alice", &Role::viewer()).unwrap();
         for (id, created) in [("old", 100), ("new", 300), ("mid", 200)] {
             let snap = autome_core::RunCheckpoint::queued(id, "wf-1", 1, "manual", created);
-            runs_store.checkpoint(&snap).unwrap();
+            runs_store.checkpoint(&snap).await.unwrap();
         }
         // Run d'un autre workflow, doit être filtré.
         let other = autome_core::RunCheckpoint::queued("other", "wf-2", 1, "manual", 500);
-        runs_store.checkpoint(&other).unwrap();
+        runs_store.checkpoint(&other).await.unwrap();
         let token = svc.issue_access("alice", 900, FIXED_NOW).unwrap();
         let app = runs_router(state);
         let response = app
@@ -599,7 +603,7 @@ mod tests {
                 "manual",
                 1000 - i as i64,
             );
-            runs_store.checkpoint(&snap).unwrap();
+            runs_store.checkpoint(&snap).await.unwrap();
         }
         let token = svc.issue_access("alice", 900, FIXED_NOW).unwrap();
         let app = runs_router(state);
@@ -643,7 +647,7 @@ mod tests {
         // Viewer n'a pas runs.execute → 403 (workflows.read seul ne suffit pas).
         let (state, svc, perms, _, workflows, _) = make_test_state();
         perms.assign_role("alice", &Role::viewer()).unwrap();
-        workflows.create(sample_workflow("wf-1")).unwrap();
+        workflows.create(sample_workflow("wf-1")).await.unwrap();
         let token = svc.issue_access("alice", 900, FIXED_NOW).unwrap();
         let app = runs_router(state);
         let response = app
@@ -672,7 +676,7 @@ mod tests {
     async fn create_run_records_audit_event_with_run_id() {
         let (state, svc, perms, audit, workflows, _) = make_test_state();
         perms.assign_role("alice", &Role::editor()).unwrap();
-        workflows.create(sample_workflow("wf-1")).unwrap();
+        workflows.create(sample_workflow("wf-1")).await.unwrap();
         let token = svc.issue_access("alice", 900, FIXED_NOW).unwrap();
         let app = runs_router(state);
         let _ = app

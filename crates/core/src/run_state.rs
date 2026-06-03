@@ -13,12 +13,12 @@
 //!
 //! ```ignore
 //! // À chaque transition de node, le worker checkpoint :
-//! store.checkpoint(&snapshot)?;
+//! store.checkpoint(&snapshot).await?;
 //!
 //! // Au démarrage, on cherche les runs orphelins :
 //! let cutoff = now_ms - max_run_age_ms;
-//! for orphan in store.list_orphans(cutoff)? {
-//!     store.mark_failed(&orphan.run_id, "orphan: worker mort", now_ms)?;
+//! for orphan in store.list_orphans(cutoff).await? {
+//!     store.mark_failed(&orphan.run_id, "orphan: worker mort", now_ms).await?;
 //! }
 //!
 //! // Reprise : si un run est interrompu (status=Running au démarrage),
@@ -29,6 +29,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Mutex;
 
+use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -113,30 +114,30 @@ impl RunCheckpoint {
 
 /// Contrat de persistance d'état d'exécution.
 ///
-/// Volontairement minimal et sync. Le store en base réelle (sqlx +
-/// `runs`/`run_steps`) viendra dans une PR ultérieure ; les triplets
-/// (run_id, status, started_at) sont la matière première.
-pub trait RunStateStore {
+/// **Async** (dette #107) : l'impl PostgreSQL (`runs`/`run_steps`) fait des
+/// I/O. L'impl in-memory reste triviale.
+#[async_trait]
+pub trait RunStateStore: Send + Sync {
     /// Persiste un snapshot — crée si inconnu, écrase sinon (last-write-wins).
-    fn checkpoint(&self, snapshot: &RunCheckpoint) -> Result<()>;
+    async fn checkpoint(&self, snapshot: &RunCheckpoint) -> Result<()>;
 
     /// Charge le dernier snapshot d'un run, ou `None`.
-    fn load(&self, run_id: &str) -> Result<Option<RunCheckpoint>>;
+    async fn load(&self, run_id: &str) -> Result<Option<RunCheckpoint>>;
 
     /// Liste les runs **orphelins** : `status == Running` et `started_at_ms`
     /// strictement antérieur à `older_than_ms`. Caller responsable de
     /// calculer le seuil (`now_ms - max_run_age_ms`).
-    fn list_orphans(&self, older_than_ms: i64) -> Result<Vec<RunCheckpoint>>;
+    async fn list_orphans(&self, older_than_ms: i64) -> Result<Vec<RunCheckpoint>>;
 
     /// Marque un run comme `Failed` avec une raison, et pose `finished_at_ms`.
     /// `Err` si le run est inconnu. Idempotent sur un run déjà `Failed`.
-    fn mark_failed(&self, run_id: &str, reason: &str, now_ms: i64) -> Result<()>;
+    async fn mark_failed(&self, run_id: &str, reason: &str, now_ms: i64) -> Result<()>;
 
     /// Liste paginée des runs d'un workflow, triés par `created_at_ms`
     /// décroissant (plus récent d'abord), ordre stabilisé par `run_id` à
     /// égalité de timestamp. Consommé par l'endpoint API
     /// `GET /workflows/{id}/runs` (F7.2.d).
-    fn list_by_workflow(&self, workflow_id: &str, paging: Pagination) -> Result<RunListPage>;
+    async fn list_by_workflow(&self, workflow_id: &str, paging: Pagination) -> Result<RunListPage>;
 }
 
 /// Résultat paginé de [`RunStateStore::list_by_workflow`].
@@ -163,8 +164,9 @@ impl InMemoryRunStateStore {
     }
 }
 
+#[async_trait]
 impl RunStateStore for InMemoryRunStateStore {
-    fn checkpoint(&self, snapshot: &RunCheckpoint) -> Result<()> {
+    async fn checkpoint(&self, snapshot: &RunCheckpoint) -> Result<()> {
         let mut map = self
             .inner
             .lock()
@@ -173,7 +175,7 @@ impl RunStateStore for InMemoryRunStateStore {
         Ok(())
     }
 
-    fn load(&self, run_id: &str) -> Result<Option<RunCheckpoint>> {
+    async fn load(&self, run_id: &str) -> Result<Option<RunCheckpoint>> {
         let map = self
             .inner
             .lock()
@@ -181,7 +183,7 @@ impl RunStateStore for InMemoryRunStateStore {
         Ok(map.get(run_id).cloned())
     }
 
-    fn list_orphans(&self, older_than_ms: i64) -> Result<Vec<RunCheckpoint>> {
+    async fn list_orphans(&self, older_than_ms: i64) -> Result<Vec<RunCheckpoint>> {
         let map = self
             .inner
             .lock()
@@ -199,7 +201,7 @@ impl RunStateStore for InMemoryRunStateStore {
         Ok(orphans)
     }
 
-    fn mark_failed(&self, run_id: &str, reason: &str, now_ms: i64) -> Result<()> {
+    async fn mark_failed(&self, run_id: &str, reason: &str, now_ms: i64) -> Result<()> {
         let mut map = self
             .inner
             .lock()
@@ -216,7 +218,7 @@ impl RunStateStore for InMemoryRunStateStore {
         Ok(())
     }
 
-    fn list_by_workflow(&self, workflow_id: &str, paging: Pagination) -> Result<RunListPage> {
+    async fn list_by_workflow(&self, workflow_id: &str, paging: Pagination) -> Result<RunListPage> {
         let map = self
             .inner
             .lock()
@@ -258,46 +260,48 @@ mod tests {
 
     // ───── F5.4.a — checkpoint ─────
 
-    #[test]
-    fn checkpoint_inserts_new_run() {
+    #[tokio::test]
+    async fn checkpoint_inserts_new_run() {
         let store = InMemoryRunStateStore::new();
         let snap = snapshot("r-1", RunStatus::Queued, None);
-        store.checkpoint(&snap).unwrap();
-        let loaded = store.load("r-1").unwrap().unwrap();
+        store.checkpoint(&snap).await.unwrap();
+        let loaded = store.load("r-1").await.unwrap().unwrap();
         assert_eq!(loaded, snap);
     }
 
-    #[test]
-    fn checkpoint_overwrites_existing() {
+    #[tokio::test]
+    async fn checkpoint_overwrites_existing() {
         let store = InMemoryRunStateStore::new();
         store
             .checkpoint(&snapshot("r-1", RunStatus::Queued, None))
+            .await
             .unwrap();
         store
             .checkpoint(&snapshot("r-1", RunStatus::Running, Some(2000)))
+            .await
             .unwrap();
-        let loaded = store.load("r-1").unwrap().unwrap();
+        let loaded = store.load("r-1").await.unwrap().unwrap();
         assert_eq!(loaded.status, RunStatus::Running);
         assert_eq!(loaded.started_at_ms, Some(2000));
     }
 
-    #[test]
-    fn checkpoint_persists_outputs_and_next_node() {
+    #[tokio::test]
+    async fn checkpoint_persists_outputs_and_next_node() {
         let store = InMemoryRunStateStore::new();
         let mut snap = snapshot("r-1", RunStatus::Running, Some(1500));
         snap.outputs.insert("n1".into(), json!({ "result": 42 }));
         snap.outputs
             .insert("n2".into(), json!({ "items": [1, 2, 3] }));
         snap.next_node = Some("n3".into());
-        store.checkpoint(&snap).unwrap();
-        let loaded = store.load("r-1").unwrap().unwrap();
+        store.checkpoint(&snap).await.unwrap();
+        let loaded = store.load("r-1").await.unwrap().unwrap();
         assert_eq!(loaded.outputs["n1"], json!({ "result": 42 }));
         assert_eq!(loaded.outputs["n2"], json!({ "items": [1, 2, 3] }));
         assert_eq!(loaded.next_node.as_deref(), Some("n3"));
     }
 
-    #[test]
-    fn checkpoint_roundtrips_through_json() {
+    #[tokio::test]
+    async fn checkpoint_roundtrips_through_json() {
         let mut snap = snapshot("r-1", RunStatus::Running, Some(1500));
         snap.outputs.insert("n".into(), json!({ "x": 1 }));
         snap.next_node = Some("next".into());
@@ -308,21 +312,21 @@ mod tests {
 
     // ───── F5.4.b — load (reprise) ─────
 
-    #[test]
-    fn load_unknown_run_returns_none() {
+    #[tokio::test]
+    async fn load_unknown_run_returns_none() {
         let store = InMemoryRunStateStore::new();
-        assert!(store.load("missing").unwrap().is_none());
+        assert!(store.load("missing").await.unwrap().is_none());
     }
 
-    #[test]
-    fn load_returns_full_snapshot_for_resume() {
+    #[tokio::test]
+    async fn load_returns_full_snapshot_for_resume() {
         let store = InMemoryRunStateStore::new();
         let mut snap = snapshot("r-1", RunStatus::Running, Some(1500));
         snap.outputs.insert("a".into(), json!("done"));
         snap.next_node = Some("b".into());
-        store.checkpoint(&snap).unwrap();
+        store.checkpoint(&snap).await.unwrap();
         // Simule un crash + redémarrage : on charge depuis le store.
-        let resumed = store.load("r-1").unwrap().unwrap();
+        let resumed = store.load("r-1").await.unwrap().unwrap();
         // Le worker peut reprendre à partir de `next_node` avec les outputs
         // déjà connus.
         assert_eq!(resumed.next_node.as_deref(), Some("b"));
@@ -332,106 +336,115 @@ mod tests {
 
     // ───── F5.4.c — list_orphans + mark_failed ─────
 
-    #[test]
-    fn list_orphans_returns_running_runs_older_than_cutoff() {
+    #[tokio::test]
+    async fn list_orphans_returns_running_runs_older_than_cutoff() {
         let store = InMemoryRunStateStore::new();
         // Run vieux et running → orphan
         store
             .checkpoint(&snapshot("old", RunStatus::Running, Some(100)))
+            .await
             .unwrap();
         // Run récent et running → pas orphan
         store
             .checkpoint(&snapshot("recent", RunStatus::Running, Some(9_000)))
+            .await
             .unwrap();
         // Run vieux mais succeeded → pas orphan
         store
             .checkpoint(&snapshot("done", RunStatus::Succeeded, Some(100)))
+            .await
             .unwrap();
         // Run queued → pas orphan (started_at = None)
         store
             .checkpoint(&snapshot("q", RunStatus::Queued, None))
+            .await
             .unwrap();
 
-        let orphans = store.list_orphans(5_000).unwrap();
+        let orphans = store.list_orphans(5_000).await.unwrap();
         assert_eq!(orphans.len(), 1);
         assert_eq!(orphans[0].run_id, "old");
     }
 
-    #[test]
-    fn list_orphans_uses_strict_inequality() {
+    #[tokio::test]
+    async fn list_orphans_uses_strict_inequality() {
         let store = InMemoryRunStateStore::new();
         // Run dont started_at == cutoff → pas orphan (strict)
         store
             .checkpoint(&snapshot("edge", RunStatus::Running, Some(5_000)))
+            .await
             .unwrap();
-        let orphans = store.list_orphans(5_000).unwrap();
+        let orphans = store.list_orphans(5_000).await.unwrap();
         assert!(orphans.is_empty());
     }
 
-    #[test]
-    fn list_orphans_returns_empty_when_none_match() {
+    #[tokio::test]
+    async fn list_orphans_returns_empty_when_none_match() {
         let store = InMemoryRunStateStore::new();
         store
             .checkpoint(&snapshot("a", RunStatus::Queued, None))
+            .await
             .unwrap();
         store
             .checkpoint(&snapshot("b", RunStatus::Succeeded, Some(100)))
+            .await
             .unwrap();
-        assert!(store.list_orphans(1_000_000).unwrap().is_empty());
+        assert!(store.list_orphans(1_000_000).await.unwrap().is_empty());
     }
 
-    #[test]
-    fn list_orphans_is_sorted_by_run_id() {
+    #[tokio::test]
+    async fn list_orphans_is_sorted_by_run_id() {
         let store = InMemoryRunStateStore::new();
         for id in &["zeta", "alpha", "mu"] {
             store
                 .checkpoint(&snapshot(id, RunStatus::Running, Some(100)))
+                .await
                 .unwrap();
         }
-        let orphans = store.list_orphans(5_000).unwrap();
+        let orphans = store.list_orphans(5_000).await.unwrap();
         let ids: Vec<&str> = orphans.iter().map(|o| o.run_id.as_str()).collect();
         assert_eq!(ids, vec!["alpha", "mu", "zeta"]);
     }
 
-    #[test]
-    fn mark_failed_transitions_run() {
+    #[tokio::test]
+    async fn mark_failed_transitions_run() {
         let store = InMemoryRunStateStore::new();
         store
             .checkpoint(&snapshot("r-1", RunStatus::Running, Some(1500)))
+            .await
             .unwrap();
-        store.mark_failed("r-1", "worker died", 9999).unwrap();
-        let loaded = store.load("r-1").unwrap().unwrap();
+        store.mark_failed("r-1", "worker died", 9999).await.unwrap();
+        let loaded = store.load("r-1").await.unwrap().unwrap();
         assert_eq!(loaded.status, RunStatus::Failed);
         assert_eq!(loaded.error.as_deref(), Some("worker died"));
         assert_eq!(loaded.finished_at_ms, Some(9999));
     }
 
-    #[test]
-    fn mark_failed_unknown_run_errors() {
+    #[tokio::test]
+    async fn mark_failed_unknown_run_errors() {
         let store = InMemoryRunStateStore::new();
-        let err = store.mark_failed("missing", "x", 0).unwrap_err();
+        let err = store.mark_failed("missing", "x", 0).await.unwrap_err();
         assert!(matches!(err, Error::Invalid(ref m) if m.contains("missing")));
     }
 
-    #[test]
-    fn mark_failed_is_idempotent_on_already_failed() {
+    #[tokio::test]
+    async fn mark_failed_is_idempotent_on_already_failed() {
         let store = InMemoryRunStateStore::new();
         let mut snap = snapshot("r-1", RunStatus::Failed, Some(1500));
         snap.error = Some("original".into());
         snap.finished_at_ms = Some(2000);
-        store.checkpoint(&snap).unwrap();
+        store.checkpoint(&snap).await.unwrap();
 
         // Re-marquer ne doit pas écraser la raison originale.
-        store.mark_failed("r-1", "second pass", 9999).unwrap();
-        let loaded = store.load("r-1").unwrap().unwrap();
+        store.mark_failed("r-1", "second pass", 9999).await.unwrap();
+        let loaded = store.load("r-1").await.unwrap().unwrap();
         assert_eq!(loaded.error.as_deref(), Some("original"));
         assert_eq!(loaded.finished_at_ms, Some(2000));
     }
 
     /// Vérifie la composition : `Send + Sync` sur l'impl de référence
     /// (précondition pour le sweep périodique d'orphelins en F5.5/F5.6).
-    #[test]
-    fn in_memory_store_is_send_sync() {
+    #[tokio::test]
+    async fn in_memory_store_is_send_sync() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<InMemoryRunStateStore>();
     }
@@ -444,20 +457,24 @@ mod tests {
         s
     }
 
-    #[test]
-    fn list_by_workflow_filters_by_workflow_id() {
+    #[tokio::test]
+    async fn list_by_workflow_filters_by_workflow_id() {
         let store = InMemoryRunStateStore::new();
         store
             .checkpoint(&run_with_created("r1", "wf-a", 100))
+            .await
             .unwrap();
         store
             .checkpoint(&run_with_created("r2", "wf-b", 200))
+            .await
             .unwrap();
         store
             .checkpoint(&run_with_created("r3", "wf-a", 300))
+            .await
             .unwrap();
         let page = store
             .list_by_workflow("wf-a", Pagination::default())
+            .await
             .unwrap();
         assert_eq!(page.total, 2);
         assert_eq!(page.items.len(), 2);
@@ -466,30 +483,37 @@ mod tests {
         }
     }
 
-    #[test]
-    fn list_by_workflow_orders_by_created_desc() {
+    #[tokio::test]
+    async fn list_by_workflow_orders_by_created_desc() {
         let store = InMemoryRunStateStore::new();
         store
             .checkpoint(&run_with_created("old", "wf", 100))
+            .await
             .unwrap();
         store
             .checkpoint(&run_with_created("new", "wf", 300))
+            .await
             .unwrap();
         store
             .checkpoint(&run_with_created("mid", "wf", 200))
+            .await
             .unwrap();
-        let page = store.list_by_workflow("wf", Pagination::default()).unwrap();
+        let page = store
+            .list_by_workflow("wf", Pagination::default())
+            .await
+            .unwrap();
         let ids: Vec<&str> = page.items.iter().map(|c| c.run_id.as_str()).collect();
         assert_eq!(ids, vec!["new", "mid", "old"]);
     }
 
-    #[test]
-    fn list_by_workflow_paginates() {
+    #[tokio::test]
+    async fn list_by_workflow_paginates() {
         let store = InMemoryRunStateStore::new();
         for i in 0..5 {
             // created_at distinct pour ordre stable
             store
                 .checkpoint(&run_with_created(&format!("r{i}"), "wf", 1000 - i as i64))
+                .await
                 .unwrap();
         }
         let page = store
@@ -500,6 +524,7 @@ mod tests {
                     limit: 2,
                 },
             )
+            .await
             .unwrap();
         assert_eq!(page.total, 5);
         assert_eq!(page.items.len(), 2);
@@ -509,11 +534,12 @@ mod tests {
         assert_eq!(ids, vec!["r1", "r2"]);
     }
 
-    #[test]
-    fn list_by_workflow_returns_empty_when_unknown() {
+    #[tokio::test]
+    async fn list_by_workflow_returns_empty_when_unknown() {
         let store = InMemoryRunStateStore::new();
         let page = store
             .list_by_workflow("nope", Pagination::default())
+            .await
             .unwrap();
         assert_eq!(page.total, 0);
         assert!(page.items.is_empty());

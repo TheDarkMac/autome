@@ -20,3 +20,8 @@ autome-core = { workspace = true }
 autome-engine = { workspace = true }
 serde_json = { workspace = true }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
+
+[dev-dependencies]
+# Pont synchrone → stores asynchrones dans le test e2e (dette #107). Le worker
+# de production reste thread-based (sync) ; sa bascule async viendra avec lapin.
+tokio = { workspace = true, features = ["rt-multi-thread"] }

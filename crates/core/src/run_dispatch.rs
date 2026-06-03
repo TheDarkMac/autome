@@ -14,6 +14,7 @@
 
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use serde_json::{json, Value};
 
 use crate::queue::{Message, Queue};
@@ -45,10 +46,11 @@ pub struct DispatchOutcome {
 
 /// Contrat de déclenchement d'un run. L'API consomme un
 /// `Arc<dyn RunDispatcher + Send + Sync>` ; les tests utilisent un mock.
-pub trait RunDispatcher {
+#[async_trait]
+pub trait RunDispatcher: Send + Sync {
     /// Démarre un nouveau run et renvoie son identifiant. Persiste
     /// l'état initial (Queued) puis publie un message dispatching.
-    fn dispatch(&self, req: DispatchRequest) -> Result<DispatchOutcome>;
+    async fn dispatch(&self, req: DispatchRequest) -> Result<DispatchOutcome>;
 }
 
 // ────────────────────── QueueRunDispatcher ──────────────────────
@@ -96,8 +98,9 @@ impl QueueRunDispatcher {
     }
 }
 
+#[async_trait]
 impl RunDispatcher for QueueRunDispatcher {
-    fn dispatch(&self, req: DispatchRequest) -> Result<DispatchOutcome> {
+    async fn dispatch(&self, req: DispatchRequest) -> Result<DispatchOutcome> {
         let run_id = (self.id_gen)();
 
         // 1. Persistance de l'état initial (Queued).
@@ -108,7 +111,7 @@ impl RunDispatcher for QueueRunDispatcher {
             &req.trigger_type,
             req.now_ms,
         );
-        self.store.checkpoint(&checkpoint)?;
+        self.store.checkpoint(&checkpoint).await?;
 
         // 2. Publication sur la queue (le worker la consommera).
         let body = json!({
@@ -174,18 +177,18 @@ mod tests {
         }
     }
 
-    #[test]
-    fn dispatch_returns_run_id_from_id_generator() {
+    #[tokio::test]
+    async fn dispatch_returns_run_id_from_id_generator() {
         let (d, _, _) = make_dispatcher();
-        let outcome = d.dispatch(sample_request()).unwrap();
+        let outcome = d.dispatch(sample_request()).await.unwrap();
         assert_eq!(outcome.run_id, "fixed-run-id");
     }
 
-    #[test]
-    fn dispatch_persists_checkpoint_in_queued_state() {
+    #[tokio::test]
+    async fn dispatch_persists_checkpoint_in_queued_state() {
         let (d, _, store) = make_dispatcher();
-        d.dispatch(sample_request()).unwrap();
-        let snap = store.load("fixed-run-id").unwrap().expect("stored");
+        d.dispatch(sample_request()).await.unwrap();
+        let snap = store.load("fixed-run-id").await.unwrap().expect("stored");
         assert_eq!(snap.run_id, "fixed-run-id");
         assert_eq!(snap.workflow_id, "wf-1");
         assert_eq!(snap.version, 1);
@@ -196,10 +199,10 @@ mod tests {
         assert!(snap.next_node.is_none());
     }
 
-    #[test]
-    fn dispatch_publishes_message_with_run_payload_on_runs_queue() {
+    #[tokio::test]
+    async fn dispatch_publishes_message_with_run_payload_on_runs_queue() {
         let (d, queue, _) = make_dispatcher();
-        d.dispatch(sample_request()).unwrap();
+        d.dispatch(sample_request()).await.unwrap();
         assert_eq!(queue.depth("runs").unwrap(), 1);
         let delivery = queue.poll("runs").unwrap().expect("message");
         assert_eq!(delivery.message.body["run_id"], "fixed-run-id");
@@ -228,8 +231,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn with_queue_name_targets_a_custom_queue() {
+    #[tokio::test]
+    async fn with_queue_name_targets_a_custom_queue() {
         let queue: Arc<InMemoryQueue> = Arc::new(InMemoryQueue::new());
         let store: Arc<InMemoryRunStateStore> = Arc::new(InMemoryRunStateStore::new());
         let d = QueueRunDispatcher::new(
@@ -238,38 +241,38 @@ mod tests {
         )
         .with_queue_name("manual-runs")
         .with_id_generator(|| "x".into());
-        d.dispatch(sample_request()).unwrap();
+        d.dispatch(sample_request()).await.unwrap();
         assert_eq!(queue.depth("manual-runs").unwrap(), 1);
         assert_eq!(queue.depth("runs").unwrap(), 0);
     }
 
-    #[test]
-    fn default_uuid_like_generator_produces_unique_ids() {
+    #[tokio::test]
+    async fn default_uuid_like_generator_produces_unique_ids() {
         let queue: Arc<InMemoryQueue> = Arc::new(InMemoryQueue::new());
         let store: Arc<InMemoryRunStateStore> = Arc::new(InMemoryRunStateStore::new());
         let d = QueueRunDispatcher::new(
             Arc::clone(&queue) as Arc<dyn Queue + Send + Sync>,
             Arc::clone(&store) as Arc<dyn RunStateStore + Send + Sync>,
         );
-        let o1 = d.dispatch(sample_request()).unwrap();
-        let o2 = d.dispatch(sample_request()).unwrap();
+        let o1 = d.dispatch(sample_request()).await.unwrap();
+        let o2 = d.dispatch(sample_request()).await.unwrap();
         assert_ne!(o1.run_id, o2.run_id);
         // Format `run-<16 hex>` (préfixe + séquence atomique).
         assert!(o1.run_id.starts_with("run-"), "id = {}", o1.run_id);
         assert_eq!(o1.run_id.len(), 4 + 16);
     }
 
-    #[test]
-    fn dispatcher_is_send_sync() {
+    #[tokio::test]
+    async fn dispatcher_is_send_sync() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<QueueRunDispatcher>();
     }
 
-    #[test]
-    fn dispatch_outcome_equals_run_id_in_store() {
+    #[tokio::test]
+    async fn dispatch_outcome_equals_run_id_in_store() {
         let (d, _, store) = make_dispatcher();
-        let outcome = d.dispatch(sample_request()).unwrap();
-        let snap = store.load(&outcome.run_id).unwrap().unwrap();
+        let outcome = d.dispatch(sample_request()).await.unwrap();
+        let snap = store.load(&outcome.run_id).await.unwrap().unwrap();
         assert_eq!(snap.run_id, outcome.run_id);
     }
 }

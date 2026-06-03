@@ -10,6 +10,7 @@ use std::sync::Mutex;
 
 use crate::workflow::{WorkflowGraph, WorkflowId};
 use crate::{Error, Result};
+use async_trait::async_trait;
 
 /// Critères de pagination pour [`WorkflowRepository::list`].
 #[derive(Debug, Clone, Copy)]
@@ -47,22 +48,23 @@ pub struct WorkflowPage {
 }
 
 /// Contrat de persistance d'un workflow.
-pub trait WorkflowRepository {
+#[async_trait]
+pub trait WorkflowRepository: Send + Sync {
     /// Crée un workflow. `Err` si l'`id` existe déjà.
-    fn create(&self, workflow: WorkflowGraph) -> Result<()>;
+    async fn create(&self, workflow: WorkflowGraph) -> Result<()>;
 
     /// Charge un workflow par id. `Ok(None)` si inconnu.
-    fn get(&self, id: &WorkflowId) -> Result<Option<WorkflowGraph>>;
+    async fn get(&self, id: &WorkflowId) -> Result<Option<WorkflowGraph>>;
 
     /// Liste paginée, ordre stable par `WorkflowId`.
-    fn list(&self, paging: Pagination) -> Result<WorkflowPage>;
+    async fn list(&self, paging: Pagination) -> Result<WorkflowPage>;
 
     /// Met à jour un workflow existant. `Err` si inconnu.
     /// L'`id` du `WorkflowGraph` doit correspondre.
-    fn update(&self, workflow: WorkflowGraph) -> Result<()>;
+    async fn update(&self, workflow: WorkflowGraph) -> Result<()>;
 
     /// Supprime un workflow. `Ok(false)` si inconnu (idempotent côté caller).
-    fn delete(&self, id: &WorkflowId) -> Result<bool>;
+    async fn delete(&self, id: &WorkflowId) -> Result<bool>;
 }
 
 /// Impl in-process, thread-safe (`Mutex<HashMap>`). Pour tests + dev.
@@ -78,8 +80,9 @@ impl InMemoryWorkflowRepository {
     }
 }
 
+#[async_trait]
 impl WorkflowRepository for InMemoryWorkflowRepository {
-    fn create(&self, workflow: WorkflowGraph) -> Result<()> {
+    async fn create(&self, workflow: WorkflowGraph) -> Result<()> {
         let mut map = self
             .inner
             .lock()
@@ -94,7 +97,7 @@ impl WorkflowRepository for InMemoryWorkflowRepository {
         Ok(())
     }
 
-    fn get(&self, id: &WorkflowId) -> Result<Option<WorkflowGraph>> {
+    async fn get(&self, id: &WorkflowId) -> Result<Option<WorkflowGraph>> {
         Ok(self
             .inner
             .lock()
@@ -103,7 +106,7 @@ impl WorkflowRepository for InMemoryWorkflowRepository {
             .cloned())
     }
 
-    fn list(&self, paging: Pagination) -> Result<WorkflowPage> {
+    async fn list(&self, paging: Pagination) -> Result<WorkflowPage> {
         let map = self
             .inner
             .lock()
@@ -120,7 +123,7 @@ impl WorkflowRepository for InMemoryWorkflowRepository {
         Ok(WorkflowPage { items, total })
     }
 
-    fn update(&self, workflow: WorkflowGraph) -> Result<()> {
+    async fn update(&self, workflow: WorkflowGraph) -> Result<()> {
         let mut map = self
             .inner
             .lock()
@@ -135,7 +138,7 @@ impl WorkflowRepository for InMemoryWorkflowRepository {
         Ok(())
     }
 
-    fn delete(&self, id: &WorkflowId) -> Result<bool> {
+    async fn delete(&self, id: &WorkflowId) -> Result<bool> {
         let mut map = self
             .inner
             .lock()
@@ -166,53 +169,54 @@ mod tests {
         }
     }
 
-    #[test]
-    fn create_then_get_round_trips() {
+    #[tokio::test]
+    async fn create_then_get_round_trips() {
         let repo = InMemoryWorkflowRepository::new();
         let w = sample("wf-1");
-        repo.create(w.clone()).unwrap();
-        let loaded = repo.get(&WorkflowId::new("wf-1")).unwrap().unwrap();
+        repo.create(w.clone()).await.unwrap();
+        let loaded = repo.get(&WorkflowId::new("wf-1")).await.unwrap().unwrap();
         assert_eq!(loaded, w);
     }
 
-    #[test]
-    fn get_unknown_returns_none() {
+    #[tokio::test]
+    async fn get_unknown_returns_none() {
         let repo = InMemoryWorkflowRepository::new();
-        assert!(repo.get(&WorkflowId::new("nope")).unwrap().is_none());
+        assert!(repo.get(&WorkflowId::new("nope")).await.unwrap().is_none());
     }
 
-    #[test]
-    fn duplicate_create_errors() {
+    #[tokio::test]
+    async fn duplicate_create_errors() {
         let repo = InMemoryWorkflowRepository::new();
-        repo.create(sample("wf-1")).unwrap();
-        let err = repo.create(sample("wf-1")).unwrap_err();
+        repo.create(sample("wf-1")).await.unwrap();
+        let err = repo.create(sample("wf-1")).await.unwrap_err();
         assert!(matches!(err, Error::Invalid(ref m) if m.contains("déjà")));
     }
 
-    #[test]
-    fn list_returns_all_sorted() {
+    #[tokio::test]
+    async fn list_returns_all_sorted() {
         let repo = InMemoryWorkflowRepository::new();
         for id in ["zeta", "alpha", "mu"] {
-            repo.create(sample(id)).unwrap();
+            repo.create(sample(id)).await.unwrap();
         }
-        let page = repo.list(Pagination::default()).unwrap();
+        let page = repo.list(Pagination::default()).await.unwrap();
         assert_eq!(page.total, 3);
         assert_eq!(page.items.len(), 3);
         let ids: Vec<&str> = page.items.iter().map(|w| w.id.0.as_str()).collect();
         assert_eq!(ids, vec!["alpha", "mu", "zeta"]);
     }
 
-    #[test]
-    fn list_pagination_skips_and_limits() {
+    #[tokio::test]
+    async fn list_pagination_skips_and_limits() {
         let repo = InMemoryWorkflowRepository::new();
         for i in 0..10 {
-            repo.create(sample(&format!("wf-{i:02}"))).unwrap();
+            repo.create(sample(&format!("wf-{i:02}"))).await.unwrap();
         }
         let page = repo
             .list(Pagination {
                 offset: 3,
                 limit: 4,
             })
+            .await
             .unwrap();
         assert_eq!(page.total, 10, "total ignore pagination");
         assert_eq!(page.items.len(), 4);
@@ -220,54 +224,55 @@ mod tests {
         assert_eq!(ids, vec!["wf-03", "wf-04", "wf-05", "wf-06"]);
     }
 
-    #[test]
-    fn list_with_offset_beyond_total_returns_empty() {
+    #[tokio::test]
+    async fn list_with_offset_beyond_total_returns_empty() {
         let repo = InMemoryWorkflowRepository::new();
-        repo.create(sample("only")).unwrap();
+        repo.create(sample("only")).await.unwrap();
         let page = repo
             .list(Pagination {
                 offset: 100,
                 limit: 50,
             })
+            .await
             .unwrap();
         assert_eq!(page.total, 1);
         assert!(page.items.is_empty());
     }
 
-    #[test]
-    fn update_replaces_existing() {
+    #[tokio::test]
+    async fn update_replaces_existing() {
         let repo = InMemoryWorkflowRepository::new();
-        repo.create(sample("wf-1")).unwrap();
+        repo.create(sample("wf-1")).await.unwrap();
         let mut modified = sample("wf-1");
         modified.name = "renamed".into();
-        repo.update(modified.clone()).unwrap();
-        let loaded = repo.get(&WorkflowId::new("wf-1")).unwrap().unwrap();
+        repo.update(modified.clone()).await.unwrap();
+        let loaded = repo.get(&WorkflowId::new("wf-1")).await.unwrap().unwrap();
         assert_eq!(loaded.name, "renamed");
     }
 
-    #[test]
-    fn update_unknown_errors() {
+    #[tokio::test]
+    async fn update_unknown_errors() {
         let repo = InMemoryWorkflowRepository::new();
-        let err = repo.update(sample("nope")).unwrap_err();
+        let err = repo.update(sample("nope")).await.unwrap_err();
         assert!(matches!(err, Error::Invalid(ref m) if m.contains("inconnu")));
     }
 
-    #[test]
-    fn delete_existing_returns_true() {
+    #[tokio::test]
+    async fn delete_existing_returns_true() {
         let repo = InMemoryWorkflowRepository::new();
-        repo.create(sample("wf-1")).unwrap();
-        assert!(repo.delete(&WorkflowId::new("wf-1")).unwrap());
-        assert!(repo.get(&WorkflowId::new("wf-1")).unwrap().is_none());
+        repo.create(sample("wf-1")).await.unwrap();
+        assert!(repo.delete(&WorkflowId::new("wf-1")).await.unwrap());
+        assert!(repo.get(&WorkflowId::new("wf-1")).await.unwrap().is_none());
     }
 
-    #[test]
-    fn delete_unknown_returns_false() {
+    #[tokio::test]
+    async fn delete_unknown_returns_false() {
         let repo = InMemoryWorkflowRepository::new();
-        assert!(!repo.delete(&WorkflowId::new("nope")).unwrap());
+        assert!(!repo.delete(&WorkflowId::new("nope")).await.unwrap());
     }
 
-    #[test]
-    fn repo_is_send_sync() {
+    #[tokio::test]
+    async fn repo_is_send_sync() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<InMemoryWorkflowRepository>();
     }
