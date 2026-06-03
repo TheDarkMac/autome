@@ -11,16 +11,33 @@
 
 use std::sync::Arc;
 
+use autome_connectors::oauth::{InMemoryConnectorTokenStore, OAuthClient, OAuthRegistry};
+use autome_connectors::{CredentialService, OAuthCredentialService, ReqwestHttpClient};
 use autome_core::{
-    Config, Error, InMemoryQueue, InMemoryRunStateStore, InMemoryWorkflowRepository, Queue,
-    QueueRunDispatcher, Result, RunDispatcher, RunStateStore, WorkflowRepository,
+    Config, EnvelopeCipher, Error, InMemoryKeyProvider, InMemoryQueue, InMemoryRunStateStore,
+    InMemoryWorkflowRepository, Queue, QueueRunDispatcher, Result, RunDispatcher, RunStateStore,
+    WorkflowRepository,
 };
 use autome_persistence::{
     connect, run_migrations, PgAuditSink, PgPermissionStore, PgRevocationStore, PgRunStateStore,
     PgWorkflowRepository,
 };
+use sha2::{Digest, Sha256};
 
 use crate::auth::{token_service_from_config, AuthState};
+
+/// Construit le service de credentials OAuth (dette #107, constat 3) :
+/// transport HTTP **réel** ([`ReqwestHttpClient`]) + store de tokens **chiffré
+/// au repos** avec une clé dérivée de `config.encryption_key` (SHA-256 → 32 o).
+/// Le registre de providers est vide pour l'instant (config providers = futur).
+fn build_credential_service(config: &Config) -> Arc<dyn CredentialService + Send + Sync> {
+    let key: [u8; 32] = Sha256::digest(config.encryption_key.expose().as_bytes()).into();
+    let keys = InMemoryKeyProvider::new();
+    keys.add_key("v1", key, true).expect("clé de chiffrement");
+    let store = Arc::new(InMemoryConnectorTokenStore::new(EnvelopeCipher::new(keys)));
+    let oauth = OAuthClient::new(OAuthRegistry::new(), ReqwestHttpClient::new());
+    Arc::new(OAuthCredentialService::new(oauth, store))
+}
 
 /// Backends applicatifs assemblés selon le [`PersistenceMode`] : un seul jeu
 /// de stores partagé par tous les routers (auth + workflows + runs).
@@ -33,6 +50,8 @@ pub struct Backends {
     pub runs: Arc<dyn RunStateStore + Send + Sync>,
     /// Dispatcher de runs (publie sur la file + checkpoint initial).
     pub dispatcher: Arc<dyn RunDispatcher + Send + Sync>,
+    /// Service de credentials OAuth (transport HTTP réel + store chiffré).
+    pub credentials: Arc<dyn CredentialService + Send + Sync>,
 }
 
 /// Assemble les backends. En `Postgres`, **un seul pool** est partagé par tous
@@ -49,6 +68,7 @@ pub fn build_backends(config: &Config, mode: PersistenceMode) -> Result<Backends
                 workflows: Arc::new(InMemoryWorkflowRepository::new()),
                 runs,
                 dispatcher,
+                credentials: build_credential_service(config),
             })
         }
         PersistenceMode::Postgres => {
@@ -68,6 +88,7 @@ pub fn build_backends(config: &Config, mode: PersistenceMode) -> Result<Backends
                 workflows: Arc::new(PgWorkflowRepository::new(pool)),
                 runs,
                 dispatcher,
+                credentials: build_credential_service(config),
             })
         }
     }

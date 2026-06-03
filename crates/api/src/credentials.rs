@@ -303,13 +303,24 @@ pub async fn complete_authorize(
         .await?;
     let now_ms = state.auth.clock.now_unix_seconds().saturating_mul(1_000);
     let _ = body.state; // F7.3 : le caller a déjà comparé state ; on l'accepte tel quel.
-    match state.service.complete_authorize(
-        user.user_id(),
-        &provider_id,
-        &body.code,
-        &body.code_verifier,
-        now_ms,
-    ) {
+
+    // L'échange OAuth fait un appel HTTP **bloquant** (`HttpClient` sync) : on
+    // l'exécute via `spawn_blocking` pour ne pas bloquer — ni paniquer — sur le
+    // runtime tokio (dette #107). Données clonées car déplacées dans la tâche.
+    let service = state.service.clone();
+    let (uid, pid, code, verifier) = (
+        user.user_id().to_string(),
+        provider_id.clone(),
+        body.code.clone(),
+        body.code_verifier.clone(),
+    );
+    let result = tokio::task::spawn_blocking(move || {
+        service.complete_authorize(&uid, &pid, &code, &verifier, now_ms)
+    })
+    .await
+    .map_err(|e| CredentialError::Internal(format!("tâche OAuth annulée : {e}")))?;
+
+    match result {
         Ok(summary) => {
             audit_event(
                 &state,

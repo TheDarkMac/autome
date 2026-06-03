@@ -58,6 +58,10 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 rustls-pemfile = "2"
 # Spec OpenAPI générée à la compilation (F7.4)
 utoipa = { version = "5", features = ["axum_extras"] }
+# Transport HTTP de production des connecteurs (dette #107). Client **bloquant**
+# (le trait `HttpClient` est sync, exécuté par le worker thread-based) ; TLS via
+# rustls pour rester cohérent avec le serveur (pas d'OpenSSL système).
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls", "json"] }
 
 # Lints partagés (F1.3.g) : appliqués via `[lints] workspace = true` dans
 # chaque crate. `clippy -- -D warnings` en CI (cf. CONVENTIONS §4/§5).
