@@ -11,12 +11,67 @@
 
 use std::sync::Arc;
 
-use autome_core::{Config, Error, Result};
+use autome_core::{
+    Config, Error, InMemoryQueue, InMemoryRunStateStore, InMemoryWorkflowRepository, Queue,
+    QueueRunDispatcher, Result, RunDispatcher, RunStateStore, WorkflowRepository,
+};
 use autome_persistence::{
-    connect, run_migrations, PgAuditSink, PgPermissionStore, PgRevocationStore,
+    connect, run_migrations, PgAuditSink, PgPermissionStore, PgRevocationStore, PgRunStateStore,
+    PgWorkflowRepository,
 };
 
 use crate::auth::{token_service_from_config, AuthState};
+
+/// Backends applicatifs assemblés selon le [`PersistenceMode`] : un seul jeu
+/// de stores partagé par tous les routers (auth + workflows + runs).
+pub struct Backends {
+    /// État d'authentification (token + révocations/permissions/audit).
+    pub auth: AuthState,
+    /// Repository des workflows.
+    pub workflows: Arc<dyn WorkflowRepository + Send + Sync>,
+    /// Store d'état des runs.
+    pub runs: Arc<dyn RunStateStore + Send + Sync>,
+    /// Dispatcher de runs (publie sur la file + checkpoint initial).
+    pub dispatcher: Arc<dyn RunDispatcher + Send + Sync>,
+}
+
+/// Assemble les backends. En `Postgres`, **un seul pool** est partagé par tous
+/// les stores. La file reste in-memory (RabbitMQ : chantier ultérieur).
+pub fn build_backends(config: &Config, mode: PersistenceMode) -> Result<Backends> {
+    let queue: Arc<dyn Queue + Send + Sync> = Arc::new(InMemoryQueue::new());
+    match mode {
+        PersistenceMode::Memory => {
+            let runs: Arc<dyn RunStateStore + Send + Sync> = Arc::new(InMemoryRunStateStore::new());
+            let dispatcher: Arc<dyn RunDispatcher + Send + Sync> =
+                Arc::new(QueueRunDispatcher::new(queue, runs.clone()));
+            Ok(Backends {
+                auth: AuthState::from_config(config),
+                workflows: Arc::new(InMemoryWorkflowRepository::new()),
+                runs,
+                dispatcher,
+            })
+        }
+        PersistenceMode::Postgres => {
+            let pool = connect(&config.database_url)?;
+            let auth = AuthState::new(
+                token_service_from_config(config),
+                Arc::new(PgRevocationStore::new(pool.clone())),
+                Arc::new(PgPermissionStore::new(pool.clone())),
+                Arc::new(PgAuditSink::new(pool.clone())),
+            );
+            let runs: Arc<dyn RunStateStore + Send + Sync> =
+                Arc::new(PgRunStateStore::new(pool.clone()));
+            let dispatcher: Arc<dyn RunDispatcher + Send + Sync> =
+                Arc::new(QueueRunDispatcher::new(queue, runs.clone()));
+            Ok(Backends {
+                auth,
+                workflows: Arc::new(PgWorkflowRepository::new(pool)),
+                runs,
+                dispatcher,
+            })
+        }
+    }
+}
 
 /// `true` si `AUTOME_MIGRATE` demande d'appliquer les migrations au démarrage
 /// (`1`/`true`/`yes`, insensible à la casse).

@@ -8,10 +8,16 @@
 
 use std::sync::Arc;
 
-use autome_api::auth::{protected_router, AuthState};
+use autome_api::auth::protected_router;
 use autome_api::metrics::{metrics_router, with_metrics, Metrics};
-use autome_api::runtime::{build_auth_state, migrate, migrate_on_boot_requested, PersistenceMode};
+use autome_api::runs::{runs_router, RunsState};
+use autome_api::runtime::{
+    build_backends, migrate, migrate_on_boot_requested, Backends, PersistenceMode,
+};
 use autome_api::tls::load_rustls_config;
+use autome_api::workflows::{
+    create_workflow, delete_workflow, get_workflow, list_workflows, update_workflow, WorkflowsState,
+};
 use autome_core::{Config, Profile};
 use axum::{routing::get, Router};
 
@@ -20,15 +26,39 @@ async fn health() -> &'static str {
     "ok"
 }
 
-/// Construit le routeur racine — `/health` + `/metrics` publics, `/auth/*`
-/// protégé par JWT. Toutes les routes sont instrumentées par le middleware de
-/// métriques (F10.6.a).
+/// Construit le routeur racine : `/health` + `/metrics` publics, `/auth/*`
+/// protégé par JWT, et le CRUD `workflows` + `runs` (domaine 7). Toutes les
+/// routes sont instrumentées par le middleware de métriques (F10.6.a).
+///
+/// Les routes workflows sont posées **à plat** (`/workflows`, `/workflows/:id`)
+/// plutôt que `nest`ées : le catch-all d'un nest entrerait en conflit avec
+/// `/workflows/:id/runs` du router runs.
 ///
 /// Isolé de `main` pour être testable sans démarrer de serveur.
-fn build_router(auth: AuthState, metrics: Arc<Metrics>) -> Router {
+fn build_router(backends: &Backends, metrics: Arc<Metrics>) -> Router {
+    let wf_state = WorkflowsState::new(backends.auth.clone(), backends.workflows.clone());
+    let runs_state = RunsState::new(
+        backends.auth.clone(),
+        backends.workflows.clone(),
+        backends.runs.clone(),
+        backends.dispatcher.clone(),
+    );
+
+    let workflows_routes = Router::new()
+        .route("/workflows", get(list_workflows).post(create_workflow))
+        .route(
+            "/workflows/:id",
+            get(get_workflow)
+                .put(update_workflow)
+                .delete(delete_workflow),
+        )
+        .with_state(wf_state);
+
     let router = Router::new()
         .route("/health", get(health))
-        .nest("/auth", protected_router(auth))
+        .nest("/auth", protected_router(backends.auth.clone()))
+        .merge(workflows_routes)
+        .merge(runs_router(runs_state))
         .merge(metrics_router(metrics.clone()));
     with_metrics(router, metrics)
 }
@@ -50,7 +80,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("autome-api : migrations appliquées = {applied}");
     }
 
-    let auth = build_auth_state(&config, mode)?;
+    let backends = build_backends(&config, mode)?;
     println!("autome-api : persistance = {mode:?}");
 
     // Garde prod (dette #107, constat 4) : en in-memory, l'état (révocations/
@@ -66,7 +96,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let metrics = Arc::new(Metrics::new());
-    let app = build_router(auth, metrics);
+    let app = build_router(&backends, metrics);
 
     // F6.4 — HTTPS via rustls si `AUTOME_TLS_CERT` + `AUTOME_TLS_KEY`
     // sont positionnées ; sinon HTTP en clair. Décision all-or-nothing
@@ -114,10 +144,12 @@ mod tests {
 
     #[test]
     fn router_builds() {
-        // Le routeur se construit sans panique (route /health + /auth/*),
-        // avec un `AuthState` dérivé d'une config de dev.
+        // Le routeur racine complet (health + auth + workflows + runs +
+        // metrics) se construit sans panique ni conflit de routes, avec des
+        // backends in-memory dérivés d'une config de dev.
         let config = Config::load(|_| None).expect("config dev par défaut");
-        let auth = AuthState::from_config(&config);
-        let _app: Router = build_router(auth, Arc::new(Metrics::new()));
+        let backends =
+            build_backends(&config, PersistenceMode::Memory).expect("backends in-memory");
+        let _app: Router = build_router(&backends, Arc::new(Metrics::new()));
     }
 }
