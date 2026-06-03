@@ -17,6 +17,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 
+use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 use crate::{Error, Result};
@@ -140,10 +141,11 @@ pub fn has_permission(granted: &HashSet<String>, needed: &str) -> bool {
 /// Une impl peut résoudre à travers des rôles intermédiaires ou
 /// directement (à la discrétion du store). Le trait n'expose pas la
 /// notion de rôle pour rester général.
-pub trait PermissionStore {
+#[async_trait]
+pub trait PermissionStore: Send + Sync {
     /// Retourne l'ensemble des permissions de l'utilisateur. `Ok(empty)`
     /// si l'utilisateur n'a aucune permission (pas une erreur).
-    fn permissions_for(&self, user_id: &str) -> Result<HashSet<String>>;
+    async fn permissions_for(&self, user_id: &str) -> Result<HashSet<String>>;
 }
 
 /// Impl in-process, thread-safe (`Mutex<HashMap>`).
@@ -200,8 +202,9 @@ impl InMemoryPermissionStore {
     }
 }
 
+#[async_trait]
 impl PermissionStore for InMemoryPermissionStore {
-    fn permissions_for(&self, user_id: &str) -> Result<HashSet<String>> {
+    async fn permissions_for(&self, user_id: &str) -> Result<HashSet<String>> {
         let map = self
             .inner
             .lock()
@@ -279,57 +282,65 @@ mod tests {
 
     // ───── InMemoryPermissionStore ─────
 
-    #[test]
-    fn empty_store_returns_empty_set() {
+    #[tokio::test]
+    async fn empty_store_returns_empty_set() {
         let s = InMemoryPermissionStore::new();
-        let perms = s.permissions_for("user-1").unwrap();
+        let perms = s.permissions_for("user-1").await.unwrap();
         assert!(perms.is_empty());
     }
 
-    #[test]
-    fn assign_role_grants_all_role_permissions() {
+    #[tokio::test]
+    async fn assign_role_grants_all_role_permissions() {
         let s = InMemoryPermissionStore::new();
         s.assign_role("user-1", &Role::editor()).unwrap();
-        let perms = s.permissions_for("user-1").unwrap();
+        let perms = s.permissions_for("user-1").await.unwrap();
         assert!(perms.contains(PERM_WORKFLOWS_WRITE));
         assert!(perms.contains(PERM_RUNS_EXECUTE));
         assert!(!perms.contains(PERM_USERS_ADMIN));
     }
 
-    #[test]
-    fn assign_role_is_idempotent() {
+    #[tokio::test]
+    async fn assign_role_is_idempotent() {
         let s = InMemoryPermissionStore::new();
         s.assign_role("u", &Role::viewer()).unwrap();
         s.assign_role("u", &Role::viewer()).unwrap();
-        let perms = s.permissions_for("u").unwrap();
+        let perms = s.permissions_for("u").await.unwrap();
         assert_eq!(perms.len(), 2); // viewer = 2 perms, pas dupliquées
     }
 
-    #[test]
-    fn assign_multiple_roles_accumulates() {
+    #[tokio::test]
+    async fn assign_multiple_roles_accumulates() {
         let s = InMemoryPermissionStore::new();
         s.assign_role("u", &Role::viewer()).unwrap();
         s.assign_role("u", &Role::editor()).unwrap();
-        let perms = s.permissions_for("u").unwrap();
+        let perms = s.permissions_for("u").await.unwrap();
         // editor ⊇ viewer ; on doit avoir au moins les permissions de editor
         assert!(perms.contains(PERM_WORKFLOWS_WRITE));
         assert!(perms.contains(PERM_RUNS_READ));
     }
 
-    #[test]
-    fn grant_and_revoke_work_individually() {
+    #[tokio::test]
+    async fn grant_and_revoke_work_individually() {
         let s = InMemoryPermissionStore::new();
         s.grant("u", PERM_USERS_ADMIN).unwrap();
-        assert!(s.permissions_for("u").unwrap().contains(PERM_USERS_ADMIN));
+        assert!(s
+            .permissions_for("u")
+            .await
+            .unwrap()
+            .contains(PERM_USERS_ADMIN));
         s.revoke("u", PERM_USERS_ADMIN).unwrap();
-        assert!(!s.permissions_for("u").unwrap().contains(PERM_USERS_ADMIN));
+        assert!(!s
+            .permissions_for("u")
+            .await
+            .unwrap()
+            .contains(PERM_USERS_ADMIN));
     }
 
-    #[test]
-    fn revoke_unknown_user_is_noop() {
+    #[tokio::test]
+    async fn revoke_unknown_user_is_noop() {
         let s = InMemoryPermissionStore::new();
         s.revoke("unknown", "x").unwrap();
-        assert!(s.permissions_for("unknown").unwrap().is_empty());
+        assert!(s.permissions_for("unknown").await.unwrap().is_empty());
     }
 
     #[test]

@@ -140,7 +140,7 @@ impl TokenService {
     ///
     /// Retourne `Err` si le token n'est pas un refresh, est expiré, est
     /// déjà révoqué ou n'est pas signé par ce service.
-    pub fn rotate<S: RevocationStore>(
+    pub async fn rotate<S: RevocationStore + ?Sized>(
         &self,
         refresh_token: &str,
         store: &S,
@@ -154,13 +154,15 @@ impl TokenService {
                 "rotation : un access token n'est pas rotable".into(),
             ));
         }
-        if store.is_revoked(&claims.jti)? {
+        if store.is_revoked(&claims.jti).await? {
             return Err(Error::Invalid(
                 "rotation : refresh token déjà révoqué".into(),
             ));
         }
         // exp en ms = exp (secondes) * 1000
-        store.revoke(&claims.jti, claims.exp.saturating_mul(1_000))?;
+        store
+            .revoke(&claims.jti, claims.exp.saturating_mul(1_000))
+            .await?;
         let access = self.issue_access(&claims.sub, access_ttl_seconds, now)?;
         let refresh = self.issue_refresh(&claims.sub, refresh_ttl_seconds, now)?;
         Ok((access, refresh))
@@ -238,16 +240,19 @@ mod tests {
         assert_ne!(c1.jti, c2.jti);
     }
 
-    #[test]
-    fn rotate_consumes_refresh_and_issues_new_pair() {
+    #[tokio::test]
+    async fn rotate_consumes_refresh_and_issues_new_pair() {
         let s = svc();
         let store = InMemoryRevocationStore::new();
         let refresh = s.issue_refresh("u", 3_600, NOW).unwrap();
         let original_jti = s.verify(&refresh, NOW + 1).unwrap().jti;
 
-        let (access, new_refresh) = s.rotate(&refresh, &store, 900, 3_600, NOW + 10).unwrap();
+        let (access, new_refresh) = s
+            .rotate(&refresh, &store, 900, 3_600, NOW + 10)
+            .await
+            .unwrap();
         // L'ancien refresh est désormais révoqué
-        assert!(store.is_revoked(&original_jti).unwrap());
+        assert!(store.is_revoked(&original_jti).await.unwrap());
         // Le nouvel access est un Access valide
         let ac = s.verify(&access, NOW + 11).unwrap();
         assert_eq!(ac.kind, TokenKind::Access);
@@ -258,35 +263,43 @@ mod tests {
         assert_ne!(rc.jti, original_jti);
     }
 
-    #[test]
-    fn rotate_rejects_already_revoked_refresh() {
+    #[tokio::test]
+    async fn rotate_rejects_already_revoked_refresh() {
         let s = svc();
         let store = InMemoryRevocationStore::new();
         let refresh = s.issue_refresh("u", 3_600, NOW).unwrap();
-        let _ = s.rotate(&refresh, &store, 900, 3_600, NOW + 10).unwrap();
+        let _ = s
+            .rotate(&refresh, &store, 900, 3_600, NOW + 10)
+            .await
+            .unwrap();
         // Deuxième rotation avec le même refresh → rejetée (replay attack)
         let err = s
             .rotate(&refresh, &store, 900, 3_600, NOW + 20)
+            .await
             .unwrap_err();
         assert!(matches!(err, Error::Invalid(ref m) if m.contains("révoqué")));
     }
 
-    #[test]
-    fn rotate_rejects_access_token() {
+    #[tokio::test]
+    async fn rotate_rejects_access_token() {
         let s = svc();
         let store = InMemoryRevocationStore::new();
         let access = s.issue_access("u", 900, NOW).unwrap();
-        let err = s.rotate(&access, &store, 900, 3_600, NOW + 10).unwrap_err();
+        let err = s
+            .rotate(&access, &store, 900, 3_600, NOW + 10)
+            .await
+            .unwrap_err();
         assert!(matches!(err, Error::Invalid(ref m) if m.contains("access")));
     }
 
-    #[test]
-    fn rotate_rejects_expired_refresh() {
+    #[tokio::test]
+    async fn rotate_rejects_expired_refresh() {
         let s = svc();
         let store = InMemoryRevocationStore::new();
         let refresh = s.issue_refresh("u", 60, NOW).unwrap();
         let err = s
             .rotate(&refresh, &store, 900, 3_600, NOW + 61)
+            .await
             .unwrap_err();
         assert!(matches!(err, Error::Invalid(ref m) if m.contains("expiré")));
     }

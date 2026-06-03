@@ -1,9 +1,9 @@
-//! [`AuditSink`] adossé à PostgreSQL (table `audit_events`).
+//! [`AuditSink`] adossé à PostgreSQL (table `audit_events`), **async**.
 //!
-//! Append-only, lecture en ordre d'insertion (clé `id` BIGSERIAL). Persiste
-//! les events d'audit (F6.6) au-delà du processus. Schéma : migration
-//! `migrations/0008_audit_events.sql`.
+//! Append-only, lecture en ordre d'insertion (clé `id` BIGSERIAL). Métadonnées
+//! en `jsonb`. Schéma : migration `migrations/0008_audit_events.sql`.
 
+use async_trait::async_trait;
 use autome_core::{AuditEvent, AuditOutcome, AuditSink, Error};
 use serde_json::Value;
 
@@ -46,9 +46,10 @@ impl PgAuditSink {
     }
 }
 
+#[async_trait]
 impl AuditSink for PgAuditSink {
-    fn record(&self, event: AuditEvent) -> autome_core::Result<()> {
-        let mut client = self.pool.get().map_err(|e| storage_err("pool", e))?;
+    async fn record(&self, event: AuditEvent) -> autome_core::Result<()> {
+        let client = self.pool.get().await.map_err(|e| storage_err("pool", e))?;
         client
             .execute(
                 "INSERT INTO audit_events \
@@ -63,18 +64,20 @@ impl AuditSink for PgAuditSink {
                     &event.metadata,
                 ],
             )
+            .await
             .map_err(|e| storage_err("record", e))?;
         Ok(())
     }
 
-    fn list(&self) -> autome_core::Result<Vec<AuditEvent>> {
-        let mut client = self.pool.get().map_err(|e| storage_err("pool", e))?;
+    async fn list(&self) -> autome_core::Result<Vec<AuditEvent>> {
+        let client = self.pool.get().await.map_err(|e| storage_err("pool", e))?;
         let rows = client
             .query(
                 "SELECT timestamp_ms, actor, action, resource, outcome, metadata \
                  FROM audit_events ORDER BY id",
                 &[],
             )
+            .await
             .map_err(|e| storage_err("list", e))?;
         rows.iter()
             .map(|r| {

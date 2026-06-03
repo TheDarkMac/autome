@@ -165,7 +165,7 @@ impl IntoResponse for CredentialError {
     }
 }
 
-fn audit_event(
+async fn audit_event(
     state: &CredentialsState,
     actor: &str,
     action: &str,
@@ -174,7 +174,7 @@ fn audit_event(
 ) {
     let now_ms = state.auth.clock.now_unix_seconds().saturating_mul(1_000);
     let event = AuditEvent::new(now_ms, actor, action, outcome).with_resource(resource);
-    if let Err(e) = state.auth.audit.record(event) {
+    if let Err(e) = state.auth.audit.record(event).await {
         eprintln!("[credentials] audit record failed: {e}");
     }
 }
@@ -199,7 +199,8 @@ pub async fn list_providers(
 ) -> Result<Json<ListProvidersResponse>, CredentialError> {
     state
         .auth
-        .require_permission(&user, PERM_CREDENTIALS_MANAGE)?;
+        .require_permission(&user, PERM_CREDENTIALS_MANAGE)
+        .await?;
     let items: Vec<ProviderDto> = state
         .service
         .list_providers()
@@ -215,7 +216,8 @@ pub async fn list_providers(
         "credentials.providers",
         "*",
         AuditOutcome::Success,
-    );
+    )
+    .await;
     Ok(Json(ListProvidersResponse { items }))
 }
 
@@ -240,7 +242,8 @@ pub async fn start_authorize(
 ) -> Result<Json<AuthorizeResponse>, CredentialError> {
     state
         .auth
-        .require_permission(&user, PERM_CREDENTIALS_MANAGE)?;
+        .require_permission(&user, PERM_CREDENTIALS_MANAGE)
+        .await?;
     match state.service.start_authorize(&provider_id) {
         Ok(start) => {
             audit_event(
@@ -249,7 +252,8 @@ pub async fn start_authorize(
                 "credentials.authorize",
                 &provider_id,
                 AuditOutcome::Success,
-            );
+            )
+            .await;
             Ok(Json(AuthorizeResponse {
                 authorize_url: start.authorize_url,
                 state: start.state,
@@ -263,7 +267,8 @@ pub async fn start_authorize(
                 "credentials.authorize",
                 &provider_id,
                 AuditOutcome::Failure,
-            );
+            )
+            .await;
             Err(CredentialError::NotFound(format!(
                 "provider '{provider_id}' inconnu : {e}"
             )))
@@ -294,7 +299,8 @@ pub async fn complete_authorize(
 ) -> Result<Json<CredentialDto>, CredentialError> {
     state
         .auth
-        .require_permission(&user, PERM_CREDENTIALS_MANAGE)?;
+        .require_permission(&user, PERM_CREDENTIALS_MANAGE)
+        .await?;
     let now_ms = state.auth.clock.now_unix_seconds().saturating_mul(1_000);
     let _ = body.state; // F7.3 : le caller a déjà comparé state ; on l'accepte tel quel.
     match state.service.complete_authorize(
@@ -311,7 +317,8 @@ pub async fn complete_authorize(
                 "credentials.callback",
                 &provider_id,
                 AuditOutcome::Success,
-            );
+            )
+            .await;
             Ok(Json(summary.into()))
         }
         Err(e) => {
@@ -321,7 +328,8 @@ pub async fn complete_authorize(
                 "credentials.callback",
                 &provider_id,
                 AuditOutcome::Failure,
-            );
+            )
+            .await;
             Err(CredentialError::Upstream(e.to_string()))
         }
     }
@@ -345,7 +353,8 @@ pub async fn list_credentials(
 ) -> Result<Json<ListCredentialsResponse>, CredentialError> {
     state
         .auth
-        .require_permission(&user, PERM_CREDENTIALS_MANAGE)?;
+        .require_permission(&user, PERM_CREDENTIALS_MANAGE)
+        .await?;
     let items: Vec<CredentialDto> = state
         .service
         .list_for_user(user.user_id())
@@ -359,7 +368,8 @@ pub async fn list_credentials(
         "credentials.list",
         "*",
         AuditOutcome::Success,
-    );
+    )
+    .await;
     Ok(Json(ListCredentialsResponse { items }))
 }
 
@@ -383,7 +393,8 @@ pub async fn delete_credential(
 ) -> Result<StatusCode, CredentialError> {
     state
         .auth
-        .require_permission(&user, PERM_CREDENTIALS_MANAGE)?;
+        .require_permission(&user, PERM_CREDENTIALS_MANAGE)
+        .await?;
     state
         .service
         .delete(user.user_id(), &provider_id)
@@ -394,7 +405,8 @@ pub async fn delete_credential(
         "credentials.delete",
         &provider_id,
         AuditOutcome::Success,
-    );
+    )
+    .await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -835,7 +847,7 @@ mod tests {
             ))
             .await
             .unwrap();
-        let events = audit.list().unwrap();
+        let events = audit.list().await.unwrap();
         let evt = events
             .iter()
             .find(|e| e.action == "credentials.authorize" && e.outcome == AuditOutcome::Success)
@@ -862,6 +874,7 @@ mod tests {
             .unwrap();
         let evt = audit
             .list()
+            .await
             .unwrap()
             .into_iter()
             .find(|e| e.action == "credentials.callback" && e.outcome == AuditOutcome::Failure)
@@ -881,6 +894,7 @@ mod tests {
             .unwrap();
         let evt = audit
             .list()
+            .await
             .unwrap()
             .into_iter()
             .find(|e| e.action == "credentials.delete")

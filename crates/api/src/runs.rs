@@ -145,7 +145,7 @@ impl IntoResponse for RunError {
     }
 }
 
-fn audit_event(
+async fn audit_event(
     state: &RunsState,
     actor: &str,
     action: &str,
@@ -154,7 +154,7 @@ fn audit_event(
 ) {
     let now_ms = state.auth.clock.now_unix_seconds().saturating_mul(1_000);
     let event = AuditEvent::new(now_ms, actor, action, outcome).with_resource(resource);
-    if let Err(e) = state.auth.audit.record(event) {
+    if let Err(e) = state.auth.audit.record(event).await {
         eprintln!("[runs] audit record failed: {e}");
     }
 }
@@ -180,7 +180,10 @@ pub async fn create_run(
     Path(workflow_id): Path<String>,
     body: Option<Json<CreateRunBody>>,
 ) -> Result<(StatusCode, Json<CreateRunResponse>), RunError> {
-    state.auth.require_permission(&user, PERM_RUNS_EXECUTE)?;
+    state
+        .auth
+        .require_permission(&user, PERM_RUNS_EXECUTE)
+        .await?;
 
     // 1. Vérifie que le workflow existe — sinon 404.
     let exists = state
@@ -195,7 +198,8 @@ pub async fn create_run(
             "runs.create",
             &workflow_id,
             AuditOutcome::Failure,
-        );
+        )
+        .await;
         return Err(RunError::NotFound(format!(
             "workflow '{workflow_id}' inconnu"
         )));
@@ -222,7 +226,8 @@ pub async fn create_run(
         "runs.create",
         &outcome.run_id,
         AuditOutcome::Success,
-    );
+    )
+    .await;
 
     Ok((
         StatusCode::ACCEPTED,
@@ -252,7 +257,7 @@ pub async fn get_run(
     State(state): State<RunsState>,
     Path(run_id): Path<String>,
 ) -> Result<Json<RunCheckpoint>, RunError> {
-    state.auth.require_permission(&user, PERM_RUNS_READ)?;
+    state.auth.require_permission(&user, PERM_RUNS_READ).await?;
     match state
         .runs
         .load(&run_id)
@@ -265,7 +270,8 @@ pub async fn get_run(
                 "runs.get",
                 &run_id,
                 AuditOutcome::Success,
-            );
+            )
+            .await;
             Ok(Json(snap))
         }
         None => {
@@ -275,7 +281,8 @@ pub async fn get_run(
                 "runs.get",
                 &run_id,
                 AuditOutcome::Failure,
-            );
+            )
+            .await;
             Err(RunError::NotFound(format!("run '{run_id}' inconnu")))
         }
     }
@@ -303,7 +310,7 @@ pub async fn list_runs(
     Path(workflow_id): Path<String>,
     Query(q): Query<ListQuery>,
 ) -> Result<Json<ListRunsResponse>, RunError> {
-    state.auth.require_permission(&user, PERM_RUNS_READ)?;
+    state.auth.require_permission(&user, PERM_RUNS_READ).await?;
     let paging = Pagination {
         offset: q.offset.unwrap_or(0),
         limit: q.limit.unwrap_or(50),
@@ -318,7 +325,8 @@ pub async fn list_runs(
         "runs.list",
         &workflow_id,
         AuditOutcome::Success,
-    );
+    )
+    .await;
     Ok(Json(ListRunsResponse {
         items,
         total,
@@ -671,7 +679,7 @@ mod tests {
             .oneshot(auth_req("POST", "/workflows/wf-1/runs", &token, Some("{}")))
             .await
             .unwrap();
-        let events = audit.list().unwrap();
+        let events = audit.list().await.unwrap();
         let create_evt = events
             .iter()
             .find(|e| e.action == "runs.create" && e.outcome == AuditOutcome::Success)
@@ -695,7 +703,7 @@ mod tests {
             ))
             .await
             .unwrap();
-        let events = audit.list().unwrap();
+        let events = audit.list().await.unwrap();
         let evt = events
             .iter()
             .find(|e| e.action == "runs.create" && e.outcome == AuditOutcome::Failure)
@@ -713,7 +721,7 @@ mod tests {
             .oneshot(auth_req("GET", "/workflows/wf-1/runs", &token, None))
             .await
             .unwrap();
-        let events = audit.list().unwrap();
+        let events = audit.list().await.unwrap();
         let evt = events
             .iter()
             .find(|e| e.action == "runs.list")

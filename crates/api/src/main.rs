@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use autome_api::auth::{protected_router, AuthState};
 use autome_api::metrics::{metrics_router, with_metrics, Metrics};
-use autome_api::runtime::{build_auth_state, PersistenceMode};
+use autome_api::runtime::{build_auth_state, migrate, migrate_on_boot_requested, PersistenceMode};
 use autome_api::tls::load_rustls_config;
 use autome_core::{Config, Profile};
 use axum::{routing::get, Router};
@@ -41,6 +41,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // les stores d'auth à PostgreSQL ; défaut `memory` (dev/tests/single-node).
     // Le secret JWT vient toujours de `config.jwt_secret` (constat 1).
     let mode = PersistenceMode::from_env()?;
+
+    // Runner de migrations (dette #107) : en mode `postgres` avec
+    // `AUTOME_MIGRATE=1`, applique les migrations manquantes au démarrage
+    // (idempotent, sérialisé entre répliques par un verrou applicatif).
+    if mode == PersistenceMode::Postgres && migrate_on_boot_requested() {
+        let applied = migrate(&config).await?;
+        println!("autome-api : migrations appliquées = {applied}");
+    }
+
     let auth = build_auth_state(&config, mode)?;
     println!("autome-api : persistance = {mode:?}");
 
