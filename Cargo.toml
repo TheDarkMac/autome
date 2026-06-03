@@ -8,6 +8,7 @@ members = [
     "crates/engine",
     "crates/api",
     "crates/worker",
+    "crates/persistence",
 ]
 
 # Métadonnées partagées par tous les crates du workspace.
@@ -28,6 +29,7 @@ authors = ["Équipe Autome"]
 autome-core = { path = "crates/core" }
 autome-engine = { path = "crates/engine" }
 autome-connectors = { path = "crates/connectors" }
+autome-persistence = { path = "crates/persistence" }
 # Dépendances tierces communes
 thiserror = "1"
 serde = { version = "1", features = ["derive"] }
@@ -44,6 +46,11 @@ rand = "0.8"
 # Chiffrement secrets au repos (F6.3)
 aes-gcm = "0.10"
 base64 = "0.22"
+# Persistance PostgreSQL (dette #107) — driver bloquant (les traits stores de
+# `core` sont synchrones) + pool de connexions.
+postgres = "0.19"
+r2d2 = "0.8"
+r2d2_postgres = "0.18"
 # TLS (F6.4) — server HTTPS rustls (provider explicite : ring)
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 rustls-pemfile = "2"
