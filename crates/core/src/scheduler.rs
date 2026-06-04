@@ -128,7 +128,7 @@ impl Scheduler {
     /// Un trigger qui renvoie une erreur arrête la passe courante — les
     /// triggers suivants ne sont pas pollés ; le caller décide quoi faire
     /// (typiquement : ignorer et retenter au tick suivant).
-    pub fn tick(&mut self) -> Result<usize> {
+    pub async fn tick(&mut self) -> Result<usize> {
         let mut dispatched = 0;
         for trigger in &mut self.triggers {
             while let Some(event) = trigger.poll()? {
@@ -143,7 +143,7 @@ impl Scheduler {
                 let msg = Message::new(body)
                     .with_header("idempotency-key", &key)
                     .with_header("trigger-source", &event.source);
-                self.queue.publish(&self.queue_name, msg)?;
+                self.queue.publish(&self.queue_name, msg).await?;
                 dispatched += 1;
             }
         }
@@ -161,7 +161,7 @@ impl Scheduler {
             .name("autome-scheduler".into())
             .spawn(move || {
                 while !stop.load(Ordering::Acquire) {
-                    if let Err(e) = scheduler.tick() {
+                    if let Err(e) = pollster::block_on(scheduler.tick()) {
                         eprintln!("[autome-scheduler] tick error: {e}");
                     }
                     thread::sleep(interval);
@@ -253,8 +253,8 @@ mod tests {
 
     // ───── F5.3.a / F5.3.b — tick + dispatch ─────
 
-    #[test]
-    fn tick_dispatches_event_to_queue() {
+    #[tokio::test]
+    async fn tick_dispatches_event_to_queue() {
         let queue = Arc::new(InMemoryQueue::new());
         let mut scheduler = Scheduler::new(
             Arc::clone(&queue) as Arc<dyn Queue + Send + Sync>,
@@ -265,10 +265,10 @@ mod tests {
             "replay",
             json!({ "a": 1 }),
         )])));
-        let count = scheduler.tick().unwrap();
+        let count = scheduler.tick().await.unwrap();
         assert_eq!(count, 1);
-        assert_eq!(queue.depth("runs").unwrap(), 1);
-        let d = queue.poll("runs").unwrap().unwrap();
+        assert_eq!(queue.depth("runs").await.unwrap(), 1);
+        let d = queue.poll("runs").await.unwrap().unwrap();
         assert_eq!(d.message.body["source"], json!("replay"));
         assert_eq!(d.message.body["payload"], json!({ "a": 1 }));
         // Headers
@@ -284,8 +284,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn tick_returns_zero_when_no_events() {
+    #[tokio::test]
+    async fn tick_returns_zero_when_no_events() {
         let queue = Arc::new(InMemoryQueue::new());
         let mut scheduler = Scheduler::new(
             Arc::clone(&queue) as Arc<dyn Queue + Send + Sync>,
@@ -293,12 +293,12 @@ mod tests {
             Arc::new(InMemoryDedupLock::new()),
         )
         .register(Box::new(Replay::new(vec![])));
-        assert_eq!(scheduler.tick().unwrap(), 0);
-        assert_eq!(queue.depth("runs").unwrap(), 0);
+        assert_eq!(scheduler.tick().await.unwrap(), 0);
+        assert_eq!(queue.depth("runs").await.unwrap(), 0);
     }
 
-    #[test]
-    fn tick_drains_all_pending_events_in_one_pass() {
+    #[tokio::test]
+    async fn tick_drains_all_pending_events_in_one_pass() {
         let queue = Arc::new(InMemoryQueue::new());
         let events = (0..5)
             .map(|i| TriggerEvent::new("replay", json!({ "n": i })))
@@ -309,12 +309,12 @@ mod tests {
             Arc::new(InMemoryDedupLock::new()),
         )
         .register(Box::new(Replay::new(events)));
-        assert_eq!(scheduler.tick().unwrap(), 5);
-        assert_eq!(queue.depth("runs").unwrap(), 5);
+        assert_eq!(scheduler.tick().await.unwrap(), 5);
+        assert_eq!(queue.depth("runs").await.unwrap(), 5);
     }
 
-    #[test]
-    fn tick_aggregates_multiple_triggers() {
+    #[tokio::test]
+    async fn tick_aggregates_multiple_triggers() {
         let queue = Arc::new(InMemoryQueue::new());
         let mut scheduler = Scheduler::new(
             Arc::clone(&queue) as Arc<dyn Queue + Send + Sync>,
@@ -329,14 +329,14 @@ mod tests {
             "b",
             json!({}),
         )])));
-        assert_eq!(scheduler.tick().unwrap(), 2);
-        assert_eq!(queue.depth("runs").unwrap(), 2);
+        assert_eq!(scheduler.tick().await.unwrap(), 2);
+        assert_eq!(queue.depth("runs").await.unwrap(), 2);
     }
 
     // ───── F5.3.c — déduplication ─────
 
-    #[test]
-    fn duplicate_event_is_filtered_by_dedup_lock() {
+    #[tokio::test]
+    async fn duplicate_event_is_filtered_by_dedup_lock() {
         let queue = Arc::new(InMemoryQueue::new());
         // Même événement deux fois
         let mut scheduler = Scheduler::new(
@@ -348,13 +348,13 @@ mod tests {
             TriggerEvent::new("dup", json!({ "id": 1 })),
             TriggerEvent::new("dup", json!({ "id": 1 })),
         ])));
-        let dispatched = scheduler.tick().unwrap();
+        let dispatched = scheduler.tick().await.unwrap();
         assert_eq!(dispatched, 1);
-        assert_eq!(queue.depth("runs").unwrap(), 1);
+        assert_eq!(queue.depth("runs").await.unwrap(), 1);
     }
 
-    #[test]
-    fn distinct_events_are_all_dispatched() {
+    #[tokio::test]
+    async fn distinct_events_are_all_dispatched() {
         let queue = Arc::new(InMemoryQueue::new());
         let mut scheduler = Scheduler::new(
             Arc::clone(&queue) as Arc<dyn Queue + Send + Sync>,
@@ -366,11 +366,11 @@ mod tests {
             TriggerEvent::new("dup", json!({ "id": 2 })),
             TriggerEvent::new("dup", json!({ "id": 3 })),
         ])));
-        assert_eq!(scheduler.tick().unwrap(), 3);
+        assert_eq!(scheduler.tick().await.unwrap(), 3);
     }
 
-    #[test]
-    fn dedup_persists_across_ticks() {
+    #[tokio::test]
+    async fn dedup_persists_across_ticks() {
         let queue = Arc::new(InMemoryQueue::new());
         let (feed, backlog) = Feed::new();
         let mut scheduler = Scheduler::new(
@@ -385,26 +385,26 @@ mod tests {
             .lock()
             .unwrap()
             .push(TriggerEvent::new("feed", json!({ "id": "X" })));
-        assert_eq!(scheduler.tick().unwrap(), 1);
+        assert_eq!(scheduler.tick().await.unwrap(), 1);
 
         // Tick 2 : ré-émet le MÊME event X → filtré par dedup
         backlog
             .lock()
             .unwrap()
             .push(TriggerEvent::new("feed", json!({ "id": "X" })));
-        assert_eq!(scheduler.tick().unwrap(), 0);
+        assert_eq!(scheduler.tick().await.unwrap(), 0);
 
         // Tick 3 : event Y nouveau → dispatché
         backlog
             .lock()
             .unwrap()
             .push(TriggerEvent::new("feed", json!({ "id": "Y" })));
-        assert_eq!(scheduler.tick().unwrap(), 1);
-        assert_eq!(queue.depth("runs").unwrap(), 2);
+        assert_eq!(scheduler.tick().await.unwrap(), 1);
+        assert_eq!(queue.depth("runs").await.unwrap(), 2);
     }
 
-    #[test]
-    fn custom_dedup_key_is_used() {
+    #[tokio::test]
+    async fn custom_dedup_key_is_used() {
         let queue = Arc::new(InMemoryQueue::new());
         // Clé custom : seulement le champ `id` du payload, on ignore le reste.
         let mut scheduler = Scheduler::new(
@@ -425,12 +425,12 @@ mod tests {
             TriggerEvent::new("b", json!({ "id": "K", "extra": 2 })),
             TriggerEvent::new("c", json!({ "id": "OTHER" })),
         ])));
-        let dispatched = scheduler.tick().unwrap();
+        let dispatched = scheduler.tick().await.unwrap();
         assert_eq!(dispatched, 2);
     }
 
-    #[test]
-    fn in_memory_dedup_lock_returns_true_first_then_false() {
+    #[tokio::test]
+    async fn in_memory_dedup_lock_returns_true_first_then_false() {
         let l = InMemoryDedupLock::new();
         assert!(l.try_acquire("k"));
         assert!(!l.try_acquire("k"));
@@ -438,8 +438,8 @@ mod tests {
         assert!(l.try_acquire("other"));
     }
 
-    #[test]
-    fn default_dedup_key_combines_source_and_payload() {
+    #[tokio::test]
+    async fn default_dedup_key_combines_source_and_payload() {
         let e1 = TriggerEvent::new("s", json!({ "x": 1 }));
         let e2 = TriggerEvent::new("s", json!({ "x": 1 }));
         let e3 = TriggerEvent::new("s", json!({ "x": 2 }));
@@ -449,8 +449,8 @@ mod tests {
 
     // ───── F5.3.a — start / stop ─────
 
-    #[test]
-    fn start_runs_tick_periodically_and_stop_joins_cleanly() {
+    #[tokio::test]
+    async fn start_runs_tick_periodically_and_stop_joins_cleanly() {
         let queue = Arc::new(InMemoryQueue::new());
         let (feed, backlog) = Feed::new();
 
@@ -478,16 +478,16 @@ mod tests {
             .push(TriggerEvent::new("feed", json!({ "id": 3 })));
 
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
-        while queue.depth("runs").unwrap() < 3 {
+        while queue.depth("runs").await.unwrap() < 3 {
             if std::time::Instant::now() > deadline {
                 panic!(
                     "scheduler n'a pas dispatché les 3 événements (queue depth={})",
-                    queue.depth("runs").unwrap()
+                    queue.depth("runs").await.unwrap()
                 );
             }
             thread::sleep(Duration::from_millis(5));
         }
         running.stop();
-        assert!(queue.depth("runs").unwrap() >= 3);
+        assert!(queue.depth("runs").await.unwrap() >= 3);
     }
 }

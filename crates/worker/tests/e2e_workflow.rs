@@ -36,23 +36,6 @@ use serde_json::{json, Value};
 const QUEUE: &str = "runs";
 const NOW_MS: i64 = 1_700_000_000_000;
 
-/// Pont synchrone → async : le worker est thread-based (sync) mais les stores
-/// sont désormais asynchrones (dette #107). Un runtime tokio dédié, partagé,
-/// permet de `block_on` les appels stores depuis les threads (sync) du pool et
-/// le corps des tests. (La bascule async du worker viendra avec lapin.)
-fn block<F: std::future::Future>(f: F) -> F::Output {
-    use std::sync::OnceLock;
-    static RT: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
-    RT.get_or_init(|| {
-        tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .enable_all()
-            .build()
-            .expect("runtime de test")
-    })
-    .block_on(f)
-}
-
 /// Workflow réaliste à trois nodes avec **mapping de données** :
 /// `entry` (trigger) → `fetch` (produit `{ value: 21 }`) → `double`
 /// (lit la sortie de `fetch` et produit `{ result: 42 }`).
@@ -135,24 +118,34 @@ struct RunExecutor {
     runs: Arc<AtomicU32>,
 }
 
+#[async_trait::async_trait]
 impl Handler for RunExecutor {
-    fn handle(&self, delivery: &autome_core::Delivery) -> HandlerVerdict {
+    async fn handle(&self, delivery: &autome_core::Delivery) -> HandlerVerdict {
         let body = &delivery.message.body;
         let run_id = body["run_id"].as_str().expect("run_id dans le message");
         let workflow_id = body["workflow_id"].as_str().expect("workflow_id");
 
-        let workflow = block(self.repo.get(&WorkflowId::new(workflow_id)))
+        let workflow = self
+            .repo
+            .get(&WorkflowId::new(workflow_id))
+            .await
             .expect("repo get")
             .expect("workflow connu");
         let dag = Dag::from_workflow(&workflow).expect("DAG valide");
 
         // Transition Queued → Running.
-        let mut checkpoint = block(self.store.load(run_id))
+        let mut checkpoint = self
+            .store
+            .load(run_id)
+            .await
             .expect("load")
             .expect("run connu");
         checkpoint.status = RunStatus::Running;
         checkpoint.started_at_ms = Some(NOW_MS);
-        block(self.store.checkpoint(&checkpoint)).expect("checkpoint running");
+        self.store
+            .checkpoint(&checkpoint)
+            .await
+            .expect("checkpoint running");
 
         // Exécution du moteur.
         let runner = make_runner(Arc::clone(&self.runs));
@@ -177,7 +170,10 @@ impl Handler for RunExecutor {
                 .find_map(|s| s.error.clone())
                 .or_else(|| Some("run en échec".into()));
         }
-        block(self.store.checkpoint(&checkpoint)).expect("checkpoint final");
+        self.store
+            .checkpoint(&checkpoint)
+            .await
+            .expect("checkpoint final");
 
         match report.status {
             EngineRunStatus::Succeeded => HandlerVerdict::Ok,
@@ -231,42 +227,48 @@ impl Stack {
     }
 
     /// Dispatche un run pour `workflow_id` (le workflow doit déjà exister).
-    fn dispatch(&self, workflow_id: &str) -> String {
-        block(self.dispatcher.dispatch(DispatchRequest {
-            workflow_id: workflow_id.into(),
-            version: 1,
-            trigger_type: "manual".into(),
-            payload: json!({ "seed": true }),
-            now_ms: NOW_MS,
-        }))
-        .expect("dispatch")
-        .run_id
+    async fn dispatch(&self, workflow_id: &str) -> String {
+        self.dispatcher
+            .dispatch(DispatchRequest {
+                workflow_id: workflow_id.into(),
+                version: 1,
+                trigger_type: "manual".into(),
+                payload: json!({ "seed": true }),
+                now_ms: NOW_MS,
+            })
+            .await
+            .expect("dispatch")
+            .run_id
     }
 }
 
 // ───────────────────────── F9.4.b — chemin nominal ─────────────────────
 
-#[test]
-fn dispatched_workflow_runs_to_completion_with_persisted_outputs() {
+#[tokio::test]
+async fn dispatched_workflow_runs_to_completion_with_persisted_outputs() {
     let stack = Stack::new();
-    block(stack.repo.create(pipeline_workflow("wf-pipe"))).unwrap();
+    stack
+        .repo
+        .create(pipeline_workflow("wf-pipe"))
+        .await
+        .unwrap();
 
     // À l'instant du dispatch, le run est Queued et la queue contient 1 msg.
-    let run_id = stack.dispatch("wf-pipe");
+    let run_id = stack.dispatch("wf-pipe").await;
     assert_eq!(
-        block(stack.store.load(&run_id)).unwrap().unwrap().status,
+        stack.store.load(&run_id).await.unwrap().unwrap().status,
         RunStatus::Queued
     );
-    assert_eq!(stack.queue.depth(QUEUE).unwrap(), 1);
+    assert_eq!(stack.queue.depth(QUEUE).await.unwrap(), 1);
 
     // Un seul `process_one` draine et exécute le run de bout en bout.
     let pool = stack.pool(1);
-    let outcome = pool.process_one().unwrap();
+    let outcome = pool.process_one().await.unwrap();
     assert_eq!(outcome, ProcessOutcome::Handled(HandlerVerdict::Ok));
 
     // État final : Succeeded, sorties des deux actions persistées (la donnée
     // `21` a transité de `fetch` vers `double` via le moteur → `42`).
-    let final_state = block(stack.store.load(&run_id)).unwrap().unwrap();
+    let final_state = stack.store.load(&run_id).await.unwrap().unwrap();
     assert_eq!(final_state.status, RunStatus::Succeeded);
     assert_eq!(final_state.outputs["fetch"], json!({ "value": 21 }));
     assert_eq!(final_state.outputs["double"], json!({ "result": 42 }));
@@ -274,27 +276,27 @@ fn dispatched_workflow_runs_to_completion_with_persisted_outputs() {
     assert_eq!(final_state.finished_at_ms, Some(NOW_MS));
 
     // Queue drainée (message acké), runner appelé une fois pour `fetch`.
-    assert_eq!(stack.queue.depth(QUEUE).unwrap(), 0);
+    assert_eq!(stack.queue.depth(QUEUE).await.unwrap(), 0);
     assert_eq!(stack.runs.load(Ordering::SeqCst), 1);
 }
 
 // ───────────────────────── F9.4.c — chemin d'échec ─────────────────────
 
-#[test]
-fn failing_node_marks_run_failed_and_dead_letters_message() {
+#[tokio::test]
+async fn failing_node_marks_run_failed_and_dead_letters_message() {
     let stack = Stack::new();
     // Workflow dont le second node échoue (`name == "boom"`).
     let mut wf = pipeline_workflow("wf-boom");
     wf.nodes[1].name = "boom".into();
-    block(stack.repo.create(wf)).unwrap();
+    stack.repo.create(wf).await.unwrap();
 
-    let run_id = stack.dispatch("wf-boom");
+    let run_id = stack.dispatch("wf-boom").await;
     let pool = stack.pool(1);
-    let outcome = pool.process_one().unwrap();
+    let outcome = pool.process_one().await.unwrap();
     assert_eq!(outcome, ProcessOutcome::Handled(HandlerVerdict::DeadLetter));
 
     // Run marqué Failed avec un message d'erreur.
-    let final_state = block(stack.store.load(&run_id)).unwrap().unwrap();
+    let final_state = stack.store.load(&run_id).await.unwrap().unwrap();
     assert_eq!(final_state.status, RunStatus::Failed);
     assert!(
         final_state.error.is_some(),
@@ -302,36 +304,47 @@ fn failing_node_marks_run_failed_and_dead_letters_message() {
     );
 
     // Le message a quitté la queue principale pour la DLQ.
-    assert_eq!(stack.queue.depth(QUEUE).unwrap(), 0);
-    assert_eq!(stack.queue.depth(&dlq_of(QUEUE)).unwrap(), 1);
+    assert_eq!(stack.queue.depth(QUEUE).await.unwrap(), 0);
+    assert_eq!(stack.queue.depth(&dlq_of(QUEUE)).await.unwrap(), 1);
 }
 
 // ───────────────────────── F9.4.d — pool concurrent + idempotence ──────
 
-#[test]
-fn concurrent_pool_drains_all_dispatched_runs_to_success() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_pool_drains_all_dispatched_runs_to_success() {
     let stack = Stack::new();
-    block(stack.repo.create(pipeline_workflow("wf-pipe"))).unwrap();
+    stack
+        .repo
+        .create(pipeline_workflow("wf-pipe"))
+        .await
+        .unwrap();
 
     const N: usize = 50;
-    let run_ids: Vec<String> = (0..N).map(|_| stack.dispatch("wf-pipe")).collect();
-    assert_eq!(stack.queue.depth(QUEUE).unwrap(), N);
+    let mut run_ids: Vec<String> = Vec::with_capacity(N);
+    for _ in 0..N {
+        run_ids.push(stack.dispatch("wf-pipe").await);
+    }
+    assert_eq!(stack.queue.depth(QUEUE).await.unwrap(), N);
 
-    // 4 threads consomment la queue en parallèle.
+    // 4 tâches consomment la queue en parallèle.
     let running = stack.pool(4).start();
 
     // Attend que tous les runs soient Succeeded (timeout de garde).
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
-        let done = run_ids
-            .iter()
-            .filter(|id| {
-                block(stack.store.load(id))
-                    .unwrap()
-                    .map(|c| c.status == RunStatus::Succeeded)
-                    .unwrap_or(false)
-            })
-            .count();
+        let mut done = 0usize;
+        for id in &run_ids {
+            if stack
+                .store
+                .load(id)
+                .await
+                .unwrap()
+                .map(|c| c.status == RunStatus::Succeeded)
+                .unwrap_or(false)
+            {
+                done += 1;
+            }
+        }
         if done == N {
             break;
         }
@@ -339,19 +352,23 @@ fn concurrent_pool_drains_all_dispatched_runs_to_success() {
             Instant::now() < deadline,
             "seulement {done}/{N} runs terminés avant le timeout"
         );
-        std::thread::sleep(Duration::from_millis(5));
+        tokio::time::sleep(Duration::from_millis(5)).await;
     }
-    running.stop();
+    running.stop().await;
 
     // Queue entièrement drainée et chaque run exécuté exactement une fois.
-    assert_eq!(stack.queue.depth(QUEUE).unwrap(), 0);
+    assert_eq!(stack.queue.depth(QUEUE).await.unwrap(), 0);
     assert_eq!(stack.runs.load(Ordering::SeqCst), N as u32);
 }
 
-#[test]
-fn duplicate_delivery_is_deduplicated_and_executes_once() {
+#[tokio::test]
+async fn duplicate_delivery_is_deduplicated_and_executes_once() {
     let stack = Stack::new();
-    block(stack.repo.create(pipeline_workflow("wf-pipe"))).unwrap();
+    stack
+        .repo
+        .create(pipeline_workflow("wf-pipe"))
+        .await
+        .unwrap();
 
     // Deux dispatchs avec le *même* run_id → même `idempotency-key`, deux
     // messages sur la queue (le store est ré-écrit en Queued à l'identique).
@@ -367,21 +384,24 @@ fn duplicate_delivery_is_deduplicated_and_executes_once() {
         payload: Value::Null,
         now_ms: NOW_MS,
     };
-    block(fixed.dispatch(req())).unwrap();
-    block(fixed.dispatch(req())).unwrap();
-    assert_eq!(stack.queue.depth(QUEUE).unwrap(), 2);
+    fixed.dispatch(req()).await.unwrap();
+    fixed.dispatch(req()).await.unwrap();
+    assert_eq!(stack.queue.depth(QUEUE).await.unwrap(), 2);
 
     let pool = stack.pool(1);
     // 1ʳᵉ livraison : exécutée.
     assert_eq!(
-        pool.process_one().unwrap(),
+        pool.process_one().await.unwrap(),
         ProcessOutcome::Handled(HandlerVerdict::Ok)
     );
     // 2ᵉ livraison (même clé) : dédupliquée, handler non rappelé.
-    assert_eq!(pool.process_one().unwrap(), ProcessOutcome::Deduplicated);
+    assert_eq!(
+        pool.process_one().await.unwrap(),
+        ProcessOutcome::Deduplicated
+    );
 
     assert_eq!(
-        block(stack.store.load("run-dup")).unwrap().unwrap().status,
+        stack.store.load("run-dup").await.unwrap().unwrap().status,
         RunStatus::Succeeded
     );
     assert_eq!(

@@ -17,6 +17,8 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 # Traits de stockage asynchrones (dette #107) — `async fn` en trait objet.
 async-trait = { workspace = true }
+# block_on minimal pour ponter le scheduler thread-based vers Queue async (#107).
+pollster = { workspace = true }
 # Auth (F6.1)
 jsonwebtoken = { workspace = true }
 argon2 = { workspace = true }

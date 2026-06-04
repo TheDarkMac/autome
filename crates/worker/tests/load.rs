@@ -71,8 +71,8 @@ where
 
 /// F5.6.a — Smoke test : passe la chaîne complète sur ~100 events et vérifie
 /// que tous sont traités, sans message en DLQ et avec un débit minimum.
-#[test]
-fn smoke_full_pipeline_scheduler_to_worker() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn smoke_full_pipeline_scheduler_to_worker() {
     const N: u32 = 100;
     const WORKERS: usize = 2;
 
@@ -114,7 +114,7 @@ fn smoke_full_pipeline_scheduler_to_worker() {
     // ce qu'il a au premier `poll`). En production le scheduler tickerait
     // périodiquement avec `start()` ; pour le test on l'appelle directement.
     let mut scheduler = scheduler;
-    let dispatched = scheduler.tick().expect("scheduler tick");
+    let dispatched = scheduler.tick().await.expect("scheduler tick");
     assert_eq!(
         dispatched, N as usize,
         "tous les events doivent être dispatchés"
@@ -127,8 +127,8 @@ fn smoke_full_pipeline_scheduler_to_worker() {
         "processed == N",
     );
     // Laisser un cycle aux workers pour ack le dernier
-    thread::sleep(Duration::from_millis(20));
-    running.stop();
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    running.stop().await;
 
     let elapsed = start.elapsed();
     let throughput = N as f64 / elapsed.as_secs_f64();
@@ -138,8 +138,16 @@ fn smoke_full_pipeline_scheduler_to_worker() {
     );
 
     // Aucun message ne doit traîner ni en file principale ni en DLQ
-    assert_eq!(queue.depth("runs").unwrap(), 0, "queue principale vidée");
-    assert_eq!(queue.depth("runs.dlq").unwrap(), 0, "pas de DLQ orpheline");
+    assert_eq!(
+        queue.depth("runs").await.unwrap(),
+        0,
+        "queue principale vidée"
+    );
+    assert_eq!(
+        queue.depth("runs.dlq").await.unwrap(),
+        0,
+        "pas de DLQ orpheline"
+    );
     assert_eq!(processed.load(Ordering::SeqCst), N);
 
     // Assertion débit *très* conservative pour ne pas être flake sur CI faible.
@@ -153,9 +161,9 @@ fn smoke_full_pipeline_scheduler_to_worker() {
 ///
 /// Marqué `#[ignore]` pour ne pas alourdir `cargo test`. Lancer avec
 /// `cargo test -p autome-worker --test load -- --ignored --nocapture`.
-#[test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "load test — invoque avec --ignored --nocapture pour voir le throughput"]
-fn load_throughput_baseline() {
+async fn load_throughput_baseline() {
     const N: u32 = 10_000;
     const WORKERS: usize = 8;
     const MIN_THROUGHPUT_PER_SEC: f64 = 1_000.0;
@@ -173,6 +181,7 @@ fn load_throughput_baseline() {
                 "runs",
                 Message::new(json!({ "n": i })).with_header("idempotency-key", format!("evt-{i}")),
             )
+            .await
             .expect("publish");
     }
     let publish_elapsed = publish_start.elapsed();
@@ -207,8 +216,8 @@ fn load_throughput_baseline() {
         "load: processed == N",
     );
     let consume_elapsed = consume_start.elapsed();
-    thread::sleep(Duration::from_millis(20));
-    running.stop();
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    running.stop().await;
 
     let throughput = N as f64 / consume_elapsed.as_secs_f64();
     println!(
@@ -216,8 +225,8 @@ fn load_throughput_baseline() {
         consume_elapsed, throughput
     );
 
-    assert_eq!(queue.depth("runs").unwrap(), 0);
-    assert_eq!(queue.depth("runs.dlq").unwrap(), 0);
+    assert_eq!(queue.depth("runs").await.unwrap(), 0);
+    assert_eq!(queue.depth("runs.dlq").await.unwrap(), 0);
     assert_eq!(processed.load(Ordering::SeqCst), N);
     assert!(
         throughput >= MIN_THROUGHPUT_PER_SEC,
@@ -228,8 +237,8 @@ fn load_throughput_baseline() {
 /// Garde-fou : la backpressure entre en jeu sous forte charge si la queue
 /// est sous-dimensionnée. On vérifie qu'on obtient bien un `Err(Backpressure)`
 /// quand on cible une queue plus petite que le burst de publication.
-#[test]
-fn backpressure_triggers_under_burst() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn backpressure_triggers_under_burst() {
     const N: u32 = 1_000;
     const QUEUE_LIMIT: usize = 100;
 
@@ -238,7 +247,7 @@ fn backpressure_triggers_under_burst() {
     let mut backpressure_count = 0;
     let mut accepted = 0;
     for i in 0..N {
-        match queue.publish("runs", Message::new(json!({ "n": i }))) {
+        match queue.publish("runs", Message::new(json!({ "n": i }))).await {
             Ok(()) => accepted += 1,
             Err(autome_core::Error::Backpressure { .. }) => backpressure_count += 1,
             Err(e) => panic!("erreur inattendue : {e}"),
@@ -253,5 +262,5 @@ fn backpressure_triggers_under_burst() {
         N as usize - QUEUE_LIMIT,
         "le reste doit déclencher de la backpressure"
     );
-    assert_eq!(queue.depth("runs").unwrap(), QUEUE_LIMIT);
+    assert_eq!(queue.depth("runs").await.unwrap(), QUEUE_LIMIT);
 }

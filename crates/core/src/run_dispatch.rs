@@ -124,12 +124,15 @@ impl RunDispatcher for QueueRunDispatcher {
         let msg = Message::new(body)
             .with_header("idempotency-key", &run_id)
             .with_header("trigger-source", &req.trigger_type);
-        self.queue.publish(&self.queue_name, msg).map_err(|e| {
-            // Si la publication échoue, le run reste à `Queued` dans le store
-            // — un sweep d'orphelins (F5.4.c) finira par le marquer Failed.
-            // On propage l'erreur telle quelle au caller HTTP.
-            Error::Invalid(format!("dispatch : publication échouée : {e}"))
-        })?;
+        self.queue
+            .publish(&self.queue_name, msg)
+            .await
+            .map_err(|e| {
+                // Si la publication échoue, le run reste à `Queued` dans le store
+                // — un sweep d'orphelins (F5.4.c) finira par le marquer Failed.
+                // On propage l'erreur telle quelle au caller HTTP.
+                Error::Invalid(format!("dispatch : publication échouée : {e}"))
+            })?;
 
         Ok(DispatchOutcome { run_id })
     }
@@ -203,8 +206,8 @@ mod tests {
     async fn dispatch_publishes_message_with_run_payload_on_runs_queue() {
         let (d, queue, _) = make_dispatcher();
         d.dispatch(sample_request()).await.unwrap();
-        assert_eq!(queue.depth("runs").unwrap(), 1);
-        let delivery = queue.poll("runs").unwrap().expect("message");
+        assert_eq!(queue.depth("runs").await.unwrap(), 1);
+        let delivery = queue.poll("runs").await.unwrap().expect("message");
         assert_eq!(delivery.message.body["run_id"], "fixed-run-id");
         assert_eq!(delivery.message.body["workflow_id"], "wf-1");
         assert_eq!(delivery.message.body["trigger_type"], "manual");
@@ -242,8 +245,8 @@ mod tests {
         .with_queue_name("manual-runs")
         .with_id_generator(|| "x".into());
         d.dispatch(sample_request()).await.unwrap();
-        assert_eq!(queue.depth("manual-runs").unwrap(), 1);
-        assert_eq!(queue.depth("runs").unwrap(), 0);
+        assert_eq!(queue.depth("manual-runs").await.unwrap(), 1);
+        assert_eq!(queue.depth("runs").await.unwrap(), 0);
     }
 
     #[tokio::test]
