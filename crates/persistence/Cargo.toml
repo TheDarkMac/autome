@@ -13,6 +13,7 @@ workspace = true
 
 [dependencies]
 autome-core = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
 async-trait = { workspace = true }
 # Driver PostgreSQL **async** (tokio-postgres) + pool deadpool : compatibles
@@ -20,7 +21,12 @@ async-trait = { workspace = true }
 # `with-serde_json-1` : mapping `serde_json::Value` ↔ colonne `jsonb`.
 tokio-postgres = { workspace = true }
 deadpool-postgres = { workspace = true }
+# Broker RabbitMQ async (dette #107).
+lapin = { workspace = true }
+tokio-executor-trait = { workspace = true }
+tokio-reactor-trait = { workspace = true }
 
 [dev-dependencies]
-# Exécuteur des tests d'intégration asynchrones.
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+# Exécuteur des tests d'intégration asynchrones. `net`/`time` requis par le
+# réacteur tokio de lapin (I/O AMQP).
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net", "time", "io-util"] }

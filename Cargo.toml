@@ -56,6 +56,11 @@ pollster = "0.3"
 # deadpool, compatibles avec le runtime tokio de l'API.
 tokio-postgres = { version = "0.7", features = ["with-serde_json-1"] }
 deadpool-postgres = "0.14"
+# Broker RabbitMQ async (dette #107) : client AMQP `lapin` + adaptateurs tokio
+# (exécuteur/réacteur) pour le faire tourner sur le runtime de l'app.
+lapin = "2"
+tokio-executor-trait = "2"
+tokio-reactor-trait = "1"
 # TLS (F6.4) — server HTTPS rustls (provider explicite : ring)
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 rustls-pemfile = "2"
