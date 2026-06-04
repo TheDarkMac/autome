@@ -13,7 +13,8 @@ use autome_api::credentials::{credentials_router, CredentialsState};
 use autome_api::metrics::{metrics_router, with_metrics, Metrics};
 use autome_api::runs::{runs_router, RunsState};
 use autome_api::runtime::{
-    build_backends, migrate, migrate_on_boot_requested, Backends, PersistenceMode,
+    build_backends, build_queue, migrate, migrate_on_boot_requested, Backends, PersistenceMode,
+    QueueMode,
 };
 use autome_api::tls::load_rustls_config;
 use autome_api::workflows::{
@@ -85,7 +86,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("autome-api : migrations appliquées = {applied}");
     }
 
-    let backends = build_backends(&config, mode)?;
+    // File de messages (dette #107) : `AUTOME_QUEUE=rabbitmq` se connecte au
+    // broker (`QUEUE_URL`) ; défaut `memory`. Le dispatcher de runs publie dessus.
+    let queue_mode = QueueMode::from_env()?;
+    let queue = build_queue(&config, queue_mode).await?;
+    println!("autome-api : file = {queue_mode:?}");
+
+    let backends = build_backends(&config, mode, queue)?;
     println!("autome-api : persistance = {mode:?}");
 
     // Garde prod (dette #107, constat 4) : en in-memory, l'état (révocations/
@@ -153,8 +160,9 @@ mod tests {
         // metrics) se construit sans panique ni conflit de routes, avec des
         // backends in-memory dérivés d'une config de dev.
         let config = Config::load(|_| None).expect("config dev par défaut");
+        let queue = std::sync::Arc::new(autome_core::InMemoryQueue::new());
         let backends =
-            build_backends(&config, PersistenceMode::Memory).expect("backends in-memory");
+            build_backends(&config, PersistenceMode::Memory, queue).expect("backends in-memory");
         let _app: Router = build_router(&backends, Arc::new(Metrics::new()));
     }
 }

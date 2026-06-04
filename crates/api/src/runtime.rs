@@ -20,11 +20,47 @@ use autome_core::{
 };
 use autome_persistence::{
     connect, run_migrations, PgAuditSink, PgPermissionStore, PgRevocationStore, PgRunStateStore,
-    PgWorkflowRepository,
+    PgWorkflowRepository, RabbitMqQueue,
 };
 use sha2::{Digest, Sha256};
 
 use crate::auth::{token_service_from_config, AuthState};
+
+/// Backend de file retenu pour cette exécution (`AUTOME_QUEUE`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueueMode {
+    /// File in-process (défaut).
+    Memory,
+    /// Broker RabbitMQ (`config.queue_url`).
+    Rabbitmq,
+}
+
+impl QueueMode {
+    /// Lit le mode depuis `AUTOME_QUEUE` (défaut : `Memory`).
+    pub fn from_env() -> Result<Self> {
+        match std::env::var("AUTOME_QUEUE")
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "" | "memory" | "in-memory" => Ok(Self::Memory),
+            "rabbitmq" | "rabbit" | "amqp" => Ok(Self::Rabbitmq),
+            other => Err(Error::Invalid(format!(
+                "AUTOME_QUEUE invalide : `{other}` (attendu : memory | rabbitmq)"
+            ))),
+        }
+    }
+}
+
+/// Construit la file selon le `mode`. En `Rabbitmq`, se connecte au broker
+/// (`config.queue_url`) — opération **async**.
+pub async fn build_queue(config: &Config, mode: QueueMode) -> Result<Arc<dyn Queue + Send + Sync>> {
+    match mode {
+        QueueMode::Memory => Ok(Arc::new(InMemoryQueue::new())),
+        QueueMode::Rabbitmq => Ok(Arc::new(RabbitMqQueue::connect(&config.queue_url).await?)),
+    }
+}
 
 /// Construit le service de credentials OAuth (dette #107, constat 3) :
 /// transport HTTP **réel** ([`ReqwestHttpClient`]) + store de tokens **chiffré
@@ -55,9 +91,13 @@ pub struct Backends {
 }
 
 /// Assemble les backends. En `Postgres`, **un seul pool** est partagé par tous
-/// les stores. La file reste in-memory (RabbitMQ : chantier ultérieur).
-pub fn build_backends(config: &Config, mode: PersistenceMode) -> Result<Backends> {
-    let queue: Arc<dyn Queue + Send + Sync> = Arc::new(InMemoryQueue::new());
+/// les stores. La `queue` (construite par [`build_queue`] selon `AUTOME_QUEUE`)
+/// est injectée — le dispatcher publie dessus.
+pub fn build_backends(
+    config: &Config,
+    mode: PersistenceMode,
+    queue: Arc<dyn Queue + Send + Sync>,
+) -> Result<Backends> {
     match mode {
         PersistenceMode::Memory => {
             let runs: Arc<dyn RunStateStore + Send + Sync> = Arc::new(InMemoryRunStateStore::new());
