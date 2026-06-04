@@ -25,6 +25,7 @@
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::Mutex;
 
+use async_trait::async_trait;
 use serde_json::Value;
 
 use crate::{Error, Result};
@@ -101,28 +102,28 @@ pub enum Nack {
 
 /// Contrat racine d'un broker de messages.
 ///
-/// Volontairement *sync* dans cette première itération pour rester cohérent
-/// avec le reste de la stack ; l'API publique exposera un wrapper async
-/// (`tokio::task::spawn_blocking` ou un client `lapin` async direct) en F5.2.
-pub trait Queue {
+/// **Async** (dette #107) : l'impl réelle (`lapin`/AMQP) fait des I/O réseau ;
+/// le worker async la consomme directement. L'impl in-memory reste triviale.
+#[async_trait]
+pub trait Queue: Send + Sync {
     /// Publie `msg` sur la queue `name`. La queue est créée à la volée
     /// (côté impl de référence) ou doit être déclarée en amont (RabbitMQ).
-    fn publish(&self, name: &str, msg: Message) -> Result<()>;
+    async fn publish(&self, name: &str, msg: Message) -> Result<()>;
 
     /// Récupère le prochain message de la queue `name` (FIFO).
     /// Retourne `None` si la queue est vide.
     ///
     /// Le message passe en *in-flight* jusqu'à `ack`/`nack`.
-    fn poll(&self, name: &str) -> Result<Option<Delivery>>;
+    async fn poll(&self, name: &str) -> Result<Option<Delivery>>;
 
     /// Confirme le succès du traitement — supprime le message in-flight.
-    fn ack(&self, id: &DeliveryId) -> Result<()>;
+    async fn ack(&self, id: &DeliveryId) -> Result<()>;
 
     /// Reporte l'échec — selon le verdict, requeue ou déplace en DLQ.
-    fn nack(&self, id: &DeliveryId, verdict: Nack) -> Result<()>;
+    async fn nack(&self, id: &DeliveryId, verdict: Nack) -> Result<()>;
 
     /// Nombre de messages **en attente** (hors in-flight) sur `name`.
-    fn depth(&self, name: &str) -> Result<usize>;
+    async fn depth(&self, name: &str) -> Result<usize>;
 }
 
 /// Convention de nommage des dead-letter queues.
@@ -166,8 +167,9 @@ impl InMemoryQueue {
     }
 }
 
+#[async_trait]
 impl Queue for InMemoryQueue {
-    fn publish(&self, name: &str, msg: Message) -> Result<()> {
+    async fn publish(&self, name: &str, msg: Message) -> Result<()> {
         let mut state = self
             .state
             .lock()
@@ -184,7 +186,7 @@ impl Queue for InMemoryQueue {
         Ok(())
     }
 
-    fn poll(&self, name: &str) -> Result<Option<Delivery>> {
+    async fn poll(&self, name: &str) -> Result<Option<Delivery>> {
         let mut state = self
             .state
             .lock()
@@ -204,7 +206,7 @@ impl Queue for InMemoryQueue {
         Ok(Some(delivery))
     }
 
-    fn ack(&self, id: &DeliveryId) -> Result<()> {
+    async fn ack(&self, id: &DeliveryId) -> Result<()> {
         let mut state = self
             .state
             .lock()
@@ -216,7 +218,7 @@ impl Queue for InMemoryQueue {
         Ok(())
     }
 
-    fn nack(&self, id: &DeliveryId, verdict: Nack) -> Result<()> {
+    async fn nack(&self, id: &DeliveryId, verdict: Nack) -> Result<()> {
         let mut state = self
             .state
             .lock()
@@ -244,7 +246,7 @@ impl Queue for InMemoryQueue {
         Ok(())
     }
 
-    fn depth(&self, name: &str) -> Result<usize> {
+    async fn depth(&self, name: &str) -> Result<usize> {
         let state = self
             .state
             .lock()
@@ -268,7 +270,7 @@ impl Queue for InMemoryQueue {
 /// ```
 ///
 /// Sémantique de bound *soft* : la vérification se fait via
-/// `inner.depth(name)` puis `inner.publish(name, msg)` — un autre
+/// `inner.depth(name).await` puis `inner.publish(name, msg).await` — un autre
 /// producteur peut s'intercaler. En pratique le dépassement est borné
 /// par le nombre de publishers concurrents, ce qui est acceptable pour
 /// un seuil de protection (pas un quota strict).
@@ -316,10 +318,11 @@ impl<Q: Queue> BoundedQueue<Q> {
     }
 }
 
+#[async_trait]
 impl<Q: Queue> Queue for BoundedQueue<Q> {
-    fn publish(&self, name: &str, msg: Message) -> Result<()> {
+    async fn publish(&self, name: &str, msg: Message) -> Result<()> {
         if let Some(max) = self.limit_for(name) {
-            let depth = self.inner.depth(name)?;
+            let depth = self.inner.depth(name).await?;
             if depth >= max {
                 return Err(Error::Backpressure {
                     queue: name.to_string(),
@@ -328,23 +331,23 @@ impl<Q: Queue> Queue for BoundedQueue<Q> {
                 });
             }
         }
-        self.inner.publish(name, msg)
+        self.inner.publish(name, msg).await
     }
 
-    fn poll(&self, name: &str) -> Result<Option<Delivery>> {
-        self.inner.poll(name)
+    async fn poll(&self, name: &str) -> Result<Option<Delivery>> {
+        self.inner.poll(name).await
     }
 
-    fn ack(&self, id: &DeliveryId) -> Result<()> {
-        self.inner.ack(id)
+    async fn ack(&self, id: &DeliveryId) -> Result<()> {
+        self.inner.ack(id).await
     }
 
-    fn nack(&self, id: &DeliveryId, verdict: Nack) -> Result<()> {
-        self.inner.nack(id, verdict)
+    async fn nack(&self, id: &DeliveryId, verdict: Nack) -> Result<()> {
+        self.inner.nack(id, verdict).await
     }
 
-    fn depth(&self, name: &str) -> Result<usize> {
-        self.inner.depth(name)
+    async fn depth(&self, name: &str) -> Result<usize> {
+        self.inner.depth(name).await
     }
 }
 
@@ -357,24 +360,24 @@ mod tests {
         Message::new(body)
     }
 
-    #[test]
-    fn publish_increments_depth() {
+    #[tokio::test]
+    async fn publish_increments_depth() {
         let q = InMemoryQueue::new();
-        assert_eq!(q.depth("runs").unwrap(), 0);
-        q.publish("runs", msg(json!({ "n": 1 }))).unwrap();
-        q.publish("runs", msg(json!({ "n": 2 }))).unwrap();
-        assert_eq!(q.depth("runs").unwrap(), 2);
+        assert_eq!(q.depth("runs").await.unwrap(), 0);
+        q.publish("runs", msg(json!({ "n": 1 }))).await.unwrap();
+        q.publish("runs", msg(json!({ "n": 2 }))).await.unwrap();
+        assert_eq!(q.depth("runs").await.unwrap(), 2);
     }
 
-    #[test]
-    fn poll_returns_messages_in_fifo_order() {
+    #[tokio::test]
+    async fn poll_returns_messages_in_fifo_order() {
         let q = InMemoryQueue::new();
-        q.publish("runs", msg(json!({ "n": 1 }))).unwrap();
-        q.publish("runs", msg(json!({ "n": 2 }))).unwrap();
-        q.publish("runs", msg(json!({ "n": 3 }))).unwrap();
-        let d1 = q.poll("runs").unwrap().unwrap();
-        let d2 = q.poll("runs").unwrap().unwrap();
-        let d3 = q.poll("runs").unwrap().unwrap();
+        q.publish("runs", msg(json!({ "n": 1 }))).await.unwrap();
+        q.publish("runs", msg(json!({ "n": 2 }))).await.unwrap();
+        q.publish("runs", msg(json!({ "n": 3 }))).await.unwrap();
+        let d1 = q.poll("runs").await.unwrap().unwrap();
+        let d2 = q.poll("runs").await.unwrap().unwrap();
+        let d3 = q.poll("runs").await.unwrap().unwrap();
         assert_eq!(d1.message.body, json!({ "n": 1 }));
         assert_eq!(d2.message.body, json!({ "n": 2 }));
         assert_eq!(d3.message.body, json!({ "n": 3 }));
@@ -382,117 +385,120 @@ mod tests {
         assert_eq!(d1.redeliveries, 0);
     }
 
-    #[test]
-    fn poll_on_empty_queue_returns_none() {
+    #[tokio::test]
+    async fn poll_on_empty_queue_returns_none() {
         let q = InMemoryQueue::new();
-        assert!(q.poll("missing").unwrap().is_none());
+        assert!(q.poll("missing").await.unwrap().is_none());
     }
 
-    #[test]
-    fn poll_moves_message_to_in_flight() {
+    #[tokio::test]
+    async fn poll_moves_message_to_in_flight() {
         let q = InMemoryQueue::new();
-        q.publish("runs", msg(json!({}))).unwrap();
-        assert_eq!(q.depth("runs").unwrap(), 1);
-        let _d = q.poll("runs").unwrap().unwrap();
+        q.publish("runs", msg(json!({}))).await.unwrap();
+        assert_eq!(q.depth("runs").await.unwrap(), 1);
+        let _d = q.poll("runs").await.unwrap().unwrap();
         // Plus dans la file principale (mais en in-flight) :
-        assert_eq!(q.depth("runs").unwrap(), 0);
+        assert_eq!(q.depth("runs").await.unwrap(), 0);
     }
 
-    #[test]
-    fn ack_removes_in_flight() {
+    #[tokio::test]
+    async fn ack_removes_in_flight() {
         let q = InMemoryQueue::new();
-        q.publish("runs", msg(json!({}))).unwrap();
-        let d = q.poll("runs").unwrap().unwrap();
-        q.ack(&d.id).unwrap();
+        q.publish("runs", msg(json!({}))).await.unwrap();
+        let d = q.poll("runs").await.unwrap().unwrap();
+        q.ack(&d.id).await.unwrap();
         // Tenter d'ack une seconde fois échoue : delivery déjà acquittée.
-        let err = q.ack(&d.id).unwrap_err();
+        let err = q.ack(&d.id).await.unwrap_err();
         assert!(matches!(err, Error::Invalid(ref m) if m.contains("delivery")));
     }
 
-    #[test]
-    fn nack_requeue_puts_message_back_with_redelivery_count() {
+    #[tokio::test]
+    async fn nack_requeue_puts_message_back_with_redelivery_count() {
         let q = InMemoryQueue::new();
-        q.publish("runs", msg(json!({ "n": 1 }))).unwrap();
-        let d1 = q.poll("runs").unwrap().unwrap();
+        q.publish("runs", msg(json!({ "n": 1 }))).await.unwrap();
+        let d1 = q.poll("runs").await.unwrap().unwrap();
         assert_eq!(d1.redeliveries, 0);
-        q.nack(&d1.id, Nack::Requeue).unwrap();
+        q.nack(&d1.id, Nack::Requeue).await.unwrap();
         // Le message est de retour en tête de file
-        assert_eq!(q.depth("runs").unwrap(), 1);
-        let d2 = q.poll("runs").unwrap().unwrap();
+        assert_eq!(q.depth("runs").await.unwrap(), 1);
+        let d2 = q.poll("runs").await.unwrap().unwrap();
         assert_eq!(d2.message.body, json!({ "n": 1 }));
         assert_eq!(d2.redeliveries, 1);
         // Re-nack, re-poll : compteur = 2
-        q.nack(&d2.id, Nack::Requeue).unwrap();
-        let d3 = q.poll("runs").unwrap().unwrap();
+        q.nack(&d2.id, Nack::Requeue).await.unwrap();
+        let d3 = q.poll("runs").await.unwrap().unwrap();
         assert_eq!(d3.redeliveries, 2);
     }
 
-    #[test]
-    fn nack_dead_letter_routes_to_dlq() {
+    #[tokio::test]
+    async fn nack_dead_letter_routes_to_dlq() {
         let q = InMemoryQueue::new();
-        q.publish("runs", msg(json!({ "n": 7 }))).unwrap();
-        let d = q.poll("runs").unwrap().unwrap();
-        q.nack(&d.id, Nack::DeadLetter).unwrap();
+        q.publish("runs", msg(json!({ "n": 7 }))).await.unwrap();
+        let d = q.poll("runs").await.unwrap().unwrap();
+        q.nack(&d.id, Nack::DeadLetter).await.unwrap();
         // Queue principale vide :
-        assert_eq!(q.depth("runs").unwrap(), 0);
+        assert_eq!(q.depth("runs").await.unwrap(), 0);
         // DLQ peuplée :
-        assert_eq!(q.depth("runs.dlq").unwrap(), 1);
-        let dead = q.poll("runs.dlq").unwrap().unwrap();
+        assert_eq!(q.depth("runs.dlq").await.unwrap(), 1);
+        let dead = q.poll("runs.dlq").await.unwrap().unwrap();
         assert_eq!(dead.queue, "runs.dlq");
         assert_eq!(dead.message.body, json!({ "n": 7 }));
     }
 
-    #[test]
-    fn dlq_preserves_redelivery_count() {
+    #[tokio::test]
+    async fn dlq_preserves_redelivery_count() {
         let q = InMemoryQueue::new();
-        q.publish("runs", msg(json!({}))).unwrap();
+        q.publish("runs", msg(json!({}))).await.unwrap();
         // 3 requeues puis DLQ
         for _ in 0..3 {
-            let d = q.poll("runs").unwrap().unwrap();
-            q.nack(&d.id, Nack::Requeue).unwrap();
+            let d = q.poll("runs").await.unwrap().unwrap();
+            q.nack(&d.id, Nack::Requeue).await.unwrap();
         }
-        let d = q.poll("runs").unwrap().unwrap();
+        let d = q.poll("runs").await.unwrap().unwrap();
         assert_eq!(d.redeliveries, 3);
-        q.nack(&d.id, Nack::DeadLetter).unwrap();
-        let dead = q.poll("runs.dlq").unwrap().unwrap();
+        q.nack(&d.id, Nack::DeadLetter).await.unwrap();
+        let dead = q.poll("runs.dlq").await.unwrap().unwrap();
         assert_eq!(dead.redeliveries, 3);
     }
 
-    #[test]
-    fn queues_are_isolated_by_name() {
+    #[tokio::test]
+    async fn queues_are_isolated_by_name() {
         let q = InMemoryQueue::new();
-        q.publish("a", msg(json!({ "src": "a" }))).unwrap();
-        q.publish("b", msg(json!({ "src": "b" }))).unwrap();
-        let da = q.poll("a").unwrap().unwrap();
-        let db = q.poll("b").unwrap().unwrap();
+        q.publish("a", msg(json!({ "src": "a" }))).await.unwrap();
+        q.publish("b", msg(json!({ "src": "b" }))).await.unwrap();
+        let da = q.poll("a").await.unwrap().unwrap();
+        let db = q.poll("b").await.unwrap().unwrap();
         assert_eq!(da.message.body, json!({ "src": "a" }));
         assert_eq!(db.message.body, json!({ "src": "b" }));
         // « a » est vide, mais pas « b » s'il y avait eu plus
-        assert!(q.poll("a").unwrap().is_none());
+        assert!(q.poll("a").await.unwrap().is_none());
     }
 
-    #[test]
-    fn ack_unknown_delivery_errors() {
+    #[tokio::test]
+    async fn ack_unknown_delivery_errors() {
         let q = InMemoryQueue::new();
-        let err = q.ack(&DeliveryId::new(999)).unwrap_err();
+        let err = q.ack(&DeliveryId::new(999)).await.unwrap_err();
         assert!(matches!(err, Error::Invalid(ref m) if m.contains("999")));
     }
 
-    #[test]
-    fn nack_unknown_delivery_errors() {
+    #[tokio::test]
+    async fn nack_unknown_delivery_errors() {
         let q = InMemoryQueue::new();
-        let err = q.nack(&DeliveryId::new(123), Nack::Requeue).unwrap_err();
+        let err = q
+            .nack(&DeliveryId::new(123), Nack::Requeue)
+            .await
+            .unwrap_err();
         assert!(matches!(err, Error::Invalid(ref m) if m.contains("123")));
     }
 
-    #[test]
-    fn message_headers_round_trip() {
+    #[tokio::test]
+    async fn message_headers_round_trip() {
         let q = InMemoryQueue::new();
         let m = Message::new(json!({ "n": 1 }))
             .with_header("priority", "5")
             .with_header("trace-id", "abc");
-        q.publish("runs", m.clone()).unwrap();
-        let d = q.poll("runs").unwrap().unwrap();
+        q.publish("runs", m.clone()).await.unwrap();
+        let d = q.poll("runs").await.unwrap().unwrap();
         assert_eq!(
             d.message.headers.get("priority").map(String::as_str),
             Some("5")
@@ -504,49 +510,49 @@ mod tests {
         assert_eq!(d.message, m);
     }
 
-    #[test]
-    fn dlq_of_uses_dlq_suffix() {
+    #[tokio::test]
+    async fn dlq_of_uses_dlq_suffix() {
         assert_eq!(dlq_of("runs"), "runs.dlq");
         assert_eq!(dlq_of("workflows.events"), "workflows.events.dlq");
     }
 
-    #[test]
-    fn delivery_id_is_unique_per_poll() {
+    #[tokio::test]
+    async fn delivery_id_is_unique_per_poll() {
         let q = InMemoryQueue::new();
-        q.publish("runs", msg(json!({}))).unwrap();
-        q.publish("runs", msg(json!({}))).unwrap();
-        let d1 = q.poll("runs").unwrap().unwrap();
-        let d2 = q.poll("runs").unwrap().unwrap();
+        q.publish("runs", msg(json!({}))).await.unwrap();
+        q.publish("runs", msg(json!({}))).await.unwrap();
+        let d1 = q.poll("runs").await.unwrap().unwrap();
+        let d2 = q.poll("runs").await.unwrap().unwrap();
         assert_ne!(d1.id, d2.id);
     }
 
     /// Vérifie la composition : Send + Sync sur l'impl de référence
     /// (utilisable depuis plusieurs threads — précondition pour le worker
     /// pool F5.2).
-    #[test]
-    fn in_memory_queue_is_send_sync() {
+    #[tokio::test]
+    async fn in_memory_queue_is_send_sync() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<InMemoryQueue>();
     }
 
     // ───── F5.5 — BoundedQueue ─────
 
-    #[test]
-    fn bounded_without_limits_passes_through() {
+    #[tokio::test]
+    async fn bounded_without_limits_passes_through() {
         let q = BoundedQueue::new(InMemoryQueue::new());
         for i in 0..100 {
-            q.publish("runs", msg(json!({ "n": i }))).unwrap();
+            q.publish("runs", msg(json!({ "n": i }))).await.unwrap();
         }
-        assert_eq!(q.depth("runs").unwrap(), 100);
+        assert_eq!(q.depth("runs").await.unwrap(), 100);
     }
 
-    #[test]
-    fn bounded_rejects_when_limit_reached() {
+    #[tokio::test]
+    async fn bounded_rejects_when_limit_reached() {
         let q = BoundedQueue::new(InMemoryQueue::new()).with_limit("runs", 3);
-        q.publish("runs", msg(json!({ "n": 1 }))).unwrap();
-        q.publish("runs", msg(json!({ "n": 2 }))).unwrap();
-        q.publish("runs", msg(json!({ "n": 3 }))).unwrap();
-        let err = q.publish("runs", msg(json!({ "n": 4 }))).unwrap_err();
+        q.publish("runs", msg(json!({ "n": 1 }))).await.unwrap();
+        q.publish("runs", msg(json!({ "n": 2 }))).await.unwrap();
+        q.publish("runs", msg(json!({ "n": 3 }))).await.unwrap();
+        let err = q.publish("runs", msg(json!({ "n": 4 }))).await.unwrap_err();
         match err {
             Error::Backpressure { queue, depth, max } => {
                 assert_eq!(queue, "runs");
@@ -556,97 +562,97 @@ mod tests {
             other => panic!("expected Backpressure, got {other:?}"),
         }
         // Le message rejeté n'a pas été ajouté
-        assert_eq!(q.depth("runs").unwrap(), 3);
+        assert_eq!(q.depth("runs").await.unwrap(), 3);
     }
 
-    #[test]
-    fn bounded_allows_publish_after_poll_drains() {
+    #[tokio::test]
+    async fn bounded_allows_publish_after_poll_drains() {
         let q = BoundedQueue::new(InMemoryQueue::new()).with_limit("runs", 2);
-        q.publish("runs", msg(json!({ "n": 1 }))).unwrap();
-        q.publish("runs", msg(json!({ "n": 2 }))).unwrap();
+        q.publish("runs", msg(json!({ "n": 1 }))).await.unwrap();
+        q.publish("runs", msg(json!({ "n": 2 }))).await.unwrap();
         // À la limite → rejeté
         assert!(matches!(
-            q.publish("runs", msg(json!({}))),
+            q.publish("runs", msg(json!({}))).await,
             Err(Error::Backpressure { .. })
         ));
         // Drain : poll récupère 1 message → depth=1, publish à nouveau OK
-        let d = q.poll("runs").unwrap().unwrap();
-        assert_eq!(q.depth("runs").unwrap(), 1);
-        q.publish("runs", msg(json!({ "n": 3 }))).unwrap();
-        assert_eq!(q.depth("runs").unwrap(), 2);
+        let d = q.poll("runs").await.unwrap().unwrap();
+        assert_eq!(q.depth("runs").await.unwrap(), 1);
+        q.publish("runs", msg(json!({ "n": 3 }))).await.unwrap();
+        assert_eq!(q.depth("runs").await.unwrap(), 2);
         // Ack ne change pas la depth (le message était déjà retiré de la
         // file principale par poll).
-        q.ack(&d.id).unwrap();
-        assert_eq!(q.depth("runs").unwrap(), 2);
+        q.ack(&d.id).await.unwrap();
+        assert_eq!(q.depth("runs").await.unwrap(), 2);
     }
 
-    #[test]
-    fn bounded_per_queue_limits_are_isolated() {
+    #[tokio::test]
+    async fn bounded_per_queue_limits_are_isolated() {
         let q = BoundedQueue::new(InMemoryQueue::new())
             .with_limit("small", 1)
             .with_limit("large", 100);
-        q.publish("small", msg(json!({}))).unwrap();
+        q.publish("small", msg(json!({}))).await.unwrap();
         assert!(matches!(
-            q.publish("small", msg(json!({}))),
+            q.publish("small", msg(json!({}))).await,
             Err(Error::Backpressure { .. })
         ));
         // Pas affecté
         for _ in 0..50 {
-            q.publish("large", msg(json!({}))).unwrap();
+            q.publish("large", msg(json!({}))).await.unwrap();
         }
-        assert_eq!(q.depth("large").unwrap(), 50);
+        assert_eq!(q.depth("large").await.unwrap(), 50);
     }
 
-    #[test]
-    fn bounded_default_limit_covers_unspecified_queues() {
+    #[tokio::test]
+    async fn bounded_default_limit_covers_unspecified_queues() {
         let q = BoundedQueue::new(InMemoryQueue::new())
             .with_default_limit(2)
             .with_limit("special", 10);
         // Queue arbitraire → cap par défaut
-        q.publish("a", msg(json!({}))).unwrap();
-        q.publish("a", msg(json!({}))).unwrap();
+        q.publish("a", msg(json!({}))).await.unwrap();
+        q.publish("a", msg(json!({}))).await.unwrap();
         assert!(matches!(
-            q.publish("a", msg(json!({}))),
+            q.publish("a", msg(json!({}))).await,
             Err(Error::Backpressure { .. })
         ));
         // Queue avec override → cap explicite
         for _ in 0..10 {
-            q.publish("special", msg(json!({}))).unwrap();
+            q.publish("special", msg(json!({}))).await.unwrap();
         }
         assert!(matches!(
-            q.publish("special", msg(json!({}))),
+            q.publish("special", msg(json!({}))).await,
             Err(Error::Backpressure { .. })
         ));
     }
 
-    #[test]
-    fn bounded_explicit_limit_overrides_default() {
+    #[tokio::test]
+    async fn bounded_explicit_limit_overrides_default() {
         let q = BoundedQueue::new(InMemoryQueue::new())
             .with_default_limit(100)
             .with_limit("tight", 1);
-        q.publish("tight", msg(json!({}))).unwrap();
+        q.publish("tight", msg(json!({}))).await.unwrap();
         assert!(matches!(
-            q.publish("tight", msg(json!({}))),
+            q.publish("tight", msg(json!({}))).await,
             Err(Error::Backpressure { .. })
         ));
     }
 
-    #[test]
-    fn bounded_nack_requeue_does_not_violate_limit() {
+    #[tokio::test]
+    async fn bounded_nack_requeue_does_not_violate_limit() {
         let q = BoundedQueue::new(InMemoryQueue::new()).with_limit("runs", 1);
-        q.publish("runs", msg(json!({ "n": 1 }))).unwrap();
-        let d = q.poll("runs").unwrap().unwrap();
+        q.publish("runs", msg(json!({ "n": 1 }))).await.unwrap();
+        let d = q.poll("runs").await.unwrap().unwrap();
         // Après poll, depth=0 → on peut re-publish
-        q.publish("runs", msg(json!({ "n": 2 }))).unwrap();
-        assert_eq!(q.depth("runs").unwrap(), 1);
+        q.publish("runs", msg(json!({ "n": 2 }))).await.unwrap();
+        assert_eq!(q.depth("runs").await.unwrap(), 1);
         // nack(Requeue) remet en tête → depth=2 (dépasse la limite, mais c'est
         // un nack interne, pas un publish — donc accepté).
-        q.nack(&d.id, Nack::Requeue).unwrap();
-        assert_eq!(q.depth("runs").unwrap(), 2);
+        q.nack(&d.id, Nack::Requeue).await.unwrap();
+        assert_eq!(q.depth("runs").await.unwrap(), 2);
     }
 
-    #[test]
-    fn bounded_limit_for_returns_effective_value() {
+    #[tokio::test]
+    async fn bounded_limit_for_returns_effective_value() {
         let q = BoundedQueue::new(InMemoryQueue::new())
             .with_default_limit(10)
             .with_limit("explicit", 1);
@@ -657,17 +663,17 @@ mod tests {
         assert_eq!(q_none.limit_for("anything"), None);
     }
 
-    #[test]
-    fn bounded_is_send_sync_when_inner_is() {
+    #[tokio::test]
+    async fn bounded_is_send_sync_when_inner_is() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<BoundedQueue<InMemoryQueue>>();
     }
 
-    #[test]
-    fn backpressure_error_message_is_explicit() {
+    #[tokio::test]
+    async fn backpressure_error_message_is_explicit() {
         let q = BoundedQueue::new(InMemoryQueue::new()).with_limit("q", 1);
-        q.publish("q", msg(json!({}))).unwrap();
-        let err = q.publish("q", msg(json!({}))).unwrap_err();
+        q.publish("q", msg(json!({}))).await.unwrap();
+        let err = q.publish("q", msg(json!({}))).await.unwrap_err();
         let display = format!("{err}");
         assert!(display.contains("backpressure"), "msg={display}");
         assert!(display.contains("q"), "msg={display}");

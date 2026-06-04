@@ -49,6 +49,9 @@ base64 = "0.22"
 # Traits de stockage asynchrones (dette #107 — refactor async).
 async-trait = "0.1"
 tokio = { version = "1" }
+# `block_on` minimal (sans runtime) pour ponter la boucle thread-based du
+# scheduler vers les traits async — dette #107.
+pollster = "0.3"
 # Persistance PostgreSQL **async** (dette #107) : driver tokio-postgres + pool
 # deadpool, compatibles avec le runtime tokio de l'API.
 tokio-postgres = { version = "0.7", features = ["with-serde_json-1"] }

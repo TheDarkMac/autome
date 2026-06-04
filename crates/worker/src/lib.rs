@@ -4,11 +4,10 @@
 //! [`Handler`], et applique le verdict (`ack` / `nack(Requeue)` /
 //! `nack(DeadLetter)`).
 //!
-//! L'implémentation est synchrone (`std::thread` + `Arc<AtomicBool>` pour le
-//! shutdown) — pas de dépendance à `tokio` côté worker. Quand on branchera
-//! le client `lapin` réel (qui est async), une fine couche d'adaptation
-//! (un thread bloqueur qui tourne un runtime mono-thread) suffira ; le
-//! contrat de cette PR reste indépendant du transport choisi.
+//! L'implémentation est **asynchrone** (tâches tokio + `Arc<AtomicBool>` pour
+//! le shutdown) depuis la bascule async des traits (dette #107) : le pool
+//! `await` directement la [`Queue`] et le [`Handler`] async, ce qui permet de
+//! brancher un broker réel (`lapin`/AMQP) sans couche d'adaptation.
 //!
 //! ## Architecture
 //!
@@ -21,10 +20,10 @@
 //!   garde un `HashSet` sous `Mutex` ; un store persistant (Redis, base)
 //!   viendra avec F5.4.
 //! - [`WorkerPool::process_one`] : unité atomique (poll + handle + ack/nack),
-//!   testable sans threads.
-//! - [`WorkerPool::start`] : spawne `concurrency` threads qui appellent
-//!   `process_one` en boucle. Renvoie un [`RunningPool`] dont `stop()`
-//!   signale l'arrêt et `join()` proprement les threads.
+//!   testable sans pool.
+//! - [`WorkerPool::start`] : spawne `concurrency` tâches tokio qui appellent
+//!   `process_one` en boucle. Renvoie un [`RunningPool`] dont `stop()` signale
+//!   l'arrêt et `await` proprement les tâches.
 //!
 //! ## Concurrence & backpressure (F5.5)
 //!
@@ -43,10 +42,11 @@
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
+use async_trait::async_trait;
 use autome_core::{Delivery, Nack, Queue, Result};
+use tokio::task::JoinHandle;
 
 /// Verdict que retourne un [`Handler`] après traitement.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -60,17 +60,21 @@ pub enum HandlerVerdict {
 }
 
 /// Logique métier d'un worker : traite une livraison et retourne son verdict.
-pub trait Handler {
+///
+/// **Async** (dette #107) : le handler accède aux stores/connecteurs async.
+#[async_trait]
+pub trait Handler: Send + Sync {
     /// Traite `delivery` et retourne le verdict (ack/retry/dlq).
-    fn handle(&self, delivery: &Delivery) -> HandlerVerdict;
+    async fn handle(&self, delivery: &Delivery) -> HandlerVerdict;
 }
 
-/// Tout `Fn(&Delivery) -> HandlerVerdict` est automatiquement un `Handler`.
+/// Tout `Fn(&Delivery) -> HandlerVerdict` synchrone est un `Handler`.
+#[async_trait]
 impl<F> Handler for F
 where
-    F: Fn(&Delivery) -> HandlerVerdict,
+    F: Fn(&Delivery) -> HandlerVerdict + Send + Sync,
 {
-    fn handle(&self, delivery: &Delivery) -> HandlerVerdict {
+    async fn handle(&self, delivery: &Delivery) -> HandlerVerdict {
         (self)(delivery)
     }
 }
@@ -161,31 +165,32 @@ impl WorkerPool {
         self
     }
 
-    /// Traite UN message si disponible. Méthode synchrone, exposée pour les
-    /// tests et pour piloter le worker en mode déterministe.
-    pub fn process_one(&self) -> Result<ProcessOutcome> {
-        let Some(delivery) = self.queue.poll(&self.queue_name)? else {
+    /// Traite UN message si disponible. Exposée pour les tests et pour piloter
+    /// le worker en mode déterministe.
+    pub async fn process_one(&self) -> Result<ProcessOutcome> {
+        let Some(delivery) = self.queue.poll(&self.queue_name).await? else {
             return Ok(ProcessOutcome::Idle);
         };
         // Idempotence (F5.2.c) : si le message porte une clé déjà vue,
         // ack sans appeler le handler.
         if let Some(key) = delivery.message.headers.get("idempotency-key").cloned() {
             if self.idempotency.check_or_mark(&key) {
-                self.queue.ack(&delivery.id)?;
+                self.queue.ack(&delivery.id).await?;
                 return Ok(ProcessOutcome::Deduplicated);
             }
         }
-        let verdict = self.handler.handle(&delivery);
+        let verdict = self.handler.handle(&delivery).await;
         match &verdict {
-            HandlerVerdict::Ok => self.queue.ack(&delivery.id)?,
-            HandlerVerdict::Retry => self.queue.nack(&delivery.id, Nack::Requeue)?,
-            HandlerVerdict::DeadLetter => self.queue.nack(&delivery.id, Nack::DeadLetter)?,
+            HandlerVerdict::Ok => self.queue.ack(&delivery.id).await?,
+            HandlerVerdict::Retry => self.queue.nack(&delivery.id, Nack::Requeue).await?,
+            HandlerVerdict::DeadLetter => self.queue.nack(&delivery.id, Nack::DeadLetter).await?,
         }
         Ok(ProcessOutcome::Handled(verdict))
     }
 
-    /// Démarre `self.concurrency` threads workers. Renvoie un [`RunningPool`]
-    /// pour stopper proprement (signal d'arrêt + join).
+    /// Démarre `self.concurrency` **tâches tokio** consommatrices. Renvoie un
+    /// [`RunningPool`] pour stopper proprement (signal d'arrêt + join). À
+    /// appeler depuis un runtime tokio.
     pub fn start(self) -> RunningPool {
         let shutdown = Arc::new(AtomicBool::new(false));
         let pool = Arc::new(self);
@@ -193,24 +198,22 @@ impl WorkerPool {
         for i in 0..pool.concurrency {
             let pool = Arc::clone(&pool);
             let stop = Arc::clone(&shutdown);
-            let handle = thread::Builder::new()
-                .name(format!("autome-worker-{i}"))
-                .spawn(move || worker_loop(&pool, &stop, i))
-                .expect("spawn worker thread");
-            handles.push(handle);
+            handles.push(tokio::spawn(async move {
+                worker_loop(&pool, &stop, i).await;
+            }));
         }
         RunningPool { handles, shutdown }
     }
 }
 
-fn worker_loop(pool: &WorkerPool, shutdown: &AtomicBool, id: usize) {
+async fn worker_loop(pool: &WorkerPool, shutdown: &AtomicBool, id: usize) {
     while !shutdown.load(Ordering::Acquire) {
-        match pool.process_one() {
-            Ok(ProcessOutcome::Idle) => thread::sleep(pool.poll_idle_sleep),
+        match pool.process_one().await {
+            Ok(ProcessOutcome::Idle) => tokio::time::sleep(pool.poll_idle_sleep).await,
             Ok(_) => {}
             Err(e) => {
                 eprintln!("[autome-worker-{id}] queue error: {e}");
-                thread::sleep(pool.poll_idle_sleep);
+                tokio::time::sleep(pool.poll_idle_sleep).await;
             }
         }
     }
@@ -219,27 +222,27 @@ fn worker_loop(pool: &WorkerPool, shutdown: &AtomicBool, id: usize) {
 /// Handle d'un pool en cours d'exécution. Doit être stoppé proprement par
 /// [`RunningPool::stop`] (sinon `Drop` log un warning, mais ne join pas —
 /// les threads continueraient en arrière-plan jusqu'à arrêt du process).
-#[must_use = "RunningPool doit être stoppé via `.stop()` pour arrêter proprement les threads"]
+#[must_use = "RunningPool doit être stoppé via `.stop().await` pour arrêter proprement les threads"]
 pub struct RunningPool {
     handles: Vec<JoinHandle<()>>,
     shutdown: Arc<AtomicBool>,
 }
 
 impl RunningPool {
-    /// Signale l'arrêt et `join()` tous les threads. Méthode consommante :
-    /// après cet appel le pool n'est plus utilisable.
-    pub fn stop(mut self) {
+    /// Signale l'arrêt et `await` la fin de toutes les tâches. Consommante :
+    /// après cet appel le pool n'est plus utilisable. À appeler dans un runtime.
+    pub async fn stop(mut self) {
         self.shutdown.store(true, Ordering::Release);
-        // Vider `handles` AVANT que `Drop` voie un Vec non-vide (sinon
-        // double-signalement + warning à tort).
+        // Vider `handles` AVANT que `Drop` voie un Vec non-vide (sinon abort
+        // à tort des tâches déjà attendues).
         let handles = std::mem::take(&mut self.handles);
         for handle in handles {
-            let _ = handle.join();
+            let _ = handle.await;
         }
     }
 
-    /// Nombre de threads vivants (utile pour les assertions de tests).
-    pub fn thread_count(&self) -> usize {
+    /// Nombre de tâches vivantes (utile pour les assertions de tests).
+    pub fn task_count(&self) -> usize {
         self.handles.len()
     }
 }
@@ -247,12 +250,14 @@ impl RunningPool {
 impl Drop for RunningPool {
     fn drop(&mut self) {
         if !self.handles.is_empty() {
-            // L'appelant a oublié `stop()` : on signale l'arrêt — les
-            // `JoinHandle` sont dropés (= threads détachées), elles sortent
-            // à leur prochaine itération de boucle.
+            // L'appelant a oublié `stop()` : on signale l'arrêt et on **abort**
+            // les tâches (on ne peut pas `await` dans `Drop`).
             self.shutdown.store(true, Ordering::Release);
+            for handle in &self.handles {
+                handle.abort();
+            }
             eprintln!(
-                "RunningPool drop sans stop() — {} thread(s) signalés mais détachés",
+                "RunningPool drop sans stop() — {} tâche(s) avortées",
                 self.handles.len()
             );
         }
@@ -280,57 +285,61 @@ mod tests {
 
     // ───── F5.2.a — process_one ─────
 
-    #[test]
-    fn process_one_empty_queue_is_idle() {
+    #[tokio::test]
+    async fn process_one_empty_queue_is_idle() {
         let q = Arc::new(InMemoryQueue::new());
         let (pool, _) = build(Arc::clone(&q), HandlerVerdict::Ok);
-        assert_eq!(pool.process_one().unwrap(), ProcessOutcome::Idle);
+        assert_eq!(pool.process_one().await.unwrap(), ProcessOutcome::Idle);
     }
 
-    #[test]
-    fn process_one_ok_acks_and_drains_queue() {
+    #[tokio::test]
+    async fn process_one_ok_acks_and_drains_queue() {
         let q = Arc::new(InMemoryQueue::new());
-        q.publish("runs", Message::new(json!({ "n": 1 }))).unwrap();
+        q.publish("runs", Message::new(json!({ "n": 1 })))
+            .await
+            .unwrap();
         let (pool, _) = build(Arc::clone(&q), HandlerVerdict::Ok);
-        let outcome = pool.process_one().unwrap();
+        let outcome = pool.process_one().await.unwrap();
         assert_eq!(outcome, ProcessOutcome::Handled(HandlerVerdict::Ok));
         // Queue principale vide, DLQ aussi (rien d'in-flight non plus puisque ack)
-        assert_eq!(q.depth("runs").unwrap(), 0);
-        assert_eq!(q.depth("runs.dlq").unwrap(), 0);
+        assert_eq!(q.depth("runs").await.unwrap(), 0);
+        assert_eq!(q.depth("runs.dlq").await.unwrap(), 0);
     }
 
-    #[test]
-    fn process_one_retry_requeues_and_increments_redeliveries() {
+    #[tokio::test]
+    async fn process_one_retry_requeues_and_increments_redeliveries() {
         let q = Arc::new(InMemoryQueue::new());
-        q.publish("runs", Message::new(json!({}))).unwrap();
+        q.publish("runs", Message::new(json!({}))).await.unwrap();
         let (pool, _) = build(Arc::clone(&q), HandlerVerdict::Retry);
-        let outcome = pool.process_one().unwrap();
+        let outcome = pool.process_one().await.unwrap();
         assert_eq!(outcome, ProcessOutcome::Handled(HandlerVerdict::Retry));
         // Le message est de retour
-        assert_eq!(q.depth("runs").unwrap(), 1);
-        let d = q.poll("runs").unwrap().unwrap();
+        assert_eq!(q.depth("runs").await.unwrap(), 1);
+        let d = q.poll("runs").await.unwrap().unwrap();
         assert_eq!(d.redeliveries, 1);
     }
 
-    #[test]
-    fn process_one_dead_letter_moves_to_dlq() {
+    #[tokio::test]
+    async fn process_one_dead_letter_moves_to_dlq() {
         let q = Arc::new(InMemoryQueue::new());
-        q.publish("runs", Message::new(json!({ "n": 9 }))).unwrap();
+        q.publish("runs", Message::new(json!({ "n": 9 })))
+            .await
+            .unwrap();
         let (pool, _) = build(Arc::clone(&q), HandlerVerdict::DeadLetter);
-        let outcome = pool.process_one().unwrap();
+        let outcome = pool.process_one().await.unwrap();
         assert_eq!(outcome, ProcessOutcome::Handled(HandlerVerdict::DeadLetter));
-        assert_eq!(q.depth("runs").unwrap(), 0);
-        assert_eq!(q.depth("runs.dlq").unwrap(), 1);
+        assert_eq!(q.depth("runs").await.unwrap(), 0);
+        assert_eq!(q.depth("runs.dlq").await.unwrap(), 1);
     }
 
     // ───── F5.2.c — idempotence ─────
 
-    #[test]
-    fn duplicate_idempotency_key_skips_handler() {
+    #[tokio::test]
+    async fn duplicate_idempotency_key_skips_handler() {
         let q = Arc::new(InMemoryQueue::new());
         let msg = Message::new(json!({ "n": 1 })).with_header("idempotency-key", "abc");
-        q.publish("runs", msg.clone()).unwrap();
-        q.publish("runs", msg).unwrap();
+        q.publish("runs", msg.clone()).await.unwrap();
+        q.publish("runs", msg).await.unwrap();
 
         // Compteur d'appels au handler
         let call_count = Arc::new(Mutex::new(0_u32));
@@ -349,29 +358,31 @@ mod tests {
             1,
         );
 
-        let first = pool.process_one().unwrap();
-        let second = pool.process_one().unwrap();
+        let first = pool.process_one().await.unwrap();
+        let second = pool.process_one().await.unwrap();
         assert_eq!(first, ProcessOutcome::Handled(HandlerVerdict::Ok));
         assert_eq!(second, ProcessOutcome::Deduplicated);
         // Handler appelé une seule fois
         assert_eq!(*call_count.lock().unwrap(), 1);
         // Les deux messages ont été ack'és → file vide, pas de DLQ
-        assert_eq!(q.depth("runs").unwrap(), 0);
-        assert_eq!(q.depth("runs.dlq").unwrap(), 0);
+        assert_eq!(q.depth("runs").await.unwrap(), 0);
+        assert_eq!(q.depth("runs.dlq").await.unwrap(), 0);
     }
 
-    #[test]
-    fn different_idempotency_keys_both_processed() {
+    #[tokio::test]
+    async fn different_idempotency_keys_both_processed() {
         let q = Arc::new(InMemoryQueue::new());
         q.publish(
             "runs",
             Message::new(json!({})).with_header("idempotency-key", "a"),
         )
+        .await
         .unwrap();
         q.publish(
             "runs",
             Message::new(json!({})).with_header("idempotency-key", "b"),
         )
+        .await
         .unwrap();
 
         let call_count = Arc::new(Mutex::new(0_u32));
@@ -388,16 +399,16 @@ mod tests {
             1,
         );
 
-        pool.process_one().unwrap();
-        pool.process_one().unwrap();
+        pool.process_one().await.unwrap();
+        pool.process_one().await.unwrap();
         assert_eq!(*call_count.lock().unwrap(), 2);
     }
 
-    #[test]
-    fn missing_idempotency_key_does_not_dedupe() {
+    #[tokio::test]
+    async fn missing_idempotency_key_does_not_dedupe() {
         let q = Arc::new(InMemoryQueue::new());
-        q.publish("runs", Message::new(json!({}))).unwrap();
-        q.publish("runs", Message::new(json!({}))).unwrap();
+        q.publish("runs", Message::new(json!({}))).await.unwrap();
+        q.publish("runs", Message::new(json!({}))).await.unwrap();
         let call_count = Arc::new(Mutex::new(0_u32));
         let cc = Arc::clone(&call_count);
         let handler: Arc<dyn Handler + Send + Sync> = Arc::new(move |_d: &Delivery| {
@@ -411,13 +422,13 @@ mod tests {
             "runs",
             1,
         );
-        pool.process_one().unwrap();
-        pool.process_one().unwrap();
+        pool.process_one().await.unwrap();
+        pool.process_one().await.unwrap();
         assert_eq!(*call_count.lock().unwrap(), 2);
     }
 
-    #[test]
-    fn in_memory_idempotency_returns_false_first_then_true() {
+    #[tokio::test]
+    async fn in_memory_idempotency_returns_false_first_then_true() {
         let s = InMemoryIdempotencyStore::new();
         assert!(!s.check_or_mark("k"));
         assert!(s.check_or_mark("k"));
@@ -428,12 +439,14 @@ mod tests {
 
     // ───── F5.2.b — pool concurrent + shutdown ─────
 
-    #[test]
-    fn pool_drains_all_messages_with_multiple_threads() {
+    #[tokio::test]
+    async fn pool_drains_all_messages_with_multiple_threads() {
         let q = Arc::new(InMemoryQueue::new());
         const N: usize = 200;
         for i in 0..N {
-            q.publish("runs", Message::new(json!({ "n": i }))).unwrap();
+            q.publish("runs", Message::new(json!({ "n": i })))
+                .await
+                .unwrap();
         }
         // Handler qui compte les appels
         let processed = Arc::new(Mutex::new(0_u32));
@@ -451,26 +464,26 @@ mod tests {
         )
         .with_idle_sleep(Duration::from_millis(1));
         let running = pool.start();
-        assert_eq!(running.thread_count(), 4);
+        assert_eq!(running.task_count(), 4);
 
         // Attendre que la file soit drainée (avec garde-fou anti-flake)
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while q.depth("runs").unwrap() != 0 {
+        while q.depth("runs").await.unwrap() != 0 {
             if std::time::Instant::now() > deadline {
                 panic!("file non drainée dans le délai");
             }
-            thread::sleep(Duration::from_millis(5));
+            tokio::time::sleep(Duration::from_millis(5)).await;
         }
         // Petit délai pour laisser les threads finir le dernier ack
-        thread::sleep(Duration::from_millis(50));
-        running.stop();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        running.stop().await;
         assert_eq!(*processed.lock().unwrap() as usize, N);
         // Pas de message orphelin en DLQ
-        assert_eq!(q.depth("runs.dlq").unwrap(), 0);
+        assert_eq!(q.depth("runs.dlq").await.unwrap(), 0);
     }
 
-    #[test]
-    fn pool_stops_cleanly_when_signaled() {
+    #[tokio::test]
+    async fn pool_stops_cleanly_when_signaled() {
         let q = Arc::new(InMemoryQueue::new());
         let handler: Arc<dyn Handler + Send + Sync> = Arc::new(|_d: &Delivery| HandlerVerdict::Ok);
         let pool = WorkerPool::new(
@@ -483,13 +496,13 @@ mod tests {
         .with_idle_sleep(Duration::from_millis(5));
         let running = pool.start();
         // Pas de message — les workers restent en idle
-        thread::sleep(Duration::from_millis(20));
-        running.stop();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        running.stop().await;
         // Si on arrive ici sans hang, stop() a join()é proprement.
     }
 
-    #[test]
-    fn concurrency_zero_clamps_to_one() {
+    #[tokio::test]
+    async fn concurrency_zero_clamps_to_one() {
         let q = Arc::new(InMemoryQueue::new());
         let handler: Arc<dyn Handler + Send + Sync> = Arc::new(|_d: &Delivery| HandlerVerdict::Ok);
         let pool = WorkerPool::new(
@@ -501,14 +514,14 @@ mod tests {
         )
         .with_idle_sleep(Duration::from_millis(5));
         let running = pool.start();
-        assert_eq!(running.thread_count(), 1);
-        running.stop();
+        assert_eq!(running.task_count(), 1);
+        running.stop().await;
     }
 
     // ───── garde-fou : Handler depuis closure compile bien ─────
 
-    #[test]
-    fn closure_is_a_handler() {
+    #[tokio::test]
+    async fn closure_is_a_handler() {
         let h = |_d: &Delivery| HandlerVerdict::Ok;
         let delivery = Delivery {
             id: DeliveryId::new(1),
@@ -516,6 +529,6 @@ mod tests {
             message: Message::new(json!({})),
             redeliveries: 0,
         };
-        assert_eq!(h.handle(&delivery), HandlerVerdict::Ok);
+        assert_eq!(h.handle(&delivery).await, HandlerVerdict::Ok);
     }
 }
