@@ -357,7 +357,7 @@ itération. Ordre par valeur décroissante.
 
 | Priorité | Issue | Chantier | Pourquoi |
 |---|---|---|---|
-| 🔴 Haute | [#159](https://github.com/TheDarkMac/autome/issues/159) | **Worker : dispatch des connecteurs + injection credentials** | Le runner n'exécute que `http_request` ; Slack/Gmail/Notion/GitHub (déjà codés) ne sont pas dispatchés → un workflow multi-services (objectif n°1) échoue en prod. |
+| 🔴 Haute · [~] | [#159](https://github.com/TheDarkMac/autome/issues/159) | **Worker : dispatch des connecteurs + injection credentials** *(en cours)* | Le runner n'exécute que `http_request` ; Slack/Gmail/Notion/GitHub (déjà codés) ne sont pas dispatchés → un workflow multi-services (objectif n°1) échoue en prod. |
 | 🟠 Moyenne | [#160](https://github.com/TheDarkMac/autome/issues/160) | **Worker : templating inter-nodes au runtime** (`{{ steps.x.output }}`) | `engine::mapping` existe mais le runner passe `node.params` brut → pas de chaînage de données. Prérequis utile à #159. |
 | 🟢 Basse | [#161](https://github.com/TheDarkMac/autome/issues/161) | **Config des providers OAuth** (`OAuthRegistry` vide) | Dernier reliquat de la dette #107 (constat 3) : endpoints `/credentials/*` montés mais aucun provider listé. |
 | 🟢 Basse | [#162](https://github.com/TheDarkMac/autome/issues/162) | **CI/CD : `npm ci` + lockfile, pin images `@sha256`** | Écarts de reproductibilité/supply-chain déjà documentés dans `docs/CICD.md` §6. |
