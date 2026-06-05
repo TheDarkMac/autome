@@ -14,53 +14,19 @@ use std::sync::Arc;
 use autome_connectors::oauth::{InMemoryConnectorTokenStore, OAuthClient, OAuthRegistry};
 use autome_connectors::{CredentialService, OAuthCredentialService, ReqwestHttpClient};
 use autome_core::{
-    Config, EnvelopeCipher, Error, InMemoryKeyProvider, InMemoryQueue, InMemoryRunStateStore,
-    InMemoryWorkflowRepository, Queue, QueueRunDispatcher, Result, RunDispatcher, RunStateStore,
-    WorkflowRepository,
+    Config, EnvelopeCipher, InMemoryKeyProvider, InMemoryRunStateStore, InMemoryWorkflowRepository,
+    Queue, QueueRunDispatcher, Result, RunDispatcher, RunStateStore, WorkflowRepository,
 };
 use autome_persistence::{
     connect, run_migrations, PgAuditSink, PgPermissionStore, PgRevocationStore, PgRunStateStore,
-    PgWorkflowRepository, RabbitMqQueue,
+    PgWorkflowRepository,
 };
 use sha2::{Digest, Sha256};
 
 use crate::auth::{token_service_from_config, AuthState};
 
-/// Backend de file retenu pour cette exécution (`AUTOME_QUEUE`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum QueueMode {
-    /// File in-process (défaut).
-    Memory,
-    /// Broker RabbitMQ (`config.queue_url`).
-    Rabbitmq,
-}
-
-impl QueueMode {
-    /// Lit le mode depuis `AUTOME_QUEUE` (défaut : `Memory`).
-    pub fn from_env() -> Result<Self> {
-        match std::env::var("AUTOME_QUEUE")
-            .unwrap_or_default()
-            .trim()
-            .to_ascii_lowercase()
-            .as_str()
-        {
-            "" | "memory" | "in-memory" => Ok(Self::Memory),
-            "rabbitmq" | "rabbit" | "amqp" => Ok(Self::Rabbitmq),
-            other => Err(Error::Invalid(format!(
-                "AUTOME_QUEUE invalide : `{other}` (attendu : memory | rabbitmq)"
-            ))),
-        }
-    }
-}
-
-/// Construit la file selon le `mode`. En `Rabbitmq`, se connecte au broker
-/// (`config.queue_url`) — opération **async**.
-pub async fn build_queue(config: &Config, mode: QueueMode) -> Result<Arc<dyn Queue + Send + Sync>> {
-    match mode {
-        QueueMode::Memory => Ok(Arc::new(InMemoryQueue::new())),
-        QueueMode::Rabbitmq => Ok(Arc::new(RabbitMqQueue::connect(&config.queue_url).await?)),
-    }
-}
+// Sélecteurs de file/stores partagés avec le worker (dette #107).
+pub use autome_persistence::{build_queue, PersistenceMode, QueueMode};
 
 /// Construit le service de credentials OAuth (dette #107, constat 3) :
 /// transport HTTP **réel** ([`ReqwestHttpClient`]) + store de tokens **chiffré
@@ -154,33 +120,6 @@ pub async fn migrate(config: &Config) -> Result<usize> {
     run_migrations(&pool).await
 }
 
-/// Backend de persistance retenu pour cette exécution.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PersistenceMode {
-    /// Stores in-process (défaut).
-    Memory,
-    /// Stores PostgreSQL (`autome-persistence`).
-    Postgres,
-}
-
-impl PersistenceMode {
-    /// Lit le mode depuis `AUTOME_PERSISTENCE` (défaut : `Memory`).
-    pub fn from_env() -> Result<Self> {
-        Self::parse(std::env::var("AUTOME_PERSISTENCE").ok().as_deref())
-    }
-
-    /// Parse une valeur optionnelle (`None`/`""` ⇒ `Memory`).
-    pub fn parse(value: Option<&str>) -> Result<Self> {
-        match value.unwrap_or("").trim().to_ascii_lowercase().as_str() {
-            "" | "memory" | "in-memory" => Ok(Self::Memory),
-            "postgres" | "postgresql" | "pg" => Ok(Self::Postgres),
-            other => Err(Error::Invalid(format!(
-                "AUTOME_PERSISTENCE invalide : `{other}` (attendu : memory | postgres)"
-            ))),
-        }
-    }
-}
-
 /// Construit l'[`AuthState`] selon le `mode` :
 /// - `Memory` : [`AuthState::from_config`] (in-memory) ;
 /// - `Postgres` : pool partagé + stores PG. Le pool n'ouvre pas de connexion à
@@ -206,39 +145,6 @@ pub fn build_auth_state(config: &Config, mode: PersistenceMode) -> Result<AuthSt
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn parse_defaults_to_memory() {
-        assert_eq!(
-            PersistenceMode::parse(None).unwrap(),
-            PersistenceMode::Memory
-        );
-        assert_eq!(
-            PersistenceMode::parse(Some("")).unwrap(),
-            PersistenceMode::Memory
-        );
-        assert_eq!(
-            PersistenceMode::parse(Some("memory")).unwrap(),
-            PersistenceMode::Memory
-        );
-    }
-
-    #[test]
-    fn parse_postgres_variants() {
-        for v in ["postgres", "Postgres", "POSTGRESQL", " pg "] {
-            assert_eq!(
-                PersistenceMode::parse(Some(v)).unwrap(),
-                PersistenceMode::Postgres,
-                "valeur: {v}"
-            );
-        }
-    }
-
-    #[test]
-    fn parse_rejects_unknown() {
-        let err = PersistenceMode::parse(Some("redis")).unwrap_err();
-        assert!(matches!(err, Error::Invalid(m) if m.contains("AUTOME_PERSISTENCE")));
-    }
 
     #[test]
     fn memory_mode_builds_in_memory_auth_state() {

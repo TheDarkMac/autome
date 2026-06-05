@@ -1,59 +1,90 @@
-//! `autome-worker` — exécuteur de runs.
+//! `autome-worker` — exécuteur de runs **de production** (dette #107, constat 2).
 //!
-//! Stateless (ARCHITECTURE.md §2) : consomme un message `{run_id}` depuis la
-//! file, charge l'état en base, délègue l'exécution à `engine`. La file
-//! (F5.1), le pool de workers (F5.2) et la persistance (F5.4) arrivent au
-//! domaine 5. Ici : câblage minimal du moteur séquentiel (F2.2).
+//! Stateless (ARCHITECTURE.md §2) : consomme la file `runs`, charge l'état en
+//! base, délègue l'exécution au moteur via [`RunExecutor`], persiste le
+//! checkpoint final. File et stores sont sélectionnés par l'environnement
+//! (mêmes sélecteurs que l'API) :
+//!
+//! - `AUTOME_QUEUE` : `memory` (défaut) | `rabbitmq` (`config.queue_url`) ;
+//! - `AUTOME_PERSISTENCE` : `memory` (défaut) | `postgres` (`config.database_url`) ;
+//! - `AUTOME_WORKER_CONCURRENCY` : nombre de tâches consommatrices (défaut 4).
+//!
+//! Arrêt **gracieux** : sur `SIGINT`/`SIGTERM`, le pool stoppe et `await` la
+//! fin des tâches en cours (pas de message perdu en vol).
 
-use autome_core::{Config, Node, NodeId, NodeKind, WorkflowGraph, WorkflowId};
-use autome_engine::{Dag, Engine, RunContext, RunStatus};
-use serde_json::Value;
+use std::sync::Arc;
 
-/// Exécute un run de démonstration et renvoie son statut global.
-///
-/// Le chargement réel du workflow depuis la base et le runner concret
-/// (connecteurs) relèvent de F5.*/F3.*/F4. : ici un DAG mono-node et un
-/// runner no-op suffisent à exercer le moteur de bout en bout.
-fn process_run(run_id: &str) -> autome_core::Result<RunStatus> {
-    let workflow = WorkflowGraph {
-        id: WorkflowId::new(run_id),
-        name: format!("run::{run_id}"),
-        nodes: vec![Node {
-            id: NodeId::new("entry"),
-            name: "entry".into(),
-            kind: NodeKind::Trigger {
-                trigger_type: "manual".into(),
-            },
-            params: Value::Null,
-        }],
-        edges: vec![],
-    };
-    let dag =
-        Dag::from_workflow(&workflow).map_err(|e| autome_core::Error::Invalid(e.to_string()))?;
+use autome_core::Config;
+use autome_persistence::selectors::{
+    build_queue, build_run_state_store, build_workflow_repository, PersistenceMode, QueueMode,
+};
+use autome_worker::{Handler, IdempotencyStore, InMemoryIdempotencyStore, RunExecutor, WorkerPool};
 
-    let runner = |_: &Node, _: &RunContext| Ok(Value::Null);
-    let report = Engine::new().run(&dag, &runner);
-    Ok(report.status)
+/// Queue des runs (alignée sur `QueueRunDispatcher::queue_name` par défaut).
+const RUNS_QUEUE: &str = "runs";
+
+/// Lit `AUTOME_WORKER_CONCURRENCY` (défaut 4, plancher 1).
+fn concurrency_from_env() -> usize {
+    std::env::var("AUTOME_WORKER_CONCURRENCY")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(4)
+        .max(1)
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = Config::from_env()?;
+    let persistence = PersistenceMode::from_env()?;
+    let queue_mode = QueueMode::from_env()?;
+    let concurrency = concurrency_from_env();
+
+    // Backends sélectionnés par l'environnement (partagés avec l'API).
+    let queue = build_queue(&config, queue_mode).await?;
+    let repo = build_workflow_repository(&config, persistence)?;
+    let store = build_run_state_store(&config, persistence)?;
+
+    let handler: Arc<dyn Handler + Send + Sync> = Arc::new(RunExecutor::new(repo, store));
+    let idempotency: Arc<dyn IdempotencyStore + Send + Sync> =
+        Arc::new(InMemoryIdempotencyStore::new());
+
     println!(
-        "autome-worker ({:?}) démarré (en attente d'une file — F5.1)",
-        config.profile
+        "autome-worker ({:?}) démarré — queue={:?} persistence={:?} concurrency={} (file `{}`)",
+        config.profile, queue_mode, persistence, concurrency, RUNS_QUEUE
     );
-    let status = process_run("bootstrap")?;
-    println!("run bootstrap terminé : {status:?}");
+
+    let pool = WorkerPool::new(queue, handler, idempotency, RUNS_QUEUE, concurrency);
+    let running = pool.start();
+
+    // Arrêt gracieux : SIGINT (Ctrl-C) ou SIGTERM (orchestrateur).
+    shutdown_signal().await;
+    println!("autome-worker : signal d'arrêt reçu — drain en cours…");
+    running.stop().await;
+    println!("autome-worker : arrêté proprement.");
     Ok(())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+/// Attend `SIGINT` (Ctrl-C) ou, sous Unix, `SIGTERM`.
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
 
-    #[test]
-    fn process_run_succeeds_on_minimal_workflow() {
-        assert_eq!(process_run("run-1").unwrap(), RunStatus::Succeeded);
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut sig) => {
+                sig.recv().await;
+            }
+            Err(e) => eprintln!("autome-worker : SIGTERM indisponible : {e}"),
+        }
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {}
+        _ = terminate => {}
     }
 }
