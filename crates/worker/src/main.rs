@@ -8,6 +8,8 @@
 //! - `AUTOME_QUEUE` : `memory` (défaut) | `rabbitmq` (`config.queue_url`) ;
 //! - `AUTOME_PERSISTENCE` : `memory` (défaut) | `postgres` (`config.database_url`) ;
 //! - `AUTOME_WORKER_CONCURRENCY` : nombre de tâches consommatrices (défaut 4).
+//! - `AUTOME_CONNECTOR_TOKEN_<PROVIDER>` : token bearer mono-tenant injecté dans
+//!   les actions de connecteurs (`SLACK`/`GMAIL`/`NOTION`/`GITHUB`) — cf. #159.
 //!
 //! Arrêt **gracieux** : sur `SIGINT`/`SIGTERM`, le pool stoppe et `await` la
 //! fin des tâches en cours (pas de message perdu en vol).
