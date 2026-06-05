@@ -4,6 +4,7 @@
   "version": "0.1.0",
   "type": "module",
   "description": "Frontend Autome — éditeur visuel de workflows (F8.1+).",
+  "packageManager": "pnpm@10.33.2",
   "scripts": {
     "dev": "vite",
     "build": "tsc -b && vite build",

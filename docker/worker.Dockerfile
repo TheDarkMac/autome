@@ -10,7 +10,10 @@
 #   docker build -f docker/worker.Dockerfile -t autome-worker .
 
 # ───────────────────────── Builder ─────────────────────────
-FROM rust:1.90-bookworm AS builder
+# Image de base pinnée par digest (reproductibilité supply-chain, #162).
+# Tag lisible : rust:1.90-bookworm. Pour rafraîchir le digest :
+#   docker buildx imagetools inspect rust:1.90-bookworm
+FROM rust:1.90-bookworm@sha256:3914072ca0c3b8aad871db9169a651ccfce30cf58303e5d6f2db16d1d8a7e58f AS builder
 
 WORKDIR /app
 COPY . .
@@ -19,7 +22,8 @@ RUN cargo build --release --locked -p autome-worker \
     && strip target/release/autome-worker
 
 # ───────────────────────── Runtime ─────────────────────────
-FROM debian:bookworm-slim AS runtime
+# Tag lisible : debian:bookworm-slim (digest épinglé, cf. ci-dessus).
+FROM debian:bookworm-slim@sha256:0104b334637a5f19aa9c983a91b54c89887c0984081f2068983107a6f6c21eeb AS runtime
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates \

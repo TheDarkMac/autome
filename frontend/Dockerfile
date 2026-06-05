@@ -11,24 +11,32 @@
 #     --build-arg VITE_API_URL=https://api.example.com -t autome-frontend frontend
 
 # ───────────────────────── Builder ─────────────────────────
-FROM node:20-bookworm-slim AS builder
+# Image de base pinnée par digest (reproductibilité supply-chain, #162).
+# Tag lisible : node:20-bookworm-slim. Pour mettre à jour le digest :
+#   docker buildx imagetools inspect node:20-bookworm-slim
+FROM node:20-bookworm-slim@sha256:2cf067cfed83d5ea958367df9f966191a942351a2df77d6f0193e162b5febfc0 AS builder
 
 WORKDIR /app
 
-# Couche dépendances : ne dépend que du manifeste → cache tant qu'il
-# ne change pas. (Pas de package-lock.json versionné → `npm install`.)
-COPY package.json ./
-RUN npm install
+# pnpm via Corepack (version pinnée par `packageManager` dans package.json).
+ENV CI=true
+RUN corepack enable
+
+# Couche dépendances : manifeste + lockfile → cache tant qu'ils ne changent
+# pas. `--frozen-lockfile` (équivalent `npm ci`) = installs déterministes.
+COPY package.json pnpm-lock.yaml ./
+RUN pnpm install --frozen-lockfile
 
 COPY . .
 
 # URL du backend inlinée dans le bundle au build (défaut : même origine).
 ARG VITE_API_URL=""
 ENV VITE_API_URL=$VITE_API_URL
-RUN npm run build
+RUN pnpm run build
 
 # ───────────────────────── Runtime ─────────────────────────
-FROM nginx:1.27-alpine AS runtime
+# Tag lisible : nginx:1.27-alpine (digest épinglé, cf. ci-dessus).
+FROM nginx:1.27-alpine@sha256:65645c7bb6a0661892a8b03b89d0743208a18dd2f3f17a54ef4b76fb8e2f2a10 AS runtime
 
 # Config SPA (fallback try_files vers index.html).
 COPY nginx.conf /etc/nginx/conf.d/default.conf

@@ -16,7 +16,7 @@ Déclenchée sur **push** et **pull request** vers `main`. Reproduit la
 | Job | Étapes |
 |---|---|
 | **Backend (Rust)** | toolchain pinnée + cache · `cargo fmt --all --check` · `cargo clippy --workspace --all-targets -- -D warnings` · `cargo test --workspace --locked` · `cargo build --workspace --release --locked` |
-| **Frontend (Node)** | `npm install` · `npm run typecheck` · `npm run lint` · `npm run test` (Vitest) |
+| **Frontend (Node)** | Corepack/pnpm · `pnpm install --frozen-lockfile` · `pnpm run typecheck` · `pnpm run lint` · `pnpm run test` (Vitest) |
 
 - `concurrency` avec `cancel-in-progress` (annule les runs obsolètes).
 - `permissions: contents: read` (moindre privilège).
@@ -43,10 +43,12 @@ protégé + secret optionnel.
 | Aspect | État | Référence |
 |---|---|---|
 | Lockfile Rust | `Cargo.lock` **versionné** | racine du dépôt |
-| Builds Rust verrouillés | `--locked` en CI (`test`, `build`) **et** dans les Dockerfiles | `ci.yml`, `docker/*.Dockerfile` |
+| Builds Rust verrouillés | `--locked` en CI (`clippy`, `test`, `build`) **et** dans les Dockerfiles | `ci.yml`, `docker/*.Dockerfile` |
+| Lockfile frontend | `pnpm-lock.yaml` **versionné** + `pnpm install --frozen-lockfile` (CI + Docker) | `frontend/`, `ci.yml`, `frontend/Dockerfile` |
 | Toolchain Rust | **pinnée 1.90** (CI `dtolnay/rust-toolchain@1.90` + images `rust:1.90-bookworm`) | `ci.yml`, `docker/*` |
 | MSRV | `rust-version = "1.85"` (plancher edition2024) | `Cargo.toml` |
-| Node | **20** (CI `setup-node@v4` + image `node:20-bookworm-slim`) | `ci.yml`, `frontend/Dockerfile` |
+| Node / pnpm | Node **20** (CI `setup-node@v4` + image `node:20-…`) ; pnpm via Corepack (`packageManager` pinné) | `ci.yml`, `frontend/` |
+| Images de base | pinnées par **digest `@sha256:`** (tag lisible en commentaire) | `docker/*.Dockerfile`, `frontend/Dockerfile` |
 
 > La cohérence toolchain CI ↔ images (1.90) garantit que « vert en CI » ⇒
 > « build identique en conteneur ».
@@ -57,8 +59,10 @@ protégé + secret optionnel.
 
 - **Images multi-stage** : builder lourd jeté, runtime minimal non-root
   (cf. [INSTALLATION](INSTALLATION.md) / F10.1).
-- **Bases pinnées par tag** : `rust:1.90-bookworm`, `debian:bookworm-slim`,
-  `node:20-bookworm-slim`, `nginx:1.27-alpine`.
+- **Bases pinnées par digest `@sha256:`** (#162) : `rust:1.90-bookworm`,
+  `debian:bookworm-slim`, `node:20-bookworm-slim`, `nginx:1.27-alpine` — le tag
+  lisible reste en commentaire. Rafraîchir un digest :
+  `docker buildx imagetools inspect <image:tag>`.
 - **Tags d'images immuables** : la CD pousse `sha-<court>` (commit) en plus de
   `latest` / semver, et **déploie le tag `sha`** → un déploiement pointe vers un
   artefact précis et traçable (pas le `latest` mouvant).
@@ -98,24 +102,20 @@ protégé + secret optionnel.
 **Reproductibilité**
 - [x] `Cargo.lock` versionné + `--locked` partout (CI + Docker).
 - [x] Toolchain Rust et Node **pinnées** et cohérentes CI ↔ images.
-- [x] Bases d'images pinnées par tag.
 - [x] Aucun secret committé.
-- [ ] Frontend : `package-lock.json` versionné + `npm ci` *(cf. §6)*.
-- [ ] Images de base pinnées par **digest** `@sha256:` *(cf. §6)*.
+- [x] Frontend : lockfile `pnpm-lock.yaml` versionné + `pnpm install --frozen-lockfile` (CI + Dockerfile) — #162.
+- [x] Images de base pinnées par **digest** `@sha256:` (CI/Docker) — #162.
 
 ---
 
 ## 6. Écarts connus & recommandations
 
-| # | Écart | Recommandation |
+| # | Écart | État |
 |---|---|---|
-| 1 | **Frontend non verrouillé** : pas de `package-lock.json` versionné ; CI et `frontend/Dockerfile` utilisent `npm install` (résolution non déterministe) | Committer un `package-lock.json` et passer à **`npm ci`** (CI + Dockerfile) pour des builds frontend reproductibles. |
-| 2 | **Bases d'images par tag** (`debian:bookworm-slim`, `node:20-…`, etc.) : un tag peut bouger | Pinner par **digest** (`image@sha256:…`) pour une reproductibilité bit-à-bit, avec une routine de mise à jour. |
-| 3 | `cargo fmt`/`clippy` sans `--locked` | Cosmétique ; ajouter `--locked` pour l'uniformité si souhaité. |
-| 4 | **Branchement runtime** (PostgreSQL/RabbitMQ) non câblé dans les binaires | Suivi par la [dette #107](https://github.com/TheDarkMac/autome/issues/107) ; sans impact sur la reproductibilité des builds. |
-
-> Ces écarts sont **documentés** ici plutôt que corrigés : F11.5 est une feature
-> de documentation. Les points 1 et 2 méritent chacun une feature/issue dédiée.
+| 1 | **Frontend non verrouillé** : CI et `frontend/Dockerfile` utilisaient `npm install` (résolution non déterministe) | ✅ **Résolu (#162)** : le repo a un `pnpm-lock.yaml` versionné ; CI + Dockerfile passent à **`pnpm install --frozen-lockfile`** (équivalent `npm ci`). Standardisation sur **pnpm** plutôt qu'un `package-lock.json` concurrent (cohérent avec le lockfile déjà présent). |
+| 2 | **Bases d'images par tag** (`debian:bookworm-slim`, `node:20-…`, etc.) : un tag peut bouger | ✅ **Résolu (#162)** : pinnées par **digest** `@sha256:` dans les 3 Dockerfiles (tag lisible conservé en commentaire). Mise à jour : `docker buildx imagetools inspect <image:tag>`. |
+| 3 | `cargo fmt`/`clippy` sans `--locked` | ✅ **Résolu (#162)** : `--locked` ajouté à l'étape `clippy` (la CI échoue désormais si `Cargo.lock` n'est pas en phase dès le lint). |
+| 4 | **Branchement runtime** (PostgreSQL/RabbitMQ) non câblé dans les binaires | ✅ Résolu — [dette #107](https://github.com/TheDarkMac/autome/issues/107) close (API + worker branchés sur PG/RabbitMQ via `AUTOME_PERSISTENCE`/`AUTOME_QUEUE`). |
 
 ---
 

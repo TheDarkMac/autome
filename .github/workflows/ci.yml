@@ -43,7 +43,7 @@ jobs:
         run: cargo fmt --all --check
 
       - name: Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
       - name: Tests
         run: cargo test --workspace --locked
@@ -65,14 +65,21 @@ jobs:
         with:
           node-version: 20
 
+      # pnpm via Corepack (version pinnée par `packageManager` dans
+      # package.json) — pas d'action tierce.
+      - name: Enable Corepack (pnpm)
+        run: corepack enable
+
+      # `--frozen-lockfile` = équivalent de `npm ci` : échoue si
+      # `pnpm-lock.yaml` n'est pas en phase → installs déterministes.
       - name: Install dependencies
-        run: npm install
+        run: pnpm install --frozen-lockfile
 
       - name: Typecheck
-        run: npm run typecheck
+        run: pnpm run typecheck
 
       - name: Lint
-        run: npm run lint
+        run: pnpm run lint
 
       - name: Tests
-        run: npm run test
+        run: pnpm run test
