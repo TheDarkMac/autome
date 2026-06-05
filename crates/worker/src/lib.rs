@@ -48,6 +48,9 @@ use async_trait::async_trait;
 use autome_core::{Delivery, Nack, Queue, Result};
 use tokio::task::JoinHandle;
 
+pub mod executor;
+pub use executor::RunExecutor;
+
 /// Verdict que retourne un [`Handler`] après traitement.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HandlerVerdict {

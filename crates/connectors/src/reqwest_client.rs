@@ -13,16 +13,18 @@
 //! (cas `application/x-www-form-urlencoded` de l'échange OAuth), sinon le
 //! `Value` est sérialisé en JSON.
 
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 use serde_json::Value;
 
 use crate::http::{HttpClient, HttpRequest, HttpResponse};
 
-/// Client HTTP réel, bloquant, à TLS rustls. Réutilisable (`Send + Sync`).
-#[derive(Default)]
+/// Client HTTP réel, bloquant, à TLS rustls. Réutilisable et **clonable** : le
+/// client `reqwest` sous-jacent (paresseux) est partagé via `Arc<OnceLock>`,
+/// donc cloner ne reconstruit pas le runtime interne.
+#[derive(Default, Clone)]
 pub struct ReqwestHttpClient {
-    inner: OnceLock<reqwest::blocking::Client>,
+    inner: Arc<OnceLock<reqwest::blocking::Client>>,
 }
 
 impl ReqwestHttpClient {
