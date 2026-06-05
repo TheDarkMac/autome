@@ -36,9 +36,12 @@ use serde_json::{json, Value};
 const QUEUE: &str = "runs";
 const NOW_MS: i64 = 1_700_000_000_000;
 
-/// Workflow réaliste à trois nodes avec **mapping de données** :
-/// `entry` (trigger) → `fetch` (produit `{ value: 21 }`) → `double`
-/// (lit la sortie de `fetch` et produit `{ result: 42 }`).
+/// Workflow réaliste à trois nodes avec **mapping de données par templating
+/// (#160)** : `entry` (trigger) → `fetch` (produit `{ value: 21 }`) → `double`
+/// (lit la sortie de `fetch` **via `{{ fetch.value }}` dans ses `params`** et
+/// produit `{ result: 42 }`). Le moteur résout le template **avant** d'appeler
+/// le runner ; ce dernier ne fait que lire `node.params` déjà résolu — preuve
+/// que le chaînage inter-nodes fonctionne de bout en bout côté worker.
 fn pipeline_workflow(id: &str) -> WorkflowGraph {
     use autome_core::Edge;
     WorkflowGraph {
@@ -67,7 +70,9 @@ fn pipeline_workflow(id: &str) -> WorkflowGraph {
                 kind: NodeKind::Action {
                     action_type: "transform".into(),
                 },
-                params: Value::Null,
+                // Référence templatée à la sortie du node amont `fetch`. Le
+                // type est préservé (expression unique → entier, pas chaîne).
+                params: json!({ "input": "{{ fetch.value }}" }),
             },
         ],
         edges: vec![
@@ -85,11 +90,12 @@ fn pipeline_workflow(id: &str) -> WorkflowGraph {
     }
 }
 
-/// Runner de nodes : `fetch` produit `21`, `double` lit la sortie de
-/// `fetch` et la double. Tout node `name == "boom"` échoue (chemin d'erreur).
-/// `runs` compte les exécutions effectives (pour l'idempotence).
+/// Runner de nodes : `fetch` produit `21`, `double` lit son entrée **depuis
+/// `node.params["input"]` déjà résolu par le moteur** (templating #160) et la
+/// double. Tout node `name == "boom"` échoue (chemin d'erreur). `runs` compte
+/// les exécutions effectives (pour l'idempotence).
 fn make_runner(runs: Arc<AtomicU32>) -> impl NodeRunner + Sync {
-    move |node: &Node, ctx: &autome_engine::RunContext| -> Result<Value, String> {
+    move |node: &Node, _ctx: &autome_engine::RunContext| -> Result<Value, String> {
         match node.name.as_str() {
             "boom" => Err("échec simulé du node".into()),
             "fetch" => {
@@ -97,12 +103,14 @@ fn make_runner(runs: Arc<AtomicU32>) -> impl NodeRunner + Sync {
                 Ok(json!({ "value": 21 }))
             }
             "double" => {
-                let upstream = ctx
-                    .output(&NodeId::new("fetch"))
-                    .and_then(|v| v.get("value"))
+                // `{{ fetch.value }}` a été résolu en l'entier `21` (type
+                // préservé) avant d'atteindre le runner.
+                let input = node
+                    .params
+                    .get("input")
                     .and_then(Value::as_i64)
-                    .ok_or("double : sortie de `fetch` absente")?;
-                Ok(json!({ "result": upstream * 2 }))
+                    .ok_or("double : `params.input` (templaté depuis `fetch`) absent")?;
+                Ok(json!({ "result": input * 2 }))
             }
             _ => Ok(Value::Null),
         }
@@ -267,7 +275,8 @@ async fn dispatched_workflow_runs_to_completion_with_persisted_outputs() {
     assert_eq!(outcome, ProcessOutcome::Handled(HandlerVerdict::Ok));
 
     // État final : Succeeded, sorties des deux actions persistées (la donnée
-    // `21` a transité de `fetch` vers `double` via le moteur → `42`).
+    // `21` a transité de `fetch` vers `double` via le **templating** `{{
+    // fetch.value }}` résolu par le moteur côté worker → `42`, #160).
     let final_state = stack.store.load(&run_id).await.unwrap().unwrap();
     assert_eq!(final_state.status, RunStatus::Succeeded);
     assert_eq!(final_state.outputs["fetch"], json!({ "value": 21 }));
