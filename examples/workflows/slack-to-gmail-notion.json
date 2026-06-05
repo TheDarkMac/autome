@@ -26,7 +26,8 @@
       "action_type": "gmail.send_email",
       "params": {
         "to": "ops@example.com",
-        "subject": "Résumé Slack #deploys"
+        "subject": "Résumé Slack #deploys",
+        "body": "Dernier message #deploys : {{ slack_read.messages.0.text }}"
       }
     },
     {
@@ -35,7 +36,11 @@
       "kind": "action",
       "action_type": "notion.create_page",
       "params": {
-        "parent": { "database_id": "db-archive-0001" }
+        "parent": { "database_id": "db-archive-0001" },
+        "properties": {
+          "Name": { "title": [ { "text": { "content": "{{ slack_read.messages.0.text }}" } } ] },
+          "EmailId": { "rich_text": [ { "text": { "content": "{{ gmail_send.id }}" } } ] }
+        }
       }
     }
   ],

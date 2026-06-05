@@ -13,8 +13,14 @@
 //! (preuve qu'un `WorkflowGraph` est un artefact déclaratif désérialisable),
 //! puis exécuté par le **vrai moteur** (`Engine::run`) avec les **vrais
 //! connecteurs** (`SlackReadChannel`, `GmailSendEmail`, `NotionCreatePage`)
-//! branchés sur un transport HTTP factice. Le `NodeRunner` joue le rôle de la
-//! glue de mapping de données (F2.6) entre les nodes.
+//! branchés sur un transport HTTP factice.
+//!
+//! Le **mapping de données (F2.6) est porté par les `params` du JSON**, pas par
+//! la glue du runner : `gmail_send` et `notion_create` référencent les sorties
+//! amont via `{{ slack_read.messages.0.text }}` / `{{ gmail_send.id }}`, que le
+//! moteur résout **avant** d'appeler le runner (#160). Le `NodeRunner` se borne
+//! donc à du **dispatch** vers le connecteur — il ne recopie plus aucune donnée
+//! d'un node à l'autre.
 
 use std::sync::{Arc, Mutex};
 
@@ -65,16 +71,6 @@ impl HttpClient for MockHttp {
     }
 }
 
-/// Fusionne l'objet `params` statique du node avec des champs calculés
-/// (mapping de données issu des sorties amont).
-fn with_params(base: &Value, extra: Vec<(&str, Value)>) -> Value {
-    let mut obj = base.as_object().cloned().unwrap_or_default();
-    for (k, v) in extra {
-        obj.insert(k.to_string(), v);
-    }
-    Value::Object(obj)
-}
-
 fn load_workflow() -> WorkflowGraph {
     let path = concat!(
         env!("CARGO_MANIFEST_DIR"),
@@ -103,11 +99,13 @@ fn slack_to_gmail_to_notion_runs_end_to_end() {
         json!({ "object": "page", "id": "notion-page-1", "url": "https://notion.so/notion-page-1" }),
     );
 
-    // Le runner câble chaque node sur le connecteur réel et fait transiter la
-    // donnée d'un node à l'autre (ce que produira le mapping F2.6 en prod).
+    // Le runner se contente de **dispatcher** chaque node vers le connecteur
+    // réel : les `params` lui arrivent déjà résolus par le moteur (#160), donc
+    // `node.params` porte le corps de l'email et les propriétés Notion calculés
+    // à partir des sorties amont — plus aucune recopie manuelle ici.
     let runner = {
         let (slack, gmail, notion) = (slack.clone(), gmail.clone(), notion.clone());
-        move |node: &autome_core::Node, ctx: &RunContext| -> Result<Value, String> {
+        move |node: &autome_core::Node, _ctx: &RunContext| -> Result<Value, String> {
             let action_type = match &node.kind {
                 autome_core::NodeKind::Action { action_type } => action_type.as_str(),
                 // Le trigger n'exécute aucun appel : il amorce simplement le run.
@@ -121,45 +119,17 @@ fn slack_to_gmail_to_notion_runs_end_to_end() {
                 }
 
                 "gmail.send_email" => {
-                    // Mapping : le corps de l'email = dernier message Slack.
-                    let text = ctx
-                        .output(&NodeId::new("slack_read"))
-                        .and_then(|o| o.pointer("/messages/0/text"))
-                        .and_then(Value::as_str)
-                        .ok_or("gmail : message Slack introuvable en amont")?;
-                    let params = with_params(
-                        &node.params,
-                        vec![("body", json!(format!("Dernier message #deploys : {text}")))],
-                    );
                     GmailSendEmail::new(GmailAuth::OAuth2("ya29.test".into()), gmail.clone())
-                        .execute(&params)
+                        .execute(&node.params)
                         .map_err(|e| e.to_string())
                 }
 
-                "notion.create_page" => {
-                    // Mapping : titre = message Slack ; on trace l'id de l'email.
-                    let text = ctx
-                        .output(&NodeId::new("slack_read"))
-                        .and_then(|o| o.pointer("/messages/0/text"))
-                        .and_then(Value::as_str)
-                        .ok_or("notion : message Slack introuvable en amont")?;
-                    let email_id = ctx
-                        .output(&NodeId::new("gmail_send"))
-                        .and_then(|o| o.get("id"))
-                        .and_then(Value::as_str)
-                        .ok_or("notion : id de l'email introuvable en amont")?;
-                    let properties = json!({
-                        "Name": { "title": [ { "text": { "content": text } } ] },
-                        "EmailId": { "rich_text": [ { "text": { "content": email_id } } ] }
-                    });
-                    let params = with_params(&node.params, vec![("properties", properties)]);
-                    NotionCreatePage::new(
-                        NotionAuth::Integration("secret_test".into()),
-                        notion.clone(),
-                    )
-                    .execute(&params)
-                    .map_err(|e| e.to_string())
-                }
+                "notion.create_page" => NotionCreatePage::new(
+                    NotionAuth::Integration("secret_test".into()),
+                    notion.clone(),
+                )
+                .execute(&node.params)
+                .map_err(|e| e.to_string()),
 
                 other => Err(format!("action non gérée par l'exemple : {other}")),
             }

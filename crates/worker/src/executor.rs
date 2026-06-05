@@ -92,6 +92,12 @@ fn now_ms() -> i64 {
 ///   [`dispatch_action`] (injection du token via `resolver`).
 /// - autre `Action` : erreur explicite.
 /// - `Switch`/`Loop` : gérés par le moteur, jamais soumis au runner.
+///
+/// `_ctx` est **volontairement inutilisé** : le templating inter-nodes (#160,
+/// F2.6) est résolu **en amont** par le moteur (`run_sequential` →
+/// `evaluate_node` → `mapping::resolve_params`), si bien que `node.params`
+/// arrive **déjà résolu** ici (les `{{ <node>.<champ> }}` pointant sur les
+/// sorties amont sont substitués avant l'appel au runner).
 fn run_node(
     node: &Node,
     _ctx: &RunContext,
