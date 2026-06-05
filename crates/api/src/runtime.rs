@@ -31,14 +31,16 @@ pub use autome_persistence::{build_queue, PersistenceMode, QueueMode};
 /// Construit le service de credentials OAuth (dette #107, constat 3) :
 /// transport HTTP **réel** ([`ReqwestHttpClient`]) + store de tokens **chiffré
 /// au repos** avec une clé dérivée de `config.encryption_key` (SHA-256 → 32 o).
-/// Le registre de providers est vide pour l'instant (config providers = futur).
-fn build_credential_service(config: &Config) -> Arc<dyn CredentialService + Send + Sync> {
+/// Le registre de providers est peuplé au démarrage depuis l'environnement
+/// (`AUTOME_OAUTH_PROVIDERS` + `AUTOME_OAUTH_<ID>_*`, #161) — vide en l'absence
+/// de config (OAuth alors indisponible) ; une config incomplète échoue (fail-fast).
+fn build_credential_service(config: &Config) -> Result<Arc<dyn CredentialService + Send + Sync>> {
     let key: [u8; 32] = Sha256::digest(config.encryption_key.expose().as_bytes()).into();
     let keys = InMemoryKeyProvider::new();
     keys.add_key("v1", key, true).expect("clé de chiffrement");
     let store = Arc::new(InMemoryConnectorTokenStore::new(EnvelopeCipher::new(keys)));
-    let oauth = OAuthClient::new(OAuthRegistry::new(), ReqwestHttpClient::new());
-    Arc::new(OAuthCredentialService::new(oauth, store))
+    let oauth = OAuthClient::new(OAuthRegistry::from_env()?, ReqwestHttpClient::new());
+    Ok(Arc::new(OAuthCredentialService::new(oauth, store)))
 }
 
 /// Backends applicatifs assemblés selon le [`PersistenceMode`] : un seul jeu
@@ -74,7 +76,7 @@ pub fn build_backends(
                 workflows: Arc::new(InMemoryWorkflowRepository::new()),
                 runs,
                 dispatcher,
-                credentials: build_credential_service(config),
+                credentials: build_credential_service(config)?,
             })
         }
         PersistenceMode::Postgres => {
@@ -94,7 +96,7 @@ pub fn build_backends(
                 workflows: Arc::new(PgWorkflowRepository::new(pool)),
                 runs,
                 dispatcher,
-                credentials: build_credential_service(config),
+                credentials: build_credential_service(config)?,
             })
         }
     }
