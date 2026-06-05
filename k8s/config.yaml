@@ -10,12 +10,16 @@ metadata:
 data:
   APP_PROFILE: "prod"
   APP_HTTP_ADDR: "0.0.0.0:8080"
+  # Providers OAuth activés (#161). Les AUTOME_OAUTH_<ID>_* non sensibles
+  # (URLs, scopes) peuvent vivre ici ; client_id/client_secret vont au Secret.
+  # Vide/absent = OAuth désactivé.
+  AUTOME_OAUTH_PROVIDERS: ""
 ---
 # Secrets (F10.3) — VALEURS DE DÉMONSTRATION, à remplacer impérativement
 # avant tout usage réel (SealedSecrets / External Secrets / Vault…).
 # `DATABASE_URL` et `QUEUE_URL` contiennent des identifiants → ici plutôt
-# que dans le ConfigMap. NB : l'API ne lit pas encore `JWT_SECRET` (dette
-# #107) ; ces clés sont câblées pour quand ce sera le cas.
+# que dans le ConfigMap. `JWT_SECRET`/`ENCRYPTION_KEY` sont effectivement lus
+# par l'API depuis la config (dette #107 résorbée).
 apiVersion: v1
 kind: Secret
 metadata:
@@ -30,3 +34,11 @@ stringData:
   POSTGRES_PASSWORD: "REPLACE_ME_postgres_password"
   DATABASE_URL: "postgres://postgres:REPLACE_ME_postgres_password@postgres:5432/autome"
   QUEUE_URL: "amqp://guest:guest@rabbitmq:5672/"
+  # Credentials des providers OAuth (#161) — à renseigner par provider listé
+  # dans AUTOME_OAUTH_PROVIDERS. Exemple (décommenter + compléter) :
+  #AUTOME_OAUTH_GOOGLE_CLIENT_ID: "REPLACE_ME"
+  #AUTOME_OAUTH_GOOGLE_CLIENT_SECRET: "REPLACE_ME"
+  #AUTOME_OAUTH_GOOGLE_AUTHORIZE_URL: "https://accounts.google.com/o/oauth2/v2/auth"
+  #AUTOME_OAUTH_GOOGLE_TOKEN_URL: "https://oauth2.googleapis.com/token"
+  #AUTOME_OAUTH_GOOGLE_REDIRECT_URI: "https://app.autome/oauth/callback/google"
+  #AUTOME_OAUTH_GOOGLE_SCOPES: "openid,email,profile"
