@@ -105,7 +105,10 @@ mod tests {
 
     #[test]
     fn persistence_mode_parse() {
-        assert_eq!(PersistenceMode::parse(None).unwrap(), PersistenceMode::Memory);
+        assert_eq!(
+            PersistenceMode::parse(None).unwrap(),
+            PersistenceMode::Memory
+        );
         assert_eq!(
             PersistenceMode::parse(Some("postgres")).unwrap(),
             PersistenceMode::Postgres
