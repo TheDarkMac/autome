@@ -32,29 +32,44 @@ use autome_core::{
 };
 use autome_engine::{Dag, Engine, RunContext, StepStatus};
 
+use crate::dispatch::{dispatch_action, CredentialResolver, EnvCredentialResolver};
 use crate::{Handler, HandlerVerdict};
 
 /// Handler de production : exécute un run de bout en bout et persiste son état.
 ///
 /// Construit avec des `Arc<dyn …>` (repo/store sélectionnés par
-/// `AUTOME_PERSISTENCE`) et un [`ReqwestHttpClient`] clonable partagé entre
-/// toutes les actions HTTP.
+/// `AUTOME_PERSISTENCE`), un [`ReqwestHttpClient`] clonable partagé entre
+/// toutes les actions HTTP, et un [`CredentialResolver`] qui injecte les tokens
+/// des connecteurs (#159).
 pub struct RunExecutor {
     repo: Arc<dyn WorkflowRepository + Send + Sync>,
     store: Arc<dyn RunStateStore + Send + Sync>,
     http: ReqwestHttpClient,
+    resolver: Arc<dyn CredentialResolver>,
 }
 
 impl RunExecutor {
     /// Construit l'executor sur un repo de workflows et un store d'état donnés.
+    /// Résolveur de credentials par défaut : [`EnvCredentialResolver`]
+    /// (`AUTOME_CONNECTOR_TOKEN_<PROVIDER>`).
     pub fn new(
         repo: Arc<dyn WorkflowRepository + Send + Sync>,
         store: Arc<dyn RunStateStore + Send + Sync>,
+    ) -> Self {
+        Self::with_resolver(repo, store, Arc::new(EnvCredentialResolver))
+    }
+
+    /// Variante avec un [`CredentialResolver`] explicite (tests, futur store).
+    pub fn with_resolver(
+        repo: Arc<dyn WorkflowRepository + Send + Sync>,
+        store: Arc<dyn RunStateStore + Send + Sync>,
+        resolver: Arc<dyn CredentialResolver>,
     ) -> Self {
         Self {
             repo,
             store,
             http: ReqwestHttpClient::new(),
+            resolver,
         }
     }
 }
@@ -67,17 +82,21 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
-/// Runner de nodes de production. `http` est cloné dans le thread bloquant.
+/// Runner de nodes de production. `http`/`resolver` sont clonés/partagés dans
+/// le thread bloquant.
 ///
 /// - `Trigger` : pass-through (`Null`) — le déclenchement a eu lieu côté API.
 /// - `Action { http_request }` : délègue à [`HttpAction`] (les `params` du
 ///   node portent `url`/`method`/`headers`/`body`).
-/// - autre `Action` : erreur explicite (connecteurs à venir).
+/// - `Action { slack.* | gmail.* | notion.* | github.* }` : délègue à
+///   [`dispatch_action`] (injection du token via `resolver`).
+/// - autre `Action` : erreur explicite.
 /// - `Switch`/`Loop` : gérés par le moteur, jamais soumis au runner.
 fn run_node(
     node: &Node,
     _ctx: &RunContext,
     http: &ReqwestHttpClient,
+    resolver: &dyn CredentialResolver,
 ) -> Result<serde_json::Value, String> {
     match &node.kind {
         NodeKind::Trigger { .. } => Ok(serde_json::Value::Null),
@@ -85,9 +104,7 @@ fn run_node(
             "http_request" => HttpAction::new(http.clone())
                 .execute(&node.params)
                 .map_err(|e| e.to_string()),
-            other => Err(format!(
-                "action `{other}` non supportée par le worker (connecteurs à venir)"
-            )),
+            other => dispatch_action(other, &node.params, http, resolver),
         },
         other => Err(format!(
             "node de type {other:?} non exécutable par le runner"
@@ -149,8 +166,10 @@ impl Handler for RunExecutor {
 
         // Exécution **synchrone + bloquante** du moteur, hors runtime tokio.
         let http = self.http.clone();
+        let resolver = Arc::clone(&self.resolver);
         let report = match tokio::task::spawn_blocking(move || {
-            let runner = move |node: &Node, ctx: &RunContext| run_node(node, ctx, &http);
+            let runner =
+                move |node: &Node, ctx: &RunContext| run_node(node, ctx, &http, resolver.as_ref());
             Engine::new().run(&dag, &runner)
         })
         .await

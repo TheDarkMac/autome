@@ -48,7 +48,9 @@ use async_trait::async_trait;
 use autome_core::{Delivery, Nack, Queue, Result};
 use tokio::task::JoinHandle;
 
+pub mod dispatch;
 pub mod executor;
+pub use dispatch::{CredentialResolver, EnvCredentialResolver};
 pub use executor::RunExecutor;
 
 /// Verdict que retourne un [`Handler`] après traitement.
