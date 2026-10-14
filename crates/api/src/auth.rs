@@ -28,6 +28,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use autome_core::{
     has_permission, AuditEvent, AuditOutcome, AuditSink, Claims, Config, InMemoryPermissionStore,
     InMemoryRevocationStore, NoopAuditSink, PermissionStore, RevocationStore, TokenService,
+    PERM_WILDCARD,
 };
 use axum::{
     extract::{FromRef, FromRequestParts},
@@ -181,6 +182,51 @@ impl AuthState {
             Ok(())
         } else {
             Err(AuthError::Forbidden(needed.to_string()))
+        }
+    }
+    /// Périmètre de ressources de `user` : [`OwnerScope::All`] s'il détient le
+    /// wildcard `*` (super-admin), sinon ses seules ressources. À appeler
+    /// **après** [`Self::require_permission`] (qui, lui, audite la décision).
+    pub async fn owner_scope(&self, user: &AuthenticatedUser) -> Result<OwnerScope, AuthError> {
+        let perms = self
+            .permissions
+            .permissions_for(user.user_id())
+            .await
+            .map_err(|e| AuthError::Internal(e.to_string()))?;
+        Ok(if perms.contains(PERM_WILDCARD) {
+            OwnerScope::All
+        } else {
+            OwnerScope::Owner(user.user_id().to_string())
+        })
+    }
+}
+
+/// Accès d'un utilisateur à une ressource possédée (workflow, run) — backlog
+/// BOLA. Les permissions RBAC disent *quoi* on peut faire ; l'ownership dit
+/// *sur quoi*.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OwnerScope {
+    /// Super-admin (`*`) : toutes les ressources, y compris sans propriétaire.
+    All,
+    /// Utilisateur ordinaire : uniquement ses ressources (`owner_id == sub`).
+    Owner(String),
+}
+
+impl OwnerScope {
+    /// `true` si une ressource de propriétaire `owner` est dans le périmètre.
+    /// Une ressource sans propriétaire (`None`) n'est visible que de [`Self::All`].
+    pub fn allows(&self, owner: Option<&str>) -> bool {
+        match self {
+            OwnerScope::All => true,
+            OwnerScope::Owner(me) => owner == Some(me.as_str()),
+        }
+    }
+
+    /// Filtre propriétaire à passer aux stores (`None` = pas de filtre).
+    pub fn filter(&self) -> Option<&str> {
+        match self {
+            OwnerScope::All => None,
+            OwnerScope::Owner(me) => Some(me),
         }
     }
 }

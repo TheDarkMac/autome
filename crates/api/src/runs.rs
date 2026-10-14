@@ -11,6 +11,12 @@
 //! Toutes les routes sont protégées par [`crate::auth::AuthenticatedUser`]
 //! + check `require_permission`. Chaque appel enregistre un event audit
 //!   `runs.<verb>` (actor = user_id, resource = run_id / workflow_id).
+//!
+//! **Isolation par propriétaire** (backlog BOLA) : un run appartient au
+//! propriétaire de son workflow au moment du dispatch (`RunCheckpoint::owner_id`).
+//! Démarrer un run sur le workflow d'autrui ou lire le run d'autrui répond 404 ;
+//! la liste ne contient que les runs de l'appelant (vide pour le workflow
+//! d'autrui, comme pour un workflow inconnu). Super-admin (`*`) : tout.
 
 use std::sync::Arc;
 
@@ -185,13 +191,22 @@ pub async fn create_run(
         .require_permission(&user, PERM_RUNS_EXECUTE)
         .await?;
 
-    // 1. Vérifie que le workflow existe — sinon 404.
-    let exists = state
+    // 1. Vérifie que le workflow existe et appartient à l'appelant — sinon 404
+    //    (le workflow d'autrui est traité comme inconnu).
+    let id = WorkflowId::new(&workflow_id);
+    let scope = state.auth.owner_scope(&user).await?;
+    let owner = state
         .workflows
-        .get(&WorkflowId::new(&workflow_id))
+        .owner_of(&id)
         .await
-        .map_err(|e| RunError::Internal(e.to_string()))?
-        .is_some();
+        .map_err(|e| RunError::Internal(e.to_string()))?;
+    let exists = scope.allows(owner.as_deref())
+        && state
+            .workflows
+            .get(&id)
+            .await
+            .map_err(|e| RunError::Internal(e.to_string()))?
+            .is_some();
     if !exists {
         audit_event(
             &state,
@@ -215,6 +230,9 @@ pub async fn create_run(
         trigger_type: "manual".into(),
         payload: body.payload,
         now_ms,
+        // Le run appartient au propriétaire du workflow, même s'il est
+        // déclenché par un super-admin.
+        owner_id: owner,
     };
     let outcome = state
         .dispatcher
@@ -260,12 +278,25 @@ pub async fn get_run(
     Path(run_id): Path<String>,
 ) -> Result<Json<RunCheckpoint>, RunError> {
     state.auth.require_permission(&user, PERM_RUNS_READ).await?;
+    let scope = state.auth.owner_scope(&user).await?;
     match state
         .runs
         .load(&run_id)
         .await
         .map_err(|e| RunError::Internal(e.to_string()))?
     {
+        // Run d'autrui : même réponse qu'un run inconnu.
+        Some(snap) if !scope.allows(snap.owner_id.as_deref()) => {
+            audit_event(
+                &state,
+                user.user_id(),
+                "runs.get",
+                &run_id,
+                AuditOutcome::Denied,
+            )
+            .await;
+            Err(RunError::NotFound(format!("run '{run_id}' inconnu")))
+        }
         Some(snap) => {
             audit_event(
                 &state,
@@ -318,9 +349,10 @@ pub async fn list_runs(
         offset: q.offset.unwrap_or(0),
         limit: q.limit.unwrap_or(50),
     };
+    let scope = state.auth.owner_scope(&user).await?;
     let RunListPage { items, total } = state
         .runs
-        .list_by_workflow(&workflow_id, paging)
+        .list_by_workflow(&workflow_id, scope.filter(), paging)
         .await
         .map_err(|e| RunError::Internal(e.to_string()))?;
     audit_event(
@@ -455,7 +487,10 @@ mod tests {
     async fn create_run_returns_202_and_run_id_when_workflow_exists() {
         let (state, svc, perms, _, workflows, runs_store) = make_test_state();
         perms.assign_role("alice", &Role::editor()).unwrap();
-        workflows.create(sample_workflow("wf-1")).await.unwrap();
+        workflows
+            .create(sample_workflow("wf-1"), Some("alice"))
+            .await
+            .unwrap();
         let token = svc.issue_access("alice", 900, FIXED_NOW).unwrap();
         let app = runs_router(state);
         let response = app
@@ -477,7 +512,10 @@ mod tests {
     async fn create_run_with_no_body_uses_defaults() {
         let (state, svc, perms, _, workflows, _) = make_test_state();
         perms.assign_role("alice", &Role::editor()).unwrap();
-        workflows.create(sample_workflow("wf-1")).await.unwrap();
+        workflows
+            .create(sample_workflow("wf-1"), Some("alice"))
+            .await
+            .unwrap();
         let token = svc.issue_access("alice", 900, FIXED_NOW).unwrap();
         let app = runs_router(state);
         let response = app
@@ -509,7 +547,10 @@ mod tests {
     async fn create_run_passes_payload_to_dispatcher() {
         let (state, svc, perms, _, workflows, runs_store) = make_test_state();
         perms.assign_role("alice", &Role::editor()).unwrap();
-        workflows.create(sample_workflow("wf-1")).await.unwrap();
+        workflows
+            .create(sample_workflow("wf-1"), Some("alice"))
+            .await
+            .unwrap();
         let token = svc.issue_access("alice", 900, FIXED_NOW).unwrap();
         let app = runs_router(state);
         let _ = app
@@ -533,7 +574,8 @@ mod tests {
     async fn get_run_returns_200_when_exists() {
         let (state, svc, perms, _, _, runs_store) = make_test_state();
         perms.assign_role("alice", &Role::viewer()).unwrap();
-        let snap = autome_core::RunCheckpoint::queued("r-1", "wf-1", 1, "manual", 1000);
+        let snap = autome_core::RunCheckpoint::queued("r-1", "wf-1", 1, "manual", 1000)
+            .with_owner(Some("alice".into()));
         runs_store.checkpoint(&snap).await.unwrap();
         let token = svc.issue_access("alice", 900, FIXED_NOW).unwrap();
         let app = runs_router(state);
@@ -567,11 +609,13 @@ mod tests {
         let (state, svc, perms, _, _, runs_store) = make_test_state();
         perms.assign_role("alice", &Role::viewer()).unwrap();
         for (id, created) in [("old", 100), ("new", 300), ("mid", 200)] {
-            let snap = autome_core::RunCheckpoint::queued(id, "wf-1", 1, "manual", created);
+            let snap = autome_core::RunCheckpoint::queued(id, "wf-1", 1, "manual", created)
+                .with_owner(Some("alice".into()));
             runs_store.checkpoint(&snap).await.unwrap();
         }
         // Run d'un autre workflow, doit être filtré.
-        let other = autome_core::RunCheckpoint::queued("other", "wf-2", 1, "manual", 500);
+        let other = autome_core::RunCheckpoint::queued("other", "wf-2", 1, "manual", 500)
+            .with_owner(Some("alice".into()));
         runs_store.checkpoint(&other).await.unwrap();
         let token = svc.issue_access("alice", 900, FIXED_NOW).unwrap();
         let app = runs_router(state);
@@ -602,7 +646,8 @@ mod tests {
                 1,
                 "manual",
                 1000 - i as i64,
-            );
+            )
+            .with_owner(Some("alice".into()));
             runs_store.checkpoint(&snap).await.unwrap();
         }
         let token = svc.issue_access("alice", 900, FIXED_NOW).unwrap();
@@ -647,7 +692,10 @@ mod tests {
         // Viewer n'a pas runs.execute → 403 (workflows.read seul ne suffit pas).
         let (state, svc, perms, _, workflows, _) = make_test_state();
         perms.assign_role("alice", &Role::viewer()).unwrap();
-        workflows.create(sample_workflow("wf-1")).await.unwrap();
+        workflows
+            .create(sample_workflow("wf-1"), Some("alice"))
+            .await
+            .unwrap();
         let token = svc.issue_access("alice", 900, FIXED_NOW).unwrap();
         let app = runs_router(state);
         let response = app
@@ -676,7 +724,10 @@ mod tests {
     async fn create_run_records_audit_event_with_run_id() {
         let (state, svc, perms, audit, workflows, _) = make_test_state();
         perms.assign_role("alice", &Role::editor()).unwrap();
-        workflows.create(sample_workflow("wf-1")).await.unwrap();
+        workflows
+            .create(sample_workflow("wf-1"), Some("alice"))
+            .await
+            .unwrap();
         let token = svc.issue_access("alice", 900, FIXED_NOW).unwrap();
         let app = runs_router(state);
         let _ = app
@@ -731,5 +782,177 @@ mod tests {
             .find(|e| e.action == "runs.list")
             .expect("runs.list event présent");
         assert_eq!(evt.resource.as_deref(), Some("wf-1"));
+    }
+
+    // ───── Backlog BOLA — isolation par propriétaire ─────
+
+    #[tokio::test]
+    async fn run_inherits_the_workflow_owner() {
+        let (state, svc, perms, _, workflows, runs_store) = make_test_state();
+        perms.assign_role("alice", &Role::editor()).unwrap();
+        workflows
+            .create(sample_workflow("wf-1"), Some("alice"))
+            .await
+            .unwrap();
+        let token = svc.issue_access("alice", 900, FIXED_NOW).unwrap();
+        let response = runs_router(state)
+            .oneshot(auth_req("POST", "/workflows/wf-1/runs", &token, Some("{}")))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let snap = runs_store.load("fixed-run").await.unwrap().unwrap();
+        assert_eq!(snap.owner_id.as_deref(), Some("alice"));
+    }
+
+    #[tokio::test]
+    async fn cannot_start_a_run_on_someone_elses_workflow() {
+        let (state, svc, perms, audit, workflows, runs_store) = make_test_state();
+        perms.assign_role("bob", &Role::editor()).unwrap();
+        workflows
+            .create(sample_workflow("wf-1"), Some("alice"))
+            .await
+            .unwrap();
+        let token = svc.issue_access("bob", 900, FIXED_NOW).unwrap();
+        let response = runs_router(state)
+            .oneshot(auth_req("POST", "/workflows/wf-1/runs", &token, Some("{}")))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert!(runs_store.load("fixed-run").await.unwrap().is_none());
+        let events = audit.list().await.unwrap();
+        assert!(events
+            .iter()
+            .any(|e| e.action == "runs.create" && e.outcome == AuditOutcome::Failure));
+    }
+
+    #[tokio::test]
+    async fn cannot_read_someone_elses_run() {
+        let (state, svc, perms, audit, _, runs_store) = make_test_state();
+        perms.assign_role("bob", &Role::viewer()).unwrap();
+        let snap = autome_core::RunCheckpoint::queued("r-1", "wf-1", 1, "manual", 1000)
+            .with_owner(Some("alice".into()));
+        runs_store.checkpoint(&snap).await.unwrap();
+        let token = svc.issue_access("bob", 900, FIXED_NOW).unwrap();
+        let response = runs_router(state)
+            .oneshot(auth_req("GET", "/runs/r-1", &token, None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert!(!body_string(response).await.contains("alice"));
+        let events = audit.list().await.unwrap();
+        assert!(events
+            .iter()
+            .any(|e| e.action == "runs.get" && e.outcome == AuditOutcome::Denied));
+    }
+
+    #[tokio::test]
+    async fn run_without_owner_is_only_visible_to_super_admin() {
+        let (state, svc, perms, _, _, runs_store) = make_test_state();
+        perms.assign_role("alice", &Role::viewer()).unwrap();
+        perms.assign_role("root", &Role::super_admin()).unwrap();
+        let legacy = autome_core::RunCheckpoint::queued("r-legacy", "wf-1", 1, "manual", 1);
+        runs_store.checkpoint(&legacy).await.unwrap();
+        let app = runs_router(state);
+        let alice = svc.issue_access("alice", 900, FIXED_NOW).unwrap();
+        let root = svc.issue_access("root", 900, FIXED_NOW).unwrap();
+        let r = app
+            .clone()
+            .oneshot(auth_req("GET", "/runs/r-legacy", &alice, None))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::NOT_FOUND);
+        let r = app
+            .oneshot(auth_req("GET", "/runs/r-legacy", &root, None))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn listing_shows_only_the_callers_runs() {
+        let (state, svc, perms, _, _, runs_store) = make_test_state();
+        perms.assign_role("bob", &Role::viewer()).unwrap();
+        perms.assign_role("root", &Role::super_admin()).unwrap();
+        for (id, owner) in [("a1", "alice"), ("a2", "alice"), ("b1", "bob")] {
+            let snap = autome_core::RunCheckpoint::queued(id, "wf-1", 1, "manual", 1)
+                .with_owner(Some(owner.into()));
+            runs_store.checkpoint(&snap).await.unwrap();
+        }
+        let app = runs_router(state);
+        let bob = svc.issue_access("bob", 900, FIXED_NOW).unwrap();
+        let body: serde_json::Value = serde_json::from_str(
+            &body_string(
+                app.clone()
+                    .oneshot(auth_req("GET", "/workflows/wf-1/runs", &bob, None))
+                    .await
+                    .unwrap(),
+            )
+            .await,
+        )
+        .unwrap();
+        assert_eq!(body["total"], 1);
+        assert_eq!(body["items"][0]["run_id"], "b1");
+
+        let root = svc.issue_access("root", 900, FIXED_NOW).unwrap();
+        let body: serde_json::Value = serde_json::from_str(
+            &body_string(
+                app.oneshot(auth_req("GET", "/workflows/wf-1/runs", &root, None))
+                    .await
+                    .unwrap(),
+            )
+            .await,
+        )
+        .unwrap();
+        assert_eq!(body["total"], 3, "super-admin : tous les runs");
+    }
+
+    #[tokio::test]
+    async fn recreated_workflow_does_not_expose_previous_owners_runs() {
+        let (state, svc, perms, _, workflows, runs_store) = make_test_state();
+        perms.assign_role("bob", &Role::editor()).unwrap();
+        // Run d'alice sur `wf-1`, puis `wf-1` supprimé et recréé par bob.
+        let old = autome_core::RunCheckpoint::queued("r-alice", "wf-1", 1, "manual", 1)
+            .with_owner(Some("alice".into()));
+        runs_store.checkpoint(&old).await.unwrap();
+        workflows
+            .create(sample_workflow("wf-1"), Some("bob"))
+            .await
+            .unwrap();
+        let app = runs_router(state);
+        let bob = svc.issue_access("bob", 900, FIXED_NOW).unwrap();
+        let list: serde_json::Value = serde_json::from_str(
+            &body_string(
+                app.clone()
+                    .oneshot(auth_req("GET", "/workflows/wf-1/runs", &bob, None))
+                    .await
+                    .unwrap(),
+            )
+            .await,
+        )
+        .unwrap();
+        assert_eq!(list["total"], 0);
+        let r = app
+            .oneshot(auth_req("GET", "/runs/r-alice", &bob, None))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn super_admin_run_on_users_workflow_belongs_to_the_owner() {
+        let (state, svc, perms, _, workflows, runs_store) = make_test_state();
+        perms.assign_role("root", &Role::super_admin()).unwrap();
+        workflows
+            .create(sample_workflow("wf-1"), Some("alice"))
+            .await
+            .unwrap();
+        let root = svc.issue_access("root", 900, FIXED_NOW).unwrap();
+        let r = runs_router(state)
+            .oneshot(auth_req("POST", "/workflows/wf-1/runs", &root, Some("{}")))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::ACCEPTED);
+        let snap = runs_store.load("fixed-run").await.unwrap().unwrap();
+        assert_eq!(snap.owner_id.as_deref(), Some("alice"));
     }
 }
