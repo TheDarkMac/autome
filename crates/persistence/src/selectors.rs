@@ -8,7 +8,7 @@ use std::sync::Arc;
 use autome_connectors::oauth::{ConnectorTokenStore, InMemoryConnectorTokenStore};
 use autome_core::{
     Config, EnvelopeCipher, Error, InMemoryKeyProvider, InMemoryQueue, InMemoryRunStateStore,
-    InMemoryWorkflowRepository, Queue, Result, RunStateStore, WorkflowRepository,
+    InMemoryWorkflowRepository, Profile, Queue, Result, RunStateStore, WorkflowRepository,
 };
 use sha2::{Digest, Sha256};
 
@@ -66,6 +66,38 @@ impl QueueMode {
             ))),
         }
     }
+}
+
+/// Refuse les backends **éphémères** en profil `prod` (API et worker).
+///
+/// En `memory`, chaque process a sa propre file et ses propres stores : l'API
+/// publie les runs sur une file que le worker ne voit pas (runs bloqués en
+/// `queued`), et comptes, workflows et tokens sont perdus au redémarrage et
+/// jamais partagés entre répliques. Un `prod` en mémoire est donc toujours une
+/// erreur de configuration ; le profil `dev` reste libre.
+pub fn ensure_durable_backends(
+    profile: Profile,
+    persistence: PersistenceMode,
+    queue: QueueMode,
+) -> Result<()> {
+    if profile != Profile::Prod {
+        return Ok(());
+    }
+    let mut missing = Vec::new();
+    if persistence == PersistenceMode::Memory {
+        missing.push("AUTOME_PERSISTENCE=postgres");
+    }
+    if queue == QueueMode::Memory {
+        missing.push("AUTOME_QUEUE=rabbitmq");
+    }
+    if missing.is_empty() {
+        return Ok(());
+    }
+    Err(Error::Invalid(format!(
+        "profil prod : backends in-memory refusés (état perdu au redémarrage, \
+         non partagé entre l'API, le worker et leurs répliques) — positionner {}",
+        missing.join(" et ")
+    )))
 }
 
 /// Construit la file selon le `mode`. En `Rabbitmq`, se connecte au broker
@@ -148,6 +180,47 @@ mod tests {
     async fn build_queue_memory_does_not_touch_network() {
         let config = Config::load(|_| None).unwrap();
         let _q = build_queue(&config, QueueMode::Memory).await.unwrap();
+    }
+
+    #[test]
+    fn dev_profile_accepts_in_memory_backends() {
+        ensure_durable_backends(Profile::Dev, PersistenceMode::Memory, QueueMode::Memory).unwrap();
+    }
+
+    #[test]
+    fn prod_profile_accepts_durable_backends() {
+        ensure_durable_backends(
+            Profile::Prod,
+            PersistenceMode::Postgres,
+            QueueMode::Rabbitmq,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn prod_profile_rejects_each_in_memory_backend_naming_the_variable() {
+        let err =
+            ensure_durable_backends(Profile::Prod, PersistenceMode::Memory, QueueMode::Rabbitmq)
+                .unwrap_err()
+                .to_string();
+        assert!(err.contains("AUTOME_PERSISTENCE=postgres"), "{err}");
+        assert!(!err.contains("AUTOME_QUEUE"), "{err}");
+
+        let err =
+            ensure_durable_backends(Profile::Prod, PersistenceMode::Postgres, QueueMode::Memory)
+                .unwrap_err()
+                .to_string();
+        assert!(err.contains("AUTOME_QUEUE=rabbitmq"), "{err}");
+        assert!(!err.contains("AUTOME_PERSISTENCE"), "{err}");
+
+        let err =
+            ensure_durable_backends(Profile::Prod, PersistenceMode::Memory, QueueMode::Memory)
+                .unwrap_err()
+                .to_string();
+        assert!(
+            err.contains("AUTOME_PERSISTENCE=postgres et AUTOME_QUEUE=rabbitmq"),
+            "{err}"
+        );
     }
 
     fn config_with_key(key: &'static str) -> Config {

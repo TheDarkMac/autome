@@ -33,7 +33,7 @@ pub use revocation::PgRevocationStore;
 pub use run_state::PgRunStateStore;
 pub use selectors::{
     build_connector_token_store, build_queue, build_run_state_store, build_workflow_repository,
-    connector_cipher, PersistenceMode, QueueMode,
+    connector_cipher, ensure_durable_backends, PersistenceMode, QueueMode,
 };
 pub use users::PgUserStore;
 pub use workflow_repo::PgWorkflowRepository;

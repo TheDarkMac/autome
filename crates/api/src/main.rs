@@ -14,14 +14,14 @@ use autome_api::credentials::{credentials_router, CredentialsState};
 use autome_api::metrics::{metrics_router, with_metrics, Metrics};
 use autome_api::runs::{runs_router, RunsState};
 use autome_api::runtime::{
-    build_backends, build_queue, migrate, migrate_on_boot_requested, Backends, PersistenceMode,
-    QueueMode,
+    build_backends, build_queue, ensure_durable_backends, migrate, migrate_on_boot_requested,
+    Backends, PersistenceMode, QueueMode,
 };
 use autome_api::tls::load_rustls_config;
 use autome_api::workflows::{
     create_workflow, delete_workflow, get_workflow, list_workflows, update_workflow, WorkflowsState,
 };
-use autome_core::{Argon2PasswordHasher, Config, Profile};
+use autome_core::{Argon2PasswordHasher, Config};
 use axum::{routing::get, Router};
 
 /// Handler de la sonde de santé.
@@ -91,6 +91,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // les stores d'auth à PostgreSQL ; défaut `memory` (dev/tests/single-node).
     // Le secret JWT vient toujours de `config.jwt_secret` (constat 1).
     let mode = PersistenceMode::from_env()?;
+    let queue_mode = QueueMode::from_env()?;
+    // Garde prod (#172) : refus de démarrer en `prod` sur des backends in-memory
+    // (l'état serait perdu et invisible du worker).
+    ensure_durable_backends(config.profile, mode, queue_mode)?;
 
     // Runner de migrations (dette #107) : en mode `postgres` avec
     // `AUTOME_MIGRATE=1`, applique les migrations manquantes au démarrage
@@ -102,24 +106,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // File de messages (dette #107) : `AUTOME_QUEUE=rabbitmq` se connecte au
     // broker (`QUEUE_URL`) ; défaut `memory`. Le dispatcher de runs publie dessus.
-    let queue_mode = QueueMode::from_env()?;
     let queue = build_queue(&config, queue_mode).await?;
     println!("autome-api : file = {queue_mode:?}");
 
     let backends = build_backends(&config, mode, queue)?;
     println!("autome-api : persistance = {mode:?}");
-
-    // Garde prod (dette #107, constat 4) : en in-memory, l'état (révocations/
-    // permissions/audit) n'est ni persisté ni partagé entre répliques. On le
-    // signale fort plutôt que de refuser le démarrage (l'image prod resterait
-    // bootable). En prod, positionner `AUTOME_PERSISTENCE=postgres`.
-    if config.profile == Profile::Prod && mode == PersistenceMode::Memory {
-        eprintln!(
-            "AVERTISSEMENT (prod) : stores in-memory — état non persisté ni \
-             partagé entre répliques. Positionnez AUTOME_PERSISTENCE=postgres \
-             (cf. dette #107)."
-        );
-    }
 
     let accounts = accounts_state(&backends)?;
     let metrics = Arc::new(Metrics::new());
