@@ -13,6 +13,12 @@
 //! Toutes les routes sont protégées par [`crate::auth::AuthenticatedUser`].
 //! Chaque appel enregistre un event audit `workflows.<verb>` via
 //! [`autome_core::AuditSink`] avec actor + resource = workflow_id.
+//!
+//! **Isolation par propriétaire** (backlog BOLA) : un workflow appartient à
+//! l'utilisateur qui l'a créé. La liste est filtrée sur lui ; lire, modifier
+//! ou supprimer le workflow d'un autre répond **comme s'il n'existait pas**
+//! (404, ou 204 pour le DELETE idempotent) — pas de 403 qui confirmerait son
+//! existence. Seul un super-admin (`*`) voit tous les workflows.
 
 use std::sync::Arc;
 
@@ -30,7 +36,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use utoipa::{IntoParams, ToSchema};
 
-use crate::auth::{AuthError, AuthState, AuthenticatedUser};
+use crate::auth::{AuthError, AuthState, AuthenticatedUser, OwnerScope};
 
 /// État partagé par les handlers workflows : auth + repo + audit.
 #[derive(Clone)]
@@ -116,6 +122,26 @@ impl IntoResponse for WorkflowError {
     }
 }
 
+/// `true` si `user` peut accéder au workflow `id` : il en est propriétaire, ou
+/// il est super-admin. Un workflow inconnu est inaccessible à un utilisateur
+/// ordinaire (même réponse qu'un workflow d'autrui).
+async fn can_access(
+    state: &WorkflowsState,
+    user: &AuthenticatedUser,
+    id: &str,
+) -> Result<bool, WorkflowError> {
+    let scope = state.auth.owner_scope(user).await?;
+    if scope == OwnerScope::All {
+        return Ok(true);
+    }
+    let owner = state
+        .repo
+        .owner_of(&WorkflowId::new(id))
+        .await
+        .map_err(|e| WorkflowError::Internal(e.to_string()))?;
+    Ok(scope.allows(owner.as_deref()))
+}
+
 async fn audit_event(
     state: &WorkflowsState,
     actor: &str,
@@ -156,9 +182,10 @@ pub async fn list_workflows(
         offset: q.offset.unwrap_or(0),
         limit: q.limit.unwrap_or(50),
     };
+    let scope = state.auth.owner_scope(&user).await?;
     let WorkflowPage { items, total } = state
         .repo
-        .list(paging)
+        .list(scope.filter(), paging)
         .await
         .map_err(|e| WorkflowError::Internal(e.to_string()))?;
     audit_event(
@@ -201,7 +228,12 @@ pub async fn create_workflow(
         .require_permission(&user, PERM_WORKFLOWS_WRITE)
         .await?;
     let workflow_id = workflow.id.0.clone();
-    match state.repo.create(workflow.clone()).await {
+    // Le créateur devient propriétaire (y compris un super-admin).
+    match state
+        .repo
+        .create(workflow.clone(), Some(user.user_id()))
+        .await
+    {
         Ok(()) => {
             audit_event(
                 &state,
@@ -255,6 +287,17 @@ pub async fn get_workflow(
         .auth
         .require_permission(&user, PERM_WORKFLOWS_READ)
         .await?;
+    if !can_access(&state, &user, &id).await? {
+        audit_event(
+            &state,
+            user.user_id(),
+            "workflows.get",
+            &id,
+            AuditOutcome::Denied,
+        )
+        .await;
+        return Err(WorkflowError::NotFound(format!("workflow '{id}' inconnu")));
+    }
     match state
         .repo
         .get(&WorkflowId::new(&id))
@@ -319,6 +362,19 @@ pub async fn update_workflow(
             workflow.id.0
         )));
     }
+    if !can_access(&state, &user, &id).await? {
+        audit_event(
+            &state,
+            user.user_id(),
+            "workflows.update",
+            &id,
+            AuditOutcome::Denied,
+        )
+        .await;
+        return Err(WorkflowError::NotFound(format!(
+            "workflow : id '{id}' inconnu"
+        )));
+    }
     match state.repo.update(workflow.clone()).await {
         Ok(()) => {
             audit_event(
@@ -372,6 +428,19 @@ pub async fn delete_workflow(
         .auth
         .require_permission(&user, PERM_WORKFLOWS_WRITE)
         .await?;
+    // Workflow d'autrui : 204 sans rien supprimer — même réponse qu'un id
+    // inconnu (DELETE idempotent), l'existence n'est pas révélée.
+    if !can_access(&state, &user, &id).await? {
+        audit_event(
+            &state,
+            user.user_id(),
+            "workflows.delete",
+            &id,
+            AuditOutcome::Denied,
+        )
+        .await;
+        return Ok(StatusCode::NO_CONTENT);
+    }
     let _existed = state
         .repo
         .delete(&WorkflowId::new(&id))
@@ -539,7 +608,9 @@ mod tests {
     async fn get_returns_200_when_workflow_exists() {
         let (state, svc, perms, _, repo) = make_test_state();
         perms.assign_role("alice", &Role::viewer()).unwrap();
-        repo.create(sample_workflow("wf-1")).await.unwrap();
+        repo.create(sample_workflow("wf-1"), Some("alice"))
+            .await
+            .unwrap();
         let token = svc.issue_access("alice", 900, FIXED_NOW).unwrap();
         let app = workflows_router(state);
         let response = app
@@ -568,7 +639,9 @@ mod tests {
     async fn update_returns_200_with_updated_workflow() {
         let (state, svc, perms, _, repo) = make_test_state();
         perms.assign_role("alice", &Role::editor()).unwrap();
-        repo.create(sample_workflow("wf-1")).await.unwrap();
+        repo.create(sample_workflow("wf-1"), Some("alice"))
+            .await
+            .unwrap();
         let token = svc.issue_access("alice", 900, FIXED_NOW).unwrap();
         let app = workflows_router(state);
         let mut new_payload = sample_workflow_json("wf-1");
@@ -597,7 +670,9 @@ mod tests {
     async fn delete_returns_204_and_removes_workflow() {
         let (state, svc, perms, _, repo) = make_test_state();
         perms.assign_role("alice", &Role::editor()).unwrap();
-        repo.create(sample_workflow("wf-1")).await.unwrap();
+        repo.create(sample_workflow("wf-1"), Some("alice"))
+            .await
+            .unwrap();
         let token = svc.issue_access("alice", 900, FIXED_NOW).unwrap();
         let app = workflows_router(state);
         let response = app
@@ -614,7 +689,9 @@ mod tests {
     async fn create_duplicate_returns_409() {
         let (state, svc, perms, _, repo) = make_test_state();
         perms.assign_role("alice", &Role::editor()).unwrap();
-        repo.create(sample_workflow("wf-1")).await.unwrap();
+        repo.create(sample_workflow("wf-1"), Some("alice"))
+            .await
+            .unwrap();
         let token = svc.issue_access("alice", 900, FIXED_NOW).unwrap();
         let app = workflows_router(state);
         let payload = sample_workflow_json("wf-1").to_string();
@@ -643,7 +720,9 @@ mod tests {
     async fn update_with_mismatched_id_returns_400() {
         let (state, svc, perms, _, repo) = make_test_state();
         perms.assign_role("alice", &Role::editor()).unwrap();
-        repo.create(sample_workflow("wf-1")).await.unwrap();
+        repo.create(sample_workflow("wf-1"), Some("alice"))
+            .await
+            .unwrap();
         let token = svc.issue_access("alice", 900, FIXED_NOW).unwrap();
         let app = workflows_router(state);
         // body id != path id
@@ -739,7 +818,7 @@ mod tests {
         let (state, svc, perms, _, repo) = make_test_state();
         perms.assign_role("alice", &Role::editor()).unwrap();
         for i in 0..5 {
-            repo.create(sample_workflow(&format!("wf-{i}")))
+            repo.create(sample_workflow(&format!("wf-{i}")), Some("alice"))
                 .await
                 .unwrap();
         }
@@ -755,5 +834,171 @@ mod tests {
         assert_eq!(body["items"].as_array().unwrap().len(), 2);
         assert_eq!(body["offset"], 2);
         assert_eq!(body["limit"], 2);
+    }
+
+    // ───── Backlog BOLA — isolation par propriétaire ─────
+
+    /// État avec alice et bob (editor) + root (super-admin), et `wf-a`
+    /// appartenant à alice.
+    async fn two_users() -> (
+        Router,
+        TokenService,
+        Arc<InMemoryAuditSink>,
+        Arc<dyn WorkflowRepository + Send + Sync>,
+    ) {
+        let (state, svc, perms, audit, repo) = make_test_state();
+        perms.assign_role("alice", &Role::editor()).unwrap();
+        perms.assign_role("bob", &Role::editor()).unwrap();
+        perms.assign_role("root", &Role::super_admin()).unwrap();
+        repo.create(sample_workflow("wf-a"), Some("alice"))
+            .await
+            .unwrap();
+        (workflows_router(state), svc, audit, repo)
+    }
+
+    fn token(svc: &TokenService, sub: &str) -> String {
+        svc.issue_access(sub, 900, FIXED_NOW).unwrap()
+    }
+
+    #[tokio::test]
+    async fn create_records_the_caller_as_owner() {
+        let (state, svc, perms, _, repo) = make_test_state();
+        perms.assign_role("alice", &Role::editor()).unwrap();
+        let payload = sample_workflow_json("wf-new").to_string();
+        let r = workflows_router(state)
+            .oneshot(auth_req("POST", "/", &token(&svc, "alice"), Some(&payload)))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::CREATED);
+        assert_eq!(
+            repo.owner_of(&WorkflowId::new("wf-new"))
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("alice")
+        );
+    }
+
+    #[tokio::test]
+    async fn list_only_returns_the_callers_workflows() {
+        let (app, svc, _, repo) = two_users().await;
+        repo.create(sample_workflow("wf-b"), Some("bob"))
+            .await
+            .unwrap();
+        repo.create(sample_workflow("wf-legacy"), None)
+            .await
+            .unwrap();
+        let ids = |body: String| -> Vec<String> {
+            let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+            v["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|w| w["id"].as_str().unwrap().to_string())
+                .collect()
+        };
+        let bob = app
+            .clone()
+            .oneshot(auth_req("GET", "/", &token(&svc, "bob"), None))
+            .await
+            .unwrap();
+        assert_eq!(ids(body_string(bob).await), vec!["wf-b"]);
+        let root = app
+            .oneshot(auth_req("GET", "/", &token(&svc, "root"), None))
+            .await
+            .unwrap();
+        assert_eq!(ids(body_string(root).await).len(), 3, "super-admin : tout");
+    }
+
+    #[tokio::test]
+    async fn cannot_read_someone_elses_workflow() {
+        let (app, svc, audit, _) = two_users().await;
+        let r = app
+            .clone()
+            .oneshot(auth_req("GET", "/wf-a", &token(&svc, "bob"), None))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::NOT_FOUND);
+        // Même réponse que pour un id inconnu : l'existence n'est pas révélée.
+        let unknown = app
+            .oneshot(auth_req("GET", "/wf-zzz", &token(&svc, "bob"), None))
+            .await
+            .unwrap();
+        assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            body_string(r).await.replace("wf-a", "ID"),
+            body_string(unknown).await.replace("wf-zzz", "ID")
+        );
+        let events = audit.list().await.unwrap();
+        assert!(events
+            .iter()
+            .any(|e| e.action == "workflows.get" && e.outcome == AuditOutcome::Denied));
+    }
+
+    #[tokio::test]
+    async fn cannot_update_someone_elses_workflow() {
+        let (app, svc, _, repo) = two_users().await;
+        let mut hijack = sample_workflow_json("wf-a");
+        hijack["name"] = serde_json::json!("pwned");
+        let r = app
+            .oneshot(auth_req(
+                "PUT",
+                "/wf-a",
+                &token(&svc, "bob"),
+                Some(&hijack.to_string()),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::NOT_FOUND);
+        let kept = repo.get(&WorkflowId::new("wf-a")).await.unwrap().unwrap();
+        assert_eq!(kept.name, "workflow wf-a");
+    }
+
+    #[tokio::test]
+    async fn cannot_delete_someone_elses_workflow() {
+        let (app, svc, audit, repo) = two_users().await;
+        let r = app
+            .oneshot(auth_req("DELETE", "/wf-a", &token(&svc, "bob"), None))
+            .await
+            .unwrap();
+        // 204 comme pour un id inconnu, mais rien n'est supprimé.
+        assert_eq!(r.status(), StatusCode::NO_CONTENT);
+        assert!(repo.get(&WorkflowId::new("wf-a")).await.unwrap().is_some());
+        let events = audit.list().await.unwrap();
+        assert!(events
+            .iter()
+            .any(|e| e.action == "workflows.delete" && e.outcome == AuditOutcome::Denied));
+    }
+
+    #[tokio::test]
+    async fn owner_and_super_admin_keep_full_access() {
+        let (app, svc, _, repo) = two_users().await;
+        for who in ["alice", "root"] {
+            let r = app
+                .clone()
+                .oneshot(auth_req("GET", "/wf-a", &token(&svc, who), None))
+                .await
+                .unwrap();
+            assert_eq!(r.status(), StatusCode::OK, "{who} doit lire wf-a");
+        }
+        let r = app
+            .oneshot(auth_req("DELETE", "/wf-a", &token(&svc, "root"), None))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::NO_CONTENT);
+        assert!(repo.get(&WorkflowId::new("wf-a")).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn workflow_without_owner_is_hidden_from_regular_users() {
+        let (app, svc, _, repo) = two_users().await;
+        repo.create(sample_workflow("wf-legacy"), None)
+            .await
+            .unwrap();
+        let r = app
+            .oneshot(auth_req("GET", "/wf-legacy", &token(&svc, "alice"), None))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::NOT_FOUND);
     }
 }

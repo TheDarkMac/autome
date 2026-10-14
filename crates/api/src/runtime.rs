@@ -11,17 +11,21 @@
 
 use std::sync::Arc;
 
-use autome_connectors::oauth::{InMemoryConnectorTokenStore, OAuthClient, OAuthRegistry};
-use autome_connectors::{CredentialService, OAuthCredentialService, ReqwestHttpClient};
+use autome_connectors::oauth::{
+    ConnectorTokenStore, InMemoryConnectorTokenStore, OAuthClient, OAuthRegistry,
+};
+use autome_connectors::{
+    CredentialService, EgressPolicy, OAuthCredentialService, ReqwestHttpClient,
+};
 use autome_core::{
-    Config, EnvelopeCipher, InMemoryKeyProvider, InMemoryRunStateStore, InMemoryWorkflowRepository,
-    Queue, QueueRunDispatcher, Result, RunDispatcher, RunStateStore, WorkflowRepository,
+    Config, InMemoryPermissionStore, InMemoryRevocationStore, InMemoryRunStateStore,
+    InMemoryUserStore, InMemoryWorkflowRepository, NoopAuditSink, Queue, QueueRunDispatcher,
+    Result, RunDispatcher, RunStateStore, UserStore, WorkflowRepository,
 };
 use autome_persistence::{
-    connect, run_migrations, PgAuditSink, PgPermissionStore, PgRevocationStore, PgRunStateStore,
-    PgWorkflowRepository,
+    connect, connector_cipher, run_migrations, PgAuditSink, PgConnectorTokenStore,
+    PgPermissionStore, PgRevocationStore, PgRunStateStore, PgUserStore, PgWorkflowRepository,
 };
-use sha2::{Digest, Sha256};
 
 use crate::auth::{token_service_from_config, AuthState};
 
@@ -29,17 +33,22 @@ use crate::auth::{token_service_from_config, AuthState};
 pub use autome_persistence::{build_queue, PersistenceMode, QueueMode};
 
 /// Construit le service de credentials OAuth (dette #107, constat 3) :
-/// transport HTTP **réel** ([`ReqwestHttpClient`]) + store de tokens **chiffré
-/// au repos** avec une clé dérivée de `config.encryption_key` (SHA-256 → 32 o).
+/// transport HTTP **réel** ([`ReqwestHttpClient`]) + `store` de tokens
+/// **chiffré au repos** ([`connector_cipher`] : clé dérivée de
+/// `config.encryption_key`) — en `postgres`, la table `connector_tokens` que le
+/// worker relit pour le propriétaire de chaque run.
 /// Le registre de providers est peuplé au démarrage depuis l'environnement
 /// (`AUTOME_OAUTH_PROVIDERS` + `AUTOME_OAUTH_<ID>_*`, #161) — vide en l'absence
 /// de config (OAuth alors indisponible) ; une config incomplète échoue (fail-fast).
-fn build_credential_service(config: &Config) -> Result<Arc<dyn CredentialService + Send + Sync>> {
-    let key: [u8; 32] = Sha256::digest(config.encryption_key.expose().as_bytes()).into();
-    let keys = InMemoryKeyProvider::new();
-    keys.add_key("v1", key, true).expect("clé de chiffrement");
-    let store = Arc::new(InMemoryConnectorTokenStore::new(EnvelopeCipher::new(keys)));
-    let oauth = OAuthClient::new(OAuthRegistry::from_env()?, ReqwestHttpClient::new());
+/// Le transport applique le filtre anti-SSRF : un endpoint OAuth interne (IdP
+/// on-prem) doit figurer dans `AUTOME_EGRESS_ALLOWLIST`.
+fn build_credential_service(
+    store: Arc<dyn ConnectorTokenStore + Send + Sync>,
+) -> Result<Arc<dyn CredentialService + Send + Sync>> {
+    let oauth = OAuthClient::new(
+        OAuthRegistry::from_env()?,
+        ReqwestHttpClient::with_policy(EgressPolicy::from_env()),
+    );
     Ok(Arc::new(OAuthCredentialService::new(oauth, store)))
 }
 
@@ -56,6 +65,9 @@ pub struct Backends {
     pub dispatcher: Arc<dyn RunDispatcher + Send + Sync>,
     /// Service de credentials OAuth (transport HTTP réel + store chiffré).
     pub credentials: Arc<dyn CredentialService + Send + Sync>,
+    /// Comptes utilisateurs (signup/login). Écrit dans le même store de
+    /// permissions que `auth`, sans quoi un compte créé n'aurait aucun droit.
+    pub users: Arc<dyn UserStore + Send + Sync>,
 }
 
 /// Assemble les backends. En `Postgres`, **un seul pool** est partagé par tous
@@ -71,12 +83,22 @@ pub fn build_backends(
             let runs: Arc<dyn RunStateStore + Send + Sync> = Arc::new(InMemoryRunStateStore::new());
             let dispatcher: Arc<dyn RunDispatcher + Send + Sync> =
                 Arc::new(QueueRunDispatcher::new(queue, runs.clone()));
+            let permissions = Arc::new(InMemoryPermissionStore::new());
+            let auth = AuthState::new(
+                token_service_from_config(config),
+                Arc::new(InMemoryRevocationStore::new()),
+                permissions.clone(),
+                Arc::new(NoopAuditSink),
+            );
             Ok(Backends {
-                auth: AuthState::from_config(config),
+                auth,
                 workflows: Arc::new(InMemoryWorkflowRepository::new()),
                 runs,
                 dispatcher,
-                credentials: build_credential_service(config)?,
+                credentials: build_credential_service(Arc::new(InMemoryConnectorTokenStore::new(
+                    connector_cipher(config),
+                )))?,
+                users: Arc::new(InMemoryUserStore::new(permissions)),
             })
         }
         PersistenceMode::Postgres => {
@@ -93,10 +115,14 @@ pub fn build_backends(
                 Arc::new(QueueRunDispatcher::new(queue, runs.clone()));
             Ok(Backends {
                 auth,
-                workflows: Arc::new(PgWorkflowRepository::new(pool)),
+                workflows: Arc::new(PgWorkflowRepository::new(pool.clone())),
                 runs,
                 dispatcher,
-                credentials: build_credential_service(config)?,
+                credentials: build_credential_service(Arc::new(PgConnectorTokenStore::new(
+                    pool.clone(),
+                    connector_cipher(config),
+                )))?,
+                users: Arc::new(PgUserStore::new(pool)),
             })
         }
     }
@@ -169,5 +195,57 @@ mod tests {
         })
         .expect("config prod");
         let _state = build_auth_state(&config, PersistenceMode::Postgres).unwrap();
+    }
+
+    /// Gaté par `TEST_DATABASE_URL` : en `postgres`, `/credentials/*` lit et
+    /// révoque les tokens dans la table partagée `connector_tokens` (celle que
+    /// le worker relit), plus dans un store propre au process.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn postgres_backends_use_the_shared_connector_tokens_table() {
+        let Some(url) = std::env::var("TEST_DATABASE_URL").ok() else {
+            eprintln!("TEST_DATABASE_URL absent → test PostgreSQL sauté");
+            return;
+        };
+        let config =
+            Config::load(move |k| (k == "DATABASE_URL").then(|| url.clone())).expect("config");
+        let pool = connect(&config.database_url).unwrap();
+        let ddl = autome_persistence::MIGRATIONS
+            .iter()
+            .find(|(name, _)| *name == "0011_connector_tokens.sql")
+            .map(|(_, sql)| *sql)
+            .unwrap();
+        pool.get()
+            .await
+            .unwrap()
+            .batch_execute(&format!("DROP TABLE IF EXISTS connector_tokens; {ddl}"))
+            .await
+            .unwrap();
+
+        // Un autre process (même ENCRYPTION_KEY) a enregistré le token.
+        let other_process =
+            autome_persistence::build_connector_token_store(&config, PersistenceMode::Postgres)
+                .unwrap();
+        let tokens = autome_connectors::oauth::TokenSet {
+            access_token: "xoxb-api-alice".into(),
+            refresh_token: None,
+            expires_at_ms: None,
+            token_type: "Bearer".into(),
+            scope: Some("chat:write".into()),
+        };
+        other_process.store("api-alice", "slack", &tokens).unwrap();
+
+        let queue = Arc::new(autome_core::InMemoryQueue::new());
+        let backends = build_backends(&config, PersistenceMode::Postgres, queue).unwrap();
+        let listed = backends.credentials.list_for_user("api-alice").unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].provider_id, "slack");
+        assert!(backends
+            .credentials
+            .list_for_user("api-bob")
+            .unwrap()
+            .is_empty());
+
+        backends.credentials.delete("api-alice", "slack").unwrap();
+        assert_eq!(other_process.load("api-alice", "slack").unwrap(), None);
     }
 }

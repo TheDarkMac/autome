@@ -366,13 +366,18 @@ pub async fn list_credentials(
         .auth
         .require_permission(&user, PERM_CREDENTIALS_MANAGE)
         .await?;
-    let items: Vec<CredentialDto> = state
-        .service
-        .list_for_user(user.user_id())
-        .map_err(|e| CredentialError::Internal(e.to_string()))?
-        .into_iter()
-        .map(Into::into)
-        .collect();
+    // Le store de tokens est synchrone (PostgreSQL ponté en bloquant) : hors
+    // du runtime async, comme l'échange OAuth du callback.
+    let service = state.service.clone();
+    let uid = user.user_id().to_string();
+    let items: Vec<CredentialDto> =
+        tokio::task::spawn_blocking(move || service.list_for_user(&uid))
+            .await
+            .map_err(|e| CredentialError::Internal(format!("tâche credentials annulée : {e}")))?
+            .map_err(|e| CredentialError::Internal(e.to_string()))?
+            .into_iter()
+            .map(Into::into)
+            .collect();
     audit_event(
         &state,
         user.user_id(),
@@ -406,9 +411,11 @@ pub async fn delete_credential(
         .auth
         .require_permission(&user, PERM_CREDENTIALS_MANAGE)
         .await?;
-    state
-        .service
-        .delete(user.user_id(), &provider_id)
+    let service = state.service.clone();
+    let (uid, pid) = (user.user_id().to_string(), provider_id.clone());
+    tokio::task::spawn_blocking(move || service.delete(&uid, &pid))
+        .await
+        .map_err(|e| CredentialError::Internal(format!("tâche credentials annulée : {e}")))?
         .map_err(|e| CredentialError::Internal(e.to_string()))?;
     audit_event(
         &state,

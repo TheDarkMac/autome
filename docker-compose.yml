@@ -77,6 +77,8 @@ services:
       APP_PROFILE: dev
       DATABASE_URL: postgres://postgres:postgres@db:5432/autome
       QUEUE_URL: amqp://guest:guest@queue:5672/
+      # Même clé que l'API : le worker déchiffre les tokens OAuth des connecteurs.
+      ENCRYPTION_KEY: dev-insecure-encryption-key
     depends_on:
       db:
         condition: service_healthy

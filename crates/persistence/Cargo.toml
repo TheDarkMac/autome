@@ -13,6 +13,13 @@ workspace = true
 
 [dependencies]
 autome-core = { workspace = true }
+# Trait `ConnectorTokenStore` + format d'enveloppe des tokens OAuth (backlog
+# post-audit : tokens de connecteurs par propriétaire).
+autome-connectors = { workspace = true }
+# Dérivation de la clé des credentials depuis `ENCRYPTION_KEY` (SHA-256).
+sha2 = { workspace = true }
+# Pont sync → async du store de tokens (`block_in_place` + `Handle::block_on`).
+tokio = { workspace = true, features = ["rt", "rt-multi-thread"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 async-trait = { workspace = true }
@@ -29,4 +36,5 @@ tokio-reactor-trait = { workspace = true }
 [dev-dependencies]
 # Exécuteur des tests d'intégration asynchrones. `net`/`time` requis par le
 # réacteur tokio de lapin (I/O AMQP).
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net", "time", "io-util"] }
+# `sync` : `OnceCell` (schéma de test appliqué une fois par binaire).
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net", "time", "io-util", "sync"] }

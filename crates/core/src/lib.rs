@@ -23,8 +23,9 @@ pub mod workflow;
 pub use action::Action;
 pub use audit::{AuditEvent, AuditOutcome, AuditSink, InMemoryAuditSink, NoopAuditSink};
 pub use auth::{
-    Argon2PasswordHasher, Claims, InMemoryRevocationStore, PasswordHasher, RevocationStore,
-    TokenKind, TokenService,
+    normalize_email, validate_email, validate_password, Argon2PasswordHasher, Claims, CreateUser,
+    InMemoryRevocationStore, InMemoryUserStore, PasswordHasher, RevocationStore, TokenKind,
+    TokenService, UserRecord, UserStore,
 };
 pub use config::{Config, Profile, Secret};
 pub use queue::{dlq_of, BoundedQueue, Delivery, DeliveryId, InMemoryQueue, Message, Nack, Queue};
@@ -33,7 +34,9 @@ pub use rbac::{
     PERM_CREDENTIALS_MANAGE, PERM_RUNS_EXECUTE, PERM_RUNS_READ, PERM_USERS_ADMIN, PERM_WILDCARD,
     PERM_WORKFLOWS_READ, PERM_WORKFLOWS_WRITE,
 };
-pub use run_dispatch::{DispatchOutcome, DispatchRequest, QueueRunDispatcher, RunDispatcher};
+pub use run_dispatch::{
+    random_run_id, DispatchOutcome, DispatchRequest, QueueRunDispatcher, RunDispatcher,
+};
 pub use run_state::{InMemoryRunStateStore, RunCheckpoint, RunListPage, RunStateStore, RunStatus};
 pub use scheduler::{
     default_dedup_key, DedupKeyFn, DedupLock, InMemoryDedupLock, RunningScheduler, Scheduler,

@@ -10,10 +10,15 @@ INSERT INTO users (id, email, password_hash, role)
 VALUES (
     '00000000-0000-0000-0000-000000000001',
     'dev@autome.local',
-    -- Placeholder : le hachage argon2 réel est posé en F6.1.
-    'argon2-placeholder',
+    -- Argon2id (PHC) du mot de passe de DEV `autome-dev-password` — connexion
+    -- via `POST /auth/login`. Ne jamais réutiliser hors base de dev.
+    '$argon2id$v=19$m=19456,t=2,p=1$tgpscoPhcSuThQd6egmrLw$FknLiARlQHDBxMAu8p9aZ9RDLotN21vSC36+JcBpDig',
     'admin'
 );
+
+-- Super-admin de dev : wildcard RBAC (`user_permissions.user_id` = claims.sub).
+INSERT INTO user_permissions (user_id, permission)
+VALUES ('00000000-0000-0000-0000-000000000001', '*');
 
 INSERT INTO workflows (id, name, active, current_version, created_at_ms, updated_at_ms)
 VALUES ('wf-demo', 'Demo : Webhook -> HTTP', TRUE, 1, 1700000000000, 1700000000000);

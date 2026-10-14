@@ -30,7 +30,11 @@ impl PgWorkflowRepository {
 
 #[async_trait]
 impl WorkflowRepository for PgWorkflowRepository {
-    async fn create(&self, workflow: WorkflowGraph) -> autome_core::Result<()> {
+    async fn create(
+        &self,
+        workflow: WorkflowGraph,
+        owner: Option<&str>,
+    ) -> autome_core::Result<()> {
         let id = workflow.id.0.clone();
         let graph = serde_json::to_value(&workflow)?;
         let mut client = self.pool.get().await.map_err(|e| storage_err("pool", e))?;
@@ -43,9 +47,9 @@ impl WorkflowRepository for PgWorkflowRepository {
         // détecter le doublon sans 23505 brut.
         let inserted = tx
             .execute(
-                "INSERT INTO workflows (id, name, current_version) VALUES ($1, $2, 1) \
-                 ON CONFLICT (id) DO NOTHING",
-                &[&id, &workflow.name],
+                "INSERT INTO workflows (id, name, current_version, owner_id) \
+                 VALUES ($1, $2, 1, $3) ON CONFLICT (id) DO NOTHING",
+                &[&id, &workflow.name, &owner],
             )
             .await
             .map_err(|e| storage_err("create", e))?;
@@ -83,10 +87,27 @@ impl WorkflowRepository for PgWorkflowRepository {
         }
     }
 
-    async fn list(&self, paging: Pagination) -> autome_core::Result<WorkflowPage> {
+    async fn owner_of(&self, id: &WorkflowId) -> autome_core::Result<Option<String>> {
         let client = self.pool.get().await.map_err(|e| storage_err("pool", e))?;
+        let row = client
+            .query_opt("SELECT owner_id FROM workflows WHERE id = $1", &[&id.0])
+            .await
+            .map_err(|e| storage_err("owner_of", e))?;
+        Ok(row.and_then(|r| r.get::<_, Option<String>>(0)))
+    }
+
+    async fn list(
+        &self,
+        owner: Option<&str>,
+        paging: Pagination,
+    ) -> autome_core::Result<WorkflowPage> {
+        let client = self.pool.get().await.map_err(|e| storage_err("pool", e))?;
+        // `$1 IS NULL` ⇒ pas de filtre propriétaire (super-admin).
         let total: i64 = client
-            .query_one("SELECT count(*) FROM workflows", &[])
+            .query_one(
+                "SELECT count(*) FROM workflows WHERE ($1::text IS NULL OR owner_id = $1)",
+                &[&owner],
+            )
             .await
             .map_err(|e| storage_err("list count", e))?
             .get(0);
@@ -97,8 +118,9 @@ impl WorkflowRepository for PgWorkflowRepository {
                 "SELECT v.graph FROM workflows w \
                  JOIN workflow_versions v \
                    ON v.workflow_id = w.id AND v.version = w.current_version \
-                 ORDER BY w.id LIMIT $1 OFFSET $2",
-                &[&limit, &offset],
+                 WHERE ($1::text IS NULL OR w.owner_id = $1) \
+                 ORDER BY w.id LIMIT $2 OFFSET $3",
+                &[&owner, &limit, &offset],
             )
             .await
             .map_err(|e| storage_err("list", e))?;

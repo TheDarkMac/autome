@@ -8,8 +8,12 @@
 //! - `AUTOME_QUEUE` : `memory` (défaut) | `rabbitmq` (`config.queue_url`) ;
 //! - `AUTOME_PERSISTENCE` : `memory` (défaut) | `postgres` (`config.database_url`) ;
 //! - `AUTOME_WORKER_CONCURRENCY` : nombre de tâches consommatrices (défaut 4).
-//! - `AUTOME_CONNECTOR_TOKEN_<PROVIDER>` : token bearer mono-tenant injecté dans
-//!   les actions de connecteurs (`SLACK`/`GMAIL`/`NOTION`/`GITHUB`) — cf. #159.
+//! - `AUTOME_CONNECTOR_CREDENTIALS` : `per_user` (défaut) — chaque action de
+//!   connecteur utilise le token OAuth **du propriétaire du run**, lu dans le
+//!   store chiffré (`connector_tokens`, déchiffré avec `ENCRYPTION_KEY`, qui
+//!   doit être celle de l'API) ; `single_tenant` — opt-in mono-tenant : repli
+//!   sur le token global `AUTOME_CONNECTOR_TOKEN_<PROVIDER>` si le propriétaire
+//!   n'a pas de token.
 //!
 //! Arrêt **gracieux** : sur `SIGINT`/`SIGTERM`, le pool stoppe et `await` la
 //! fin des tâches en cours (pas de message perdu en vol).
@@ -18,9 +22,13 @@ use std::sync::Arc;
 
 use autome_core::Config;
 use autome_persistence::selectors::{
-    build_queue, build_run_state_store, build_workflow_repository, PersistenceMode, QueueMode,
+    build_connector_token_store, build_queue, build_run_state_store, build_workflow_repository,
+    PersistenceMode, QueueMode,
 };
-use autome_worker::{Handler, IdempotencyStore, InMemoryIdempotencyStore, RunExecutor, WorkerPool};
+use autome_worker::{
+    ConnectorCredentialsMode, Handler, IdempotencyStore, InMemoryIdempotencyStore, RunExecutor,
+    WorkerPool,
+};
 
 /// Queue des runs (alignée sur `QueueRunDispatcher::queue_name` par défaut).
 const RUNS_QUEUE: &str = "runs";
@@ -40,19 +48,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let persistence = PersistenceMode::from_env()?;
     let queue_mode = QueueMode::from_env()?;
     let concurrency = concurrency_from_env();
+    let credentials_mode = ConnectorCredentialsMode::from_env()?;
 
     // Backends sélectionnés par l'environnement (partagés avec l'API).
     let queue = build_queue(&config, queue_mode).await?;
     let repo = build_workflow_repository(&config, persistence)?;
     let store = build_run_state_store(&config, persistence)?;
 
-    let handler: Arc<dyn Handler + Send + Sync> = Arc::new(RunExecutor::new(repo, store));
+    // Tokens des connecteurs : ceux du propriétaire de chaque run.
+    let tokens = build_connector_token_store(&config, persistence)?;
+    let resolver = credentials_mode.resolver(tokens);
+    if credentials_mode == ConnectorCredentialsMode::SingleTenant {
+        eprintln!(
+            "autome-worker : AUTOME_CONNECTOR_CREDENTIALS=single_tenant — repli sur les tokens \
+             globaux AUTOME_CONNECTOR_TOKEN_* (tous les utilisateurs agissent avec ces comptes)"
+        );
+    }
+
+    let handler: Arc<dyn Handler + Send + Sync> = Arc::new(RunExecutor::new(repo, store, resolver));
     let idempotency: Arc<dyn IdempotencyStore + Send + Sync> =
         Arc::new(InMemoryIdempotencyStore::new());
 
     println!(
-        "autome-worker ({:?}) démarré — queue={:?} persistence={:?} concurrency={} (file `{}`)",
-        config.profile, queue_mode, persistence, concurrency, RUNS_QUEUE
+        "autome-worker ({:?}) démarré — queue={:?} persistence={:?} credentials={:?} concurrency={} (file `{}`)",
+        config.profile, queue_mode, persistence, credentials_mode, concurrency, RUNS_QUEUE
     );
 
     let pool = WorkerPool::new(queue, handler, idempotency, RUNS_QUEUE, concurrency);

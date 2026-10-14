@@ -35,6 +35,9 @@ pub struct DispatchRequest {
     /// Timestamp Unix (ms) — figé par le caller pour permettre les tests
     /// déterministes (le handler API lit son `Clock` injecté).
     pub now_ms: i64,
+    /// Propriétaire du run (celui du workflow), porté par le checkpoint
+    /// initial — cf. [`RunCheckpoint::owner_id`].
+    pub owner_id: Option<String>,
 }
 
 /// Réponse d'un dispatch — `run_id` créé + état initial persisté.
@@ -58,8 +61,8 @@ pub trait RunDispatcher: Send + Sync {
 /// Impl par défaut : persistance + publication sur queue.
 ///
 /// Le générateur d'`id` est injectable pour rendre les tests déterministes.
-/// L'impl par défaut utilise `format!("run-{}", ...counter)` ; en prod on
-/// brancherait `uuid::Uuid::new_v4()`.
+/// L'impl par défaut tire `run-<32 hex>` (128 bits aléatoires, cf.
+/// [`random_run_id`]).
 pub struct QueueRunDispatcher {
     queue: Arc<dyn Queue + Send + Sync>,
     queue_name: String,
@@ -78,7 +81,7 @@ impl QueueRunDispatcher {
             queue,
             queue_name: "runs".to_string(),
             store,
-            id_gen: Arc::new(|| format!("run-{}", uuid_like())),
+            id_gen: Arc::new(random_run_id),
         }
     }
 
@@ -110,7 +113,8 @@ impl RunDispatcher for QueueRunDispatcher {
             req.version,
             &req.trigger_type,
             req.now_ms,
-        );
+        )
+        .with_owner(req.owner_id);
         self.store.checkpoint(&checkpoint).await?;
 
         // 2. Publication sur la queue (le worker la consommera).
@@ -138,15 +142,17 @@ impl RunDispatcher for QueueRunDispatcher {
     }
 }
 
-/// Mini-générateur monotone process-local. Pas un vrai UUID — l'API et le
-/// store traitent l'id comme une string opaque. Sera remplacé par
-/// `uuid::Uuid::new_v4()` lors du branchement PostgreSQL.
-fn uuid_like() -> String {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static SEQ: AtomicU64 = AtomicU64::new(1);
-    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
-    // Format hex pour ressembler à un id opaque (et trier de façon stable).
-    format!("{seq:016x}")
+/// Identifiant de run aléatoire : `run-` + 128 bits en hex (CSPRNG).
+///
+/// Remplace un compteur process-local qui (1) repartait à 1 à chaque
+/// redémarrage et entre répliques — l'upsert de `checkpoint` écrasait alors
+/// un run existant — et (2) rendait les ids devinables, donc énumérables.
+pub fn random_run_id() -> String {
+    use rand::RngCore;
+    let mut bytes = [0u8; 16];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+    format!("run-{hex}")
 }
 
 #[cfg(test)]
@@ -177,6 +183,7 @@ mod tests {
             trigger_type: "manual".into(),
             payload: json!({ "input": "hello" }),
             now_ms: 1_700_000_000_000,
+            owner_id: Some("alice".into()),
         }
     }
 
@@ -200,6 +207,7 @@ mod tests {
         assert_eq!(snap.created_at_ms, 1_700_000_000_000);
         assert!(snap.started_at_ms.is_none());
         assert!(snap.next_node.is_none());
+        assert_eq!(snap.owner_id.as_deref(), Some("alice"));
     }
 
     #[tokio::test]
@@ -250,7 +258,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn default_uuid_like_generator_produces_unique_ids() {
+    async fn default_generator_produces_random_unique_ids() {
         let queue: Arc<InMemoryQueue> = Arc::new(InMemoryQueue::new());
         let store: Arc<InMemoryRunStateStore> = Arc::new(InMemoryRunStateStore::new());
         let d = QueueRunDispatcher::new(
@@ -260,9 +268,10 @@ mod tests {
         let o1 = d.dispatch(sample_request()).await.unwrap();
         let o2 = d.dispatch(sample_request()).await.unwrap();
         assert_ne!(o1.run_id, o2.run_id);
-        // Format `run-<16 hex>` (préfixe + séquence atomique).
+        // Format `run-<32 hex>` (128 bits aléatoires, non séquentiels).
         assert!(o1.run_id.starts_with("run-"), "id = {}", o1.run_id);
-        assert_eq!(o1.run_id.len(), 4 + 16);
+        assert_eq!(o1.run_id.len(), 4 + 32);
+        assert!(o1.run_id[4..].chars().all(|c| c.is_ascii_hexdigit()));
     }
 
     #[tokio::test]

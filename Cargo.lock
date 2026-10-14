@@ -327,7 +327,6 @@ dependencies = [
  "rustls-pemfile",
  "serde",
  "serde_json",
- "sha2 0.10.9",
  "tempfile",
  "tokio",
  "tower",
@@ -347,6 +346,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "tokio",
 ]
 
 [[package]]
@@ -386,11 +386,13 @@ name = "autome-persistence"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "autome-connectors",
  "autome-core",
  "deadpool-postgres",
  "lapin",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "tokio",
  "tokio-executor-trait",
  "tokio-postgres",

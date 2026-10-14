@@ -7,10 +7,10 @@
 //! - `GET /openapi.json` : sérialise la spec via [`utoipa::OpenApi::openapi`].
 //!
 //! La spec déclare un scheme de sécurité `bearer` (Bearer JWT, format
-//! `Authorization: Bearer <token>`) que chaque handler référence via
-//! `security(("bearer" = []))`. Aucun endpoint d'`auth` du présent module
-//! n'est exposé — seul le contenu fonctionnel (workflows, runs,
-//! credentials) figure dans la spec.
+//! `Authorization: Bearer <token>`) que chaque handler protégé référence via
+//! `security(("bearer" = []))`. Les endpoints publics de comptes
+//! (`/auth/signup|login|refresh`, qui émettent ces jetons) figurent aussi
+//! dans la spec ; les routes de démonstration `/auth/whoami|admin` non.
 
 use axum::{response::Json, routing::get, Router};
 use utoipa::{
@@ -29,6 +29,10 @@ use utoipa::{
         description = "Backend HTTP du moteur d'automatisation Autome.",
     ),
     paths(
+        // comptes (backlog auth)
+        crate::accounts::signup,
+        crate::accounts::login,
+        crate::accounts::refresh,
         // workflows (F7.1)
         crate::workflows::list_workflows,
         crate::workflows::create_workflow,
@@ -47,6 +51,9 @@ use utoipa::{
         crate::credentials::delete_credential,
     ),
     components(schemas(
+        crate::accounts::CredentialsBody,
+        crate::accounts::RefreshBody,
+        crate::accounts::TokenResponse,
         crate::workflows::ListResponse,
         crate::runs::CreateRunBody,
         crate::runs::CreateRunResponse,
@@ -59,6 +66,7 @@ use utoipa::{
         crate::credentials::ListCredentialsResponse,
     )),
     tags(
+        (name = "auth", description = "Comptes : inscription, connexion, rotation des jetons."),
         (name = "workflows", description = "CRUD des workflows."),
         (name = "runs", description = "Déclenchement et suivi des runs."),
         (name = "credentials", description = "OAuth2 connecteurs tiers."),
@@ -177,12 +185,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn openapi_documents_public_account_endpoints() {
+        let spec = fetch_spec().await;
+        for path in ["/auth/signup", "/auth/login", "/auth/refresh"] {
+            let op = &spec["paths"][path]["post"];
+            assert!(op.is_object(), "{path} doit figurer dans la spec");
+            // Endpoints publics : ils émettent les jetons, pas de bearer exigé.
+            assert!(op["security"].is_null(), "{path} ne doit pas exiger bearer");
+        }
+    }
+
+    #[tokio::test]
     async fn openapi_does_not_leak_any_secret_keyword() {
         // Sentinelle : on ne doit voir aucun nom de champ "secret".
         // (Les commentaires textuels qui mentionnent "secret" sont OK : on
         // cherche les clés JSON exactes "client_secret", "access_token",
         // "refresh_token" qui dénoteraient une fuite de schéma.)
-        let spec = fetch_spec().await;
+        //
+        // Seule exception légitime : les endpoints de session `/auth/*`, dont
+        // c'est la raison d'être d'émettre access/refresh (schémas
+        // `TokenResponse` / `RefreshBody`). On les retire avant le contrôle :
+        // les tokens OAuth des connecteurs, eux, ne doivent jamais apparaître.
+        let mut spec = fetch_spec().await;
+        let schemas = spec["components"]["schemas"].as_object_mut().unwrap();
+        assert!(schemas.remove("TokenResponse").is_some());
+        assert!(schemas.remove("RefreshBody").is_some());
+        let paths = spec["paths"].as_object_mut().unwrap();
+        paths.retain(|path, _| !path.starts_with("/auth/"));
         let text = spec.to_string();
         for forbidden in ["\"client_secret\"", "\"access_token\"", "\"refresh_token\""] {
             assert!(
@@ -197,7 +226,7 @@ mod tests {
         let spec = fetch_spec().await;
         let tags = spec["tags"].as_array().expect("tags est une liste");
         let names: Vec<&str> = tags.iter().filter_map(|t| t["name"].as_str()).collect();
-        for expected in ["workflows", "runs", "credentials"] {
+        for expected in ["auth", "workflows", "runs", "credentials"] {
             assert!(
                 names.contains(&expected),
                 "tag '{expected}' attendu dans {names:?}"

@@ -43,9 +43,51 @@ cp .env.example .env
 | `DATABASE_URL` | DSN PostgreSQL | `postgres://postgres:postgres@localhost:5432/autome` | **obligatoire** (≠ défaut) |
 | `QUEUE_URL` | URL de la file (RabbitMQ) | *(vide)* | recommandé |
 | `JWT_SECRET` | Clé de signature des JWT | `dev-insecure-jwt-secret` | **obligatoire** (non-défaut) |
-| `ENCRYPTION_KEY` | Clé de chiffrement des credentials au repos | `dev-insecure-encryption-key` | **obligatoire** (non-défaut) |
+| `ENCRYPTION_KEY` | Clé de chiffrement des credentials au repos — **identique pour l'API et le worker** | `dev-insecure-encryption-key` | **obligatoire** (non-défaut) |
 | `AUTOME_TLS_CERT` | Chemin du certificat PEM (active HTTPS) | *(non défini)* | optionnel |
 | `AUTOME_TLS_KEY` | Chemin de la clé privée PEM | *(non défini)* | optionnel |
+| `AUTOME_EGRESS_ALLOWLIST` | Hôtes internes autorisés en sortie HTTP (anti-SSRF), séparés par virgule | *(vide : public uniquement)* | selon besoin |
+| `AUTOME_CONNECTOR_CREDENTIALS` | Worker : `per_user` (token du propriétaire du run) ou `single_tenant` (repli sur `AUTOME_CONNECTOR_TOKEN_<PROVIDER>`) | `per_user` | `per_user` (instance partagée) |
+
+### Sortie réseau (anti-SSRF)
+
+Les requêtes HTTP sortantes — action `http_request` des workflows (URL choisie
+par l'utilisateur) et échanges OAuth — ne peuvent viser que des adresses
+**publiques**. Sont refusés : `localhost`/loopback, réseaux privés (RFC 1918,
+IPv6 ULA), link-local (dont `169.254.169.254`, métadonnées cloud), CGNAT,
+plages réservées/documentation, et tout schéma autre que `http`/`https`.
+Le contrôle porte sur l'IP littérale, sur **chaque adresse DNS résolue** (la
+connexion part vers l'adresse vérifiée : pas de DNS rebinding) et sur chaque
+redirection (5 au plus). Délai 30 s (connexion 10 s), réponse ≤ 10 Mio.
+
+Pour joindre un service interne légitime (IdP on-prem, API intranet), ajoutez
+son nom ou son IP à `AUTOME_EGRESS_ALLOWLIST`. Avec un **proxy sortant**
+(`HTTPS_PROXY`), ajoutez le proxy à l'allowlist : le filtrage des noms d'hôte
+revient alors au proxy, qui fait la résolution DNS.
+
+### Tokens des connecteurs (par utilisateur)
+
+Les actions `slack.*`, `gmail.*`, `notion.*` et `github.*` s'exécutent avec le
+token OAuth **du propriétaire du run** (celui du workflow, fixé au
+déclenchement). Chaque utilisateur connecte ses comptes via
+`POST /credentials/{provider}/authorize` puis `…/callback` ; l'API stocke le
+jeton **chiffré** (AES-256-GCM, clé dérivée de `ENCRYPTION_KEY`) et le worker le
+relit au moment du run. Le `provider_id` OAuth doit être le préfixe de l'action
+(`slack`, `gmail`, `notion`, `github`).
+
+- **Partage API ↔ worker** : `AUTOME_PERSISTENCE=postgres` sur les deux
+  services (table `connector_tokens`, migration `0011`) et le **même**
+  `ENCRYPTION_KEY`. En `memory`, chaque process a son propre store (dev seul).
+- **Pas de token** pour ce propriétaire, ou run sans propriétaire (créé avant
+  l'isolation par propriétaire) : le node échoue avec un message explicite ; le
+  run ne part jamais avec le compte d'un autre utilisateur.
+- **Mode mono-tenant (opt-in)** : `AUTOME_CONNECTOR_CREDENTIALS=single_tenant`
+  sur le worker rétablit le repli sur un token **global** par provider
+  (`AUTOME_CONNECTOR_TOKEN_SLACK`, `…_GMAIL`, `…_NOTION`, `…_GITHUB`) quand le
+  propriétaire n'a pas connecté le sien. Ce token est alors utilisé par **tous**
+  les utilisateurs : réservé à une instance à un seul tenant. Une erreur de
+  lecture du store ne déclenche jamais ce repli. Le worker l'annonce au
+  démarrage ; toute autre valeur que `per_user`/`single_tenant` est refusée.
 
 ### Règles du profil `prod` (fail-fast)
 
@@ -214,6 +256,43 @@ Le namespace inclut **Prometheus** (scrape de l'API) et **Grafana** (datasource
 kubectl -n autome port-forward svc/grafana 3000:3000     # http://localhost:3000 (admin/admin)
 kubectl -n autome port-forward svc/prometheus 9090:9090  # http://localhost:9090
 ```
+
+---
+
+## Authentification (comptes & jetons)
+
+L'API émet ses propres JWT (HS256, signés avec `JWT_SECRET`). Les endpoints de
+comptes sont publics ; tout le reste exige `Authorization: Bearer <access_token>`.
+
+| Méthode | Path | Body | Réponse |
+|---|---|---|---|
+| POST | `/auth/signup` | `{"email","password"}` | 201 + paire de jetons · 400 saisie invalide · 409 email déjà pris |
+| POST | `/auth/login` | `{"email","password"}` | 200 + paire de jetons · 401 identifiants invalides · 429 trop d'échecs (`Retry-After`) |
+| POST | `/auth/refresh` | `{"refresh_token"}` | 200 + nouvelle paire · 401 refresh invalide, expiré ou déjà utilisé |
+
+- Paire de jetons : `{"access_token","refresh_token","token_type":"Bearer","expires_in":900}`.
+  Access valable 15 min, refresh 7 jours et **à usage unique** (rotation).
+- Mot de passe : 8 à 1024 caractères, haché en **Argon2id**. L'email est
+  normalisé (trim + minuscules).
+- Un compte créé par `signup` reçoit le rôle **editor** (CRUD workflows, runs,
+  credentials) — pas d'administration.
+- Anti-bruteforce : 5 tentatives sans succès par email et par fenêtre de 15 min,
+  puis 429. Compteur **par réplique** (en mémoire).
+- **Isolation par propriétaire** : un workflow appartient à son créateur, un run
+  au propriétaire de son workflow. Les listes ne montrent que ses propres
+  ressources ; lire, modifier, lancer ou supprimer la ressource d'autrui répond
+  comme si elle n'existait pas (404, ou 204 pour `DELETE`). Seul un super-admin
+  (permission `*`) voit tout. Les lignes antérieures à la migration `0010`
+  (sans propriétaire) ne sont visibles que des super-admins.
+
+```bash
+curl -s -H 'content-type: application/json' \
+  -d '{"email":"me@example.com","password":"correct-horse"}' \
+  http://localhost:8080/auth/signup
+```
+
+Base de dev seedée (`migrations/seeds/dev_seed.sql`) : compte super-admin
+`dev@autome.local` / `autome-dev-password` (à ne jamais appliquer en prod).
 
 ---
 

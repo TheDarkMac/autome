@@ -50,7 +50,9 @@ use tokio::task::JoinHandle;
 
 pub mod dispatch;
 pub mod executor;
-pub use dispatch::{CredentialResolver, EnvCredentialResolver};
+pub use dispatch::{
+    ConnectorCredentialsMode, CredentialResolver, EnvCredentialResolver, OwnerCredentialResolver,
+};
 pub use executor::RunExecutor;
 
 /// Verdict que retourne un [`Handler`] après traitement.

@@ -8,6 +8,7 @@
 
 use std::sync::Arc;
 
+use autome_api::accounts::{accounts_router, AccountsState};
 use autome_api::auth::protected_router;
 use autome_api::credentials::{credentials_router, CredentialsState};
 use autome_api::metrics::{metrics_router, with_metrics, Metrics};
@@ -20,7 +21,7 @@ use autome_api::tls::load_rustls_config;
 use autome_api::workflows::{
     create_workflow, delete_workflow, get_workflow, list_workflows, update_workflow, WorkflowsState,
 };
-use autome_core::{Config, Profile};
+use autome_core::{Argon2PasswordHasher, Config, Profile};
 use axum::{routing::get, Router};
 
 /// Handler de la sonde de santé.
@@ -28,8 +29,9 @@ async fn health() -> &'static str {
     "ok"
 }
 
-/// Construit le routeur racine : `/health` + `/metrics` publics, `/auth/*`
-/// protégé par JWT, et le CRUD `workflows` + `runs` (domaine 7). Toutes les
+/// Construit le routeur racine : `/health` + `/metrics` publics,
+/// `/auth/signup|login|refresh` publics (émission des jetons), `/auth/whoami|admin`
+/// protégés par JWT, et le CRUD `workflows` + `runs` (domaine 7). Toutes les
 /// routes sont instrumentées par le middleware de métriques (F10.6.a).
 ///
 /// Les routes workflows sont posées **à plat** (`/workflows`, `/workflows/:id`)
@@ -37,7 +39,7 @@ async fn health() -> &'static str {
 /// `/workflows/:id/runs` du router runs.
 ///
 /// Isolé de `main` pour être testable sans démarrer de serveur.
-fn build_router(backends: &Backends, metrics: Arc<Metrics>) -> Router {
+fn build_router(backends: &Backends, accounts: AccountsState, metrics: Arc<Metrics>) -> Router {
     let wf_state = WorkflowsState::new(backends.auth.clone(), backends.workflows.clone());
     let runs_state = RunsState::new(
         backends.auth.clone(),
@@ -61,12 +63,24 @@ fn build_router(backends: &Backends, metrics: Arc<Metrics>) -> Router {
 
     let router = Router::new()
         .route("/health", get(health))
-        .nest("/auth", protected_router(backends.auth.clone()))
+        .nest(
+            "/auth",
+            protected_router(backends.auth.clone()).merge(accounts_router(accounts)),
+        )
         .merge(workflows_routes)
         .merge(runs_router(runs_state))
         .merge(credentials_router(credentials_state))
         .merge(metrics_router(metrics.clone()));
     with_metrics(router, metrics)
+}
+
+/// État des endpoints de comptes : Argon2id sur les stores de `backends`.
+fn accounts_state(backends: &Backends) -> autome_core::Result<AccountsState> {
+    AccountsState::new(
+        backends.auth.clone(),
+        backends.users.clone(),
+        Arc::new(Argon2PasswordHasher::new()),
+    )
 }
 
 #[tokio::main]
@@ -107,8 +121,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
+    let accounts = accounts_state(&backends)?;
     let metrics = Arc::new(Metrics::new());
-    let app = build_router(&backends, metrics);
+    let app = build_router(&backends, accounts, metrics);
 
     // F6.4 — HTTPS via rustls si `AUTOME_TLS_CERT` + `AUTOME_TLS_KEY`
     // sont positionnées ; sinon HTTP en clair. Décision all-or-nothing
@@ -163,6 +178,7 @@ mod tests {
         let queue = std::sync::Arc::new(autome_core::InMemoryQueue::new());
         let backends =
             build_backends(&config, PersistenceMode::Memory, queue).expect("backends in-memory");
-        let _app: Router = build_router(&backends, Arc::new(Metrics::new()));
+        let accounts = accounts_state(&backends).expect("état comptes");
+        let _app: Router = build_router(&backends, accounts, Arc::new(Metrics::new()));
     }
 }
