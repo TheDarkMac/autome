@@ -2,7 +2,7 @@
 
 - **Statut** : Accepté
 - **Date** : 2026-05-21
-- **Feature** : F6.3.a (cf. [ROADMAP](../../ROADMAP.md)) — issue #63
+- **Feature** : F6.3.a (cf. [ROADMAP](../../claude-code/ROADMAP.md)) — issue #63
 - **Décideurs** : équipe Autome
 - **Contexte ADR** : précise l'[ADR initial d'architecture](../ARCHITECTURE.md#7-choix-techniques-structurants-adr-initial) (« credentials chiffrés »)
 

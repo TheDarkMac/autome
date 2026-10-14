@@ -2,7 +2,7 @@
 
 - **Statut** : Accepté
 - **Date** : 2026-05-16
-- **Feature** : F1.5.a (cf. [ROADMAP](../../ROADMAP.md)) — issue #9
+- **Feature** : F1.5.a (cf. [ROADMAP](../../claude-code/ROADMAP.md)) — issue #9
 - **Décideurs** : équipe Autome
 - **Contexte ADR** : précise l'[ADR initial d'architecture](../ARCHITECTURE.md#7-choix-techniques-structurants-adr-initial) (« PostgreSQL + `sqlx` »)
 

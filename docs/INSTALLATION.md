@@ -254,5 +254,5 @@ npm run test       # Vitest
 - [README](../README.md) — vue d'ensemble & quick start.
 - [ARCHITECTURE.md](ARCHITECTURE.md) — architecture détaillée + diagrammes.
 - [adr/](adr/) — décisions d'architecture.
-- [ROADMAP.md](../ROADMAP.md) — suivi des features.
+- [ROADMAP.md](../claude-code/ROADMAP.md) — suivi des features.
 - [.env.example](../.env.example) — modèle de configuration.

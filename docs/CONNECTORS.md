@@ -331,5 +331,5 @@ Connecteurs réels à étudier, par ordre de complexité :
 
 ## Voir aussi
 
-- [README](../README.md) · [ARCHITECTURE.md](ARCHITECTURE.md) (§3, §9) · [ROADMAP.md](../ROADMAP.md)
+- [README](../README.md) · [ARCHITECTURE.md](ARCHITECTURE.md) (§3, §9) · [ROADMAP.md](../claude-code/ROADMAP.md)
 - Code : [`crates/connectors/src/sdk/`](../crates/connectors/src/sdk/) · [`template.rs`](../crates/connectors/src/template.rs)

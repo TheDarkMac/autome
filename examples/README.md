@@ -1,6 +1,6 @@
 # 🧪 Exemples de workflows
 
-Workflows automatisés de démonstration (domaine 12 de la [ROADMAP](../ROADMAP.md)).
+Workflows automatisés de démonstration (domaine 12 de la [ROADMAP](../claude-code/ROADMAP.md)).
 Chaque exemple est livré comme un **graphe `WorkflowGraph` désérialisable**
 (`workflows/*.json`) **et** un **test d'intégration exécutable** qui le fait
 tourner de bout en bout via le vrai moteur et les vrais connecteurs, sur un

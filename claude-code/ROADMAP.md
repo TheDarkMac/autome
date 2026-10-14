@@ -39,8 +39,8 @@
 
 ## 1. Fondations & Architecture
 
-- [x] **F1.1** — Document d'architecture (diagrammes composants, flux de données, déploiement) — _[docs/ARCHITECTURE.md](./docs/ARCHITECTURE.md), issue #1_
-- [x] **F1.2** — Choix & justification du framework backend (axum vs actix-web) — _[docs/adr/0001-choix-framework-backend.md](./docs/adr/0001-choix-framework-backend.md), issue #3_
+- [x] **F1.1** — Document d'architecture (diagrammes composants, flux de données, déploiement) — _[docs/ARCHITECTURE.md](../docs/ARCHITECTURE.md), issue #1_
+- [x] **F1.2** — Choix & justification du framework backend (axum vs actix-web) — _[docs/adr/0001-choix-framework-backend.md](../docs/adr/0001-choix-framework-backend.md), issue #3_
 - [x] **F1.3** — Mise en place du workspace Cargo (crates : `core`, `engine`, `api`, `connectors`, `worker`) — _issue #5_
   - [x] F1.3.a — `Cargo.toml` workspace racine + résolution des versions
   - [x] F1.3.b — Crate `core` (types partagés, erreurs, traits)

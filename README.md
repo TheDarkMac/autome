@@ -17,7 +17,7 @@ est persisté, ce qui permet la reprise après crash et le scaling horizontal.
 📍 **État du projet : 56 / 66 features** — cœur (moteur, connecteurs,
 orchestrateur, sécurité, API, frontend, tests, DevOps) terminé ; reste la
 documentation et les exemples de workflows. Détail dans la
-[ROADMAP](ROADMAP.md).
+[ROADMAP](claude-code/ROADMAP.md).
 
 ---
 
@@ -129,8 +129,9 @@ puis `typecheck` / `lint` / `test` côté frontend.
 ├── monitoring/             # Prometheus + provisioning & dashboards Grafana
 ├── docs/                   # ARCHITECTURE.md + décisions d'architecture (ADR)
 ├── scripts/                # Outils (validation des migrations…)
-├── ROADMAP.md              # Suivi des features & journal d'avancées
-└── CONVENTIONS.md          # Conventions de code & de contribution
+├── tutorial/               # Tutoriel web interactif (HTML statique)
+├── AUDIT.md                # Rapport d'audit logiciel complet
+└── claude-code/            # ROADMAP.md, CONVENTIONS.md, CLAUDE.md (règles de dev)
 ```
 
 ---
@@ -159,14 +160,15 @@ défaut**. Détail complet, diagrammes et flux dans
 
 ## 📚 Documentation
 
+- [tutorial/index.html](tutorial/index.html) — **tutoriel web interactif** : découverte d'Autome page par page (concepts, architecture animée, éditeur de workflow jouable, exécution, connecteurs, démarrage). Ouvrir le fichier dans un navigateur, aucune installation requise.
 - [docs/INSTALLATION.md](docs/INSTALLATION.md) — guide d'installation & démarrage détaillé (Compose / local / Kubernetes).
-- [ROADMAP.md](ROADMAP.md) — features, sous-tâches et journal d'avancées.
+- [ROADMAP.md](claude-code/ROADMAP.md) — features, sous-tâches et journal d'avancées.
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — architecture détaillée + diagrammes.
 - [docs/CONNECTORS.md](docs/CONNECTORS.md) — guide pour créer un connecteur (SDK + exemple).
 - [docs/CICD.md](docs/CICD.md) — checklist CI/CD & reproductibilité.
 - [examples/](examples/) — exemples de workflows exécutables (graphe JSON + test e2e).
 - [docs/adr/](docs/adr/) — décisions d'architecture (framework, broker, migrations, crypto).
-- [CONVENTIONS.md](CONVENTIONS.md) — conventions de code et de contribution.
+- [CONVENTIONS.md](claude-code/CONVENTIONS.md) — conventions de code et de contribution.
 - [.env.example](.env.example) — variables de configuration.
 
 ---
