@@ -243,6 +243,7 @@ impl Stack {
                 trigger_type: "manual".into(),
                 payload: json!({ "seed": true }),
                 now_ms: NOW_MS,
+                owner_id: None,
             })
             .await
             .expect("dispatch")
@@ -257,7 +258,7 @@ async fn dispatched_workflow_runs_to_completion_with_persisted_outputs() {
     let stack = Stack::new();
     stack
         .repo
-        .create(pipeline_workflow("wf-pipe"))
+        .create(pipeline_workflow("wf-pipe"), None)
         .await
         .unwrap();
 
@@ -297,7 +298,7 @@ async fn failing_node_marks_run_failed_and_dead_letters_message() {
     // Workflow dont le second node échoue (`name == "boom"`).
     let mut wf = pipeline_workflow("wf-boom");
     wf.nodes[1].name = "boom".into();
-    stack.repo.create(wf).await.unwrap();
+    stack.repo.create(wf, None).await.unwrap();
 
     let run_id = stack.dispatch("wf-boom").await;
     let pool = stack.pool(1);
@@ -324,7 +325,7 @@ async fn concurrent_pool_drains_all_dispatched_runs_to_success() {
     let stack = Stack::new();
     stack
         .repo
-        .create(pipeline_workflow("wf-pipe"))
+        .create(pipeline_workflow("wf-pipe"), None)
         .await
         .unwrap();
 
@@ -375,7 +376,7 @@ async fn duplicate_delivery_is_deduplicated_and_executes_once() {
     let stack = Stack::new();
     stack
         .repo
-        .create(pipeline_workflow("wf-pipe"))
+        .create(pipeline_workflow("wf-pipe"), None)
         .await
         .unwrap();
 
@@ -392,6 +393,7 @@ async fn duplicate_delivery_is_deduplicated_and_executes_once() {
         trigger_type: "manual".into(),
         payload: Value::Null,
         now_ms: NOW_MS,
+        owner_id: None,
     };
     fixed.dispatch(req()).await.unwrap();
     fixed.dispatch(req()).await.unwrap();

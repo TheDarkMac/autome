@@ -287,7 +287,7 @@ mod tests {
         run_id: &str,
     ) {
         let wf_id = wf.id.0.clone();
-        repo.create(wf).await.unwrap();
+        repo.create(wf, None).await.unwrap();
         store
             .checkpoint(&RunCheckpoint::queued(run_id, &wf_id, 1, "manual", NOW))
             .await

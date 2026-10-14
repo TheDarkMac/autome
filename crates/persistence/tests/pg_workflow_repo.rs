@@ -52,13 +52,13 @@ async fn crud_roundtrip() {
     assert!(repo.get(&WorkflowId::new("a")).await.unwrap().is_none());
 
     // Create + get.
-    repo.create(wf("a", "Alpha")).await.unwrap();
+    repo.create(wf("a", "Alpha"), Some("alice")).await.unwrap();
     let got = repo.get(&WorkflowId::new("a")).await.unwrap().unwrap();
     assert_eq!(got.name, "Alpha");
     assert_eq!(got.nodes.len(), 1);
 
     // Doublon rejeté.
-    assert!(repo.create(wf("a", "dup")).await.is_err());
+    assert!(repo.create(wf("a", "dup"), Some("bob")).await.is_err());
 
     // Update (nouvelle version, get renvoie la courante).
     repo.update(wf("a", "Alpha v2")).await.unwrap();
@@ -69,17 +69,37 @@ async fn crud_roundtrip() {
     // Update d'un inconnu → erreur.
     assert!(repo.update(wf("ghost", "x")).await.is_err());
 
-    // List paginée.
-    repo.create(wf("b", "Beta")).await.unwrap();
-    let page = repo
-        .list(Pagination {
-            offset: 0,
-            limit: 10,
-        })
-        .await
-        .unwrap();
-    assert_eq!(page.total, 2);
-    assert_eq!(page.items.len(), 2);
+    // Propriétaire : posé à la création, conservé par l'update, inchangé par
+    // un doublon refusé.
+    assert_eq!(
+        repo.owner_of(&WorkflowId::new("a"))
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("alice")
+    );
+    assert_eq!(
+        repo.owner_of(&WorkflowId::new("ghost")).await.unwrap(),
+        None
+    );
+
+    // List paginée, filtrable par propriétaire.
+    repo.create(wf("b", "Beta"), Some("bob")).await.unwrap();
+    repo.create(wf("c", "Legacy"), None).await.unwrap();
+    assert_eq!(repo.owner_of(&WorkflowId::new("c")).await.unwrap(), None);
+    let paging = Pagination {
+        offset: 0,
+        limit: 10,
+    };
+    let page = repo.list(None, paging).await.unwrap();
+    assert_eq!(page.total, 3);
+    assert_eq!(page.items.len(), 3);
+    let alice = repo.list(Some("alice"), paging).await.unwrap();
+    assert_eq!(alice.total, 1);
+    assert_eq!(alice.items[0].id, WorkflowId::new("a"));
+    let nobody = repo.list(Some("nobody"), paging).await.unwrap();
+    assert_eq!(nobody.total, 0);
+    assert!(nobody.items.is_empty());
 
     // Delete (idempotent).
     assert!(repo.delete(&WorkflowId::new("a")).await.unwrap());

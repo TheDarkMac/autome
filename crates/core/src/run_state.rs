@@ -82,6 +82,13 @@ pub struct RunCheckpoint {
     pub next_node: Option<String>,
     /// Message d'erreur en cas de `Failed`.
     pub error: Option<String>,
+    /// Propriétaire du run (`claims.sub` du propriétaire du workflow au
+    /// moment du dispatch). Seul lui — ou un super-admin — peut le lire.
+    /// **Immuable** une fois posé : les stores ignorent un changement
+    /// ultérieur. `None` = run sans propriétaire (créé avant l'isolation
+    /// par propriétaire), visible des seuls super-admins.
+    #[serde(default)]
+    pub owner_id: Option<String>,
 }
 
 impl RunCheckpoint {
@@ -106,7 +113,14 @@ impl RunCheckpoint {
             outputs: BTreeMap::new(),
             next_node: None,
             error: None,
+            owner_id: None,
         }
+    }
+
+    /// Builder : pose le propriétaire du run.
+    pub fn with_owner(mut self, owner_id: Option<String>) -> Self {
+        self.owner_id = owner_id;
+        self
     }
 }
 
@@ -137,7 +151,16 @@ pub trait RunStateStore: Send + Sync {
     /// décroissant (plus récent d'abord), ordre stabilisé par `run_id` à
     /// égalité de timestamp. Consommé par l'endpoint API
     /// `GET /workflows/{id}/runs` (F7.2.d).
-    async fn list_by_workflow(&self, workflow_id: &str, paging: Pagination) -> Result<RunListPage>;
+    ///
+    /// `owner = Some(u)` restreint aux runs de `u` : un workflow supprimé puis
+    /// recréé sous le même id par un autre utilisateur ne doit pas lui
+    /// exposer les runs de l'ancien propriétaire. `None` = tous (super-admin).
+    async fn list_by_workflow(
+        &self,
+        workflow_id: &str,
+        owner: Option<&str>,
+        paging: Pagination,
+    ) -> Result<RunListPage>;
 }
 
 /// Résultat paginé de [`RunStateStore::list_by_workflow`].
@@ -171,7 +194,15 @@ impl RunStateStore for InMemoryRunStateStore {
             .inner
             .lock()
             .map_err(|_| Error::Invalid("run_state lock empoisonné".into()))?;
-        map.insert(snapshot.run_id.clone(), snapshot.clone());
+        // Propriétaire immuable (même règle que l'impl PostgreSQL) : un
+        // checkpoint ultérieur ne peut ni l'effacer ni le changer.
+        let mut snap = snapshot.clone();
+        if let Some(existing) = map.get(&snapshot.run_id) {
+            if existing.owner_id.is_some() {
+                snap.owner_id = existing.owner_id.clone();
+            }
+        }
+        map.insert(snapshot.run_id.clone(), snap);
         Ok(())
     }
 
@@ -218,7 +249,12 @@ impl RunStateStore for InMemoryRunStateStore {
         Ok(())
     }
 
-    async fn list_by_workflow(&self, workflow_id: &str, paging: Pagination) -> Result<RunListPage> {
+    async fn list_by_workflow(
+        &self,
+        workflow_id: &str,
+        owner: Option<&str>,
+        paging: Pagination,
+    ) -> Result<RunListPage> {
         let map = self
             .inner
             .lock()
@@ -226,6 +262,7 @@ impl RunStateStore for InMemoryRunStateStore {
         let mut all: Vec<RunCheckpoint> = map
             .values()
             .filter(|c| c.workflow_id == workflow_id)
+            .filter(|c| owner.is_none() || c.owner_id.as_deref() == owner)
             .cloned()
             .collect();
         // Tri : created_at_ms desc, puis run_id asc pour stabiliser à
@@ -473,7 +510,7 @@ mod tests {
             .await
             .unwrap();
         let page = store
-            .list_by_workflow("wf-a", Pagination::default())
+            .list_by_workflow("wf-a", None, Pagination::default())
             .await
             .unwrap();
         assert_eq!(page.total, 2);
@@ -499,7 +536,7 @@ mod tests {
             .await
             .unwrap();
         let page = store
-            .list_by_workflow("wf", Pagination::default())
+            .list_by_workflow("wf", None, Pagination::default())
             .await
             .unwrap();
         let ids: Vec<&str> = page.items.iter().map(|c| c.run_id.as_str()).collect();
@@ -519,6 +556,7 @@ mod tests {
         let page = store
             .list_by_workflow(
                 "wf",
+                None,
                 Pagination {
                     offset: 1,
                     limit: 2,
@@ -538,10 +576,65 @@ mod tests {
     async fn list_by_workflow_returns_empty_when_unknown() {
         let store = InMemoryRunStateStore::new();
         let page = store
-            .list_by_workflow("nope", Pagination::default())
+            .list_by_workflow("nope", None, Pagination::default())
             .await
             .unwrap();
         assert_eq!(page.total, 0);
         assert!(page.items.is_empty());
+    }
+
+    // ───── Isolation par propriétaire (backlog BOLA) ─────
+
+    #[tokio::test]
+    async fn list_by_workflow_filters_by_owner() {
+        let store = InMemoryRunStateStore::new();
+        let mine = run_with_created("r-mine", "wf", 200).with_owner(Some("alice".into()));
+        let theirs = run_with_created("r-theirs", "wf", 100).with_owner(Some("bob".into()));
+        let legacy = run_with_created("r-legacy", "wf", 50);
+        for r in [&mine, &theirs, &legacy] {
+            store.checkpoint(r).await.unwrap();
+        }
+        let page = store
+            .list_by_workflow("wf", Some("alice"), Pagination::default())
+            .await
+            .unwrap();
+        assert_eq!(page.total, 1);
+        assert_eq!(page.items[0].run_id, "r-mine");
+        let all = store
+            .list_by_workflow("wf", None, Pagination::default())
+            .await
+            .unwrap();
+        assert_eq!(all.total, 3, "None = sans filtre (super-admin)");
+    }
+
+    #[tokio::test]
+    async fn checkpoint_keeps_the_first_owner() {
+        let store = InMemoryRunStateStore::new();
+        let queued = run_with_created("r", "wf", 1).with_owner(Some("alice".into()));
+        store.checkpoint(&queued).await.unwrap();
+        // Un checkpoint ultérieur sans propriétaire (ou avec un autre) ne
+        // doit pas le changer.
+        let mut later = run_with_created("r", "wf", 1);
+        later.status = RunStatus::Running;
+        store.checkpoint(&later).await.unwrap();
+        store
+            .checkpoint(&later.clone().with_owner(Some("mallory".into())))
+            .await
+            .unwrap();
+        let loaded = store.load("r").await.unwrap().unwrap();
+        assert_eq!(loaded.status, RunStatus::Running);
+        assert_eq!(loaded.owner_id.as_deref(), Some("alice"));
+    }
+
+    #[test]
+    fn checkpoint_without_owner_field_deserializes() {
+        // Snapshots sérialisés avant l'ajout du champ : `owner_id` absent.
+        let json = serde_json::json!({
+            "run_id": "r", "workflow_id": "wf", "version": 1, "trigger_type": "manual",
+            "status": "Queued", "started_at_ms": null, "finished_at_ms": null,
+            "created_at_ms": 1, "outputs": {}, "next_node": null, "error": null
+        });
+        let cp: RunCheckpoint = serde_json::from_value(json).unwrap();
+        assert_eq!(cp.owner_id, None);
     }
 }

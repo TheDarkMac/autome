@@ -77,12 +77,13 @@ impl PgRunStateStore {
             outputs,
             next_node: run.get("next_node"),
             error: run.get("error"),
+            owner_id: run.get("owner_id"),
         })
     }
 }
 
 const RUN_COLS: &str = "id, workflow_id, version, status, trigger_type, \
-                        started_at_ms, finished_at_ms, created_at_ms, next_node, error";
+                        started_at_ms, finished_at_ms, created_at_ms, next_node, error, owner_id";
 
 #[async_trait]
 impl RunStateStore for PgRunStateStore {
@@ -93,19 +94,21 @@ impl RunStateStore for PgRunStateStore {
             .await
             .map_err(|e| storage_err("begin", e))?;
 
-        // Upsert de la ligne run (last-write-wins).
+        // Upsert de la ligne run (last-write-wins), sauf `owner_id` :
+        // immuable une fois posé (COALESCE garde la valeur existante).
         tx.execute(
             "INSERT INTO runs \
              (id, workflow_id, version, status, trigger_type, started_at_ms, \
-              finished_at_ms, created_at_ms, next_node, error) \
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) \
+              finished_at_ms, created_at_ms, next_node, error, owner_id) \
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) \
              ON CONFLICT (id) DO UPDATE SET \
                workflow_id = EXCLUDED.workflow_id, version = EXCLUDED.version, \
                status = EXCLUDED.status, trigger_type = EXCLUDED.trigger_type, \
                started_at_ms = EXCLUDED.started_at_ms, \
                finished_at_ms = EXCLUDED.finished_at_ms, \
                created_at_ms = EXCLUDED.created_at_ms, \
-               next_node = EXCLUDED.next_node, error = EXCLUDED.error",
+               next_node = EXCLUDED.next_node, error = EXCLUDED.error, \
+               owner_id = COALESCE(runs.owner_id, EXCLUDED.owner_id)",
             &[
                 &snapshot.run_id,
                 &snapshot.workflow_id,
@@ -117,6 +120,7 @@ impl RunStateStore for PgRunStateStore {
                 &snapshot.created_at_ms,
                 &snapshot.next_node,
                 &snapshot.error,
+                &snapshot.owner_id,
             ],
         )
         .await
@@ -200,13 +204,16 @@ impl RunStateStore for PgRunStateStore {
     async fn list_by_workflow(
         &self,
         workflow_id: &str,
+        owner: Option<&str>,
         paging: Pagination,
     ) -> autome_core::Result<RunListPage> {
         let client = self.pool.get().await.map_err(|e| storage_err("pool", e))?;
+        // `$2 IS NULL` ⇒ pas de filtre propriétaire (super-admin).
         let total: i64 = client
             .query_one(
-                "SELECT count(*) FROM runs WHERE workflow_id = $1",
-                &[&workflow_id],
+                "SELECT count(*) FROM runs \
+                 WHERE workflow_id = $1 AND ($2::text IS NULL OR owner_id = $2)",
+                &[&workflow_id, &owner],
             )
             .await
             .map_err(|e| storage_err("list count", e))?
@@ -216,10 +223,11 @@ impl RunStateStore for PgRunStateStore {
         let rows = client
             .query(
                 &format!(
-                    "SELECT {RUN_COLS} FROM runs WHERE workflow_id = $1 \
-                     ORDER BY created_at_ms DESC, id LIMIT $2 OFFSET $3"
+                    "SELECT {RUN_COLS} FROM runs \
+                     WHERE workflow_id = $1 AND ($2::text IS NULL OR owner_id = $2) \
+                     ORDER BY created_at_ms DESC, id LIMIT $3 OFFSET $4"
                 ),
-                &[&workflow_id, &limit, &offset],
+                &[&workflow_id, &owner, &limit, &offset],
             )
             .await
             .map_err(|e| storage_err("list_by_workflow", e))?;

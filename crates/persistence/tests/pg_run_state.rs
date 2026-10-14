@@ -69,6 +69,7 @@ async fn checkpoint_load_orphans_failed_and_list() {
     let page = store
         .list_by_workflow(
             "wf",
+            None,
             Pagination {
                 offset: 0,
                 limit: 10,
@@ -79,4 +80,35 @@ async fn checkpoint_load_orphans_failed_and_list() {
     assert_eq!(page.total, 2);
     assert_eq!(page.items[0].run_id, "r2"); // plus récent (created 2000) d'abord
     assert_eq!(page.items[1].run_id, "r1");
+
+    // Propriétaire : persisté, immuable, et filtre de list_by_workflow.
+    let owned =
+        RunCheckpoint::queued("r3", "wf", 1, "manual", 3_000).with_owner(Some("alice".into()));
+    store.checkpoint(&owned).await.unwrap();
+    let mut later =
+        RunCheckpoint::queued("r3", "wf", 1, "manual", 3_000).with_owner(Some("mallory".into()));
+    later.status = RunStatus::Running;
+    store.checkpoint(&later).await.unwrap();
+    store
+        .checkpoint(&RunCheckpoint::queued("r3", "wf", 1, "manual", 3_000))
+        .await
+        .unwrap();
+    let r3 = store.load("r3").await.unwrap().unwrap();
+    assert_eq!(
+        r3.owner_id.as_deref(),
+        Some("alice"),
+        "propriétaire immuable"
+    );
+
+    let alice = store
+        .list_by_workflow("wf", Some("alice"), Pagination::default())
+        .await
+        .unwrap();
+    assert_eq!(alice.total, 1);
+    assert_eq!(alice.items[0].run_id, "r3");
+    let all = store
+        .list_by_workflow("wf", None, Pagination::default())
+        .await
+        .unwrap();
+    assert_eq!(all.total, 3);
 }
