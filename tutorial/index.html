@@ -1,0 +1,104 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Autome — Tutoriel</title>
+<link rel="stylesheet" href="assets/style.css" />
+</head>
+<body>
+
+<nav class="top">
+  <div class="wrap">
+    <a class="brand" href="index.html"><span class="bolt">⚡</span> Autome</a>
+    <div class="links">
+      <a href="concepts.html">Concepts</a>
+      <a href="architecture.html">Architecture</a>
+      <a href="editeur.html">Éditeur</a>
+      <a href="execution.html">Exécution</a>
+      <a href="connecteurs.html">Connecteurs</a>
+      <a href="demarrer.html">Démarrer</a>
+    </div>
+  </div>
+</nav>
+
+<header class="hero">
+  <div class="wrap">
+    <span class="eyebrow">⚡ Tutoriel interactif</span>
+    <h1 class="title">Automatisez vos workflows,<br>sans écrire une ligne.</h1>
+    <p class="subtitle">
+      Autome est une plateforme d'automatisation type <b>Make / n8n / Zapier</b> :
+      vous dessinez un graphe de <i>nodes</i> (déclencheurs, actions, logique),
+      et un moteur fiable l'exécute à votre place. Ce guide se parcourt page par page —
+      avec un éditeur jouable.
+    </p>
+    <div class="hero-cta">
+      <a class="btn primary" href="concepts.html">Commencer le tutoriel →</a>
+      <a class="btn ghost" href="editeur.html">▶ Voir l'éditeur</a>
+    </div>
+    <div class="pillrow">
+      <span class="pill">Backend <b>Rust</b></span>
+      <span class="pill">Frontend <b>React / TS</b></span>
+      <span class="pill"><b>PostgreSQL</b></span>
+      <span class="pill"><b>RabbitMQ</b></span>
+      <span class="pill">Moteur <b>DAG</b></span>
+      <span class="pill">Workers <b>stateless</b></span>
+    </div>
+  </div>
+</header>
+
+<main class="wrap">
+  <div class="block">
+    <h2>Le parcours</h2>
+    <p class="lede">Six chapitres, du vocabulaire jusqu'au lancement en local.</p>
+    <div class="grid cols-2" style="margin-top:24px">
+
+      <a class="navcard" href="concepts.html"><div class="card">
+        <span class="step-n">01 — CONCEPTS</span>
+        <h3 style="margin-top:6px">Le vocabulaire d'Autome <span class="arrow-go">→</span></h3>
+        <p>Workflow, node, trigger, run, et le templating <code>{{ }}</code> entre nodes.</p>
+      </div></a>
+
+      <a class="navcard" href="architecture.html"><div class="card">
+        <span class="step-n">02 — ARCHITECTURE</span>
+        <h3 style="margin-top:6px">Ce qui se passe sous le capot <span class="arrow-go">→</span></h3>
+        <p>API ⟷ file de messages ⟷ workers ⟷ moteur, avec un schéma animé.</p>
+      </div></a>
+
+      <a class="navcard" href="editeur.html"><div class="card">
+        <span class="step-n">03 — ÉDITEUR</span>
+        <h3 style="margin-top:6px">Construire & exécuter un workflow <span class="arrow-go">→</span></h3>
+        <p>Un éditeur jouable : sélectionnez les nodes, lancez le run, voyez-les s'allumer.</p>
+      </div></a>
+
+      <a class="navcard" href="execution.html"><div class="card">
+        <span class="step-n">04 — EXÉCUTION</span>
+        <h3 style="margin-top:6px">Le cycle de vie d'un run <span class="arrow-go">→</span></h3>
+        <p>Pas à pas + pourquoi un crash de worker ne perd jamais une exécution.</p>
+      </div></a>
+
+      <a class="navcard" href="connecteurs.html"><div class="card">
+        <span class="step-n">05 — CONNECTEURS</span>
+        <h3 style="margin-top:6px">Les briques d'action <span class="arrow-go">→</span></h3>
+        <p>Slack, Gmail, Notion, GitHub, HTTP — et la sécurité des credentials.</p>
+      </div></a>
+
+      <a class="navcard" href="demarrer.html"><div class="card">
+        <span class="step-n">06 — DÉMARRER</span>
+        <h3 style="margin-top:6px">Tout lancer en une commande <span class="arrow-go">→</span></h3>
+        <p>Docker Compose, ports, endpoints API et le format JSON d'un workflow.</p>
+      </div></a>
+
+    </div>
+  </div>
+</main>
+
+<footer>
+  <div class="wrap">
+    <a class="brand" href="index.html"><span class="bolt">⚡</span> Autome</a>
+    Plateforme d'automatisation de workflows · Rust + React · Licence MIT<br>
+    Tutoriel généré à partir du code source du dépôt.
+  </div>
+</footer>
+</body>
+</html>

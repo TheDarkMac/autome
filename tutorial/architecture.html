@@ -1,0 +1,139 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Autome — Architecture</title>
+<link rel="stylesheet" href="assets/style.css" />
+</head>
+<body>
+
+<nav class="top">
+  <div class="wrap">
+    <a class="brand" href="index.html"><span class="bolt">⚡</span> Autome</a>
+    <div class="links">
+      <a href="concepts.html">Concepts</a>
+      <a href="architecture.html" class="active">Architecture</a>
+      <a href="editeur.html">Éditeur</a>
+      <a href="execution.html">Exécution</a>
+      <a href="connecteurs.html">Connecteurs</a>
+      <a href="demarrer.html">Démarrer</a>
+    </div>
+  </div>
+</nav>
+
+<div class="page-hero">
+  <div class="wrap">
+    <span class="eyebrow">02 — Architecture</span>
+    <h1>Ce qui se passe sous le capot</h1>
+    <p class="lede">L'API et l'exécution sont séparées. Cliquez pour voir une requête traverser le système.</p>
+  </div>
+</div>
+
+<main class="wrap">
+  <div class="block">
+    <div class="arch">
+      <div class="flow" id="archFlow">
+        <div class="stage">
+          <div class="stage-label">Vous</div>
+          <div class="box" data-stage="0"><div class="t">Frontend</div><div class="s">React · éditeur visuel</div></div>
+        </div>
+        <div class="arrow" data-arrow="0">→</div>
+        <div class="stage">
+          <div class="stage-label">Entrée</div>
+          <div class="box" data-stage="1"><div class="t">API (axum)</div><div class="s">auth · CRUD · OpenAPI</div></div>
+        </div>
+        <div class="arrow" data-arrow="1">→</div>
+        <div class="stage">
+          <div class="stage-label">Découplage</div>
+          <div class="box" data-stage="2"><div class="t">RabbitMQ</div><div class="s">file de runs</div></div>
+        </div>
+        <div class="arrow" data-arrow="2">→</div>
+        <div class="stage">
+          <div class="stage-label">Exécution</div>
+          <div class="box" data-stage="3"><div class="t">Worker</div><div class="s">pool stateless</div></div>
+          <div class="arrow" style="transform:rotate(90deg)">→</div>
+          <div class="box" data-stage="4"><div class="t">Engine (DAG)</div><div class="s">séquence · if · loop</div></div>
+        </div>
+        <div class="arrow" data-arrow="3">→</div>
+        <div class="stage">
+          <div class="stage-label">Le monde</div>
+          <div class="box" data-stage="5"><div class="t">Connecteurs</div><div class="s">Slack · Gmail · Notion</div></div>
+          <div class="arrow" style="transform:rotate(90deg)">→</div>
+          <div class="box" data-stage="6"><div class="t">PostgreSQL</div><div class="s">état des runs</div></div>
+        </div>
+      </div>
+      <div style="margin-top:22px"><button class="btn ghost" id="archPlay" style="font-size:13px;padding:9px 16px">▶ Animer une requête</button></div>
+      <div class="arch-legend">
+        <span>🟡 <b>Trigger</b> → pose un run dans la file</span>
+        <span>🔵 <b>Worker</b> consomme → déroule le DAG</span>
+        <span>🟢 <b>État</b> persisté à chaque node → reprise après crash</span>
+      </div>
+    </div>
+
+    <h3 class="sub">Les principes de conception</h3>
+    <div class="grid cols-2" style="margin-top:14px">
+      <div class="card">
+        <h3><span class="ico">🔀</span> Séparation API / exécution</h3>
+        <p>L'API ne fait qu'accepter et enfiler. Elle répond instantanément ; le travail lourd part dans la file de messages.</p>
+      </div>
+      <div class="card">
+        <h3><span class="ico">📦</span> Workers stateless</h3>
+        <p>Tout l'état d'un run vit en base. Un worker ne garde rien localement, donc on peut en ajouter ou en tuer librement.</p>
+      </div>
+      <div class="card">
+        <h3><span class="ico">✉️</span> Découplage par messages</h3>
+        <p>RabbitMQ absorbe les pics (backpressure) et garantit qu'un run non terminé est repris si un worker tombe.</p>
+      </div>
+      <div class="card">
+        <h3><span class="ico">🧬</span> Cœur agnostique</h3>
+        <p>Le moteur dépend de <i>traits</i>, pas de Slack ni de Postgres. On ajoute un connecteur sans toucher à l'orchestration.</p>
+      </div>
+    </div>
+
+    <h3 class="sub">La même chose, en crates Rust</h3>
+<pre>crates/
+├── core/         <span class="c1"># types, traits & erreurs partagés (agnostique)</span>
+├── engine/       <span class="c1"># moteur DAG (séquence, conditions, boucles, //)</span>
+├── connectors/   <span class="c1"># Slack · Gmail · Notion · GitHub · HTTP + SDK</span>
+├── api/          <span class="c1"># serveur HTTP axum (auth, CRUD, /metrics, OpenAPI)</span>
+└── worker/       <span class="c1"># pool d'exécuteurs (consomme la file → moteur)</span></pre>
+
+    <div class="pager">
+      <a href="concepts.html"><div class="dir">← Précédent</div><div class="lbl">Concepts</div></a>
+      <a class="next" href="editeur.html"><div class="dir">Suivant →</div><div class="lbl">L'éditeur visuel</div></a>
+    </div>
+  </div>
+</main>
+
+<footer>
+  <div class="wrap">
+    <a class="brand" href="index.html"><span class="bolt">⚡</span> Autome</a>
+    Plateforme d'automatisation de workflows · Rust + React · Licence MIT
+  </div>
+</footer>
+
+<script>
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const archPlay = document.getElementById("archPlay");
+const archFlow = document.getElementById("archFlow");
+const stages = [...archFlow.querySelectorAll(".box")];
+const arrows = [...archFlow.querySelectorAll(".arrow[data-arrow]")];
+async function animArch() {
+  archPlay.disabled = true;
+  stages.forEach((s) => s.classList.remove("lit"));
+  arrows.forEach((a) => a.classList.remove("flowing"));
+  for (let i = 0; i < stages.length; i++) {
+    stages[i].classList.add("lit");
+    const ar = arrows[Math.min(i, arrows.length - 1)];
+    if (ar) ar.classList.add("flowing");
+    await sleep(520);
+  }
+  await sleep(500);
+  arrows.forEach((a) => a.classList.remove("flowing"));
+  archPlay.disabled = false;
+}
+archPlay.addEventListener("click", animArch);
+</script>
+</body>
+</html>
