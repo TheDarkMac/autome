@@ -10,6 +10,14 @@ metadata:
 data:
   APP_PROFILE: "prod"
   APP_HTTP_ADDR: "0.0.0.0:8080"
+  # Backends durables, obligatoires en `prod` (#172 : l'API et le worker
+  # refusent de démarrer en `memory`). PostgreSQL = `DATABASE_URL`, RabbitMQ =
+  # `QUEUE_URL` (Secret ci-dessous).
+  AUTOME_PERSISTENCE: "postgres"
+  AUTOME_QUEUE: "rabbitmq"
+  # Migrations appliquées par l'API au démarrage (idempotent, verrou
+  # applicatif entre répliques) ; ignoré par le worker.
+  AUTOME_MIGRATE: "true"
   # Providers OAuth activés (#161). Les AUTOME_OAUTH_<ID>_* non sensibles
   # (URLs, scopes) peuvent vivre ici ; client_id/client_secret vont au Secret.
   # Vide/absent = OAuth désactivé.
