@@ -63,6 +63,10 @@ pub const MIGRATIONS: &[(&str, &str)] = &[
         "0010_resource_owners.sql",
         include_str!("../../../migrations/0010_resource_owners.sql"),
     ),
+    (
+        "0011_connector_tokens.sql",
+        include_str!("../../../migrations/0011_connector_tokens.sql"),
+    ),
 ];
 
 fn storage_err(context: &str, e: impl std::fmt::Display) -> Error {
