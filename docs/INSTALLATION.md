@@ -41,9 +41,10 @@ cp .env.example .env
 | `APP_PROFILE` | Profil d'exécution : `dev` ou `prod` | `dev` | `prod` |
 | `APP_HTTP_ADDR` | Adresse d'écoute HTTP de l'API | `127.0.0.1:8080` | `0.0.0.0:8080` |
 | `DATABASE_URL` | DSN PostgreSQL | `postgres://postgres:postgres@localhost:5432/autome` | **obligatoire** (≠ défaut) |
-| `QUEUE_URL` | URL de la file (RabbitMQ) | *(vide)* | **obligatoire** (avec `AUTOME_QUEUE=rabbitmq`) |
+| `QUEUE_URL` | URL de la file (RabbitMQ). Le chemin est le vhost : `…:5672/%2f` pour le vhost par défaut `/` | *(vide)* | **obligatoire** (avec `AUTOME_QUEUE=rabbitmq`) |
 | `AUTOME_PERSISTENCE` | Stores de l'API et du worker : `memory` ou `postgres` | `memory` | **`postgres` obligatoire** |
 | `AUTOME_QUEUE` | File des runs : `memory` ou `rabbitmq` | `memory` | **`rabbitmq` obligatoire** |
+| `AUTOME_QUEUE_CONNECT_TIMEOUT_SECS` | Délai pendant lequel l'API et le worker retentent la connexion au broker au démarrage (erreurs réseau seulement) | `60` | `60` |
 | `AUTOME_MIGRATE` | L'API applique les migrations au démarrage (`true`/`1`/`yes`, mode `postgres`) | *(non)* | recommandé |
 | `JWT_SECRET` | Clé de signature des JWT | `dev-insecure-jwt-secret` | **obligatoire** (non-défaut) |
 | `ENCRYPTION_KEY` | Clé de chiffrement des credentials au repos — **identique pour l'API et le worker** | `dev-insecure-encryption-key` | **obligatoire** (non-défaut) |
@@ -156,6 +157,11 @@ démarre en une commande :
 docker compose up --build
 ```
 
+L'API et le worker y partagent **PostgreSQL** (`AUTOME_PERSISTENCE=postgres`)
+et **RabbitMQ** (`AUTOME_QUEUE=rabbitmq`) ; l'API applique les migrations au
+démarrage (`AUTOME_MIGRATE=true`). Les données survivent à un
+`docker compose restart` (volume `pgdata`).
+
 | Service | URL | Identifiants |
 |---|---|---|
 | API | http://localhost:8080 | — (`/health`, `/metrics`) |
@@ -170,6 +176,22 @@ Vérification rapide :
 ```bash
 curl http://localhost:8080/health     # -> ok
 curl http://localhost:8080/metrics    # -> métriques Prometheus
+```
+
+Vérification **de bout en bout** — compte jetable, workflow, run exécuté par
+le worker jusqu'à `succeeded` (échoue si l'API et le worker ne partagent pas
+la file) :
+
+```bash
+scripts/compose-smoke.sh
+```
+
+Compte super-admin de dev (optionnel) : appliquer le seed **après** le premier
+démarrage de l'API (migrations appliquées), puis se connecter avec
+`dev@autome.local` / `autome-dev-password` :
+
+```bash
+docker compose exec -T db psql -U postgres -d autome < migrations/seeds/dev_seed.sql
 ```
 
 Arrêt et nettoyage (supprime aussi les volumes de données) :
@@ -188,19 +210,24 @@ docker compose down -v
 ### B.1 Base de données & migrations
 
 Le schéma est versionné dans `migrations/` (`0001_users.sql` →
-`0005_indexes_constraints.sql`). Pour valider/appliquer les migrations sur un
-PostgreSQL **jetable** (conteneur Docker dédié, sans effet sur une base
-existante) :
+`0011_connector_tokens.sql`), embarqué dans le binaire de l'API. Pour
+l'appliquer sur votre base, démarrez l'API une fois avec le runner de
+migrations — idempotent, journalisé dans `schema_migrations`, sérialisé entre
+répliques par un verrou applicatif :
+
+```bash
+AUTOME_PERSISTENCE=postgres AUTOME_MIGRATE=true cargo run -p autome-api
+```
+
+> N'appliquez pas les fichiers à la main (`psql -f`) sur une base que l'API
+> gérera ensuite : le journal `schema_migrations` ne serait pas alimenté et un
+> démarrage avec `AUTOME_MIGRATE=true` tenterait de tout réappliquer.
+
+Pour seulement **valider** les migrations sur un PostgreSQL jetable
+(conteneur Docker dédié, sans effet sur une base existante) :
 
 ```bash
 scripts/check-migrations.sh
-```
-
-Pour une base que vous gérez vous-même, appliquez les fichiers dans l'ordre
-lexicographique, par exemple :
-
-```bash
-for f in migrations/*.sql; do psql "$DATABASE_URL" -f "$f"; done
 ```
 
 ### B.2 Backend (API + worker)
@@ -377,6 +404,8 @@ npm run test       # Vitest
 | Symptôme | Cause probable | Solution |
 |---|---|---|
 | `feature edition2024 is required` à la compilation | Toolchain Rust < 1.85 | `rustup update` (viser ≥ 1.85) |
+| L'API ou le worker s'arrête sur `NOT_ALLOWED - vhost  not found` | `QUEUE_URL` terminée par une barre seule (`…:5672/` = vhost vide) | Écrire le vhost : `amqp://user:pass@host:5672/%2f` |
+| Logs `connexion impossible, nouvelle tentative service="rabbitmq"` au démarrage | Broker démarré mais pas encore à l'écoute | Normal pendant quelques secondes ; au-delà de `AUTOME_QUEUE_CONNECT_TIMEOUT_SECS`, vérifier `QUEUE_URL` et le broker |
 | L'API refuse de démarrer en `prod` (`… doit être défini (non-défaut)`) | Secret laissé à la valeur de dev ou `DATABASE_URL` par défaut | Définir de vrais `JWT_SECRET` / `ENCRYPTION_KEY` / `DATABASE_URL` |
 | `TLS partiellement configuré` au démarrage | Une seule des deux variables TLS positionnée | Définir `AUTOME_TLS_CERT` **et** `AUTOME_TLS_KEY`, ou aucune |
 | Port déjà utilisé (`address already in use`) | 8080/8081/3000/9090/5432/15672 occupé | Libérer le port ou ajuster `APP_HTTP_ADDR` / les mappings du compose |
