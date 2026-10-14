@@ -14,12 +14,13 @@ use std::sync::Arc;
 use autome_connectors::oauth::{InMemoryConnectorTokenStore, OAuthClient, OAuthRegistry};
 use autome_connectors::{CredentialService, OAuthCredentialService, ReqwestHttpClient};
 use autome_core::{
-    Config, EnvelopeCipher, InMemoryKeyProvider, InMemoryRunStateStore, InMemoryWorkflowRepository,
-    Queue, QueueRunDispatcher, Result, RunDispatcher, RunStateStore, WorkflowRepository,
+    Config, EnvelopeCipher, InMemoryKeyProvider, InMemoryPermissionStore, InMemoryRevocationStore,
+    InMemoryRunStateStore, InMemoryUserStore, InMemoryWorkflowRepository, NoopAuditSink, Queue,
+    QueueRunDispatcher, Result, RunDispatcher, RunStateStore, UserStore, WorkflowRepository,
 };
 use autome_persistence::{
     connect, run_migrations, PgAuditSink, PgPermissionStore, PgRevocationStore, PgRunStateStore,
-    PgWorkflowRepository,
+    PgUserStore, PgWorkflowRepository,
 };
 use sha2::{Digest, Sha256};
 
@@ -56,6 +57,9 @@ pub struct Backends {
     pub dispatcher: Arc<dyn RunDispatcher + Send + Sync>,
     /// Service de credentials OAuth (transport HTTP réel + store chiffré).
     pub credentials: Arc<dyn CredentialService + Send + Sync>,
+    /// Comptes utilisateurs (signup/login). Écrit dans le même store de
+    /// permissions que `auth`, sans quoi un compte créé n'aurait aucun droit.
+    pub users: Arc<dyn UserStore + Send + Sync>,
 }
 
 /// Assemble les backends. En `Postgres`, **un seul pool** est partagé par tous
@@ -71,12 +75,20 @@ pub fn build_backends(
             let runs: Arc<dyn RunStateStore + Send + Sync> = Arc::new(InMemoryRunStateStore::new());
             let dispatcher: Arc<dyn RunDispatcher + Send + Sync> =
                 Arc::new(QueueRunDispatcher::new(queue, runs.clone()));
+            let permissions = Arc::new(InMemoryPermissionStore::new());
+            let auth = AuthState::new(
+                token_service_from_config(config),
+                Arc::new(InMemoryRevocationStore::new()),
+                permissions.clone(),
+                Arc::new(NoopAuditSink),
+            );
             Ok(Backends {
-                auth: AuthState::from_config(config),
+                auth,
                 workflows: Arc::new(InMemoryWorkflowRepository::new()),
                 runs,
                 dispatcher,
                 credentials: build_credential_service(config)?,
+                users: Arc::new(InMemoryUserStore::new(permissions)),
             })
         }
         PersistenceMode::Postgres => {
@@ -93,10 +105,11 @@ pub fn build_backends(
                 Arc::new(QueueRunDispatcher::new(queue, runs.clone()));
             Ok(Backends {
                 auth,
-                workflows: Arc::new(PgWorkflowRepository::new(pool)),
+                workflows: Arc::new(PgWorkflowRepository::new(pool.clone())),
                 runs,
                 dispatcher,
                 credentials: build_credential_service(config)?,
+                users: Arc::new(PgUserStore::new(pool)),
             })
         }
     }
