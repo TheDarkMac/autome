@@ -44,7 +44,8 @@ stringData:
   ENCRYPTION_KEY: "REPLACE_ME_with_a_real_encryption_key"
   POSTGRES_PASSWORD: "REPLACE_ME_postgres_password"
   DATABASE_URL: "postgres://postgres:REPLACE_ME_postgres_password@postgres:5432/autome"
-  QUEUE_URL: "amqp://guest:guest@rabbitmq:5672/"
+  # Vhost par défaut `/` = `%2f` (une barre finale seule = vhost vide, refusé).
+  QUEUE_URL: "amqp://guest:guest@rabbitmq:5672/%2f"
   # Credentials des providers OAuth (#161) — à renseigner par provider listé
   # dans AUTOME_OAUTH_PROVIDERS. Exemple (décommenter + compléter) :
   #AUTOME_OAUTH_GOOGLE_CLIENT_ID: "REPLACE_ME"
