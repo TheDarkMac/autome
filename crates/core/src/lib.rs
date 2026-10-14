@@ -17,6 +17,7 @@ pub mod run_dispatch;
 pub mod run_state;
 pub mod scheduler;
 pub mod secrets;
+pub mod telemetry;
 pub mod trigger;
 pub mod workflow;
 
