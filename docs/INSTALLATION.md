@@ -43,10 +43,11 @@ cp .env.example .env
 | `DATABASE_URL` | DSN PostgreSQL | `postgres://postgres:postgres@localhost:5432/autome` | **obligatoire** (≠ défaut) |
 | `QUEUE_URL` | URL de la file (RabbitMQ) | *(vide)* | recommandé |
 | `JWT_SECRET` | Clé de signature des JWT | `dev-insecure-jwt-secret` | **obligatoire** (non-défaut) |
-| `ENCRYPTION_KEY` | Clé de chiffrement des credentials au repos | `dev-insecure-encryption-key` | **obligatoire** (non-défaut) |
+| `ENCRYPTION_KEY` | Clé de chiffrement des credentials au repos — **identique pour l'API et le worker** | `dev-insecure-encryption-key` | **obligatoire** (non-défaut) |
 | `AUTOME_TLS_CERT` | Chemin du certificat PEM (active HTTPS) | *(non défini)* | optionnel |
 | `AUTOME_TLS_KEY` | Chemin de la clé privée PEM | *(non défini)* | optionnel |
 | `AUTOME_EGRESS_ALLOWLIST` | Hôtes internes autorisés en sortie HTTP (anti-SSRF), séparés par virgule | *(vide : public uniquement)* | selon besoin |
+| `AUTOME_CONNECTOR_CREDENTIALS` | Worker : `per_user` (token du propriétaire du run) ou `single_tenant` (repli sur `AUTOME_CONNECTOR_TOKEN_<PROVIDER>`) | `per_user` | `per_user` (instance partagée) |
 
 ### Sortie réseau (anti-SSRF)
 
@@ -63,6 +64,30 @@ Pour joindre un service interne légitime (IdP on-prem, API intranet), ajoutez
 son nom ou son IP à `AUTOME_EGRESS_ALLOWLIST`. Avec un **proxy sortant**
 (`HTTPS_PROXY`), ajoutez le proxy à l'allowlist : le filtrage des noms d'hôte
 revient alors au proxy, qui fait la résolution DNS.
+
+### Tokens des connecteurs (par utilisateur)
+
+Les actions `slack.*`, `gmail.*`, `notion.*` et `github.*` s'exécutent avec le
+token OAuth **du propriétaire du run** (celui du workflow, fixé au
+déclenchement). Chaque utilisateur connecte ses comptes via
+`POST /credentials/{provider}/authorize` puis `…/callback` ; l'API stocke le
+jeton **chiffré** (AES-256-GCM, clé dérivée de `ENCRYPTION_KEY`) et le worker le
+relit au moment du run. Le `provider_id` OAuth doit être le préfixe de l'action
+(`slack`, `gmail`, `notion`, `github`).
+
+- **Partage API ↔ worker** : `AUTOME_PERSISTENCE=postgres` sur les deux
+  services (table `connector_tokens`, migration `0011`) et le **même**
+  `ENCRYPTION_KEY`. En `memory`, chaque process a son propre store (dev seul).
+- **Pas de token** pour ce propriétaire, ou run sans propriétaire (créé avant
+  l'isolation par propriétaire) : le node échoue avec un message explicite ; le
+  run ne part jamais avec le compte d'un autre utilisateur.
+- **Mode mono-tenant (opt-in)** : `AUTOME_CONNECTOR_CREDENTIALS=single_tenant`
+  sur le worker rétablit le repli sur un token **global** par provider
+  (`AUTOME_CONNECTOR_TOKEN_SLACK`, `…_GMAIL`, `…_NOTION`, `…_GITHUB`) quand le
+  propriétaire n'a pas connecté le sien. Ce token est alors utilisé par **tous**
+  les utilisateurs : réservé à une instance à un seul tenant. Une erreur de
+  lecture du store ne déclenche jamais ce repli. Le worker l'annonce au
+  démarrage ; toute autre valeur que `per_user`/`single_tenant` est refusée.
 
 ### Règles du profil `prod` (fail-fast)
 

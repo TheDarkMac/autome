@@ -284,7 +284,10 @@ cargo test -p autome-connectors
 - **OAuth2** — le module `sdk`-voisin `oauth` fournit Authorization Code + PKCE,
   l'échange/rafraîchissement de tokens et un `ConnectorTokenStore` chiffré
   (cf. F6.2/F6.3). Les credentials d'un provider OAuth se déclarent dans
-  l'`OAuthRegistry` et sont listés via `OAuthCredentialService`.
+  l'`OAuthRegistry` et sont listés via `OAuthCredentialService`. En
+  `postgres`, les tokens sont persistés chiffrés par
+  `autome_persistence::PgConnectorTokenStore` (table `connector_tokens`) —
+  même enveloppe que le store en mémoire (`seal_tokens`/`open_tokens`).
 
 Connecteurs réels à étudier, par ordre de complexité :
 
@@ -307,6 +310,26 @@ Connecteurs réels à étudier, par ordre de complexité :
    ```
 3. Écrire les tests (TDD, §5) et garder `cargo fmt` + `cargo clippy -D warnings`
    verts (DoD de la CI).
+4. Pour l'exécuter dans les workflows, l'ajouter au dispatch du worker
+   (`crates/worker/src/dispatch.rs` : `is_connector_action` + bras de
+   `dispatch_action`).
+
+### Token injecté à l'exécution
+
+Le worker ne construit jamais l'`*Auth` à partir d'un secret global : le
+**provider** est le préfixe du `action_type` (`slack.send_message` →
+`slack`) et le token est celui du **propriétaire du run**
+(`RunCheckpoint.owner_id`), lu par `OwnerCredentialResolver` dans le
+`ConnectorTokenStore` chiffré. Conséquences pour un nouveau connecteur :
+
+- déclarer son provider OAuth sous le **même identifiant** que le préfixe de
+  ses actions (`AUTOME_OAUTH_PROVIDERS=<provider>`), sinon le token de
+  l'utilisateur n'est jamais trouvé ;
+- token absent ou run sans propriétaire ⇒ le node échoue **avant** toute
+  requête HTTP (message explicite indiquant `/credentials/<provider>/authorize`) ;
+- le token global `AUTOME_CONNECTOR_TOKEN_<PROVIDER>` n'est lu qu'en repli
+  du mode mono-tenant `AUTOME_CONNECTOR_CREDENTIALS=single_tenant`
+  (cf. [INSTALLATION.md](INSTALLATION.md#tokens-des-connecteurs-par-utilisateur)).
 
 > ℹ️ **État actuel** : le moteur d'exécution et l'API ne consomment pas encore
 > automatiquement le registre de connecteurs (les `action_schemas` ne sont pas
