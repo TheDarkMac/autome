@@ -23,3 +23,6 @@ rand = { workspace = true }
 base64 = { workspace = true }
 # Transport HTTP réel (dette #107) — client bloquant rustls.
 reqwest = { workspace = true }
+# Résolution DNS async du résolveur anti-SSRF (exécuté dans le runtime interne
+# de reqwest) — backlog post-audit.
+tokio = { workspace = true, features = ["net"] }
