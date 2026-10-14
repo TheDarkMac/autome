@@ -17,14 +17,17 @@
 //! 5. [`store::ConnectorTokenStore::store`] : conserve la
 //!    [`client::TokenSet`] chiffrée via `EnvelopeCipher` (F6.3).
 //! 6. Plus tard, [`client::OAuthClient::refresh`] échange le refresh
-//!    token contre une nouvelle paire (la caller doit re-store).
+//!    token contre une nouvelle paire (la caller doit re-store) — piloté par
+//!    [`refresh`] côté worker quand l'access token expire.
 
 pub mod client;
 pub mod pkce;
 pub mod provider;
+pub mod refresh;
 pub mod store;
 
 pub use client::{AuthorizationStart, OAuthClient, TokenSet};
 pub use pkce::{generate_pkce, generate_state, PkcePair};
 pub use provider::{OAuthProviderConfig, OAuthRegistry};
+pub use refresh::{merge_refreshed, needs_refresh, TokenRefresher, REFRESH_SKEW_MS};
 pub use store::{open_tokens, seal_tokens, ConnectorTokenStore, InMemoryConnectorTokenStore};
