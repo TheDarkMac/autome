@@ -274,6 +274,9 @@ erDiagram
   une livraison dupliquée d'un run déjà pris ou terminé est acquittée sans
   ré-exécution, sur n'importe quelle réplique (#174). Un run interrompu n'est
   pas rejoué : `reap_orphans` le clôt en `failed` après `AUTOME_RUN_TIMEOUT_SECS`.
+- Broker : reconnexion à la demande après perte de RabbitMQ, `DeliveryId` lié à
+  la génération du canal (un `ack` périmé est ignoré), publisher confirms
+  réels ; backoff du worker pendant une panne (#180).
 
 **Sécurité**
 - TLS côté API (rustls, *all-or-nothing*) ; TLS d'ingress = cible (F6.4).
