@@ -14,6 +14,9 @@ data:
   # (URLs, scopes) peuvent vivre ici ; client_id/client_secret vont au Secret.
   # Vide/absent = OAuth désactivé.
   AUTOME_OAUTH_PROVIDERS: ""
+  # Anti-SSRF : hôtes internes autorisés en sortie (vide = destinations
+  # publiques uniquement). Ex. "keycloak.autome.svc.cluster.local".
+  AUTOME_EGRESS_ALLOWLIST: ""
 ---
 # Secrets (F10.3) — VALEURS DE DÉMONSTRATION, à remplacer impérativement
 # avant tout usage réel (SealedSecrets / External Secrets / Vault…).

@@ -46,6 +46,23 @@ cp .env.example .env
 | `ENCRYPTION_KEY` | Clé de chiffrement des credentials au repos | `dev-insecure-encryption-key` | **obligatoire** (non-défaut) |
 | `AUTOME_TLS_CERT` | Chemin du certificat PEM (active HTTPS) | *(non défini)* | optionnel |
 | `AUTOME_TLS_KEY` | Chemin de la clé privée PEM | *(non défini)* | optionnel |
+| `AUTOME_EGRESS_ALLOWLIST` | Hôtes internes autorisés en sortie HTTP (anti-SSRF), séparés par virgule | *(vide : public uniquement)* | selon besoin |
+
+### Sortie réseau (anti-SSRF)
+
+Les requêtes HTTP sortantes — action `http_request` des workflows (URL choisie
+par l'utilisateur) et échanges OAuth — ne peuvent viser que des adresses
+**publiques**. Sont refusés : `localhost`/loopback, réseaux privés (RFC 1918,
+IPv6 ULA), link-local (dont `169.254.169.254`, métadonnées cloud), CGNAT,
+plages réservées/documentation, et tout schéma autre que `http`/`https`.
+Le contrôle porte sur l'IP littérale, sur **chaque adresse DNS résolue** (la
+connexion part vers l'adresse vérifiée : pas de DNS rebinding) et sur chaque
+redirection (5 au plus). Délai 30 s (connexion 10 s), réponse ≤ 10 Mio.
+
+Pour joindre un service interne légitime (IdP on-prem, API intranet), ajoutez
+son nom ou son IP à `AUTOME_EGRESS_ALLOWLIST`. Avec un **proxy sortant**
+(`HTTPS_PROXY`), ajoutez le proxy à l'allowlist : le filtrage des noms d'hôte
+revient alors au proxy, qui fait la résolution DNS.
 
 ### Règles du profil `prod` (fail-fast)
 
