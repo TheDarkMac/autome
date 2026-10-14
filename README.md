@@ -38,7 +38,8 @@ documentation et les exemples de workflows. Détail dans la
 - **Éditeur visuel** : canvas drag-and-drop (React), palette de nodes,
   configuration, visualisation de l'exécution.
 - **Observabilité** : métriques **Prometheus** (`/metrics`) + dashboards
-  **Grafana** provisionnés.
+  **Grafana** provisionnés ; logs structurés `tracing` (JSON en prod) corrélés
+  par `x-request-id` côté API et par `run_id` côté worker.
 
 ---
 

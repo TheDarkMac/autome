@@ -50,6 +50,8 @@ cp .env.example .env
 | `AUTOME_TLS_CERT` | Chemin du certificat PEM (active HTTPS) | *(non défini)* | optionnel |
 | `AUTOME_TLS_KEY` | Chemin de la clé privée PEM | *(non défini)* | optionnel |
 | `AUTOME_EGRESS_ALLOWLIST` | Hôtes internes autorisés en sortie HTTP (anti-SSRF), séparés par virgule | *(vide : public uniquement)* | selon besoin |
+| `AUTOME_LOG_FORMAT` | Format des logs (API + worker) : `json` ou `text` | `text` | `json` (défaut en `prod`) |
+| `RUST_LOG` | Niveau des logs, syntaxe `EnvFilter` (ex. `info,autome_worker=debug`) | `info` | `info` |
 | `AUTOME_WORKER_CONCURRENCY` | Worker : tâches consommatrices par process | `4` | selon charge |
 | `AUTOME_RUN_TIMEOUT_SECS` | Worker : au-delà, un run encore `running` est clos en `failed` (min. 60) | `3600` | > durée du plus long run |
 | `AUTOME_CONNECTOR_CREDENTIALS` | Worker : `per_user` (token du propriétaire du run) ou `single_tenant` (repli sur `AUTOME_CONNECTOR_TOKEN_<PROVIDER>`) | `per_user` | `per_user` (instance partagée) |
@@ -295,6 +297,22 @@ Le namespace inclut **Prometheus** (scrape de l'API) et **Grafana** (datasource
 kubectl -n autome port-forward svc/grafana 3000:3000     # http://localhost:3000 (admin/admin)
 kubectl -n autome port-forward svc/prometheus 9090:9090  # http://localhost:9090
 ```
+
+**Logs** : en `prod`, l'API et le worker écrivent **une ligne JSON par
+événement** sur la sortie standard, prête pour un collecteur (Loki, Fluent Bit,
+CloudWatch…). Champs utiles :
+
+- `level`, `message`, `target`, `timestamp`, puis les champs de l'événement à
+  plat (`status`, `duration_ms`, `error`, `verdict`…) ;
+- `span.request_id` (API) : identifiant de la requête, renvoyé au client dans
+  l'en-tête `x-request-id` — un utilisateur peut le citer pour retrouver ses
+  logs. Un `x-request-id` fourni par le proxy est repris s'il est sûr
+  (alphanumérique et `-_.:`, 128 caractères max), sinon un id est généré ;
+- `span.run_id` / `span.workflow_id` (worker) : tous les logs d'un run, y
+  compris ceux des connecteurs.
+
+Le chemin est journalisé sans la query string. Pour diagnostiquer, monter le
+niveau d'un module sans redéployer l'image : `RUST_LOG=info,autome_worker=debug`.
 
 ---
 
