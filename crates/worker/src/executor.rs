@@ -16,7 +16,10 @@
 //!   [`ReqwestHttpClient`] **partagé** (un seul client bloquant réutilisé),
 //!   filtré anti-SSRF : destinations publiques seulement, sauf hôtes de
 //!   l'allowlist opérateur `AUTOME_EGRESS_ALLOWLIST` ;
-//! - tout autre `action_type` : erreur (connecteurs Slack/Gmail/… = suite).
+//! - `Action { slack.* | gmail.* | notion.* | github.* }` : connecteur, avec le
+//!   token **du propriétaire du run** (`RunCheckpoint.owner_id`) résolu par le
+//!   [`CredentialResolver`] ;
+//! - tout autre `action_type` : erreur.
 //!
 //! Le moteur est **synchrone** et le transport HTTP est **bloquant**
 //! (`reqwest::blocking`) : exécuter `Engine::run` directement sur un thread
@@ -28,49 +31,62 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
-use autome_connectors::{EgressPolicy, HttpAction, ReqwestHttpClient};
+use autome_connectors::{EgressPolicy, HttpAction, HttpClient, ReqwestHttpClient};
 use autome_core::{
     Action, Delivery, Node, NodeKind, RunStateStore, RunStatus, WorkflowId, WorkflowRepository,
 };
 use autome_engine::{Dag, Engine, RunContext, StepStatus};
 
-use crate::dispatch::{dispatch_action, CredentialResolver, EnvCredentialResolver};
+use crate::dispatch::{dispatch_action, CredentialResolver};
 use crate::{Handler, HandlerVerdict};
 
 /// Handler de production : exécute un run de bout en bout et persiste son état.
 ///
 /// Construit avec des `Arc<dyn …>` (repo/store sélectionnés par
-/// `AUTOME_PERSISTENCE`), un [`ReqwestHttpClient`] clonable partagé entre
-/// toutes les actions HTTP, et un [`CredentialResolver`] qui injecte les tokens
-/// des connecteurs (#159).
-pub struct RunExecutor {
+/// `AUTOME_PERSISTENCE`), un transport HTTP clonable partagé entre toutes les
+/// actions (par défaut [`ReqwestHttpClient`] filtré anti-SSRF), et un
+/// [`CredentialResolver`] qui injecte le token du propriétaire du run dans les
+/// connecteurs. Le résolveur est **obligatoire** : aucun défaut implicite vers
+/// un token global.
+pub struct RunExecutor<C = ReqwestHttpClient> {
     repo: Arc<dyn WorkflowRepository + Send + Sync>,
     store: Arc<dyn RunStateStore + Send + Sync>,
-    http: ReqwestHttpClient,
+    http: C,
     resolver: Arc<dyn CredentialResolver>,
 }
 
 impl RunExecutor {
-    /// Construit l'executor sur un repo de workflows et un store d'état donnés.
-    /// Résolveur de credentials par défaut : [`EnvCredentialResolver`]
-    /// (`AUTOME_CONNECTOR_TOKEN_<PROVIDER>`).
+    /// Executor de production : transport [`ReqwestHttpClient`] avec la
+    /// politique egress de l'opérateur (`AUTOME_EGRESS_ALLOWLIST`).
     pub fn new(
-        repo: Arc<dyn WorkflowRepository + Send + Sync>,
-        store: Arc<dyn RunStateStore + Send + Sync>,
-    ) -> Self {
-        Self::with_resolver(repo, store, Arc::new(EnvCredentialResolver))
-    }
-
-    /// Variante avec un [`CredentialResolver`] explicite (tests, futur store).
-    pub fn with_resolver(
         repo: Arc<dyn WorkflowRepository + Send + Sync>,
         store: Arc<dyn RunStateStore + Send + Sync>,
         resolver: Arc<dyn CredentialResolver>,
     ) -> Self {
+        Self::with_http(
+            repo,
+            store,
+            resolver,
+            ReqwestHttpClient::with_policy(EgressPolicy::from_env()),
+        )
+    }
+}
+
+impl<C> RunExecutor<C>
+where
+    C: HttpClient + Clone + Send + Sync + 'static,
+{
+    /// Variante avec un transport HTTP explicite (tests sans réseau).
+    pub fn with_http(
+        repo: Arc<dyn WorkflowRepository + Send + Sync>,
+        store: Arc<dyn RunStateStore + Send + Sync>,
+        resolver: Arc<dyn CredentialResolver>,
+        http: C,
+    ) -> Self {
         Self {
             repo,
             store,
-            http: ReqwestHttpClient::with_policy(EgressPolicy::from_env()),
+            http,
             resolver,
         }
     }
@@ -91,7 +107,8 @@ fn now_ms() -> i64 {
 /// - `Action { http_request }` : délègue à [`HttpAction`] (les `params` du
 ///   node portent `url`/`method`/`headers`/`body`).
 /// - `Action { slack.* | gmail.* | notion.* | github.* }` : délègue à
-///   [`dispatch_action`] (injection du token via `resolver`).
+///   [`dispatch_action`] (injection du token de `owner`, propriétaire du run,
+///   via `resolver`).
 /// - autre `Action` : erreur explicite.
 /// - `Switch`/`Loop` : gérés par le moteur, jamais soumis au runner.
 ///
@@ -100,11 +117,12 @@ fn now_ms() -> i64 {
 /// `evaluate_node` → `mapping::resolve_params`), si bien que `node.params`
 /// arrive **déjà résolu** ici (les `{{ <node>.<champ> }}` pointant sur les
 /// sorties amont sont substitués avant l'appel au runner).
-fn run_node(
+fn run_node<C: HttpClient + Clone>(
     node: &Node,
     _ctx: &RunContext,
-    http: &ReqwestHttpClient,
+    http: &C,
     resolver: &dyn CredentialResolver,
+    owner: Option<&str>,
 ) -> Result<serde_json::Value, String> {
     match &node.kind {
         NodeKind::Trigger { .. } => Ok(serde_json::Value::Null),
@@ -112,7 +130,7 @@ fn run_node(
             "http_request" => HttpAction::new(http.clone())
                 .execute(&node.params)
                 .map_err(|e| e.to_string()),
-            other => dispatch_action(other, &node.params, http, resolver),
+            other => dispatch_action(other, &node.params, http, resolver, owner),
         },
         other => Err(format!(
             "node de type {other:?} non exécutable par le runner"
@@ -121,7 +139,10 @@ fn run_node(
 }
 
 #[async_trait]
-impl Handler for RunExecutor {
+impl<C> Handler for RunExecutor<C>
+where
+    C: HttpClient + Clone + Send + Sync + 'static,
+{
     async fn handle(&self, delivery: &Delivery) -> HandlerVerdict {
         let body = &delivery.message.body;
         let Some(run_id) = body["run_id"].as_str() else {
@@ -173,11 +194,15 @@ impl Handler for RunExecutor {
         }
 
         // Exécution **synchrone + bloquante** du moteur, hors runtime tokio.
+        // Les tokens des connecteurs sont ceux du propriétaire du run (fixé au
+        // dispatch par l'API, immuable).
         let http = self.http.clone();
         let resolver = Arc::clone(&self.resolver);
+        let owner = checkpoint.owner_id.clone();
         let report = match tokio::task::spawn_blocking(move || {
-            let runner =
-                move |node: &Node, ctx: &RunContext| run_node(node, ctx, &http, resolver.as_ref());
+            let runner = move |node: &Node, ctx: &RunContext| {
+                run_node(node, ctx, &http, resolver.as_ref(), owner.as_deref())
+            };
             Engine::new().run(&dag, &runner)
         })
         .await
@@ -225,13 +250,74 @@ impl Handler for RunExecutor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use autome_connectors::oauth::{ConnectorTokenStore, InMemoryConnectorTokenStore, TokenSet};
+    use autome_connectors::{HttpRequest, HttpResponse};
     use autome_core::{
         Edge, InMemoryRunStateStore, InMemoryWorkflowRepository, Message, NodeId, RunCheckpoint,
         WorkflowGraph,
     };
+    use autome_core::{EnvelopeCipher, InMemoryKeyProvider};
     use serde_json::{json, Value};
+    use std::sync::Mutex;
+
+    use crate::dispatch::OwnerCredentialResolver;
 
     const NOW: i64 = 1_700_000_000_000;
+
+    /// Store chiffré : seule alice a connecté Slack.
+    fn tokens_store() -> Arc<dyn ConnectorTokenStore + Send + Sync> {
+        let store = InMemoryConnectorTokenStore::new(EnvelopeCipher::new(
+            InMemoryKeyProvider::with_key("v1", [5u8; 32]),
+        ));
+        let alice = TokenSet {
+            access_token: "xoxb-alice".into(),
+            refresh_token: None,
+            expires_at_ms: None,
+            token_type: "Bearer".into(),
+            scope: Some("chat:write".into()),
+        };
+        store.store("alice", "slack", &alice).unwrap();
+        Arc::new(store)
+    }
+
+    /// Résolveur de production (mode `per_user`) sur [`tokens_store`].
+    fn resolver() -> Arc<dyn CredentialResolver> {
+        Arc::new(OwnerCredentialResolver::new(tokens_store()))
+    }
+
+    /// Transport HTTP clonable qui enregistre les requêtes (aucun réseau).
+    #[derive(Clone, Default)]
+    struct RecordingHttp {
+        sent: Arc<Mutex<Vec<HttpRequest>>>,
+    }
+
+    impl HttpClient for RecordingHttp {
+        fn send(&self, req: &HttpRequest) -> Result<HttpResponse, String> {
+            self.sent.lock().unwrap().push(req.clone());
+            Ok(HttpResponse {
+                status: 200,
+                body: json!({ "ok": true, "ts": "1.2" }),
+            })
+        }
+    }
+
+    fn slack_workflow(id: &str) -> WorkflowGraph {
+        let mut wf = trigger_only(id);
+        wf.nodes.push(Node {
+            id: NodeId::new("notify"),
+            name: "notify".into(),
+            kind: NodeKind::Action {
+                action_type: "slack.send_message".into(),
+            },
+            params: json!({ "channel": "C1", "text": "hello" }),
+        });
+        wf.edges.push(Edge {
+            from: NodeId::new("entry"),
+            to: NodeId::new("notify"),
+            from_port: None,
+        });
+        wf
+    }
 
     fn trigger_only(id: &str) -> WorkflowGraph {
         WorkflowGraph {
@@ -288,10 +374,24 @@ mod tests {
         wf: WorkflowGraph,
         run_id: &str,
     ) {
+        seed_owned(repo, store, wf, run_id, None).await;
+    }
+
+    /// Comme [`seed`], avec le propriétaire porté par le workflow et le run.
+    async fn seed_owned(
+        repo: &Arc<InMemoryWorkflowRepository>,
+        store: &Arc<InMemoryRunStateStore>,
+        wf: WorkflowGraph,
+        run_id: &str,
+        owner: Option<&str>,
+    ) {
         let wf_id = wf.id.0.clone();
-        repo.create(wf, None).await.unwrap();
+        repo.create(wf, owner).await.unwrap();
         store
-            .checkpoint(&RunCheckpoint::queued(run_id, &wf_id, 1, "manual", NOW))
+            .checkpoint(
+                &RunCheckpoint::queued(run_id, &wf_id, 1, "manual", NOW)
+                    .with_owner(owner.map(str::to_string)),
+            )
             .await
             .unwrap();
     }
@@ -301,7 +401,7 @@ mod tests {
         let repo = Arc::new(InMemoryWorkflowRepository::new());
         let store = Arc::new(InMemoryRunStateStore::new());
         seed(&repo, &store, trigger_only("wf-ok"), "run-ok").await;
-        let exec = RunExecutor::new(repo, Arc::clone(&store) as Arc<_>);
+        let exec = RunExecutor::new(repo, Arc::clone(&store) as Arc<_>, resolver());
 
         let verdict = exec.handle(&delivery("run-ok", "wf-ok")).await;
         assert_eq!(verdict, HandlerVerdict::Ok);
@@ -316,7 +416,7 @@ mod tests {
         let repo = Arc::new(InMemoryWorkflowRepository::new());
         let store = Arc::new(InMemoryRunStateStore::new());
         seed(&repo, &store, unsupported_action("wf-bad"), "run-bad").await;
-        let exec = RunExecutor::new(repo, Arc::clone(&store) as Arc<_>);
+        let exec = RunExecutor::new(repo, Arc::clone(&store) as Arc<_>, resolver());
 
         let verdict = exec.handle(&delivery("run-bad", "wf-bad")).await;
         assert_eq!(verdict, HandlerVerdict::DeadLetter);
@@ -349,7 +449,7 @@ mod tests {
         let repo = Arc::new(InMemoryWorkflowRepository::new());
         let store = Arc::new(InMemoryRunStateStore::new());
         seed(&repo, &store, wf, "run-ssrf").await;
-        let exec = RunExecutor::new(repo, Arc::clone(&store) as Arc<_>);
+        let exec = RunExecutor::new(repo, Arc::clone(&store) as Arc<_>, resolver());
 
         let verdict = exec.handle(&delivery("run-ssrf", "wf-ssrf")).await;
         assert_eq!(verdict, HandlerVerdict::DeadLetter);
@@ -357,6 +457,79 @@ mod tests {
         assert_eq!(cp.status, RunStatus::Failed);
         let error = cp.error.unwrap();
         assert!(error.contains("egress refusé"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn connector_uses_the_token_of_the_run_owner() {
+        let repo = Arc::new(InMemoryWorkflowRepository::new());
+        let store = Arc::new(InMemoryRunStateStore::new());
+        seed_owned(
+            &repo,
+            &store,
+            slack_workflow("wf-a"),
+            "run-a",
+            Some("alice"),
+        )
+        .await;
+        let http = RecordingHttp::default();
+        let exec =
+            RunExecutor::with_http(repo, Arc::clone(&store) as Arc<_>, resolver(), http.clone());
+
+        assert_eq!(
+            exec.handle(&delivery("run-a", "wf-a")).await,
+            HandlerVerdict::Ok
+        );
+        let auth = {
+            let sent = http.sent.lock().unwrap();
+            assert_eq!(sent.len(), 1);
+            sent[0].headers.get("Authorization").cloned()
+        };
+        assert_eq!(auth.as_deref(), Some("Bearer xoxb-alice"));
+        let cp = store.load("run-a").await.unwrap().unwrap();
+        assert_eq!(cp.status, RunStatus::Succeeded);
+    }
+
+    #[tokio::test]
+    async fn run_of_an_owner_without_token_fails_without_borrowing_another_token() {
+        // bob n'a pas connecté Slack : son run ne doit jamais partir avec le
+        // token d'alice ni avec un token global.
+        let repo = Arc::new(InMemoryWorkflowRepository::new());
+        let store = Arc::new(InMemoryRunStateStore::new());
+        seed_owned(&repo, &store, slack_workflow("wf-b"), "run-b", Some("bob")).await;
+        let http = RecordingHttp::default();
+        let exec =
+            RunExecutor::with_http(repo, Arc::clone(&store) as Arc<_>, resolver(), http.clone());
+
+        assert_eq!(
+            exec.handle(&delivery("run-b", "wf-b")).await,
+            HandlerVerdict::DeadLetter
+        );
+        assert!(
+            http.sent.lock().unwrap().is_empty(),
+            "aucune requête envoyée"
+        );
+        let cp = store.load("run-b").await.unwrap().unwrap();
+        assert_eq!(cp.status, RunStatus::Failed);
+        let error = cp.error.unwrap();
+        assert!(error.contains("propriétaire `bob`"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn connector_in_a_run_without_owner_fails_explicitly() {
+        let repo = Arc::new(InMemoryWorkflowRepository::new());
+        let store = Arc::new(InMemoryRunStateStore::new());
+        seed_owned(&repo, &store, slack_workflow("wf-n"), "run-n", None).await;
+        let http = RecordingHttp::default();
+        let exec =
+            RunExecutor::with_http(repo, Arc::clone(&store) as Arc<_>, resolver(), http.clone());
+
+        assert_eq!(
+            exec.handle(&delivery("run-n", "wf-n")).await,
+            HandlerVerdict::DeadLetter
+        );
+        assert!(http.sent.lock().unwrap().is_empty());
+        let error = store.load("run-n").await.unwrap().unwrap().error.unwrap();
+        assert!(error.contains("sans propriétaire"), "{error}");
     }
 
     #[tokio::test]
@@ -374,7 +547,7 @@ mod tests {
             ))
             .await
             .unwrap();
-        let exec = RunExecutor::new(repo, Arc::clone(&store) as Arc<_>);
+        let exec = RunExecutor::new(repo, Arc::clone(&store) as Arc<_>, resolver());
         assert_eq!(
             exec.handle(&delivery("run-x", "wf-missing")).await,
             HandlerVerdict::DeadLetter
@@ -385,7 +558,7 @@ mod tests {
     async fn malformed_message_dead_letters() {
         let repo = Arc::new(InMemoryWorkflowRepository::new());
         let store = Arc::new(InMemoryRunStateStore::new());
-        let exec = RunExecutor::new(repo, store);
+        let exec = RunExecutor::new(repo, store, resolver());
         use autome_core::DeliveryId;
         let bad = Delivery {
             id: DeliveryId::new(1),
