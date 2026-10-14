@@ -14,12 +14,18 @@
 //!   doit être celle de l'API) ; `single_tenant` — opt-in mono-tenant : repli
 //!   sur le token global `AUTOME_CONNECTOR_TOKEN_<PROVIDER>` si le propriétaire
 //!   n'a pas de token.
+//! - `AUTOME_OAUTH_PROVIDERS` + `AUTOME_OAUTH_<ID>_*` : mêmes providers OAuth
+//!   que l'API ; le worker s'en sert pour **rafraîchir** les access tokens
+//!   expirés (refresh token stocké). Sans config, un token expiré fait échouer
+//!   le node avec une invitation à reconnecter le compte.
 //!
 //! Arrêt **gracieux** : sur `SIGINT`/`SIGTERM`, le pool stoppe et `await` la
 //! fin des tâches en cours (pas de message perdu en vol).
 
 use std::sync::Arc;
 
+use autome_connectors::oauth::{OAuthClient, OAuthRegistry};
+use autome_connectors::{EgressPolicy, ReqwestHttpClient};
 use autome_core::Config;
 use autome_persistence::selectors::{
     build_connector_token_store, build_queue, build_run_state_store, build_workflow_repository,
@@ -57,7 +63,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Tokens des connecteurs : ceux du propriétaire de chaque run.
     let tokens = build_connector_token_store(&config, persistence)?;
-    let resolver = credentials_mode.resolver(tokens);
+    // Rafraîchissement des tokens expirés : client OAuth (registre depuis
+    // l'env, transport filtré anti-SSRF comme côté API).
+    let oauth = OAuthClient::new(
+        OAuthRegistry::from_env()?,
+        ReqwestHttpClient::with_policy(EgressPolicy::from_env()),
+    );
+    let resolver = credentials_mode.resolver(tokens, Arc::new(oauth));
     if credentials_mode == ConnectorCredentialsMode::SingleTenant {
         eprintln!(
             "autome-worker : AUTOME_CONNECTOR_CREDENTIALS=single_tenant — repli sur les tokens \
