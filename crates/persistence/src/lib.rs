@@ -17,6 +17,7 @@ pub mod migrations;
 pub mod permission;
 pub mod pool;
 pub mod rabbitmq;
+pub mod retry;
 pub mod revocation;
 pub mod run_state;
 pub mod selectors;

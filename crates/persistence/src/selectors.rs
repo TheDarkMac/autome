@@ -4,6 +4,7 @@
 //! in-memory ↔ PostgreSQL/RabbitMQ entre les deux binaires.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use autome_connectors::oauth::{ConnectorTokenStore, InMemoryConnectorTokenStore};
 use autome_core::{
@@ -100,12 +101,30 @@ pub fn ensure_durable_backends(
     )))
 }
 
+/// Délai par défaut pour joindre le broker au démarrage.
+const QUEUE_CONNECT_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Lit `AUTOME_QUEUE_CONNECT_TIMEOUT_SECS` (défaut 60 s).
+fn queue_connect_timeout() -> Duration {
+    std::env::var("AUTOME_QUEUE_CONNECT_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .map(Duration::from_secs)
+        .unwrap_or(QUEUE_CONNECT_TIMEOUT)
+}
+
 /// Construit la file selon le `mode`. En `Rabbitmq`, se connecte au broker
-/// (`config.queue_url`) — opération **async**.
+/// (`config.queue_url`) — opération **async** —, en retentant les erreurs
+/// réseau pendant `AUTOME_QUEUE_CONNECT_TIMEOUT_SECS` (défaut 60 s) : le
+/// broker peut être démarré sans accepter encore les connexions.
 pub async fn build_queue(config: &Config, mode: QueueMode) -> Result<Arc<dyn Queue + Send + Sync>> {
     match mode {
         QueueMode::Memory => Ok(Arc::new(InMemoryQueue::new())),
-        QueueMode::Rabbitmq => Ok(Arc::new(RabbitMqQueue::connect(&config.queue_url).await?)),
+        QueueMode::Rabbitmq => {
+            let queue =
+                RabbitMqQueue::connect_retrying(&config.queue_url, queue_connect_timeout()).await?;
+            Ok(Arc::new(queue))
+        }
     }
 }
 
