@@ -235,14 +235,41 @@ impl WorkerPool {
     }
 }
 
+/// Plafond de la pause entre deux tentatives après des erreurs de file.
+const MAX_ERROR_BACKOFF: Duration = Duration::from_secs(5);
+
+/// Pause après `failures` erreurs de file consécutives : `base` doublé à
+/// chaque échec, plafonné à [`MAX_ERROR_BACKOFF`]. Évite de marteler un broker
+/// indisponible (et les logs) toutes les `base` ms pendant une panne (#180).
+fn error_backoff(base: Duration, failures: u32) -> Duration {
+    let factor = 1u32 << failures.saturating_sub(1).min(16);
+    base.saturating_mul(factor).min(MAX_ERROR_BACKOFF)
+}
+
 async fn worker_loop(pool: &WorkerPool, shutdown: &AtomicBool, id: usize) {
+    let mut failures = 0u32;
     while !shutdown.load(Ordering::Acquire) {
         match pool.process_one().await {
-            Ok(ProcessOutcome::Idle) => tokio::time::sleep(pool.poll_idle_sleep).await,
-            Ok(_) => {}
+            Ok(outcome) => {
+                if failures > 0 {
+                    tracing::info!(consumer = id, failures, "file de nouveau disponible");
+                    failures = 0;
+                }
+                if outcome == ProcessOutcome::Idle {
+                    tokio::time::sleep(pool.poll_idle_sleep).await;
+                }
+            }
             Err(e) => {
-                tracing::error!(consumer = id, error = %e, "erreur de file");
-                tokio::time::sleep(pool.poll_idle_sleep).await;
+                failures = failures.saturating_add(1);
+                let pause = error_backoff(pool.poll_idle_sleep, failures);
+                tracing::error!(
+                    consumer = id,
+                    failures,
+                    retry_in_ms = pause.as_millis() as u64,
+                    error = %e,
+                    "erreur de file"
+                );
+                tokio::time::sleep(pause).await;
             }
         }
     }
@@ -359,6 +386,18 @@ mod tests {
         assert_eq!(outcome, ProcessOutcome::Handled(HandlerVerdict::DeadLetter));
         assert_eq!(q.depth("runs").await.unwrap(), 0);
         assert_eq!(q.depth("runs.dlq").await.unwrap(), 1);
+    }
+
+    // ───── #180 — backoff sur erreurs de file ─────
+
+    #[test]
+    fn error_backoff_doubles_up_to_the_cap() {
+        let base = Duration::from_millis(50);
+        assert_eq!(error_backoff(base, 1), Duration::from_millis(50));
+        assert_eq!(error_backoff(base, 2), Duration::from_millis(100));
+        assert_eq!(error_backoff(base, 4), Duration::from_millis(400));
+        assert_eq!(error_backoff(base, 8), MAX_ERROR_BACKOFF);
+        assert_eq!(error_backoff(base, u32::MAX), MAX_ERROR_BACKOFF);
     }
 
     // ───── F5.2.c — idempotence ─────
