@@ -27,4 +27,4 @@ pub mod store;
 pub use client::{AuthorizationStart, OAuthClient, TokenSet};
 pub use pkce::{generate_pkce, generate_state, PkcePair};
 pub use provider::{OAuthProviderConfig, OAuthRegistry};
-pub use store::{ConnectorTokenStore, InMemoryConnectorTokenStore};
+pub use store::{open_tokens, seal_tokens, ConnectorTokenStore, InMemoryConnectorTokenStore};

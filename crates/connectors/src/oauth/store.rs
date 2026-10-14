@@ -5,7 +5,8 @@
 //! du JSON (compact, debuggable).
 //!
 //! L'impl [`InMemoryConnectorTokenStore`] suffit pour tests et mode dev ;
-//! une impl PG suivra avec sqlx.
+//! l'impl PostgreSQL (`autome_persistence::PgConnectorTokenStore`) réutilise
+//! [`seal_tokens`] / [`open_tokens`] : même format d'enveloppe au repos.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -50,6 +51,24 @@ impl From<SerializableTokenSet> for TokenSet {
             scope: s.scope,
         }
     }
+}
+
+/// Chiffre `tokens` en enveloppe `EnvelopeCipher` (JSON sérialisé puis
+/// chiffré) — forme stockée au repos par tous les [`ConnectorTokenStore`].
+pub fn seal_tokens<K: KeyProvider>(
+    cipher: &EnvelopeCipher<K>,
+    tokens: &TokenSet,
+) -> Result<String> {
+    let serializable: SerializableTokenSet = tokens.into();
+    let json = serde_json::to_string(&serializable)?;
+    cipher.encrypt(json.as_bytes())
+}
+
+/// Déchiffre une enveloppe produite par [`seal_tokens`].
+pub fn open_tokens<K: KeyProvider>(cipher: &EnvelopeCipher<K>, envelope: &str) -> Result<TokenSet> {
+    let plaintext = cipher.decrypt(envelope)?;
+    let serializable: SerializableTokenSet = serde_json::from_slice(&plaintext)?;
+    Ok(serializable.into())
 }
 
 /// Contrat de stockage des tokens connecteurs.
@@ -104,9 +123,7 @@ impl<K: KeyProvider> InMemoryConnectorTokenStore<K> {
 
 impl<K: KeyProvider> ConnectorTokenStore for InMemoryConnectorTokenStore<K> {
     fn store(&self, user_id: &str, provider_id: &str, tokens: &TokenSet) -> Result<()> {
-        let serializable: SerializableTokenSet = tokens.into();
-        let json = serde_json::to_string(&serializable)?;
-        let envelope = self.cipher.encrypt(json.as_bytes())?;
+        let envelope = seal_tokens(&self.cipher, tokens)?;
         self.inner
             .lock()
             .map_err(|_| Error::Invalid("token store lock empoisonné".into()))?
@@ -122,9 +139,7 @@ impl<K: KeyProvider> ConnectorTokenStore for InMemoryConnectorTokenStore<K> {
         let Some(envelope) = map.get(&(user_id.to_string(), provider_id.to_string())) else {
             return Ok(None);
         };
-        let plaintext = self.cipher.decrypt(envelope)?;
-        let serializable: SerializableTokenSet = serde_json::from_slice(&plaintext)?;
-        Ok(Some(serializable.into()))
+        open_tokens(&self.cipher, envelope).map(Some)
     }
 
     fn delete(&self, user_id: &str, provider_id: &str) -> Result<()> {
@@ -271,6 +286,23 @@ mod tests {
         store.store("alice", "google", &sample_tokens()).unwrap();
         let result = store.list_by_user("charlie").unwrap();
         assert!(result.is_empty());
+    }
+
+    #[test]
+    fn seal_then_open_round_trips_and_hides_plaintext() {
+        let cipher = EnvelopeCipher::new(InMemoryKeyProvider::with_key("k1", [3u8; 32]));
+        let envelope = seal_tokens(&cipher, &sample_tokens()).unwrap();
+        assert!(envelope.starts_with("v1:k1:"), "format envelope F6.3");
+        assert!(!envelope.contains("at-1") && !envelope.contains("rt-1"));
+        assert_eq!(open_tokens(&cipher, &envelope).unwrap(), sample_tokens());
+    }
+
+    #[test]
+    fn open_with_another_key_fails() {
+        let sealer = EnvelopeCipher::new(InMemoryKeyProvider::with_key("k1", [3u8; 32]));
+        let other = EnvelopeCipher::new(InMemoryKeyProvider::with_key("k1", [4u8; 32]));
+        let envelope = seal_tokens(&sealer, &sample_tokens()).unwrap();
+        assert!(open_tokens(&other, &envelope).is_err());
     }
 
     #[test]
