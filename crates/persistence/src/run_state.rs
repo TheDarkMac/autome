@@ -201,6 +201,49 @@ impl RunStateStore for PgRunStateStore {
         Ok(())
     }
 
+    async fn try_claim(
+        &self,
+        run_id: &str,
+        now_ms: i64,
+    ) -> autome_core::Result<Option<RunCheckpoint>> {
+        let client = self.pool.get().await.map_err(|e| storage_err("pool", e))?;
+        // Compare-and-set en une instruction : le verrou de ligne de l'UPDATE
+        // sérialise les répliques concurrentes ; la seconde réévalue
+        // `status = 'queued'` après la première et ne met rien à jour.
+        let row = client
+            .query_opt(
+                &format!(
+                    "UPDATE runs SET status = 'running', started_at_ms = $2 \
+                     WHERE id = $1 AND status = 'queued' RETURNING {RUN_COLS}"
+                ),
+                &[&run_id, &now_ms],
+            )
+            .await
+            .map_err(|e| storage_err("try_claim", e))?;
+        match row {
+            None => Ok(None),
+            Some(r) => Ok(Some(Self::row_to_checkpoint(&client, &r).await?)),
+        }
+    }
+
+    async fn fail_if_running(
+        &self,
+        run_id: &str,
+        reason: &str,
+        now_ms: i64,
+    ) -> autome_core::Result<bool> {
+        let client = self.pool.get().await.map_err(|e| storage_err("pool", e))?;
+        let n = client
+            .execute(
+                "UPDATE runs SET status = 'failed', error = $2, finished_at_ms = $3 \
+                 WHERE id = $1 AND status = 'running'",
+                &[&run_id, &reason, &now_ms],
+            )
+            .await
+            .map_err(|e| storage_err("fail_if_running", e))?;
+        Ok(n == 1)
+    }
+
     async fn list_by_workflow(
         &self,
         workflow_id: &str,

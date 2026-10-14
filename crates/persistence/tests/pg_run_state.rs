@@ -5,8 +5,13 @@ use autome_core::{Pagination, RunCheckpoint, RunStateStore, RunStatus};
 use autome_persistence::{connect, run_migrations, PgRunStateStore};
 use serde_json::json;
 
-async fn setup() -> Option<PgRunStateStore> {
+/// Chaque test repart d'un schéma vierge : on les sérialise (sinon un
+/// `DROP SCHEMA` concurrent casserait le test voisin).
+static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+async fn setup() -> Option<(PgRunStateStore, tokio::sync::MutexGuard<'static, ()>)> {
     let url = std::env::var("TEST_DATABASE_URL").ok()?;
+    let guard = SERIAL.lock().await;
     let pool = connect(&url).expect("pool");
     {
         let client = pool.get().await.expect("conn");
@@ -16,12 +21,12 @@ async fn setup() -> Option<PgRunStateStore> {
             .expect("reset");
     }
     run_migrations(&pool).await.expect("migrations");
-    Some(PgRunStateStore::new(pool))
+    Some((PgRunStateStore::new(pool), guard))
 }
 
 #[tokio::test]
 async fn checkpoint_load_orphans_failed_and_list() {
-    let Some(store) = setup().await else {
+    let Some((store, _serial)) = setup().await else {
         eprintln!("TEST_DATABASE_URL absent → test PostgreSQL sauté");
         return;
     };
@@ -111,4 +116,77 @@ async fn checkpoint_load_orphans_failed_and_list() {
         .await
         .unwrap();
     assert_eq!(all.total, 3);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn try_claim_has_a_single_winner_and_fail_if_running_is_conditional() {
+    let Some((store, _serial)) = setup().await else {
+        eprintln!("TEST_DATABASE_URL absent → test PostgreSQL sauté");
+        return;
+    };
+    let store = std::sync::Arc::new(store);
+    store
+        .checkpoint(
+            &RunCheckpoint::queued("c1", "wf", 1, "manual", 1_000).with_owner(Some("alice".into())),
+        )
+        .await
+        .unwrap();
+
+    // 16 répliques reçoivent la même livraison en parallèle : un seul claim.
+    let mut tasks = Vec::new();
+    for i in 0..16 {
+        let s = std::sync::Arc::clone(&store);
+        tasks.push(tokio::spawn(async move {
+            s.try_claim("c1", 2_000 + i).await.unwrap()
+        }));
+    }
+    let mut claimed = Vec::new();
+    for t in tasks {
+        if let Some(cp) = t.await.unwrap() {
+            claimed.push(cp);
+        }
+    }
+    assert_eq!(claimed.len(), 1, "une seule réplique prend le run");
+    assert_eq!(claimed[0].status, RunStatus::Running);
+    assert_eq!(claimed[0].owner_id.as_deref(), Some("alice"));
+    let started = claimed[0].started_at_ms;
+    assert_eq!(
+        store.load("c1").await.unwrap().unwrap().started_at_ms,
+        started
+    );
+    assert!(store.try_claim("ghost", 1).await.unwrap().is_none());
+
+    // Terminé : ni re-claim, ni écrasement par le balayage des orphelins.
+    let mut done = store.load("c1").await.unwrap().unwrap();
+    done.status = RunStatus::Succeeded;
+    done.finished_at_ms = Some(3_000);
+    store.checkpoint(&done).await.unwrap();
+    assert!(store.try_claim("c1", 4_000).await.unwrap().is_none());
+    assert!(!store
+        .fail_if_running("c1", "orphelin", 4_000)
+        .await
+        .unwrap());
+    assert_eq!(
+        store.load("c1").await.unwrap().unwrap().status,
+        RunStatus::Succeeded
+    );
+
+    // Running ⇒ Failed une seule fois.
+    store
+        .checkpoint(&RunCheckpoint::queued("c2", "wf", 1, "manual", 1_000))
+        .await
+        .unwrap();
+    store.try_claim("c2", 1_500).await.unwrap().unwrap();
+    assert!(store
+        .fail_if_running("c2", "orphelin", 5_000)
+        .await
+        .unwrap());
+    assert!(!store
+        .fail_if_running("c2", "orphelin", 6_000)
+        .await
+        .unwrap());
+    let failed = store.load("c2").await.unwrap().unwrap();
+    assert_eq!(failed.status, RunStatus::Failed);
+    assert_eq!(failed.error.as_deref(), Some("orphelin"));
+    assert_eq!(failed.finished_at_ms, Some(5_000));
 }
