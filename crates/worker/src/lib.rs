@@ -16,9 +16,10 @@
 //! - [`HandlerVerdict`] : résultat (`Ok` / `Retry` / `DeadLetter`) que le
 //!   pool traduit en `ack` ou `nack`.
 //! - [`IdempotencyStore`] (F5.2.c) : déduplication par `idempotency-key`
-//!   présent dans les en-têtes du [`Message`]. L'impl `InMemoryIdempotencyStore`
-//!   garde un `HashSet` sous `Mutex` ; un store persistant (Redis, base)
-//!   viendra avec F5.4.
+//!   présent dans les en-têtes du [`Message`], **locale au process** (fast
+//!   path). L'impl `InMemoryIdempotencyStore` garde un `HashSet` sous `Mutex`.
+//!   La garantie *entre répliques* vient du claim atomique du run en base
+//!   (`RunStateStore::try_claim`, cf. [`RunExecutor`]).
 //! - [`WorkerPool::process_one`] : unité atomique (poll + handle + ack/nack),
 //!   testable sans pool.
 //! - [`WorkerPool::start`] : spawne `concurrency` tâches tokio qui appellent
@@ -53,7 +54,7 @@ pub mod executor;
 pub use dispatch::{
     ConnectorCredentialsMode, CredentialResolver, EnvCredentialResolver, OwnerCredentialResolver,
 };
-pub use executor::RunExecutor;
+pub use executor::{reap_orphans, RunExecutor};
 
 /// Verdict que retourne un [`Handler`] après traitement.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -90,17 +91,23 @@ where
 ///
 /// Le worker pool consulte le store pour la clé `idempotency-key` (si
 /// présente dans les en-têtes du [`autome_core::Message`]). Si la clé est
-/// déjà vue, le message est `ack`'é sans appeler le handler.
+/// déjà traitée, le message est `ack`'é sans appeler le handler.
+///
+/// La clé n'est marquée qu'après un verdict **définitif** (`Ok` /
+/// `DeadLetter`) : un message renvoyé en `Retry` revient avec la même clé et
+/// doit être retraité (#174).
 pub trait IdempotencyStore {
-    /// `true` si `key` a déjà été marquée (le handler doit être *skip*) ;
-    /// `false` sinon, et la clé est marquée comme vue.
-    fn check_or_mark(&self, key: &str) -> bool;
+    /// `true` si `key` a déjà été traitée définitivement (handler à *skip*).
+    fn is_done(&self, key: &str) -> bool;
+
+    /// Marque `key` comme traitée définitivement.
+    fn mark_done(&self, key: &str);
 }
 
 /// Store de déduplication in-process (`HashSet` sous `Mutex`).
 ///
-/// Sert tests + mode dev. Un store persistant (base, Redis) viendra avec
-/// F5.4 (persistance d'état d'exécution).
+/// Fast path local : évite de recharger un run déjà traité par ce process.
+/// Ne protège pas entre répliques — c'est le rôle du claim en base.
 #[derive(Debug, Default)]
 pub struct InMemoryIdempotencyStore {
     seen: Mutex<HashSet<String>>,
@@ -114,9 +121,18 @@ impl InMemoryIdempotencyStore {
 }
 
 impl IdempotencyStore for InMemoryIdempotencyStore {
-    fn check_or_mark(&self, key: &str) -> bool {
-        let mut seen = self.seen.lock().expect("idempotency lock empoisonné");
-        !seen.insert(key.to_string())
+    fn is_done(&self, key: &str) -> bool {
+        self.seen
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains(key)
+    }
+
+    fn mark_done(&self, key: &str) {
+        self.seen
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(key.to_string());
     }
 }
 
@@ -178,10 +194,11 @@ impl WorkerPool {
         let Some(delivery) = self.queue.poll(&self.queue_name).await? else {
             return Ok(ProcessOutcome::Idle);
         };
-        // Idempotence (F5.2.c) : si le message porte une clé déjà vue,
+        // Idempotence (F5.2.c) : si le message porte une clé déjà traitée,
         // ack sans appeler le handler.
-        if let Some(key) = delivery.message.headers.get("idempotency-key").cloned() {
-            if self.idempotency.check_or_mark(&key) {
+        let key = delivery.message.headers.get("idempotency-key").cloned();
+        if let Some(key) = &key {
+            if self.idempotency.is_done(key) {
                 self.queue.ack(&delivery.id).await?;
                 return Ok(ProcessOutcome::Deduplicated);
             }
@@ -191,6 +208,11 @@ impl WorkerPool {
             HandlerVerdict::Ok => self.queue.ack(&delivery.id).await?,
             HandlerVerdict::Retry => self.queue.nack(&delivery.id, Nack::Requeue).await?,
             HandlerVerdict::DeadLetter => self.queue.nack(&delivery.id, Nack::DeadLetter).await?,
+        }
+        // Marquée seulement une fois le sort du message fixé : un `Retry`
+        // doit pouvoir être retraité à la redélivrance.
+        if let (Some(key), false) = (&key, verdict == HandlerVerdict::Retry) {
+            self.idempotency.mark_done(key);
         }
         Ok(ProcessOutcome::Handled(verdict))
     }
@@ -435,13 +457,75 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn in_memory_idempotency_returns_false_first_then_true() {
+    async fn in_memory_idempotency_marks_only_on_demand() {
         let s = InMemoryIdempotencyStore::new();
-        assert!(!s.check_or_mark("k"));
-        assert!(s.check_or_mark("k"));
-        assert!(s.check_or_mark("k"));
+        assert!(!s.is_done("k"));
+        assert!(!s.is_done("k"), "consulter ne marque pas");
+        s.mark_done("k");
+        assert!(s.is_done("k"));
         // Autre clé indépendante
-        assert!(!s.check_or_mark("other"));
+        assert!(!s.is_done("other"));
+    }
+
+    #[tokio::test]
+    async fn retried_message_is_handled_again_on_redelivery() {
+        // Régression #174 : la clé était marquée avant le handler, si bien
+        // qu'un `Retry` redélivré passait pour un doublon et était ack'é.
+        let q = Arc::new(InMemoryQueue::new());
+        q.publish(
+            "runs",
+            Message::new(json!({})).with_header("idempotency-key", "run-1"),
+        )
+        .await
+        .unwrap();
+        let calls = Arc::new(Mutex::new(0_u32));
+        let c = Arc::clone(&calls);
+        let handler: Arc<dyn Handler + Send + Sync> = Arc::new(move |_d: &Delivery| {
+            let mut n = c.lock().unwrap();
+            *n += 1;
+            if *n == 1 {
+                HandlerVerdict::Retry
+            } else {
+                HandlerVerdict::Ok
+            }
+        });
+        let pool = WorkerPool::new(
+            Arc::clone(&q) as Arc<dyn Queue + Send + Sync>,
+            handler,
+            Arc::new(InMemoryIdempotencyStore::new()),
+            "runs",
+            1,
+        );
+
+        assert_eq!(
+            pool.process_one().await.unwrap(),
+            ProcessOutcome::Handled(HandlerVerdict::Retry)
+        );
+        assert_eq!(
+            pool.process_one().await.unwrap(),
+            ProcessOutcome::Handled(HandlerVerdict::Ok),
+            "le Retry doit être retraité"
+        );
+        assert_eq!(*calls.lock().unwrap(), 2);
+        assert_eq!(q.depth("runs").await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn dead_lettered_key_is_not_handled_again() {
+        let q = Arc::new(InMemoryQueue::new());
+        let msg = Message::new(json!({})).with_header("idempotency-key", "run-x");
+        q.publish("runs", msg.clone()).await.unwrap();
+        q.publish("runs", msg).await.unwrap();
+        let (pool, idem) = build(Arc::clone(&q), HandlerVerdict::DeadLetter);
+        assert_eq!(
+            pool.process_one().await.unwrap(),
+            ProcessOutcome::Handled(HandlerVerdict::DeadLetter)
+        );
+        assert!(idem.is_done("run-x"));
+        assert_eq!(
+            pool.process_one().await.unwrap(),
+            ProcessOutcome::Deduplicated
+        );
     }
 
     // ───── F5.2.b — pool concurrent + shutdown ─────
