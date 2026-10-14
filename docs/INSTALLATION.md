@@ -50,6 +50,8 @@ cp .env.example .env
 | `AUTOME_TLS_CERT` | Chemin du certificat PEM (active HTTPS) | *(non défini)* | optionnel |
 | `AUTOME_TLS_KEY` | Chemin de la clé privée PEM | *(non défini)* | optionnel |
 | `AUTOME_EGRESS_ALLOWLIST` | Hôtes internes autorisés en sortie HTTP (anti-SSRF), séparés par virgule | *(vide : public uniquement)* | selon besoin |
+| `AUTOME_WORKER_CONCURRENCY` | Worker : tâches consommatrices par process | `4` | selon charge |
+| `AUTOME_RUN_TIMEOUT_SECS` | Worker : au-delà, un run encore `running` est clos en `failed` (min. 60) | `3600` | > durée du plus long run |
 | `AUTOME_CONNECTOR_CREDENTIALS` | Worker : `per_user` (token du propriétaire du run) ou `single_tenant` (repli sur `AUTOME_CONNECTOR_TOKEN_<PROVIDER>`) | `per_user` | `per_user` (instance partagée) |
 
 ### Sortie réseau (anti-SSRF)
@@ -67,6 +69,23 @@ Pour joindre un service interne légitime (IdP on-prem, API intranet), ajoutez
 son nom ou son IP à `AUTOME_EGRESS_ALLOWLIST`. Avec un **proxy sortant**
 (`HTTPS_PROXY`), ajoutez le proxy à l'allowlist : le filtrage des noms d'hôte
 revient alors au proxy, qui fait la résolution DNS.
+
+### Exécution des runs : au plus une fois
+
+RabbitMQ livre chaque message **au moins une fois** : après un crash ou une
+perte de connexion, un run peut être relivré, à n'importe quelle réplique du
+worker. Pour que ses effets de bord (message Slack, e-mail, issue GitHub…) ne
+se produisent pas deux fois, le worker **réclame** le run en base avant de
+l'exécuter (`queued → running`, atomique) : une seule réplique gagne, les
+livraisons dupliquées d'un run déjà pris ou terminé sont acquittées sans
+ré-exécution.
+
+Corollaire : un run interrompu en cours d'exécution (worker tué, pod évincé)
+**n'est pas rejoué**. Toutes les 60 s, chaque worker clôt en `failed` les runs
+encore `running` au-delà de `AUTOME_RUN_TIMEOUT_SECS` (défaut 1 h), avec une
+erreur explicite ; relancer le workflow si besoin. Réglez ce délai au-dessus de
+la durée du plus long run légitime : sinon un run encore actif serait affiché
+en échec jusqu'à ce que son état final le corrige.
 
 ### Tokens des connecteurs (par utilisateur)
 

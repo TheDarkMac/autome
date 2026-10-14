@@ -12,7 +12,8 @@ Autome exécute des **workflows** : un graphe de *nodes* (triggers, actions,
 logique) déclenché par un événement, puis exécuté de façon fiable et scalable.
 Un déclencheur place un *run* dans une file de messages ; un pool de workers
 *stateless* le consomme et le déroule via le moteur DAG. L'état de chaque run
-est persisté, ce qui permet la reprise après crash et le scaling horizontal.
+est persisté et réclamé atomiquement par un seul worker : plusieurs répliques
+consomment la même file sans exécuter deux fois un run (et ses effets de bord).
 
 📍 **État du projet : 56 / 66 features** — cœur (moteur, connecteurs,
 orchestrateur, sécurité, API, frontend, tests, DevOps) terminé ; reste la
