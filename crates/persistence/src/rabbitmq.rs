@@ -47,17 +47,41 @@ impl RabbitMqQueue {
     /// Se connecte au broker (`amqp://user:pass@host:5672/vhost`) et ouvre un
     /// canal. Branche l'exécuteur/réacteur **tokio** pour tourner sur le
     /// runtime de l'application.
+    ///
+    /// Le vhost est le **chemin** de l'URL : le vhost par défaut `/` s'écrit
+    /// `amqp://…:5672/%2f` ; une barre finale seule (`…:5672/`) désigne le
+    /// vhost vide, refusé par le broker (`NOT_ALLOWED - vhost not found`).
     pub async fn connect(amqp_url: &str) -> autome_core::Result<Self> {
+        Self::try_connect(amqp_url)
+            .await
+            .map_err(|e| storage_err("connexion", e))
+    }
+
+    /// Comme [`connect`](Self::connect), en retentant pendant `timeout` les
+    /// **erreurs réseau** (broker pas encore à l'écoute). Une erreur de
+    /// protocole (identifiants, vhost…) est définitive et remonte aussitôt.
+    pub async fn connect_retrying(
+        amqp_url: &str,
+        timeout: std::time::Duration,
+    ) -> autome_core::Result<Self> {
+        crate::retry::retry_until(
+            "rabbitmq",
+            timeout,
+            std::time::Duration::from_millis(500),
+            std::time::Duration::from_secs(5),
+            |e: &lapin::Error| matches!(e, lapin::Error::IOError(_)),
+            || Self::try_connect(amqp_url),
+        )
+        .await
+        .map_err(|e| storage_err("connexion", e))
+    }
+
+    async fn try_connect(amqp_url: &str) -> Result<Self, lapin::Error> {
         let props = ConnectionProperties::default()
             .with_executor(tokio_executor_trait::Tokio::current())
             .with_reactor(tokio_reactor_trait::Tokio);
-        let conn = Connection::connect(amqp_url, props)
-            .await
-            .map_err(|e| storage_err("connexion", e))?;
-        let channel = conn
-            .create_channel()
-            .await
-            .map_err(|e| storage_err("canal", e))?;
+        let conn = Connection::connect(amqp_url, props).await?;
+        let channel = conn.create_channel().await?;
         Ok(Self {
             _conn: conn,
             channel,

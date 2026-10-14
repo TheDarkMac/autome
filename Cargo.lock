@@ -400,6 +400,7 @@ dependencies = [
  "tokio-executor-trait",
  "tokio-postgres",
  "tokio-reactor-trait",
+ "tracing",
 ]
 
 [[package]]
