@@ -1,0 +1,140 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Autome — Éditeur</title>
+<link rel="stylesheet" href="assets/style.css" />
+</head>
+<body>
+
+<nav class="top">
+  <div class="wrap">
+    <a class="brand" href="index.html"><span class="bolt">⚡</span> Autome</a>
+    <div class="links">
+      <a href="concepts.html">Concepts</a>
+      <a href="architecture.html">Architecture</a>
+      <a href="editeur.html" class="active">Éditeur</a>
+      <a href="execution.html">Exécution</a>
+      <a href="connecteurs.html">Connecteurs</a>
+      <a href="demarrer.html">Démarrer</a>
+    </div>
+  </div>
+</nav>
+
+<div class="page-hero">
+  <div class="wrap">
+    <span class="eyebrow">03 — L'éditeur visuel</span>
+    <h1>Construisez un workflow, puis exécutez-le</h1>
+    <p class="lede">
+      Reproduction de l'éditeur Autome avec l'exemple réel <code>Slack → Gmail → Notion</code>.
+      Cliquez une node pour voir sa config à droite, puis lancez l'exécution.
+    </p>
+  </div>
+</div>
+
+<main class="wrap">
+  <div class="block">
+    <div class="editor">
+      <div class="ed-bar">
+        <span class="dot r"></span><span class="dot y"></span><span class="dot g"></span>
+        <span class="ed-title">autome · wf-draft · Slack → Gmail → Notion</span>
+        <div class="ed-tabs">
+          <span class="ed-tab on">Éditeur</span>
+          <span class="ed-tab">Exécutions</span>
+          <span class="ed-tab">Connecteurs</span>
+        </div>
+      </div>
+
+      <div class="ed-body">
+        <aside class="palette">
+          <div class="pal-h">Triggers</div>
+          <div class="pal-item"><span class="swatch sw-t"></span> Webhook</div>
+          <div class="pal-item"><span class="swatch sw-t"></span> Schedule (cron)</div>
+          <div class="pal-item"><span class="swatch sw-t"></span> Polling</div>
+          <div class="pal-h">Actions</div>
+          <div class="pal-item"><span class="swatch sw-a"></span> HTTP Request</div>
+          <div class="pal-item"><span class="swatch sw-a"></span> Slack — Send</div>
+          <div class="pal-item"><span class="swatch sw-a"></span> Gmail — Send</div>
+          <div class="pal-item"><span class="swatch sw-a"></span> Notion — Page</div>
+          <div class="pal-item"><span class="swatch sw-a"></span> GitHub — Issue</div>
+          <div class="pal-h">Logique</div>
+          <div class="pal-item"><span class="swatch sw-l"></span> If</div>
+          <div class="pal-item"><span class="swatch sw-l"></span> Switch</div>
+          <div class="pal-item"><span class="swatch sw-l"></span> Loop</div>
+        </aside>
+
+        <div class="canvas" id="canvas">
+          <svg class="wires" id="wires"></svg>
+          <div class="wf-node" data-kind="trigger" data-id="entry" style="left:32px; top:40px">
+            <div class="kind">⚡ trigger · manual</div>
+            <div class="name">Déclencheur manuel</div>
+            <div class="meta">entry</div>
+            <div class="status"></div>
+          </div>
+          <div class="wf-node" data-kind="action" data-id="slack_read" style="left:32px; top:160px">
+            <div class="kind">🔵 action · slack</div>
+            <div class="name">Lire le canal Slack</div>
+            <div class="meta">slack.read_channel</div>
+            <div class="status"></div>
+          </div>
+          <div class="wf-node" data-kind="action" data-id="gmail_send" style="left:288px; top:160px">
+            <div class="kind">🔵 action · gmail</div>
+            <div class="name">Envoyer un email</div>
+            <div class="meta">gmail.send_email</div>
+            <div class="status"></div>
+          </div>
+          <div class="wf-node" data-kind="action" data-id="notion_create" style="left:288px; top:280px">
+            <div class="kind">🔵 action · notion</div>
+            <div class="name">Archiver dans Notion</div>
+            <div class="meta">notion.create_page</div>
+            <div class="status"></div>
+          </div>
+        </div>
+
+        <aside class="inspector" id="inspector">
+          <div class="insp-empty" id="inspEmpty">Sélectionnez une node<br>pour voir sa configuration.</div>
+          <div id="inspBody" style="display:none">
+            <div class="insp-h" id="inspKind"></div>
+            <div id="inspFields"></div>
+          </div>
+        </aside>
+      </div>
+
+      <div class="ed-foot">
+        <button class="btn primary" id="runBtn" style="font-size:13.5px;padding:10px 18px">▶ Exécuter le workflow</button>
+        <button class="btn ghost" id="resetBtn" style="font-size:13.5px;padding:10px 16px">↺ Réinitialiser</button>
+        <span class="run-status" id="runStatus">prêt.</span>
+      </div>
+    </div>
+
+    <div class="note">
+      <b>Astuce de lecture.</b> Sélectionnez « Envoyer un email » : son champ <i>body</i> contient
+      <code class="mono">{{ slack_read.messages.0.text }}</code> — la sortie de la node Slack y est injectée
+      au moment où le moteur l'exécute. C'est ça, le <i>templating inter-nodes</i>.
+    </div>
+
+    <h3 class="sub">À l'écran, dans la vraie app</h3>
+    <div class="grid cols-3" style="margin-top:14px">
+      <div class="card"><h3><span class="ico">🎛️</span> Palette</h3><p>À gauche : tous les types de nodes, groupés en Triggers / Actions / Logique. On glisse vers le canvas.</p></div>
+      <div class="card"><h3><span class="ico">🕸️</span> Canvas</h3><p>Au centre : on dispose les nodes et on trace les <i>edges</i> qui définissent l'ordre d'exécution.</p></div>
+      <div class="card"><h3><span class="ico">⚙️</span> Inspecteur</h3><p>À droite : la configuration de la node sélectionnée (channel, destinataire, URL, templating…).</p></div>
+    </div>
+
+    <div class="pager">
+      <a href="architecture.html"><div class="dir">← Précédent</div><div class="lbl">Architecture</div></a>
+      <a class="next" href="execution.html"><div class="dir">Suivant →</div><div class="lbl">Cycle de vie d'un run</div></a>
+    </div>
+  </div>
+</main>
+
+<footer>
+  <div class="wrap">
+    <a class="brand" href="index.html"><span class="bolt">⚡</span> Autome</a>
+    Plateforme d'automatisation de workflows · Rust + React · Licence MIT
+  </div>
+</footer>
+
+<script src="assets/editor.js"></script>
+</body>
+</html>

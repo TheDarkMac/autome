@@ -2,7 +2,7 @@
 
 - **Statut** : Accepté
 - **Date** : 2026-05-16
-- **Feature** : F1.2 (cf. [ROADMAP](../../ROADMAP.md)) — issue #3
+- **Feature** : F1.2 (cf. [ROADMAP](../../claude-code/ROADMAP.md)) — issue #3
 - **Décideurs** : équipe Autome
 - **Contexte ADR** : confirme la décision provisoire de l'[ADR initial d'architecture](../ARCHITECTURE.md#7-choix-techniques-structurants-adr-initial)
 

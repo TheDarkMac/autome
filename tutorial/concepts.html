@@ -1,0 +1,107 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Autome — Concepts</title>
+<link rel="stylesheet" href="assets/style.css" />
+</head>
+<body>
+
+<nav class="top">
+  <div class="wrap">
+    <a class="brand" href="index.html"><span class="bolt">⚡</span> Autome</a>
+    <div class="links">
+      <a href="concepts.html" class="active">Concepts</a>
+      <a href="architecture.html">Architecture</a>
+      <a href="editeur.html">Éditeur</a>
+      <a href="execution.html">Exécution</a>
+      <a href="connecteurs.html">Connecteurs</a>
+      <a href="demarrer.html">Démarrer</a>
+    </div>
+  </div>
+</nav>
+
+<div class="page-hero">
+  <div class="wrap">
+    <span class="eyebrow">01 — Les concepts</span>
+    <h1>Le vocabulaire d'Autome</h1>
+    <p class="lede">Quatre notions suffisent à tout comprendre. Tout le reste en découle.</p>
+  </div>
+</div>
+
+<main class="wrap">
+  <div class="block">
+    <div class="grid cols-2">
+      <div class="card">
+        <h3><span class="ico">🔗</span> Workflow</h3>
+        <p>Un <b>graphe orienté</b> (DAG) de nodes reliés par des <i>edges</i>. C'est votre automatisation,
+        décrite en JSON et éditable visuellement. Exemple : « quand un message arrive sur Slack, envoie un email puis archive dans Notion ».</p>
+      </div>
+      <div class="card">
+        <h3><span class="ico">🧩</span> Node</h3>
+        <p>Une boîte = une étape. Trois familles :
+        <span class="badge-kind bk-t">trigger</span> qui démarre le flux,
+        <span class="badge-kind bk-a">action</span> qui fait quelque chose (Slack, Gmail…),
+        <span class="badge-kind bk-l">logique</span> (if, switch, loop, while).</p>
+      </div>
+      <div class="card">
+        <h3><span class="ico">⚡</span> Trigger</h3>
+        <p>L'événement qui démarre un <i>run</i> : <code>webhook</code> (HTTP entrant),
+        <code>schedule</code> (cron), <code>polling</code> (interrogation périodique) ou
+        <code>manual</code> (bouton). Chaque trigger pose un run dans la file de messages.</p>
+      </div>
+      <div class="card">
+        <h3><span class="ico">▶️</span> Run</h3>
+        <p>Une <b>exécution</b> du workflow. Son état (sorties de chaque node, prochain node) est
+        <b>persisté en base</b> à chaque étape : reprise après crash et scaling horizontal gratuits.</p>
+      </div>
+    </div>
+
+    <h3 class="sub">Le catalogue de nodes</h3>
+    <p class="lede" style="font-size:15px">Ce que vous trouvez dans la palette de l'éditeur, par catégorie.</p>
+    <table>
+      <thead><tr><th>Catégorie</th><th>Nodes</th></tr></thead>
+      <tbody>
+        <tr><td><span class="badge-kind bk-t">Triggers</span></td><td><code>webhook</code> · <code>schedule (cron)</code> · <code>polling</code></td></tr>
+        <tr><td><span class="badge-kind bk-a">Actions</span></td><td><code>http_request</code> · <code>slack.send</code> · <code>gmail.send</code> · <code>notion.create_page</code> · <code>github.create_issue</code></td></tr>
+        <tr><td><span class="badge-kind bk-l">Logique</span></td><td><code>if</code> · <code>switch</code> · <code>loop</code> · <code>while</code></td></tr>
+      </tbody>
+    </table>
+
+    <h3 class="sub">Le templating inter-nodes</h3>
+    <p class="lede" style="font-size:15px">La clé qui transforme des nodes isolées en un véritable pipeline de données.</p>
+    <p style="color:var(--ink-soft)">
+      Une action peut réutiliser la sortie d'une node précédente avec la syntaxe
+      <code>{{ node_id.champ }}</code>. Le moteur résout ces expressions <b>au runtime</b>,
+      juste avant d'exécuter la node.
+    </p>
+<pre><span class="c1">// la node "gmail_send" injecte la sortie de la node "slack_read"</span>
+{
+  <span class="n">"action_type"</span>: <span class="s">"gmail.send_email"</span>,
+  <span class="n">"params"</span>: {
+    <span class="n">"to"</span>: <span class="s">"ops@example.com"</span>,
+    <span class="n">"body"</span>: <span class="s">"Dernier message #deploys : {{ slack_read.messages.0.text }}"</span>
+  }
+}</pre>
+    <div class="note">
+      <b>À retenir.</b> <code class="mono">{{ slack_read.messages.0.text }}</code> signifie :
+      « prends la node <i>slack_read</i>, son tableau <i>messages</i>, le 1ᵉʳ élément, son champ <i>text</i> ».
+      C'est le même principe que dans n8n / Make.
+    </div>
+
+    <div class="pager">
+      <a href="index.html"><div class="dir">← Précédent</div><div class="lbl">Accueil</div></a>
+      <a class="next" href="architecture.html"><div class="dir">Suivant →</div><div class="lbl">Architecture</div></a>
+    </div>
+  </div>
+</main>
+
+<footer>
+  <div class="wrap">
+    <a class="brand" href="index.html"><span class="bolt">⚡</span> Autome</a>
+    Plateforme d'automatisation de workflows · Rust + React · Licence MIT
+  </div>
+</footer>
+</body>
+</html>

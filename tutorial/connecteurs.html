@@ -1,0 +1,85 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Autome — Connecteurs</title>
+<link rel="stylesheet" href="assets/style.css" />
+</head>
+<body>
+
+<nav class="top">
+  <div class="wrap">
+    <a class="brand" href="index.html"><span class="bolt">⚡</span> Autome</a>
+    <div class="links">
+      <a href="concepts.html">Concepts</a>
+      <a href="architecture.html">Architecture</a>
+      <a href="editeur.html">Éditeur</a>
+      <a href="execution.html">Exécution</a>
+      <a href="connecteurs.html" class="active">Connecteurs</a>
+      <a href="demarrer.html">Démarrer</a>
+    </div>
+  </div>
+</nav>
+
+<div class="page-hero">
+  <div class="wrap">
+    <span class="eyebrow">05 — Connecteurs</span>
+    <h1>Les briques d'action</h1>
+    <p class="lede">Des intégrations prêtes à l'emploi, plus un SDK pour en ajouter sans toucher au cœur du moteur.</p>
+  </div>
+</div>
+
+<main class="wrap">
+  <div class="block">
+    <div class="connectors">
+      <div class="conn"><span class="em">💬</span> Slack <small>read_channel · send_message</small></div>
+      <div class="conn"><span class="em">✉️</span> Gmail <small>send_email</small></div>
+      <div class="conn"><span class="em">📓</span> Notion <small>create_page</small></div>
+      <div class="conn"><span class="em">🐙</span> GitHub <small>create_issue</small></div>
+      <div class="conn"><span class="em">🌐</span> HTTP <small>GET / POST génériques</small></div>
+    </div>
+
+    <h3 class="sub">Sécurité des credentials</h3>
+    <div class="grid cols-3" style="margin-top:14px">
+      <div class="card"><h3><span class="ico">🔐</span> OAuth2 + PKCE</h3><p>Vous autorisez un compte via le flow standard <i>Authorization Code + PKCE</i> — Autome ne voit jamais votre mot de passe.</p></div>
+      <div class="card"><h3><span class="ico">🗄️</span> Chiffré au repos</h3><p>Les tokens sont stockés chiffrés en <b>AES-256-GCM</b>. Aucun secret en clair dans la base.</p></div>
+      <div class="card"><h3><span class="ico">💉</span> Injection au runtime</h3><p>Le worker injecte le credential au moment d'exécuter l'action ; il n'apparaît jamais dans le graphe du workflow.</p></div>
+    </div>
+
+    <h3 class="sub">Le flow d'autorisation</h3>
+<pre><span class="c1"># 1. lister les providers disponibles</span>
+GET /credentials/providers
+
+<span class="c1"># 2. démarrer le flow OAuth (redirige vers le provider)</span>
+GET /credentials/<span class="n">:provider</span>/authorize
+
+<span class="c1"># 3. le provider renvoie ici, Autome stocke le token chiffré</span>
+GET /credentials/<span class="n">:provider</span>/callback</pre>
+
+    <h3 class="sub">Cœur agnostique : ajouter un connecteur</h3>
+    <p style="color:var(--ink-soft)">
+      Le moteur dépend de <i>traits</i>, pas des APIs concrètes. Un nouveau connecteur, c'est implémenter
+      le SDK de connecteur — sans recompiler la logique d'orchestration ni l'éditeur. Les actions
+      apparaissent ensuite dans la palette via le catalogue.
+    </p>
+    <div class="note">
+      <b>Où c'est dans le code.</b> Les connecteurs vivent dans <code>crates/connectors/</code>
+      (Slack · Gmail · Notion · GitHub · HTTP + le SDK). Le guide d'ajout est dans <code>docs/CONNECTORS.md</code>.
+    </div>
+
+    <div class="pager">
+      <a href="execution.html"><div class="dir">← Précédent</div><div class="lbl">Cycle de vie d'un run</div></a>
+      <a class="next" href="demarrer.html"><div class="dir">Suivant →</div><div class="lbl">Démarrer en local</div></a>
+    </div>
+  </div>
+</main>
+
+<footer>
+  <div class="wrap">
+    <a class="brand" href="index.html"><span class="bolt">⚡</span> Autome</a>
+    Plateforme d'automatisation de workflows · Rust + React · Licence MIT
+  </div>
+</footer>
+</body>
+</html>

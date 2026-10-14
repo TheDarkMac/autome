@@ -1,0 +1,94 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Autome — Exécution</title>
+<link rel="stylesheet" href="assets/style.css" />
+</head>
+<body>
+
+<nav class="top">
+  <div class="wrap">
+    <a class="brand" href="index.html"><span class="bolt">⚡</span> Autome</a>
+    <div class="links">
+      <a href="concepts.html">Concepts</a>
+      <a href="architecture.html">Architecture</a>
+      <a href="editeur.html">Éditeur</a>
+      <a href="execution.html" class="active">Exécution</a>
+      <a href="connecteurs.html">Connecteurs</a>
+      <a href="demarrer.html">Démarrer</a>
+    </div>
+  </div>
+</nav>
+
+<div class="page-hero">
+  <div class="wrap">
+    <span class="eyebrow">04 — Cycle de vie d'un run</span>
+    <h1>Du clic au résultat, fiable par défaut</h1>
+    <p class="lede">Le parcours réel dans l'application, et pourquoi un crash de worker ne perd jamais une exécution.</p>
+  </div>
+</div>
+
+<main class="wrap">
+  <div class="block">
+    <h2>Créer votre première automatisation</h2>
+    <p class="lede" style="font-size:15px">Du glisser-déposer jusqu'au run.</p>
+    <div class="steps">
+      <div class="step"><div>
+        <h4>Se connecter <span class="tag">/login</span></h4>
+        <p>Authentification par JWT. Créez un compte ou connectez-vous ; l'éditeur n'est accessible qu'une fois la session établie.</p>
+      </div></div>
+      <div class="step"><div>
+        <h4>Brancher vos comptes <span class="tag">onglet Connecteurs</span></h4>
+        <p>Autorisez Slack, Gmail, Notion ou GitHub via <b>OAuth2 (Authorization Code + PKCE)</b>. Les credentials sont chiffrés au repos en <b>AES-256-GCM</b> — jamais stockés en clair.</p>
+      </div></div>
+      <div class="step"><div>
+        <h4>Poser un trigger <span class="tag">palette → canvas</span></h4>
+        <p>Glissez un déclencheur : un <code>webhook</code> pour réagir à un événement HTTP, un <code>schedule</code> cron pour du périodique, ou <code>manual</code> pour tester à la main.</p>
+      </div></div>
+      <div class="step"><div>
+        <h4>Ajouter des actions & les relier</h4>
+        <p>Déposez des actions, tracez les <i>edges</i> entre les nodes pour définir l'ordre. Chaque node se configure dans le panneau de droite.</p>
+      </div></div>
+      <div class="step"><div>
+        <h4>Chaîner les données <span class="tag">{{ }}</span></h4>
+        <p>Référencez la sortie d'une node amont avec <code>{{ id_node.champ }}</code>. Le moteur résout le templating au runtime.</p>
+      </div></div>
+      <div class="step"><div>
+        <h4>Exécuter & suivre <span class="tag">onglet Exécutions</span></h4>
+        <p>Déclenchez un run. L'onglet Exécutions liste chaque run et, par <i>polling</i>, affiche en direct quelle node est en cours, terminée ou en échec.</p>
+      </div></div>
+    </div>
+
+    <h3 class="sub">Le cycle de vie, étape par étape</h3>
+    <p class="lede" style="font-size:15px">Ce qui se déroule entre le déclenchement et le résultat.</p>
+    <div class="grid cols-3" style="margin-top:14px">
+      <div class="card"><h3><span class="ico">①</span> Enfilement</h3><p>Le trigger crée un run et le pousse dans <b>RabbitMQ</b>. L'API répond immédiatement — elle ne bloque jamais sur l'exécution.</p></div>
+      <div class="card"><h3><span class="ico">②</span> Consommation</h3><p>Un <b>worker stateless</b> du pool tire le message. N'importe quel worker peut le prendre : aucun état local.</p></div>
+      <div class="card"><h3><span class="ico">③</span> Déroulé DAG</h3><p>Le moteur exécute les nodes dans l'ordre du graphe (séquence, branches if/switch, boucles loop/while), en résolvant le templating.</p></div>
+      <div class="card"><h3><span class="ico">④</span> Checkpoint</h3><p>Après <b>chaque node</b>, l'état (sorties + prochain node) est écrit en <b>PostgreSQL</b>. Le run est rejouable depuis ce point.</p></div>
+      <div class="card"><h3><span class="ico">⑤</span> Reprise</h3><p>Worker tué en plein run ? Le message non-acquitté retourne dans la file ; un autre worker reprend au dernier checkpoint. Rien n'est perdu.</p></div>
+      <div class="card"><h3><span class="ico">⑥</span> Observabilité</h3><p>Métriques <b>Prometheus</b> sur <code>/metrics</code>, dashboards <b>Grafana</b> provisionnés, journal d'audit des actions.</p></div>
+    </div>
+
+    <div class="note">
+      <b>Le scénario de panne.</b> Imaginez le run arrêté à la node <i>gmail_send</i> (l'email est parti, le checkpoint est écrit), puis le worker crashe.
+      RabbitMQ n'a pas reçu l'acquittement → il remet le run en file → un autre worker le reprend <b>à partir de notion_create</b>, sans renvoyer l'email. Idempotence par checkpoint.
+    </div>
+
+    <div class="pager">
+      <a href="editeur.html"><div class="dir">← Précédent</div><div class="lbl">L'éditeur visuel</div></a>
+      <a class="next" href="connecteurs.html"><div class="dir">Suivant →</div><div class="lbl">Connecteurs</div></a>
+    </div>
+  </div>
+</main>
+
+<footer>
+  <div class="wrap">
+    <a class="brand" href="index.html"><span class="bolt">⚡</span> Autome</a>
+    Plateforme d'automatisation de workflows · Rust + React · Licence MIT
+  </div>
+</footer>
+</body>
+</html>

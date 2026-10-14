@@ -2,7 +2,7 @@
 
 > Plateforme d'automatisation type Make / n8n / Zapier. Backend Rust, frontend
 > React/TS. Document de référence initié en **F1.1** et mis à jour en **F11.3**
-> pour refléter l'architecture *telle que construite* (cf. [ROADMAP](../ROADMAP.md)).
+> pour refléter l'architecture *telle que construite* (cf. [ROADMAP](../claude-code/ROADMAP.md)).
 >
 > 🔎 **Lecture des diagrammes** : sauf mention « *cible production* », les
 > composants décrits sont **implémentés**. Les éléments d'exploitation encore

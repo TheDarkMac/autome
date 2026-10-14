@@ -2,7 +2,7 @@
 
 - **Statut** : Accepté
 - **Date** : 2026-05-21
-- **Feature** : F5.1.a (cf. [ROADMAP](../../ROADMAP.md)) — issue #49
+- **Feature** : F5.1.a (cf. [ROADMAP](../../claude-code/ROADMAP.md)) — issue #49
 - **Décideurs** : équipe Autome
 - **Contexte ADR** : précise l'[ADR initial d'architecture](../ARCHITECTURE.md#7-choix-techniques-structurants-adr-initial) (« file de messages externalisée »)
 

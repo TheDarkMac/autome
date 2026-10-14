@@ -1,0 +1,116 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Autome — Démarrer</title>
+<link rel="stylesheet" href="assets/style.css" />
+</head>
+<body>
+
+<nav class="top">
+  <div class="wrap">
+    <a class="brand" href="index.html"><span class="bolt">⚡</span> Autome</a>
+    <div class="links">
+      <a href="concepts.html">Concepts</a>
+      <a href="architecture.html">Architecture</a>
+      <a href="editeur.html">Éditeur</a>
+      <a href="execution.html">Exécution</a>
+      <a href="connecteurs.html">Connecteurs</a>
+      <a href="demarrer.html" class="active">Démarrer</a>
+    </div>
+  </div>
+</nav>
+
+<div class="page-hero">
+  <div class="wrap">
+    <span class="eyebrow">06 — Démarrer en local</span>
+    <h1>Tout lancer en une commande</h1>
+    <p class="lede">La stack complète (DB, queue, services, monitoring) tourne en conteneurs.</p>
+  </div>
+</div>
+
+<main class="wrap">
+  <div class="block">
+    <div class="codetitle"># Option A — tout en conteneurs (recommandé)</div>
+<pre><span class="c1"># pré-requis : Docker + Docker Compose</span>
+<span class="k">docker</span> compose up --build</pre>
+
+    <table>
+      <thead><tr><th>Service</th><th>URL</th><th>Notes</th></tr></thead>
+      <tbody>
+        <tr><td>API</td><td><code>localhost:8080</code></td><td><code>GET /health</code>, <code>GET /metrics</code></td></tr>
+        <tr><td>Frontend</td><td><code>localhost:8081</code></td><td>SPA — l'éditeur visuel</td></tr>
+        <tr><td>Grafana</td><td><code>localhost:3000</code></td><td><code>admin / admin</code></td></tr>
+        <tr><td>Prometheus</td><td><code>localhost:9090</code></td><td>scrape de l'API</td></tr>
+        <tr><td>RabbitMQ</td><td><code>localhost:15672</code></td><td>UI management — <code>guest / guest</code></td></tr>
+      </tbody>
+    </table>
+    <div class="note">Profil <code>dev</code> avec des secrets de développement — <b>ne pas utiliser tel quel en production</b>. Arrêt + nettoyage des volumes : <code>docker compose down -v</code>.</div>
+
+    <div class="codetitle"># Option B — développement local (Rust ≥ 1.85, Node ≥ 20, PostgreSQL)</div>
+<pre><span class="c1"># 1. configuration</span>
+cp .env.example .env
+
+<span class="c1"># 2. API HTTP</span>
+<span class="k">cargo</span> run -p autome-api        <span class="c1"># 127.0.0.1:8080</span>
+
+<span class="c1"># 3. worker (exécuteur de runs)</span>
+<span class="k">cargo</span> run -p autome-worker
+
+<span class="c1"># 4. frontend</span>
+<span class="k">cd</span> frontend && npm install && npm run dev</pre>
+
+    <h3 class="sub">L'API REST en bref</h3>
+    <table>
+      <thead><tr><th>Endpoint</th><th>Rôle</th></tr></thead>
+      <tbody>
+        <tr><td><code>POST /workflows</code></td><td>CRUD des workflows (graphe JSON)</td></tr>
+        <tr><td><code>POST /workflows/:id/runs</code></td><td>Déclencher manuellement un run</td></tr>
+        <tr><td><code>GET /runs/:run_id</code></td><td>État d'un run (checkpoint) — utilisé par le polling</td></tr>
+        <tr><td><code>GET /credentials/providers</code></td><td>Providers OAuth disponibles</td></tr>
+        <tr><td><code>GET /credentials/:provider/authorize</code></td><td>Démarrer le flow OAuth2 + PKCE</td></tr>
+        <tr><td><code>GET /openapi.json</code></td><td>Spécification OpenAPI générée</td></tr>
+        <tr><td><code>GET /metrics</code></td><td>Métriques Prometheus</td></tr>
+      </tbody>
+    </table>
+
+    <h3 class="sub">Un workflow, c'est juste du JSON</h3>
+    <p class="lede" style="font-size:15px">Exemple <code>Slack → Gmail → Notion</code> (extrait de <code>examples/workflows/</code>).</p>
+<pre>{
+  <span class="n">"name"</span>: <span class="s">"Slack → Gmail → Notion"</span>,
+  <span class="n">"nodes"</span>: [
+    { <span class="n">"id"</span>: <span class="s">"entry"</span>,      <span class="n">"kind"</span>: <span class="s">"trigger"</span>, <span class="n">"trigger_type"</span>: <span class="s">"manual"</span> },
+    { <span class="n">"id"</span>: <span class="s">"slack_read"</span>, <span class="n">"kind"</span>: <span class="s">"action"</span>,  <span class="n">"action_type"</span>: <span class="s">"slack.read_channel"</span> },
+    { <span class="n">"id"</span>: <span class="s">"gmail_send"</span>, <span class="n">"kind"</span>: <span class="s">"action"</span>,  <span class="n">"action_type"</span>: <span class="s">"gmail.send_email"</span>,
+      <span class="n">"params"</span>: { <span class="n">"body"</span>: <span class="s">"Dernier message : {{ slack_read.messages.0.text }}"</span> } }
+  ],
+  <span class="n">"edges"</span>: [
+    { <span class="n">"from"</span>: <span class="s">"entry"</span>,      <span class="n">"to"</span>: <span class="s">"slack_read"</span> },
+    { <span class="n">"from"</span>: <span class="s">"slack_read"</span>, <span class="n">"to"</span>: <span class="s">"gmail_send"</span> }
+  ]
+}</pre>
+
+    <h3 class="sub">Pour aller plus loin</h3>
+    <div class="grid cols-2" style="margin-top:14px">
+      <div class="card"><h3><span class="ico">📘</span> docs/INSTALLATION.md</h3><p>Guide d'installation & démarrage détaillé (Compose / local / Kubernetes).</p></div>
+      <div class="card"><h3><span class="ico">🏛️</span> docs/ARCHITECTURE.md</h3><p>Architecture détaillée, diagrammes et décisions (ADR).</p></div>
+      <div class="card"><h3><span class="ico">🔌</span> docs/CONNECTORS.md</h3><p>Créer un connecteur avec le SDK + exemple complet.</p></div>
+      <div class="card"><h3><span class="ico">🧪</span> examples/</h3><p>Workflows exécutables (graphe JSON + test e2e).</p></div>
+    </div>
+
+    <div class="pager">
+      <a href="connecteurs.html"><div class="dir">← Précédent</div><div class="lbl">Connecteurs</div></a>
+      <a class="next" href="index.html"><div class="dir">Retour →</div><div class="lbl">Accueil du tutoriel</div></a>
+    </div>
+  </div>
+</main>
+
+<footer>
+  <div class="wrap">
+    <a class="brand" href="index.html"><span class="bolt">⚡</span> Autome</a>
+    Plateforme d'automatisation de workflows · Rust + React · Licence MIT
+  </div>
+</footer>
+</body>
+</html>
