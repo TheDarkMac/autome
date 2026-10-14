@@ -287,6 +287,11 @@ erDiagram
 - Métriques **Prometheus** exposées par l'API sur `/metrics` (requêtes,
   latence, in-flight ; label `path` = template de route → cardinalité bornée),
   scrapées par Prometheus, visualisées dans Grafana (dashboard provisionné) — F10.6.
+- **Logs structurés** `tracing` (#176) : une ligne JSON par événement en `prod`
+  (`AUTOME_LOG_FORMAT`, niveau `RUST_LOG`). API : span `http_request`
+  (`request_id`, méthode, chemin sans query string) + ligne d'accès, en-tête
+  `x-request-id` repris ou généré puis renvoyé. Worker : span `run` (`run_id`,
+  `workflow_id`) propagé au thread bloquant du moteur, ligne de fin de run.
 - **CI** GitHub Actions (fmt + clippy `-D warnings` + tests workspace + build ;
   typecheck/lint/test frontend) — F10.4.
 - **CD** : build & push des images sur GHCR + déploiement Kubernetes gardé
