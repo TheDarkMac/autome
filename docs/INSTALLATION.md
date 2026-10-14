@@ -373,7 +373,13 @@ comptes sont publics ; tout le reste exige `Authorization: Bearer <access_token>
 - Un compte créé par `signup` reçoit le rôle **editor** (CRUD workflows, runs,
   credentials) — pas d'administration.
 - Anti-bruteforce : 5 tentatives sans succès par email et par fenêtre de 15 min,
-  puis 429. Compteur **par réplique** (en mémoire).
+  puis 429 (`Retry-After`) jusqu'à la fin de la fenêtre — même avec le bon mot
+  de passe. En `AUTOME_PERSISTENCE=postgres`, le compteur est **partagé par
+  toutes les répliques** de l'API et survit aux redémarrages (table
+  `login_attempts`, email stocké haché) ; en `memory`, il est propre au process.
+  Si le compteur est indisponible, la connexion est refusée (pas de
+  contournement). Les tentatives et les révocations de jetons expirées sont
+  purgées toutes les 10 min.
 - **Isolation par propriétaire** : un workflow appartient à son créateur, un run
   au propriétaire de son workflow. Les listes ne montrent que ses propres
   ressources ; lire, modifier, lancer ou supprimer la ressource d'autrui répond
