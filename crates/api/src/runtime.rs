@@ -18,12 +18,13 @@ use autome_connectors::{
     CredentialService, EgressPolicy, OAuthCredentialService, ReqwestHttpClient,
 };
 use autome_core::{
-    Config, InMemoryPermissionStore, InMemoryRevocationStore, InMemoryRunStateStore,
-    InMemoryUserStore, InMemoryWorkflowRepository, NoopAuditSink, Queue, QueueRunDispatcher,
-    Result, RunDispatcher, RunStateStore, UserStore, WorkflowRepository,
+    Config, InMemoryLoginThrottle, InMemoryPermissionStore, InMemoryRevocationStore,
+    InMemoryRunStateStore, InMemoryUserStore, InMemoryWorkflowRepository, LoginThrottleStore,
+    NoopAuditSink, Queue, QueueRunDispatcher, Result, RevocationStore, RunDispatcher,
+    RunStateStore, UserStore, WorkflowRepository,
 };
 use autome_persistence::{
-    connect, connector_cipher, run_migrations, PgAuditSink, PgConnectorTokenStore,
+    connect, connector_cipher, run_migrations, PgAuditSink, PgConnectorTokenStore, PgLoginThrottle,
     PgPermissionStore, PgRevocationStore, PgRunStateStore, PgUserStore, PgWorkflowRepository,
 };
 
@@ -68,6 +69,9 @@ pub struct Backends {
     /// Comptes utilisateurs (signup/login). Écrit dans le même store de
     /// permissions que `auth`, sans quoi un compte créé n'aurait aucun droit.
     pub users: Arc<dyn UserStore + Send + Sync>,
+    /// Compteur anti-bruteforce du login (partagé entre répliques en
+    /// `postgres`, #182).
+    pub login_throttle: Arc<dyn LoginThrottleStore>,
 }
 
 /// Assemble les backends. En `Postgres`, **un seul pool** est partagé par tous
@@ -99,6 +103,7 @@ pub fn build_backends(
                     connector_cipher(config),
                 )))?,
                 users: Arc::new(InMemoryUserStore::new(permissions)),
+                login_throttle: Arc::new(InMemoryLoginThrottle::new()),
             })
         }
         PersistenceMode::Postgres => {
@@ -122,10 +127,27 @@ pub fn build_backends(
                     pool.clone(),
                     connector_cipher(config),
                 )))?,
+                login_throttle: Arc::new(PgLoginThrottle::new(pool.clone())),
                 users: Arc::new(PgUserStore::new(pool)),
             })
         }
     }
+}
+
+/// Purge les entrées expirées des stores d'authentification : tentatives de
+/// connexion hors fenêtre et révocations de jetons échus. Renvoie
+/// `(tentatives, révocations)` supprimées. Appelée périodiquement par l'API ;
+/// idempotente, sûre à exécuter sur plusieurs répliques à la fois.
+pub async fn purge_expired(
+    login_throttle: &dyn LoginThrottleStore,
+    revocations: &(dyn RevocationStore + Send + Sync),
+    now_unix_seconds: i64,
+) -> Result<(usize, usize)> {
+    let attempts = login_throttle.gc(now_unix_seconds).await?;
+    let revoked = revocations
+        .gc(now_unix_seconds.saturating_mul(1_000))
+        .await?;
+    Ok((attempts, revoked))
 }
 
 /// `true` si `AUTOME_MIGRATE` demande d'appliquer les migrations au démarrage
@@ -195,6 +217,53 @@ mod tests {
         })
         .expect("config prod");
         let _state = build_auth_state(&config, PersistenceMode::Postgres).unwrap();
+    }
+
+    #[tokio::test]
+    async fn purge_expired_cleans_login_attempts_and_revocations() {
+        use autome_core::LOGIN_WINDOW_SECONDS;
+        let config = Config::load(|_| None).unwrap();
+        let queue = Arc::new(autome_core::InMemoryQueue::new());
+        let backends = build_backends(&config, PersistenceMode::Memory, queue).unwrap();
+        let now = 1_700_000_000;
+        backends
+            .login_throttle
+            .begin_attempt("old@example.io", now - LOGIN_WINDOW_SECONDS)
+            .await
+            .unwrap();
+        backends
+            .login_throttle
+            .begin_attempt("live@example.io", now)
+            .await
+            .unwrap();
+        backends
+            .auth
+            .revocation
+            .revoke("jti-expired", (now - 1) * 1_000)
+            .await
+            .unwrap();
+        backends
+            .auth
+            .revocation
+            .revoke("jti-live", (now + 60) * 1_000)
+            .await
+            .unwrap();
+
+        let purge = || {
+            purge_expired(
+                backends.login_throttle.as_ref(),
+                backends.auth.revocation.as_ref(),
+                now,
+            )
+        };
+        assert_eq!(purge().await.unwrap(), (1, 1));
+        assert!(backends
+            .auth
+            .revocation
+            .is_revoked("jti-live")
+            .await
+            .unwrap());
+        assert_eq!(purge().await.unwrap(), (0, 0));
     }
 
     /// Gaté par `TEST_DATABASE_URL` : en `postgres`, `/credentials/*` lit et

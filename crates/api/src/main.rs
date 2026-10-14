@@ -16,7 +16,7 @@ use autome_api::observability::with_request_tracing;
 use autome_api::runs::{runs_router, RunsState};
 use autome_api::runtime::{
     build_backends, build_queue, ensure_durable_backends, migrate, migrate_on_boot_requested,
-    Backends, PersistenceMode, QueueMode,
+    purge_expired, Backends, PersistenceMode, QueueMode,
 };
 use autome_api::tls::load_rustls_config;
 use autome_api::workflows::{
@@ -24,6 +24,9 @@ use autome_api::workflows::{
 };
 use autome_core::{telemetry, Argon2PasswordHasher, Config};
 use axum::{routing::get, Router};
+
+/// Période de la purge des entrées d'authentification expirées.
+const MAINTENANCE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(600);
 
 /// Handler de la sonde de santé.
 async fn health() -> &'static str {
@@ -79,11 +82,12 @@ fn build_router(backends: &Backends, accounts: AccountsState, metrics: Arc<Metri
 
 /// État des endpoints de comptes : Argon2id sur les stores de `backends`.
 fn accounts_state(backends: &Backends) -> autome_core::Result<AccountsState> {
-    AccountsState::new(
+    Ok(AccountsState::new(
         backends.auth.clone(),
         backends.users.clone(),
         Arc::new(Argon2PasswordHasher::new()),
-    )
+    )?
+    .with_throttle(backends.login_throttle.clone()))
 }
 
 #[tokio::main]
@@ -114,6 +118,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let queue = build_queue(&config, queue_mode).await?;
     let backends = build_backends(&config, mode, queue)?;
     tracing::info!(queue = ?queue_mode, persistence = ?mode, "backends prêts");
+
+    // Maintenance (#182) : purge des tentatives de connexion et des
+    // révocations expirées (sinon les tables croissent sans fin). Sûr sur
+    // plusieurs répliques à la fois.
+    let (throttle, revocations, clock) = (
+        backends.login_throttle.clone(),
+        backends.auth.revocation.clone(),
+        backends.auth.clock.clone(),
+    );
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(MAINTENANCE_INTERVAL);
+        loop {
+            tick.tick().await;
+            let now = clock.now_unix_seconds();
+            match purge_expired(throttle.as_ref(), revocations.as_ref(), now).await {
+                Ok((attempts, revoked)) => {
+                    tracing::debug!(
+                        attempts,
+                        revoked,
+                        "entrées d'authentification expirées purgées"
+                    )
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "purge des entrées d'authentification impossible")
+                }
+            }
+        }
+    });
 
     let accounts = accounts_state(&backends)?;
     let metrics = Arc::new(Metrics::new());
