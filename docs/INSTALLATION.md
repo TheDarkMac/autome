@@ -41,7 +41,10 @@ cp .env.example .env
 | `APP_PROFILE` | Profil d'exécution : `dev` ou `prod` | `dev` | `prod` |
 | `APP_HTTP_ADDR` | Adresse d'écoute HTTP de l'API | `127.0.0.1:8080` | `0.0.0.0:8080` |
 | `DATABASE_URL` | DSN PostgreSQL | `postgres://postgres:postgres@localhost:5432/autome` | **obligatoire** (≠ défaut) |
-| `QUEUE_URL` | URL de la file (RabbitMQ) | *(vide)* | recommandé |
+| `QUEUE_URL` | URL de la file (RabbitMQ) | *(vide)* | **obligatoire** (avec `AUTOME_QUEUE=rabbitmq`) |
+| `AUTOME_PERSISTENCE` | Stores de l'API et du worker : `memory` ou `postgres` | `memory` | **`postgres` obligatoire** |
+| `AUTOME_QUEUE` | File des runs : `memory` ou `rabbitmq` | `memory` | **`rabbitmq` obligatoire** |
+| `AUTOME_MIGRATE` | L'API applique les migrations au démarrage (`true`/`1`/`yes`, mode `postgres`) | *(non)* | recommandé |
 | `JWT_SECRET` | Clé de signature des JWT | `dev-insecure-jwt-secret` | **obligatoire** (non-défaut) |
 | `ENCRYPTION_KEY` | Clé de chiffrement des credentials au repos — **identique pour l'API et le worker** | `dev-insecure-encryption-key` | **obligatoire** (non-défaut) |
 | `AUTOME_TLS_CERT` | Chemin du certificat PEM (active HTTPS) | *(non défini)* | optionnel |
@@ -106,7 +109,12 @@ relit au moment du run. Le `provider_id` OAuth doit être le préfixe de l'actio
 En `APP_PROFILE=prod`, le démarrage **échoue immédiatement** si :
 
 - `JWT_SECRET` ou `ENCRYPTION_KEY` est vide **ou** laissé à sa valeur de dev ;
-- `DATABASE_URL` est laissé au DSN de dev.
+- `DATABASE_URL` est laissé au DSN de dev ;
+- `AUTOME_PERSISTENCE` ou `AUTOME_QUEUE` vaut `memory` (défaut) — **API et
+  worker**. En mémoire, chaque process a sa propre file et ses propres stores :
+  les runs publiés par l'API ne seraient jamais vus du worker, et comptes,
+  workflows et tokens disparaîtraient au redémarrage. Le message nomme la
+  variable à positionner (`AUTOME_PERSISTENCE=postgres`, `AUTOME_QUEUE=rabbitmq`).
 
 C'est volontaire : aucun secret de développement ne peut fuiter en production.
 
