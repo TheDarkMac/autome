@@ -29,7 +29,7 @@ use autome_connectors::{EgressPolicy, ReqwestHttpClient};
 use autome_core::Config;
 use autome_persistence::selectors::{
     build_connector_token_store, build_queue, build_run_state_store, build_workflow_repository,
-    PersistenceMode, QueueMode,
+    ensure_durable_backends, PersistenceMode, QueueMode,
 };
 use autome_worker::{
     ConnectorCredentialsMode, Handler, IdempotencyStore, InMemoryIdempotencyStore, RunExecutor,
@@ -53,6 +53,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = Config::from_env()?;
     let persistence = PersistenceMode::from_env()?;
     let queue_mode = QueueMode::from_env()?;
+    // Garde prod (#172) : un worker in-memory ne verrait aucun run publié par l'API.
+    ensure_durable_backends(config.profile, persistence, queue_mode)?;
     let concurrency = concurrency_from_env();
     let credentials_mode = ConnectorCredentialsMode::from_env()?;
 
