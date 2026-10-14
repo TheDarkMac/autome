@@ -78,3 +78,47 @@ async fn publish_poll_ack_and_dead_letter() {
     assert_eq!(d3b.redeliveries, 1, "AMQP marque le message redelivered");
     q.ack(&d3b.id).await.unwrap();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reconnects_after_losing_the_connection_and_ignores_stale_acks() {
+    let Some(url) = std::env::var("TEST_AMQP_URL").ok() else {
+        eprintln!("TEST_AMQP_URL absent → test RabbitMQ sauté");
+        return;
+    };
+    let q = RabbitMqQueue::connect(&url).await.expect("connexion");
+    let name = unique_queue();
+
+    q.publish(&name, Message::new(json!({ "n": 1 })))
+        .await
+        .unwrap();
+    let in_flight = q.poll(&name).await.unwrap().expect("message 1 livré");
+
+    // Perte du broker / du réseau : le canal se ferme avec une livraison en vol.
+    q.close_connection_for_tests().await;
+
+    // L'ack d'une livraison du canal disparu est ignoré (pas d'erreur, pas
+    // d'ack d'un autre message sur le canal neuf).
+    q.ack(&in_flight.id).await.unwrap();
+
+    // Le prochain appel reconnecte : la publication repart (confirmée).
+    q.publish(&name, Message::new(json!({ "n": 2 })))
+        .await
+        .unwrap();
+
+    // Le message 1 a été remis en file par le broker à la fermeture du canal.
+    let mut seen = Vec::new();
+    for _ in 0..50 {
+        if let Some(d) = q.poll(&name).await.unwrap() {
+            seen.push((d.message.body["n"].as_i64().unwrap(), d.redeliveries));
+            q.ack(&d.id).await.unwrap();
+            if seen.len() == 2 {
+                break;
+            }
+        } else {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+    seen.sort();
+    assert_eq!(seen, vec![(1, 1), (2, 0)], "1 redélivré, 2 neuf");
+    assert_eq!(q.depth(&name).await.unwrap(), 0);
+}

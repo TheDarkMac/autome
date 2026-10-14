@@ -19,7 +19,7 @@ autome-connectors = { workspace = true }
 # Dérivation de la clé des credentials depuis `ENCRYPTION_KEY` (SHA-256).
 sha2 = { workspace = true }
 # Pont sync → async du store de tokens (`block_in_place` + `Handle::block_on`).
-tokio = { workspace = true, features = ["rt", "rt-multi-thread", "time"] }
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "time", "sync"] }
 # Logs structurés (#176) — tentatives de connexion au broker.
 tracing = { workspace = true }
 serde = { workspace = true }
