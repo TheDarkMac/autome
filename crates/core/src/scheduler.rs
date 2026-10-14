@@ -162,7 +162,7 @@ impl Scheduler {
             .spawn(move || {
                 while !stop.load(Ordering::Acquire) {
                     if let Err(e) = pollster::block_on(scheduler.tick()) {
-                        eprintln!("[autome-scheduler] tick error: {e}");
+                        tracing::error!(error = %e, "tick du scheduler en erreur");
                     }
                     thread::sleep(interval);
                 }
@@ -196,7 +196,7 @@ impl Drop for RunningScheduler {
     fn drop(&mut self) {
         if self.handle.is_some() {
             self.shutdown.store(true, Ordering::Release);
-            eprintln!("RunningScheduler drop sans stop() — thread signalé mais détaché");
+            tracing::warn!("RunningScheduler abandonné sans stop() : thread signalé mais détaché");
         }
     }
 }

@@ -176,7 +176,7 @@ impl AuthState {
             )
             .await
         {
-            eprintln!("[auth] audit record failed: {e}");
+            tracing::error!(error = %e, "événement d'audit non enregistré");
         }
         if allowed {
             Ok(())

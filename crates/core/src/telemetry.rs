@@ -83,6 +83,14 @@ where
     }
 }
 
+/// Identifiant de corrélation d'une requête : 128 bits aléatoires en hex.
+pub fn new_request_id() -> String {
+    use rand::RngCore;
+    let mut bytes = [0u8; 16];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
 /// Installe le subscriber global (stdout) selon l'environnement et renvoie
 /// le format retenu. À appeler une fois, au démarrage du binaire.
 pub fn init(profile: Profile) -> Result<LogFormat> {
@@ -97,6 +105,14 @@ mod tests {
     use super::*;
     use std::io::Write;
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn request_ids_are_random_128_bit_hex() {
+        let (a, b) = (new_request_id(), new_request_id());
+        assert_eq!(a.len(), 32);
+        assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_ne!(a, b);
+    }
 
     #[test]
     fn default_format_depends_on_profile() {

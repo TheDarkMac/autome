@@ -241,7 +241,7 @@ async fn worker_loop(pool: &WorkerPool, shutdown: &AtomicBool, id: usize) {
             Ok(ProcessOutcome::Idle) => tokio::time::sleep(pool.poll_idle_sleep).await,
             Ok(_) => {}
             Err(e) => {
-                eprintln!("[autome-worker-{id}] queue error: {e}");
+                tracing::error!(consumer = id, error = %e, "erreur de file");
                 tokio::time::sleep(pool.poll_idle_sleep).await;
             }
         }
@@ -285,9 +285,9 @@ impl Drop for RunningPool {
             for handle in &self.handles {
                 handle.abort();
             }
-            eprintln!(
-                "RunningPool drop sans stop() — {} tâche(s) avortées",
-                self.handles.len()
+            tracing::warn!(
+                tasks = self.handles.len(),
+                "RunningPool abandonné sans stop() : tâches avortées"
             );
         }
     }

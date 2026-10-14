@@ -161,7 +161,7 @@ async fn audit_event(
     let now_ms = state.auth.clock.now_unix_seconds().saturating_mul(1_000);
     let event = AuditEvent::new(now_ms, actor, action, outcome).with_resource(resource);
     if let Err(e) = state.auth.audit.record(event).await {
-        eprintln!("[runs] audit record failed: {e}");
+        tracing::error!(action, error = %e, "événement d'audit non enregistré");
     }
 }
 

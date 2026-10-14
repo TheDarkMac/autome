@@ -218,10 +218,14 @@ impl OwnerCredentialResolver {
         if let Err(e) = self.store.store(owner, provider, &merged) {
             // Le token neuf reste utilisable pour ce run ; le prochain
             // retentera le rafraîchissement depuis l'ancien refresh token.
-            eprintln!(
-                "[autome-worker] token `{provider}` de `{owner}` rafraîchi mais non \
-                 persisté : {e}"
+            tracing::warn!(
+                provider,
+                owner,
+                error = %e,
+                "token de connecteur rafraîchi mais non persisté"
             );
+        } else {
+            tracing::info!(provider, owner, "token de connecteur rafraîchi");
         }
         Ok(Some(merged.access_token))
     }

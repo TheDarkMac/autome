@@ -46,6 +46,7 @@ use autome_core::{
     Action, Delivery, Node, NodeKind, RunStateStore, RunStatus, WorkflowId, WorkflowRepository,
 };
 use autome_engine::{Dag, Engine, RunContext, StepStatus};
+use tracing::{debug, error, info, warn, Instrument};
 
 use crate::dispatch::{dispatch_action, CredentialResolver};
 use crate::{Handler, HandlerVerdict};
@@ -106,23 +107,29 @@ where
     async fn unclaimed(&self, run_id: &str) -> HandlerVerdict {
         match self.store.load(run_id).await {
             Ok(None) => {
-                eprintln!("[autome-worker] run `{run_id}` introuvable → DLQ");
+                error!(run_id, verdict = "dead_letter", "run introuvable");
                 HandlerVerdict::DeadLetter
             }
             Ok(Some(cp)) if cp.status == RunStatus::Queued => {
                 // Course improbable (remis en file entre-temps) : on retente.
-                eprintln!("[autome-worker] run `{run_id}` encore en file → retry");
+                warn!(
+                    run_id,
+                    verdict = "retry",
+                    "run encore en file après un claim refusé"
+                );
                 HandlerVerdict::Retry
             }
             Ok(Some(cp)) => {
-                eprintln!(
-                    "[autome-worker] run `{run_id}` déjà {:?} → livraison dupliquée ignorée",
-                    cp.status
+                info!(
+                    run_id,
+                    status = ?cp.status,
+                    verdict = "ack",
+                    "livraison dupliquée ignorée : run déjà pris ou terminé"
                 );
                 HandlerVerdict::Ok
             }
             Err(e) => {
-                eprintln!("[autome-worker] erreur load run `{run_id}` : {e} → retry");
+                warn!(run_id, error = %e, verdict = "retry", "lecture du run impossible");
                 HandlerVerdict::Retry
             }
         }
@@ -215,43 +222,61 @@ where
     async fn handle(&self, delivery: &Delivery) -> HandlerVerdict {
         let body = &delivery.message.body;
         let Some(run_id) = body["run_id"].as_str() else {
-            eprintln!("[autome-worker] message sans `run_id` → DLQ");
+            error!(verdict = "dead_letter", "message sans `run_id`");
             return HandlerVerdict::DeadLetter;
         };
         let Some(workflow_id) = body["workflow_id"].as_str() else {
-            eprintln!("[autome-worker] message sans `workflow_id` → DLQ");
+            error!(
+                run_id,
+                verdict = "dead_letter",
+                "message sans `workflow_id`"
+            );
             return HandlerVerdict::DeadLetter;
         };
+        // Tous les logs du run (y compris ceux du moteur et des connecteurs)
+        // portent `run_id` / `workflow_id`.
+        let span = tracing::info_span!("run", run_id, workflow_id);
+        self.execute(run_id, workflow_id).instrument(span).await
+    }
+}
 
+impl<C> RunExecutor<C>
+where
+    C: HttpClient + Clone + Send + Sync + 'static,
+{
+    /// Exécute le run `run_id` de `workflow_id` (dans le span du run).
+    async fn execute(&self, run_id: &str, workflow_id: &str) -> HandlerVerdict {
         // Charge le workflow puis le checkpoint courant.
         let workflow = match self.repo.get(&WorkflowId::new(workflow_id)).await {
             Ok(Some(wf)) => wf,
             Ok(None) => {
-                eprintln!("[autome-worker] workflow `{workflow_id}` introuvable → DLQ");
+                error!(verdict = "dead_letter", "workflow introuvable");
                 return HandlerVerdict::DeadLetter;
             }
             Err(e) => {
-                eprintln!("[autome-worker] erreur repo workflow `{workflow_id}` : {e} → retry");
+                warn!(error = %e, verdict = "retry", "lecture du workflow impossible");
                 return HandlerVerdict::Retry;
             }
         };
         let dag = match Dag::from_workflow(&workflow) {
             Ok(dag) => dag,
             Err(e) => {
-                eprintln!("[autome-worker] DAG invalide pour `{workflow_id}` : {e} → DLQ");
+                error!(error = %e, verdict = "dead_letter", "DAG invalide");
                 return HandlerVerdict::DeadLetter;
             }
         };
         // Prise en charge atomique Queued → Running : une seule réplique
         // exécute le run, même si la livraison est dupliquée.
-        let mut checkpoint = match self.store.try_claim(run_id, now_ms()).await {
+        let started_ms = now_ms();
+        let mut checkpoint = match self.store.try_claim(run_id, started_ms).await {
             Ok(Some(cp)) => cp,
             Ok(None) => return self.unclaimed(run_id).await,
             Err(e) => {
-                eprintln!("[autome-worker] claim du run `{run_id}` échoué : {e} → retry");
+                warn!(error = %e, verdict = "retry", "claim du run impossible");
                 return HandlerVerdict::Retry;
             }
         };
+        debug!(owner = checkpoint.owner_id.as_deref(), "run réclamé");
 
         // Exécution **synchrone + bloquante** du moteur, hors runtime tokio.
         // Les tokens des connecteurs sont ceux du propriétaire du run (fixé au
@@ -259,7 +284,10 @@ where
         let http = self.http.clone();
         let resolver = Arc::clone(&self.resolver);
         let owner = checkpoint.owner_id.clone();
+        // Le span n'est pas propagé automatiquement au thread bloquant.
+        let span = tracing::Span::current();
         let report = match tokio::task::spawn_blocking(move || {
+            let _entered = span.enter();
             let runner = move |node: &Node, ctx: &RunContext| {
                 run_node(node, ctx, &http, resolver.as_ref(), owner.as_deref())
             };
@@ -271,10 +299,10 @@ where
             Err(e) => {
                 // Pas de rejeu : des nodes ont pu produire leurs effets avant
                 // le panic. Le run est clos en échec, visible de l'utilisateur.
-                eprintln!("[autome-worker] panic moteur (`{run_id}`) : {e} → échec + DLQ");
+                error!(error = %e, verdict = "dead_letter", "panic du moteur, run clos en échec");
                 let reason = format!("panic du moteur : {e}");
                 if let Err(e) = self.store.fail_if_running(run_id, &reason, now_ms()).await {
-                    eprintln!("[autome-worker] échec non persisté (`{run_id}`) : {e}");
+                    error!(error = %e, "échec du run non persisté");
                 }
                 return HandlerVerdict::DeadLetter;
             }
@@ -303,13 +331,26 @@ where
             // L'état final n'a pas pu être persisté. Le run reste `Running` en
             // base : la redélivrance ne le rejouera pas (déjà réclamé), et le
             // balayage des orphelins le clora en échec.
-            eprintln!("[autome-worker] checkpoint final échoué (`{run_id}`) : {e} → retry");
+            error!(error = %e, verdict = "retry", "état final du run non persisté");
             return HandlerVerdict::Retry;
         }
 
+        let duration_ms = now_ms().saturating_sub(started_ms);
         match report.status {
-            RunStatus::Succeeded => HandlerVerdict::Ok,
-            _ => HandlerVerdict::DeadLetter,
+            RunStatus::Succeeded => {
+                info!(status = "succeeded", duration_ms, "run terminé");
+                HandlerVerdict::Ok
+            }
+            status => {
+                warn!(
+                    status = ?status,
+                    duration_ms,
+                    error = checkpoint.error.as_deref(),
+                    verdict = "dead_letter",
+                    "run en échec"
+                );
+                HandlerVerdict::DeadLetter
+            }
         }
     }
 }
