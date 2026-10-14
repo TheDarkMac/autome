@@ -217,6 +217,37 @@ kubectl -n autome port-forward svc/prometheus 9090:9090  # http://localhost:9090
 
 ---
 
+## Authentification (comptes & jetons)
+
+L'API émet ses propres JWT (HS256, signés avec `JWT_SECRET`). Les endpoints de
+comptes sont publics ; tout le reste exige `Authorization: Bearer <access_token>`.
+
+| Méthode | Path | Body | Réponse |
+|---|---|---|---|
+| POST | `/auth/signup` | `{"email","password"}` | 201 + paire de jetons · 400 saisie invalide · 409 email déjà pris |
+| POST | `/auth/login` | `{"email","password"}` | 200 + paire de jetons · 401 identifiants invalides · 429 trop d'échecs (`Retry-After`) |
+| POST | `/auth/refresh` | `{"refresh_token"}` | 200 + nouvelle paire · 401 refresh invalide, expiré ou déjà utilisé |
+
+- Paire de jetons : `{"access_token","refresh_token","token_type":"Bearer","expires_in":900}`.
+  Access valable 15 min, refresh 7 jours et **à usage unique** (rotation).
+- Mot de passe : 8 à 1024 caractères, haché en **Argon2id**. L'email est
+  normalisé (trim + minuscules).
+- Un compte créé par `signup` reçoit le rôle **editor** (CRUD workflows, runs,
+  credentials) — pas d'administration.
+- Anti-bruteforce : 5 tentatives sans succès par email et par fenêtre de 15 min,
+  puis 429. Compteur **par réplique** (en mémoire).
+
+```bash
+curl -s -H 'content-type: application/json' \
+  -d '{"email":"me@example.com","password":"correct-horse"}' \
+  http://localhost:8080/auth/signup
+```
+
+Base de dev seedée (`migrations/seeds/dev_seed.sql`) : compte super-admin
+`dev@autome.local` / `autome-dev-password` (à ne jamais appliquer en prod).
+
+---
+
 ## 3. Tests & qualité (DoD)
 
 La CI rejoue exactement la « definition of done » appliquée à chaque feature :
