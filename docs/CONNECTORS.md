@@ -327,6 +327,12 @@ Le worker ne construit jamais l'`*Auth` à partir d'un secret global : le
   l'utilisateur n'est jamais trouvé ;
 - token absent ou run sans propriétaire ⇒ le node échoue **avant** toute
   requête HTTP (message explicite indiquant `/credentials/<provider>/authorize`) ;
+- token expiré (`expires_at_ms` à moins de `REFRESH_SKEW_MS`) ⇒ rafraîchi par
+  le worker via `oauth::TokenRefresher` (`OAuthClient::refresh`) puis
+  re-stocké (`merge_refreshed` garde refresh token et scope non renvoyés). Un
+  token sans `expires_at_ms` n'est jamais rafraîchi. Un connecteur n'a donc
+  pas à gérer l'expiration lui-même (un token révoqué côté provider reste,
+  lui, une erreur HTTP remontée par l'interpreter) ;
 - le token global `AUTOME_CONNECTOR_TOKEN_<PROVIDER>` n'est lu qu'en repli
   du mode mono-tenant `AUTOME_CONNECTOR_CREDENTIALS=single_tenant`
   (cf. [INSTALLATION.md](INSTALLATION.md#tokens-des-connecteurs-par-utilisateur)).
