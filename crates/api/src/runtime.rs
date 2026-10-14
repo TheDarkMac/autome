@@ -12,7 +12,9 @@
 use std::sync::Arc;
 
 use autome_connectors::oauth::{InMemoryConnectorTokenStore, OAuthClient, OAuthRegistry};
-use autome_connectors::{CredentialService, OAuthCredentialService, ReqwestHttpClient};
+use autome_connectors::{
+    CredentialService, EgressPolicy, OAuthCredentialService, ReqwestHttpClient,
+};
 use autome_core::{
     Config, EnvelopeCipher, InMemoryKeyProvider, InMemoryPermissionStore, InMemoryRevocationStore,
     InMemoryRunStateStore, InMemoryUserStore, InMemoryWorkflowRepository, NoopAuditSink, Queue,
@@ -35,12 +37,17 @@ pub use autome_persistence::{build_queue, PersistenceMode, QueueMode};
 /// Le registre de providers est peuplé au démarrage depuis l'environnement
 /// (`AUTOME_OAUTH_PROVIDERS` + `AUTOME_OAUTH_<ID>_*`, #161) — vide en l'absence
 /// de config (OAuth alors indisponible) ; une config incomplète échoue (fail-fast).
+/// Le transport applique le filtre anti-SSRF : un endpoint OAuth interne (IdP
+/// on-prem) doit figurer dans `AUTOME_EGRESS_ALLOWLIST`.
 fn build_credential_service(config: &Config) -> Result<Arc<dyn CredentialService + Send + Sync>> {
     let key: [u8; 32] = Sha256::digest(config.encryption_key.expose().as_bytes()).into();
     let keys = InMemoryKeyProvider::new();
     keys.add_key("v1", key, true).expect("clé de chiffrement");
     let store = Arc::new(InMemoryConnectorTokenStore::new(EnvelopeCipher::new(keys)));
-    let oauth = OAuthClient::new(OAuthRegistry::from_env()?, ReqwestHttpClient::new());
+    let oauth = OAuthClient::new(
+        OAuthRegistry::from_env()?,
+        ReqwestHttpClient::with_policy(EgressPolicy::from_env()),
+    );
     Ok(Arc::new(OAuthCredentialService::new(oauth, store)))
 }
 

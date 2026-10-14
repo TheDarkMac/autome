@@ -13,7 +13,9 @@
 //! Le **runner de nodes** traduit chaque node en effet concret :
 //! - `Trigger` : pass-through (le déclencheur a déjà eu lieu côté API) ;
 //! - `Action { action_type: "http_request" }` : [`HttpAction`] via un
-//!   [`ReqwestHttpClient`] **partagé** (un seul client bloquant réutilisé) ;
+//!   [`ReqwestHttpClient`] **partagé** (un seul client bloquant réutilisé),
+//!   filtré anti-SSRF : destinations publiques seulement, sauf hôtes de
+//!   l'allowlist opérateur `AUTOME_EGRESS_ALLOWLIST` ;
 //! - tout autre `action_type` : erreur (connecteurs Slack/Gmail/… = suite).
 //!
 //! Le moteur est **synchrone** et le transport HTTP est **bloquant**
@@ -26,7 +28,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
-use autome_connectors::{HttpAction, ReqwestHttpClient};
+use autome_connectors::{EgressPolicy, HttpAction, ReqwestHttpClient};
 use autome_core::{
     Action, Delivery, Node, NodeKind, RunStateStore, RunStatus, WorkflowId, WorkflowRepository,
 };
@@ -68,7 +70,7 @@ impl RunExecutor {
         Self {
             repo,
             store,
-            http: ReqwestHttpClient::new(),
+            http: ReqwestHttpClient::with_policy(EgressPolicy::from_env()),
             resolver,
         }
     }
@@ -321,6 +323,40 @@ mod tests {
         let cp = store.load("run-bad").await.unwrap().unwrap();
         assert_eq!(cp.status, RunStatus::Failed);
         assert!(cp.error.is_some());
+    }
+
+    #[tokio::test]
+    async fn http_request_to_cloud_metadata_is_blocked_by_egress_guard() {
+        // Le runner réel (ReqwestHttpClient + politique egress) refuse la
+        // cible avant toute connexion : le run échoue avec le motif SSRF.
+        let mut wf = trigger_only("wf-ssrf");
+        wf.nodes.push(Node {
+            id: NodeId::new("act"),
+            name: "act".into(),
+            kind: NodeKind::Action {
+                action_type: "http_request".into(),
+            },
+            params: json!({
+                "method": "GET",
+                "url": "http://169.254.169.254/latest/meta-data/iam/security-credentials/"
+            }),
+        });
+        wf.edges.push(Edge {
+            from: NodeId::new("entry"),
+            to: NodeId::new("act"),
+            from_port: None,
+        });
+        let repo = Arc::new(InMemoryWorkflowRepository::new());
+        let store = Arc::new(InMemoryRunStateStore::new());
+        seed(&repo, &store, wf, "run-ssrf").await;
+        let exec = RunExecutor::new(repo, Arc::clone(&store) as Arc<_>);
+
+        let verdict = exec.handle(&delivery("run-ssrf", "wf-ssrf")).await;
+        assert_eq!(verdict, HandlerVerdict::DeadLetter);
+        let cp = store.load("run-ssrf").await.unwrap().unwrap();
+        assert_eq!(cp.status, RunStatus::Failed);
+        let error = cp.error.unwrap();
+        assert!(error.contains("egress refusé"), "{error}");
     }
 
     #[tokio::test]
