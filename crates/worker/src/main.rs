@@ -8,6 +8,10 @@
 //! - `AUTOME_QUEUE` : `memory` (défaut) | `rabbitmq` (`config.queue_url`) ;
 //! - `AUTOME_PERSISTENCE` : `memory` (défaut) | `postgres` (`config.database_url`) ;
 //! - `AUTOME_WORKER_CONCURRENCY` : nombre de tâches consommatrices (défaut 4).
+//! - `AUTOME_RUN_TIMEOUT_SECS` : au-delà, un run toujours `running` est
+//!   considéré interrompu et clos en `failed` (défaut 3600, plancher 60). Un
+//!   run n'étant jamais rejoué (#174), c'est ce qui solde les runs d'un worker
+//!   tué en cours d'exécution.
 //! - `AUTOME_CONNECTOR_CREDENTIALS` : `per_user` (défaut) — chaque action de
 //!   connecteur utilise le token OAuth **du propriétaire du run**, lu dans le
 //!   store chiffré (`connector_tokens`, déchiffré avec `ENCRYPTION_KEY`, qui
@@ -23,6 +27,7 @@
 //! fin des tâches en cours (pas de message perdu en vol).
 
 use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use autome_connectors::oauth::{OAuthClient, OAuthRegistry};
 use autome_connectors::{EgressPolicy, ReqwestHttpClient};
@@ -32,8 +37,8 @@ use autome_persistence::selectors::{
     ensure_durable_backends, PersistenceMode, QueueMode,
 };
 use autome_worker::{
-    ConnectorCredentialsMode, Handler, IdempotencyStore, InMemoryIdempotencyStore, RunExecutor,
-    WorkerPool,
+    reap_orphans, ConnectorCredentialsMode, Handler, IdempotencyStore, InMemoryIdempotencyStore,
+    RunExecutor, WorkerPool,
 };
 
 /// Queue des runs (alignée sur `QueueRunDispatcher::queue_name` par défaut).
@@ -48,6 +53,27 @@ fn concurrency_from_env() -> usize {
         .max(1)
 }
 
+/// Période du balayage des runs orphelins.
+const REAP_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Lit `AUTOME_RUN_TIMEOUT_SECS` en millisecondes (défaut 3600 s, plancher 60 s).
+fn run_timeout_ms_from_env() -> i64 {
+    let secs = std::env::var("AUTOME_RUN_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .unwrap_or(3_600)
+        .max(60);
+    secs.saturating_mul(1_000)
+}
+
+/// Horodatage Unix (ms) courant.
+fn now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = Config::from_env()?;
@@ -56,6 +82,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Garde prod (#172) : un worker in-memory ne verrait aucun run publié par l'API.
     ensure_durable_backends(config.profile, persistence, queue_mode)?;
     let concurrency = concurrency_from_env();
+    let run_timeout_ms = run_timeout_ms_from_env();
     let credentials_mode = ConnectorCredentialsMode::from_env()?;
 
     // Backends sélectionnés par l'environnement (partagés avec l'API).
@@ -79,13 +106,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
+    // Balayage des orphelins (runs d'un worker tué) : sûr entre répliques,
+    // `fail_if_running` ne touche jamais un run terminé.
+    let reaper_store = Arc::clone(&store);
+    let reaper = tokio::spawn(async move {
+        let mut tick = tokio::time::interval(REAP_INTERVAL);
+        loop {
+            tick.tick().await;
+            match reap_orphans(reaper_store.as_ref(), now_ms(), run_timeout_ms).await {
+                Ok(0) => {}
+                Ok(n) => println!("autome-worker : {n} run(s) interrompu(s) clos en échec"),
+                Err(e) => eprintln!("autome-worker : balayage des orphelins échoué : {e}"),
+            }
+        }
+    });
+
     let handler: Arc<dyn Handler + Send + Sync> = Arc::new(RunExecutor::new(repo, store, resolver));
     let idempotency: Arc<dyn IdempotencyStore + Send + Sync> =
         Arc::new(InMemoryIdempotencyStore::new());
 
     println!(
-        "autome-worker ({:?}) démarré — queue={:?} persistence={:?} credentials={:?} concurrency={} (file `{}`)",
-        config.profile, queue_mode, persistence, credentials_mode, concurrency, RUNS_QUEUE
+        "autome-worker ({:?}) démarré — queue={:?} persistence={:?} credentials={:?} concurrency={} run_timeout={}s (file `{}`)",
+        config.profile,
+        queue_mode,
+        persistence,
+        credentials_mode,
+        concurrency,
+        run_timeout_ms / 1_000,
+        RUNS_QUEUE
     );
 
     let pool = WorkerPool::new(queue, handler, idempotency, RUNS_QUEUE, concurrency);
@@ -95,6 +143,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     shutdown_signal().await;
     println!("autome-worker : signal d'arrêt reçu — drain en cours…");
     running.stop().await;
+    reaper.abort();
     println!("autome-worker : arrêté proprement.");
     Ok(())
 }

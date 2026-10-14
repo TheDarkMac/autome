@@ -5,7 +5,7 @@
 //!
 //! ```text
 //! message {run_id, workflow_id}  →  WorkflowRepository.get
-//!                                →  RunStateStore (Queued → Running)
+//!                                →  RunStateStore.try_claim (Queued → Running, atomique)
 //!                                →  Engine.run (DAG + node runner)
 //!                                →  RunStateStore (sorties + Succeeded/Failed)
 //! ```
@@ -20,6 +20,16 @@
 //!   token **du propriétaire du run** (`RunCheckpoint.owner_id`) résolu par le
 //!   [`CredentialResolver`] ;
 //! - tout autre `action_type` : erreur.
+//!
+//! ## Livraison *au plus une fois* des effets de bord (#174)
+//!
+//! La file livre *au moins une fois* (redélivrance après crash, perte de
+//! connexion, autre réplique). Le run n'est exécuté que par le worker qui
+//! **réclame** atomiquement son passage `Queued → Running` en base : une
+//! redélivrance d'un run déjà `Running` ou terminé est `ack` sans
+//! ré-exécution (pas de second message Slack). Un run interrompu (worker
+//! tué) n'est donc pas rejoué : le balayage des orphelins
+//! ([`reap_orphans`]) le passe `Failed` passé un délai.
 //!
 //! Le moteur est **synchrone** et le transport HTTP est **bloquant**
 //! (`reqwest::blocking`) : exécuter `Engine::run` directement sur un thread
@@ -90,6 +100,65 @@ where
             resolver,
         }
     }
+
+    /// Verdict d'une livraison dont le run n'a pas pu être réclamé : inconnu
+    /// (DLQ), ou déjà pris / terminé (redélivrance ⇒ `ack` sans exécution).
+    async fn unclaimed(&self, run_id: &str) -> HandlerVerdict {
+        match self.store.load(run_id).await {
+            Ok(None) => {
+                eprintln!("[autome-worker] run `{run_id}` introuvable → DLQ");
+                HandlerVerdict::DeadLetter
+            }
+            Ok(Some(cp)) if cp.status == RunStatus::Queued => {
+                // Course improbable (remis en file entre-temps) : on retente.
+                eprintln!("[autome-worker] run `{run_id}` encore en file → retry");
+                HandlerVerdict::Retry
+            }
+            Ok(Some(cp)) => {
+                eprintln!(
+                    "[autome-worker] run `{run_id}` déjà {:?} → livraison dupliquée ignorée",
+                    cp.status
+                );
+                HandlerVerdict::Ok
+            }
+            Err(e) => {
+                eprintln!("[autome-worker] erreur load run `{run_id}` : {e} → retry");
+                HandlerVerdict::Retry
+            }
+        }
+    }
+}
+
+/// Clôt en `Failed` les runs `Running` démarrés il y a plus de `max_run_ms`
+/// (worker tué, checkpoint final perdu…), et renvoie leur nombre.
+///
+/// Sûr entre répliques et face aux runs qui se terminent pendant le
+/// balayage : [`RunStateStore::fail_if_running`] n'écrase jamais un run
+/// devenu terminal. `max_run_ms` doit dépasser la durée du plus long run
+/// légitime, sinon un run encore en cours serait marqué en échec (son
+/// checkpoint final le corrigerait ensuite).
+pub async fn reap_orphans(
+    store: &dyn RunStateStore,
+    now_ms: i64,
+    max_run_ms: i64,
+) -> autome_core::Result<usize> {
+    let reason = format!(
+        "run interrompu : toujours en cours après {} s (worker arrêté ?)",
+        max_run_ms / 1_000
+    );
+    let mut reaped = 0;
+    for orphan in store
+        .list_orphans(now_ms.saturating_sub(max_run_ms))
+        .await?
+    {
+        if store
+            .fail_if_running(&orphan.run_id, &reason, now_ms)
+            .await?
+        {
+            reaped += 1;
+        }
+    }
+    Ok(reaped)
 }
 
 /// Horodatage Unix (ms) courant.
@@ -173,25 +242,16 @@ where
                 return HandlerVerdict::DeadLetter;
             }
         };
-        let mut checkpoint = match self.store.load(run_id).await {
+        // Prise en charge atomique Queued → Running : une seule réplique
+        // exécute le run, même si la livraison est dupliquée.
+        let mut checkpoint = match self.store.try_claim(run_id, now_ms()).await {
             Ok(Some(cp)) => cp,
-            Ok(None) => {
-                eprintln!("[autome-worker] run `{run_id}` introuvable → DLQ");
-                return HandlerVerdict::DeadLetter;
-            }
+            Ok(None) => return self.unclaimed(run_id).await,
             Err(e) => {
-                eprintln!("[autome-worker] erreur load run `{run_id}` : {e} → retry");
+                eprintln!("[autome-worker] claim du run `{run_id}` échoué : {e} → retry");
                 return HandlerVerdict::Retry;
             }
         };
-
-        // Transition Queued → Running.
-        checkpoint.status = RunStatus::Running;
-        checkpoint.started_at_ms = Some(now_ms());
-        if let Err(e) = self.store.checkpoint(&checkpoint).await {
-            eprintln!("[autome-worker] checkpoint Running échoué (`{run_id}`) : {e} → retry");
-            return HandlerVerdict::Retry;
-        }
 
         // Exécution **synchrone + bloquante** du moteur, hors runtime tokio.
         // Les tokens des connecteurs sont ceux du propriétaire du run (fixé au
@@ -209,8 +269,14 @@ where
         {
             Ok(report) => report,
             Err(e) => {
-                eprintln!("[autome-worker] panic moteur (`{run_id}`) : {e} → retry");
-                return HandlerVerdict::Retry;
+                // Pas de rejeu : des nodes ont pu produire leurs effets avant
+                // le panic. Le run est clos en échec, visible de l'utilisateur.
+                eprintln!("[autome-worker] panic moteur (`{run_id}`) : {e} → échec + DLQ");
+                let reason = format!("panic du moteur : {e}");
+                if let Err(e) = self.store.fail_if_running(run_id, &reason, now_ms()).await {
+                    eprintln!("[autome-worker] échec non persisté (`{run_id}`) : {e}");
+                }
+                return HandlerVerdict::DeadLetter;
             }
         };
 
@@ -234,8 +300,9 @@ where
                 .or_else(|| Some("run en échec".into()));
         }
         if let Err(e) = self.store.checkpoint(&checkpoint).await {
-            // L'état final n'a pas pu être persisté : on retente la livraison
-            // (le moteur sera rejoué — idempotent côté store last-write-wins).
+            // L'état final n'a pas pu être persisté. Le run reste `Running` en
+            // base : la redélivrance ne le rejouera pas (déjà réclamé), et le
+            // balayage des orphelins le clora en échec.
             eprintln!("[autome-worker] checkpoint final échoué (`{run_id}`) : {e} → retry");
             return HandlerVerdict::Retry;
         }
@@ -530,6 +597,143 @@ mod tests {
         assert!(http.sent.lock().unwrap().is_empty());
         let error = store.load("run-n").await.unwrap().unwrap().error.unwrap();
         assert!(error.contains("sans propriétaire"), "{error}");
+    }
+
+    // ───── Livraison au plus une fois (#174) ─────
+
+    #[tokio::test]
+    async fn duplicate_delivery_of_a_finished_run_does_not_execute_again() {
+        let repo = Arc::new(InMemoryWorkflowRepository::new());
+        let store = Arc::new(InMemoryRunStateStore::new());
+        seed_owned(
+            &repo,
+            &store,
+            slack_workflow("wf-d"),
+            "run-d",
+            Some("alice"),
+        )
+        .await;
+        let http = RecordingHttp::default();
+        let exec =
+            RunExecutor::with_http(repo, Arc::clone(&store) as Arc<_>, resolver(), http.clone());
+
+        assert_eq!(
+            exec.handle(&delivery("run-d", "wf-d")).await,
+            HandlerVerdict::Ok
+        );
+        let finished = store.load("run-d").await.unwrap().unwrap();
+        // Redélivrance (autre réplique, ack perdu…) : ack sans ré-exécution.
+        assert_eq!(
+            exec.handle(&delivery("run-d", "wf-d")).await,
+            HandlerVerdict::Ok
+        );
+        assert_eq!(http.sent.lock().unwrap().len(), 1, "un seul message Slack");
+        assert_eq!(store.load("run-d").await.unwrap().unwrap(), finished);
+    }
+
+    #[tokio::test]
+    async fn delivery_of_a_run_claimed_elsewhere_is_acked_without_running() {
+        let repo = Arc::new(InMemoryWorkflowRepository::new());
+        let store = Arc::new(InMemoryRunStateStore::new());
+        seed_owned(
+            &repo,
+            &store,
+            slack_workflow("wf-r"),
+            "run-r",
+            Some("alice"),
+        )
+        .await;
+        // Une autre réplique a déjà réclamé le run.
+        let claimed = store.try_claim("run-r", NOW).await.unwrap().unwrap();
+        let http = RecordingHttp::default();
+        let exec =
+            RunExecutor::with_http(repo, Arc::clone(&store) as Arc<_>, resolver(), http.clone());
+
+        assert_eq!(
+            exec.handle(&delivery("run-r", "wf-r")).await,
+            HandlerVerdict::Ok
+        );
+        assert!(http.sent.lock().unwrap().is_empty());
+        assert_eq!(store.load("run-r").await.unwrap().unwrap(), claimed);
+    }
+
+    #[tokio::test]
+    async fn unknown_run_dead_letters() {
+        let repo = Arc::new(InMemoryWorkflowRepository::new());
+        repo.create(trigger_only("wf-u"), None).await.unwrap();
+        let exec = RunExecutor::new(repo, Arc::new(InMemoryRunStateStore::new()), resolver());
+        assert_eq!(
+            exec.handle(&delivery("run-ghost", "wf-u")).await,
+            HandlerVerdict::DeadLetter
+        );
+    }
+
+    /// Transport qui panique : simule un bug dans un node.
+    #[derive(Clone)]
+    struct PanickingHttp;
+    impl HttpClient for PanickingHttp {
+        fn send(&self, _req: &HttpRequest) -> Result<HttpResponse, String> {
+            panic!("bug simulé dans le transport");
+        }
+    }
+
+    #[tokio::test]
+    async fn engine_panic_fails_the_run_instead_of_replaying_it() {
+        let repo = Arc::new(InMemoryWorkflowRepository::new());
+        let store = Arc::new(InMemoryRunStateStore::new());
+        seed_owned(
+            &repo,
+            &store,
+            slack_workflow("wf-p"),
+            "run-p",
+            Some("alice"),
+        )
+        .await;
+        let exec = RunExecutor::with_http(
+            repo,
+            Arc::clone(&store) as Arc<_>,
+            resolver(),
+            PanickingHttp,
+        );
+
+        assert_eq!(
+            exec.handle(&delivery("run-p", "wf-p")).await,
+            HandlerVerdict::DeadLetter
+        );
+        let cp = store.load("run-p").await.unwrap().unwrap();
+        assert_eq!(cp.status, RunStatus::Failed);
+        assert!(cp.error.unwrap().contains("panic du moteur"));
+    }
+
+    #[tokio::test]
+    async fn reap_orphans_fails_only_stale_running_runs() {
+        let store = InMemoryRunStateStore::new();
+        let max = 3_600_000;
+        for (id, status, started) in [
+            ("stale", RunStatus::Running, NOW - max - 1),
+            ("recent", RunStatus::Running, NOW - 1_000),
+            ("done", RunStatus::Succeeded, NOW - max - 1),
+        ] {
+            let mut cp = RunCheckpoint::queued(id, "wf", 1, "manual", 0);
+            cp.status = status;
+            cp.started_at_ms = Some(started);
+            store.checkpoint(&cp).await.unwrap();
+        }
+
+        assert_eq!(reap_orphans(&store, NOW, max).await.unwrap(), 1);
+        let stale = store.load("stale").await.unwrap().unwrap();
+        assert_eq!(stale.status, RunStatus::Failed);
+        assert!(stale.error.unwrap().contains("3600 s"));
+        assert_eq!(
+            store.load("recent").await.unwrap().unwrap().status,
+            RunStatus::Running
+        );
+        assert_eq!(
+            store.load("done").await.unwrap().unwrap().status,
+            RunStatus::Succeeded
+        );
+        // Idempotent : un second balayage ne trouve plus rien.
+        assert_eq!(reap_orphans(&store, NOW, max).await.unwrap(), 0);
     }
 
     #[tokio::test]
