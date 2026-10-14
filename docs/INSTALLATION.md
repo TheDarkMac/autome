@@ -236,6 +236,12 @@ comptes sont publics ; tout le reste exige `Authorization: Bearer <access_token>
   credentials) — pas d'administration.
 - Anti-bruteforce : 5 tentatives sans succès par email et par fenêtre de 15 min,
   puis 429. Compteur **par réplique** (en mémoire).
+- **Isolation par propriétaire** : un workflow appartient à son créateur, un run
+  au propriétaire de son workflow. Les listes ne montrent que ses propres
+  ressources ; lire, modifier, lancer ou supprimer la ressource d'autrui répond
+  comme si elle n'existait pas (404, ou 204 pour `DELETE`). Seul un super-admin
+  (permission `*`) voit tout. Les lignes antérieures à la migration `0010`
+  (sans propriétaire) ne sont visibles que des super-admins.
 
 ```bash
 curl -s -H 'content-type: application/json' \
