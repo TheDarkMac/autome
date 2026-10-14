@@ -31,7 +31,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use autome_connectors::oauth::{OAuthClient, OAuthRegistry};
 use autome_connectors::{EgressPolicy, ReqwestHttpClient};
-use autome_core::Config;
+use autome_core::{telemetry, Config};
 use autome_persistence::selectors::{
     build_connector_token_store, build_queue, build_run_state_store, build_workflow_repository,
     ensure_durable_backends, PersistenceMode, QueueMode,
@@ -77,6 +77,7 @@ fn now_ms() -> i64 {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = Config::from_env()?;
+    let log_format = telemetry::init(config.profile)?;
     let persistence = PersistenceMode::from_env()?;
     let queue_mode = QueueMode::from_env()?;
     // Garde prod (#172) : un worker in-memory ne verrait aucun run publié par l'API.
@@ -100,9 +101,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     let resolver = credentials_mode.resolver(tokens, Arc::new(oauth));
     if credentials_mode == ConnectorCredentialsMode::SingleTenant {
-        eprintln!(
-            "autome-worker : AUTOME_CONNECTOR_CREDENTIALS=single_tenant — repli sur les tokens \
-             globaux AUTOME_CONNECTOR_TOKEN_* (tous les utilisateurs agissent avec ces comptes)"
+        tracing::warn!(
+            "AUTOME_CONNECTOR_CREDENTIALS=single_tenant : repli sur les tokens globaux \
+             AUTOME_CONNECTOR_TOKEN_* (tous les utilisateurs agissent avec ces comptes)"
         );
     }
 
@@ -115,8 +116,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             tick.tick().await;
             match reap_orphans(reaper_store.as_ref(), now_ms(), run_timeout_ms).await {
                 Ok(0) => {}
-                Ok(n) => println!("autome-worker : {n} run(s) interrompu(s) clos en échec"),
-                Err(e) => eprintln!("autome-worker : balayage des orphelins échoué : {e}"),
+                Ok(n) => tracing::warn!(runs = n, "runs interrompus clos en échec"),
+                Err(e) => tracing::error!(error = %e, "balayage des runs orphelins impossible"),
             }
         }
     });
@@ -125,15 +126,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let idempotency: Arc<dyn IdempotencyStore + Send + Sync> =
         Arc::new(InMemoryIdempotencyStore::new());
 
-    println!(
-        "autome-worker ({:?}) démarré — queue={:?} persistence={:?} credentials={:?} concurrency={} run_timeout={}s (file `{}`)",
-        config.profile,
-        queue_mode,
-        persistence,
-        credentials_mode,
+    tracing::info!(
+        profile = ?config.profile,
+        queue = ?queue_mode,
+        persistence = ?persistence,
+        credentials = ?credentials_mode,
         concurrency,
-        run_timeout_ms / 1_000,
-        RUNS_QUEUE
+        run_timeout_s = run_timeout_ms / 1_000,
+        runs_queue = RUNS_QUEUE,
+        log_format = ?log_format,
+        "autome-worker démarré"
     );
 
     let pool = WorkerPool::new(queue, handler, idempotency, RUNS_QUEUE, concurrency);
@@ -141,10 +143,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Arrêt gracieux : SIGINT (Ctrl-C) ou SIGTERM (orchestrateur).
     shutdown_signal().await;
-    println!("autome-worker : signal d'arrêt reçu — drain en cours…");
+    tracing::info!("signal d'arrêt reçu : drain des tâches en cours");
     running.stop().await;
     reaper.abort();
-    println!("autome-worker : arrêté proprement.");
+    tracing::info!("autome-worker arrêté proprement");
     Ok(())
 }
 
@@ -160,7 +162,7 @@ async fn shutdown_signal() {
             Ok(mut sig) => {
                 sig.recv().await;
             }
-            Err(e) => eprintln!("autome-worker : SIGTERM indisponible : {e}"),
+            Err(e) => tracing::warn!(error = %e, "SIGTERM indisponible"),
         }
     };
 

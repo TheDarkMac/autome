@@ -31,6 +31,8 @@ rustls-pemfile = { workspace = true }
 axum-server = { version = "0.7", features = ["tls-rustls"] }
 # Spec OpenAPI (F7.4)
 utoipa = { workspace = true }
+# Logs structurés (#176)
+tracing = { workspace = true }
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

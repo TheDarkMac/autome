@@ -330,6 +330,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tower",
+ "tracing",
  "utoipa",
 ]
 
@@ -412,6 +413,7 @@ dependencies = [
  "autome-persistence",
  "serde_json",
  "tokio",
+ "tracing",
 ]
 
 [[package]]

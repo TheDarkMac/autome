@@ -12,6 +12,7 @@ use autome_api::accounts::{accounts_router, AccountsState};
 use autome_api::auth::protected_router;
 use autome_api::credentials::{credentials_router, CredentialsState};
 use autome_api::metrics::{metrics_router, with_metrics, Metrics};
+use autome_api::observability::with_request_tracing;
 use autome_api::runs::{runs_router, RunsState};
 use autome_api::runtime::{
     build_backends, build_queue, ensure_durable_backends, migrate, migrate_on_boot_requested,
@@ -21,7 +22,7 @@ use autome_api::tls::load_rustls_config;
 use autome_api::workflows::{
     create_workflow, delete_workflow, get_workflow, list_workflows, update_workflow, WorkflowsState,
 };
-use autome_core::{Argon2PasswordHasher, Config};
+use autome_core::{telemetry, Argon2PasswordHasher, Config};
 use axum::{routing::get, Router};
 
 /// Handler de la sonde de santé.
@@ -71,7 +72,9 @@ fn build_router(backends: &Backends, accounts: AccountsState, metrics: Arc<Metri
         .merge(runs_router(runs_state))
         .merge(credentials_router(credentials_state))
         .merge(metrics_router(metrics.clone()));
-    with_metrics(router, metrics)
+    // Traçage en couche externe (toutes les requêtes, 404 compris), métriques
+    // par route à l'intérieur.
+    with_request_tracing(with_metrics(router, metrics))
 }
 
 /// État des endpoints de comptes : Argon2id sur les stores de `backends`.
@@ -86,6 +89,8 @@ fn accounts_state(backends: &Backends) -> autome_core::Result<AccountsState> {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = Config::from_env()?;
+    let log_format = telemetry::init(config.profile)?;
+    tracing::debug!(log_format = ?log_format, "logs initialisés");
 
     // Backend de persistance (dette #107) : `AUTOME_PERSISTENCE=postgres` adosse
     // les stores d'auth à PostgreSQL ; défaut `memory` (dev/tests/single-node).
@@ -101,16 +106,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // (idempotent, sérialisé entre répliques par un verrou applicatif).
     if mode == PersistenceMode::Postgres && migrate_on_boot_requested() {
         let applied = migrate(&config).await?;
-        println!("autome-api : migrations appliquées = {applied}");
+        tracing::info!(applied, "migrations appliquées");
     }
 
     // File de messages (dette #107) : `AUTOME_QUEUE=rabbitmq` se connecte au
     // broker (`QUEUE_URL`) ; défaut `memory`. Le dispatcher de runs publie dessus.
     let queue = build_queue(&config, queue_mode).await?;
-    println!("autome-api : file = {queue_mode:?}");
-
     let backends = build_backends(&config, mode, queue)?;
-    println!("autome-api : persistance = {mode:?}");
+    tracing::info!(queue = ?queue_mode, persistence = ?mode, "backends prêts");
 
     let accounts = accounts_state(&backends)?;
     let metrics = Arc::new(Metrics::new());
@@ -125,19 +128,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         (Some(cert), Some(key)) => {
             let tls_config = load_rustls_config(&cert, &key).await?;
             let addr: std::net::SocketAddr = config.http_addr.parse()?;
-            println!(
-                "autome-api ({:?}) en écoute sur https://{}  (TLS rustls)",
-                config.profile, addr
-            );
+            tracing::info!(profile = ?config.profile, %addr, tls = true, "autome-api en écoute (https)");
             axum_server::bind_rustls(addr, tls_config)
                 .serve(app.into_make_service())
                 .await?;
         }
         (None, None) => {
             let listener = tokio::net::TcpListener::bind(&config.http_addr).await?;
-            println!(
-                "autome-api ({:?}) en écoute sur http://{}  (sans TLS)",
-                config.profile, config.http_addr
+            tracing::info!(
+                profile = ?config.profile,
+                addr = %config.http_addr,
+                tls = false,
+                "autome-api en écoute (http)"
             );
             axum::serve(listener, app).await?;
         }

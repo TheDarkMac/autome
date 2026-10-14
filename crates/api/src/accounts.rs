@@ -207,7 +207,7 @@ impl IntoResponse for AccountError {
             )
                 .into_response(),
             AccountError::Internal(msg) => {
-                eprintln!("[accounts] erreur interne : {msg}");
+                tracing::error!(error = %msg, "erreur interne des comptes");
                 (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response()
             }
         }
@@ -232,7 +232,7 @@ async fn audit(state: &AccountsState, actor: &str, action: &str, outcome: AuditO
     let now_ms = state.auth.clock.now_unix_seconds().saturating_mul(1_000);
     let event = AuditEvent::new(now_ms, actor, action, outcome);
     if let Err(e) = state.auth.audit.record(event).await {
-        eprintln!("[accounts] audit record failed: {e}");
+        tracing::error!(action, error = %e, "événement d'audit non enregistré");
     }
 }
 

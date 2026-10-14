@@ -22,6 +22,8 @@ autome-connectors = { workspace = true }
 autome-persistence = { workspace = true }
 serde_json = { workspace = true }
 async-trait = { workspace = true }
+# Logs structurés (#176)
+tracing = { workspace = true }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time"] }
 
 [dev-dependencies]
