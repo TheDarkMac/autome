@@ -23,8 +23,9 @@ pub mod workflow;
 pub use action::Action;
 pub use audit::{AuditEvent, AuditOutcome, AuditSink, InMemoryAuditSink, NoopAuditSink};
 pub use auth::{
-    Argon2PasswordHasher, Claims, InMemoryRevocationStore, PasswordHasher, RevocationStore,
-    TokenKind, TokenService,
+    normalize_email, validate_email, validate_password, Argon2PasswordHasher, Claims, CreateUser,
+    InMemoryRevocationStore, InMemoryUserStore, PasswordHasher, RevocationStore, TokenKind,
+    TokenService, UserRecord, UserStore,
 };
 pub use config::{Config, Profile, Secret};
 pub use queue::{dlq_of, BoundedQueue, Delivery, DeliveryId, InMemoryQueue, Message, Nack, Queue};
