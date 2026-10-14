@@ -20,7 +20,8 @@ Objectifs structurants :
 
 - **Scalabilité horizontale** : milliers de workflows simultanés → exécution
   découplée via une file de messages + pool de workers stateless.
-- **Fiabilité** : état des runs persisté, reprise après crash, retry/timeout.
+- **Fiabilité** : état des runs persisté, exécution *au plus une fois* par
+  claim atomique en base, runs interrompus clos en échec après délai, retry/timeout.
 - **Sécurité** : credentials chiffrés au repos, OAuth2/JWT, TLS, RBAC.
 - **Extensibilité** : ajout de connecteurs/nodes sans toucher au cœur (traits).
 - **Observabilité** : métriques Prometheus, logs structurés, traçage des runs.
@@ -268,7 +269,11 @@ erDiagram
   file = *cible*.
 - Index ciblés en base (F1.5) ; lectures déchargées sur réplica = *cible*.
 - Limite de concurrence par node et globale, backpressure (F2.5, F5.5).
-- Idempotence des messages (ack/nack) pour rejouer sans effet de bord (F5.2).
+- File *au moins une fois*, exécution *au plus une fois* : le worker réclame
+  le run en base (`RunStateStore::try_claim`, `queued → running` atomique) ;
+  une livraison dupliquée d'un run déjà pris ou terminé est acquittée sans
+  ré-exécution, sur n'importe quelle réplique (#174). Un run interrompu n'est
+  pas rejoué : `reap_orphans` le clôt en `failed` après `AUTOME_RUN_TIMEOUT_SECS`.
 
 **Sécurité**
 - TLS côté API (rustls, *all-or-nothing*) ; TLS d'ingress = cible (F6.4).
