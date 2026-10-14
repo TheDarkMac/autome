@@ -147,6 +147,19 @@ pub trait RunStateStore: Send + Sync {
     /// `Err` si le run est inconnu. Idempotent sur un run déjà `Failed`.
     async fn mark_failed(&self, run_id: &str, reason: &str, now_ms: i64) -> Result<()>;
 
+    /// **Prise en charge atomique** d'un run par un worker : `Queued → Running`
+    /// (pose `started_at_ms = now_ms`) **seulement si** le run est encore
+    /// `Queued`. Renvoie le checkpoint réclamé, ou `None` si le run est inconnu
+    /// ou déjà pris/terminé. Entre N répliques recevant la même livraison, une
+    /// seule obtient `Some` : c'est ce qui rend l'exécution *au plus une fois*.
+    async fn try_claim(&self, run_id: &str, now_ms: i64) -> Result<Option<RunCheckpoint>>;
+
+    /// `Running → Failed` (raison + `finished_at_ms`) **seulement si** le run
+    /// est encore `Running` ; `false` sinon (inconnu, ou terminé entre-temps).
+    /// Contrairement à [`mark_failed`](Self::mark_failed), n'écrase jamais un
+    /// run qui vient de réussir : sûr pour le balayage des orphelins.
+    async fn fail_if_running(&self, run_id: &str, reason: &str, now_ms: i64) -> Result<bool>;
+
     /// Liste paginée des runs d'un workflow, triés par `created_at_ms`
     /// décroissant (plus récent d'abord), ordre stabilisé par `run_id` à
     /// égalité de timestamp. Consommé par l'endpoint API
@@ -249,6 +262,37 @@ impl RunStateStore for InMemoryRunStateStore {
         Ok(())
     }
 
+    async fn try_claim(&self, run_id: &str, now_ms: i64) -> Result<Option<RunCheckpoint>> {
+        let mut map = self
+            .inner
+            .lock()
+            .map_err(|_| Error::Invalid("run_state lock empoisonné".into()))?;
+        match map.get_mut(run_id) {
+            Some(snap) if snap.status == RunStatus::Queued => {
+                snap.status = RunStatus::Running;
+                snap.started_at_ms = Some(now_ms);
+                Ok(Some(snap.clone()))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    async fn fail_if_running(&self, run_id: &str, reason: &str, now_ms: i64) -> Result<bool> {
+        let mut map = self
+            .inner
+            .lock()
+            .map_err(|_| Error::Invalid("run_state lock empoisonné".into()))?;
+        match map.get_mut(run_id) {
+            Some(snap) if snap.status == RunStatus::Running => {
+                snap.status = RunStatus::Failed;
+                snap.error = Some(reason.to_string());
+                snap.finished_at_ms = Some(now_ms);
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
     async fn list_by_workflow(
         &self,
         workflow_id: &str,
@@ -293,6 +337,91 @@ mod tests {
         s.status = status;
         s.started_at_ms = started_at_ms;
         s
+    }
+
+    // ───── Claim atomique / échec conditionnel (#174) ─────
+
+    #[tokio::test]
+    async fn try_claim_moves_queued_to_running_once() {
+        let store = InMemoryRunStateStore::new();
+        store
+            .checkpoint(&snapshot("r1", RunStatus::Queued, None))
+            .await
+            .unwrap();
+
+        let claimed = store.try_claim("r1", 5_000).await.unwrap().unwrap();
+        assert_eq!(claimed.status, RunStatus::Running);
+        assert_eq!(claimed.started_at_ms, Some(5_000));
+        assert_eq!(store.load("r1").await.unwrap().unwrap(), claimed);
+
+        // Redélivrance : déjà pris ⇒ None, état inchangé.
+        assert!(store.try_claim("r1", 6_000).await.unwrap().is_none());
+        assert_eq!(
+            store.load("r1").await.unwrap().unwrap().started_at_ms,
+            Some(5_000)
+        );
+    }
+
+    #[tokio::test]
+    async fn try_claim_refuses_finished_and_unknown_runs() {
+        let store = InMemoryRunStateStore::new();
+        for (id, status) in [("ok", RunStatus::Succeeded), ("ko", RunStatus::Failed)] {
+            store
+                .checkpoint(&snapshot(id, status, Some(1)))
+                .await
+                .unwrap();
+            assert!(store.try_claim(id, 2).await.unwrap().is_none(), "{id}");
+            assert_eq!(store.load(id).await.unwrap().unwrap().status, status);
+        }
+        assert!(store.try_claim("ghost", 2).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn concurrent_claims_have_a_single_winner() {
+        let store = std::sync::Arc::new(InMemoryRunStateStore::new());
+        store
+            .checkpoint(&snapshot("r1", RunStatus::Queued, None))
+            .await
+            .unwrap();
+        let mut tasks = Vec::new();
+        for i in 0..16 {
+            let s = std::sync::Arc::clone(&store);
+            tasks.push(tokio::spawn(
+                async move { s.try_claim("r1", i).await.unwrap() },
+            ));
+        }
+        let mut winners = 0;
+        for t in tasks {
+            winners += usize::from(t.await.unwrap().is_some());
+        }
+        assert_eq!(winners, 1);
+    }
+
+    #[tokio::test]
+    async fn fail_if_running_never_overwrites_a_finished_run() {
+        let store = InMemoryRunStateStore::new();
+        store
+            .checkpoint(&snapshot("run", RunStatus::Running, Some(1)))
+            .await
+            .unwrap();
+        store
+            .checkpoint(&snapshot("done", RunStatus::Succeeded, Some(1)))
+            .await
+            .unwrap();
+
+        assert!(store.fail_if_running("run", "orphelin", 9).await.unwrap());
+        let failed = store.load("run").await.unwrap().unwrap();
+        assert_eq!(failed.status, RunStatus::Failed);
+        assert_eq!(failed.error.as_deref(), Some("orphelin"));
+        assert_eq!(failed.finished_at_ms, Some(9));
+        // Déjà échoué, terminé avec succès ou inconnu : rien ne change.
+        assert!(!store.fail_if_running("run", "encore", 10).await.unwrap());
+        assert!(!store.fail_if_running("done", "orphelin", 9).await.unwrap());
+        assert_eq!(
+            store.load("done").await.unwrap().unwrap().status,
+            RunStatus::Succeeded
+        );
+        assert!(!store.fail_if_running("ghost", "x", 9).await.unwrap());
     }
 
     // ───── F5.4.a — checkpoint ─────
