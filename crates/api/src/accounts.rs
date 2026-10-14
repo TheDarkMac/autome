@@ -19,21 +19,24 @@
 //! - **Pas d'énumération de comptes** au login : email inconnu et mauvais mot
 //!   de passe donnent la même réponse 401, et un email inconnu paie quand même
 //!   une vérification Argon2 (contre un hash leurre) pour égaliser le temps.
-//! - **Anti-bruteforce** ([`LoginThrottle`]) : au-delà de
+//! - **Anti-bruteforce** ([`LoginThrottleStore`]) : au-delà de
 //!   [`MAX_LOGIN_FAILURES`] tentatives sans succès sur un email dans la
-//!   fenêtre, 429 jusqu'à sa fin. Compteur **in-process** : par réplique, perdu au redémarrage.
+//!   fenêtre, 429 jusqu'à sa fin. En mode `postgres`, le compteur est
+//!   **partagé** par toutes les répliques et survit aux redémarrages (#182) ;
+//!   une erreur du compteur refuse la connexion (fail closed).
 //! - Le refresh réutilise [`autome_core::TokenService::rotate`] : le refresh
 //!   présenté est révoqué, un rejeu est refusé.
 //! - Chaque inscription/connexion produit un event d'audit `auth.signup` /
 //!   `auth.login`.
 
-use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex};
+use std::collections::HashSet;
+use std::sync::Arc;
 
 use autome_core::{
     normalize_email, validate_email, validate_password, AuditEvent, AuditOutcome, CreateUser,
-    PasswordHasher, Role, UserStore,
+    InMemoryLoginThrottle, LoginAttempt, LoginThrottleStore, PasswordHasher, Role, UserStore,
 };
+pub use autome_core::{LOGIN_WINDOW_SECONDS, MAX_LOGIN_FAILURES};
 use axum::{
     extract::State,
     http::{header, StatusCode},
@@ -50,64 +53,8 @@ use crate::auth::AuthState;
 pub const ACCESS_TTL_SECONDS: i64 = 15 * 60;
 /// Durée de vie d'un refresh token (7 jours).
 pub const REFRESH_TTL_SECONDS: i64 = 7 * 24 * 3600;
-/// Tentatives de connexion sans succès tolérées par email et par fenêtre.
-pub const MAX_LOGIN_FAILURES: u32 = 5;
-/// Fenêtre du compteur d'échecs (15 min).
-pub const LOGIN_WINDOW_SECONDS: i64 = 15 * 60;
-/// Au-delà, les fenêtres expirées sont purgées (borne mémoire face à un
-/// attaquant qui varie les emails).
-const THROTTLE_PRUNE_THRESHOLD: usize = 10_000;
 /// Mot de passe du hash leurre (jamais attribué à un compte).
 const DUMMY_PASSWORD: &str = "autome-dummy-password-for-timing";
-
-/// Compteur de tentatives de connexion par email (fenêtre fixe).
-///
-/// Une tentative est **comptée avant** la vérification du mot de passe, sous
-/// le même verrou que le contrôle de blocage : une rafale de requêtes
-/// parallèles ne peut pas dépasser le quota en passant le contrôle avant que
-/// les premiers échecs soient enregistrés. Une connexion réussie remet le
-/// compteur à zéro.
-#[derive(Debug, Default)]
-pub struct LoginThrottle {
-    /// email → (tentatives, début de fenêtre en secondes Unix).
-    attempts: Mutex<HashMap<String, (u32, i64)>>,
-}
-
-impl LoginThrottle {
-    /// Construit un compteur vide.
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Réserve une tentative pour `email`. `Err(secs)` si le quota de la
-    /// fenêtre est épuisé : réessayer dans `secs` secondes.
-    pub fn begin_attempt(&self, email: &str, now: i64) -> Result<(), i64> {
-        let Ok(mut attempts) = self.attempts.lock() else {
-            // Verrou empoisonné : on n'empêche pas la connexion (le hash
-            // Argon2 reste le coût plancher d'une tentative).
-            return Ok(());
-        };
-        if attempts.len() >= THROTTLE_PRUNE_THRESHOLD {
-            attempts.retain(|_, (_, start)| now - *start < LOGIN_WINDOW_SECONDS);
-        }
-        let entry = attempts.entry(email.to_string()).or_insert((0, now));
-        if now - entry.1 >= LOGIN_WINDOW_SECONDS {
-            *entry = (0, now);
-        }
-        if entry.0 >= MAX_LOGIN_FAILURES {
-            return Err(entry.1 + LOGIN_WINDOW_SECONDS - now);
-        }
-        entry.0 += 1;
-        Ok(())
-    }
-
-    /// Remet le compteur de `email` à zéro (connexion réussie).
-    pub fn reset(&self, email: &str) {
-        if let Ok(mut attempts) = self.attempts.lock() {
-            attempts.remove(email);
-        }
-    }
-}
 
 /// État des handlers de comptes.
 #[derive(Clone)]
@@ -118,8 +65,9 @@ pub struct AccountsState {
     pub users: Arc<dyn UserStore + Send + Sync>,
     /// Hash/vérification des mots de passe.
     pub hasher: Arc<dyn PasswordHasher + Send + Sync>,
-    /// Anti-bruteforce du login.
-    pub throttle: Arc<LoginThrottle>,
+    /// Anti-bruteforce du login (en mémoire par défaut ; partagé en
+    /// PostgreSQL via [`with_throttle`](Self::with_throttle)).
+    pub throttle: Arc<dyn LoginThrottleStore>,
     /// Permissions accordées à l'inscription (rôle `editor` par défaut).
     pub signup_permissions: HashSet<String>,
     /// Hash leurre vérifié quand l'email est inconnu (égalisation du temps).
@@ -139,10 +87,17 @@ impl AccountsState {
             auth,
             users,
             hasher,
-            throttle: Arc::new(LoginThrottle::new()),
+            throttle: Arc::new(InMemoryLoginThrottle::new()),
             signup_permissions: Role::editor().permissions,
             dummy_hash: dummy_hash.into(),
         })
+    }
+
+    /// Remplace le compteur anti-bruteforce (ex. PostgreSQL, partagé entre
+    /// répliques).
+    pub fn with_throttle(mut self, throttle: Arc<dyn LoginThrottleStore>) -> Self {
+        self.throttle = throttle;
+        self
     }
 }
 
@@ -309,9 +264,15 @@ pub async fn login(
 ) -> Result<Json<TokenResponse>, AccountError> {
     let email = normalize_email(&body.email);
     let now = state.auth.clock.now_unix_seconds();
-    if let Err(secs) = state.throttle.begin_attempt(&email, now) {
+    // Fail closed : sans compteur, pas de vérification de mot de passe.
+    if let LoginAttempt::Blocked { retry_after_secs } = state
+        .throttle
+        .begin_attempt(&email, now)
+        .await
+        .map_err(internal)?
+    {
         audit(&state, &email, "auth.login", AuditOutcome::Denied).await;
-        return Err(AccountError::TooManyAttempts(secs));
+        return Err(AccountError::TooManyAttempts(retry_after_secs));
     }
 
     let user = state.users.find_by_email(&email).await.map_err(internal)?;
@@ -328,7 +289,11 @@ pub async fn login(
 
     match user {
         Some(user) if matches => {
-            state.throttle.reset(&email);
+            // La connexion a réussi : un compteur non remis à zéro ne doit pas
+            // la faire échouer (il expirera avec sa fenêtre).
+            if let Err(e) = state.throttle.reset(&email).await {
+                tracing::warn!(error = %e, "remise à zéro du compteur de connexion impossible");
+            }
             audit(&state, &user.id, "auth.login", AuditOutcome::Success).await;
             Ok(Json(issue_pair(&state, &user.id)?))
         }
@@ -398,6 +363,7 @@ mod tests {
     use axum::http::Request;
     use http_body_util::BodyExt;
     use serde_json::json;
+    use std::sync::Mutex;
     use tower::ServiceExt;
 
     const SECRET: &[u8] = b"test-secret-must-be-long-enough-32+";
@@ -716,18 +682,5 @@ mod tests {
 
         let wrong = post(&h.app, "/login", creds("joe@example.io", "wrong-horse")).await;
         assert_eq!(wrong.status(), StatusCode::UNAUTHORIZED);
-    }
-
-    #[test]
-    fn throttle_window_resets_after_expiry() {
-        let t = LoginThrottle::new();
-        for _ in 0..MAX_LOGIN_FAILURES {
-            assert!(t.begin_attempt("a", START).is_ok());
-        }
-        assert_eq!(
-            t.begin_attempt("a", START + 60),
-            Err(LOGIN_WINDOW_SECONDS - 60)
-        );
-        assert!(t.begin_attempt("a", START + LOGIN_WINDOW_SECONDS).is_ok());
     }
 }
