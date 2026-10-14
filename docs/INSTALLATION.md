@@ -81,12 +81,24 @@ relit au moment du run. Le `provider_id` OAuth doit être le préfixe de l'actio
 - **Pas de token** pour ce propriétaire, ou run sans propriétaire (créé avant
   l'isolation par propriétaire) : le node échoue avec un message explicite ; le
   run ne part jamais avec le compte d'un autre utilisateur.
+- **Token expiré** : si l'access token expire dans moins d'une minute (Google :
+  environ 1 h après la connexion), le worker le **rafraîchit** avec le refresh
+  token stocké, puis re-stocke le nouveau jeton chiffré (le refresh token est
+  conservé quand le provider n'en renvoie pas). Il faut donc fournir au worker
+  la **même config OAuth que l'API** (`AUTOME_OAUTH_PROVIDERS` +
+  `AUTOME_OAUTH_<ID>_*` ; en k8s, déjà partagée via `envFrom`), et autoriser
+  son `TOKEN_URL` en sortie si l'IdP est interne (`AUTOME_EGRESS_ALLOWLIST`).
+  Sans refresh token, sans config OAuth sur le worker, ou si le provider refuse
+  (`invalid_grant`) : le node échoue en demandant de reconnecter le compte. Un
+  seul rafraîchissement à la fois par (utilisateur, provider) **par réplique**
+  de worker.
 - **Mode mono-tenant (opt-in)** : `AUTOME_CONNECTOR_CREDENTIALS=single_tenant`
   sur le worker rétablit le repli sur un token **global** par provider
   (`AUTOME_CONNECTOR_TOKEN_SLACK`, `…_GMAIL`, `…_NOTION`, `…_GITHUB`) quand le
   propriétaire n'a pas connecté le sien. Ce token est alors utilisé par **tous**
   les utilisateurs : réservé à une instance à un seul tenant. Une erreur de
-  lecture du store ne déclenche jamais ce repli. Le worker l'annonce au
+  lecture du store, ou un token expiré impossible à rafraîchir, ne déclenche
+  jamais ce repli. Le worker l'annonce au
   démarrage ; toute autre valeur que `per_user`/`single_tenant` est refusée.
 
 ### Règles du profil `prod` (fail-fast)
