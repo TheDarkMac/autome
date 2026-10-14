@@ -13,6 +13,7 @@
 
 pub mod audit;
 pub mod connector_tokens;
+pub mod login_throttle;
 pub mod migrations;
 pub mod permission;
 pub mod pool;
@@ -26,6 +27,7 @@ pub mod workflow_repo;
 
 pub use audit::PgAuditSink;
 pub use connector_tokens::PgConnectorTokenStore;
+pub use login_throttle::PgLoginThrottle;
 pub use migrations::{run_migrations, MIGRATIONS};
 pub use permission::PgPermissionStore;
 pub use pool::{connect, PgPool};
