@@ -1,21 +1,31 @@
 //! Persistance des workflows (F7.1.a).
 //!
 //! Le trait [`WorkflowRepository`] est consommé par l'API publique
-//! (F7.1.b/c). L'impl de référence [`InMemoryWorkflowRepository`] suffit
-//! pour tests + dev ; l'impl PG vit dans `autome-persistence`.
+//! (F7.1.b/c) et le worker. L'impl de référence [`InMemoryWorkflowRepository`]
+//! suffit pour tests + dev ; l'impl PG vit dans `autome-persistence`.
 //!
-//! **Propriétaire** (backlog BOLA) : chaque workflow est rattaché au
-//! `claims.sub` qui l'a créé. Le propriétaire n'est **pas** dans le
-//! [`WorkflowGraph`] (document soumis par le client, qui ne doit pas pouvoir
-//! le choisir) : le repository le stocke à côté, le pose à la création et ne
-//! le modifie jamais. L'enforcement (404 si non-propriétaire) vit dans l'API.
+//! **Espaces de noms par propriétaire** (#188) : l'identité d'un workflow est
+//! le couple `(owner, id)`. Chaque utilisateur (`claims.sub`) a son propre
+//! espace d'ids : deux utilisateurs peuvent créer chacun un workflow `wf-draft`
+//! sans se voir ni se gêner, et un id pris par autrui ne répond jamais 409.
+//! Le propriétaire n'est **pas** dans le [`WorkflowGraph`] (document soumis
+//! par le client, qui ne doit pas pouvoir le choisir) : le repository le
+//! reçoit de l'appelant (API : l'utilisateur authentifié ; worker : le
+//! propriétaire du run) et ne le modifie jamais.
+//!
+//! Les workflows créés avant la migration `0010` n'ont pas de propriétaire :
+//! ils vivent dans l'espace [`LEGACY_NAMESPACE`].
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::sync::Mutex;
 
 use crate::workflow::{WorkflowGraph, WorkflowId};
 use crate::{Error, Result};
 use async_trait::async_trait;
+
+/// Espace des workflows sans propriétaire (antérieurs à la migration `0010`),
+/// réservé aux super-admins. Aucun `claims.sub` n'est vide.
+pub const LEGACY_NAMESPACE: &str = "";
 
 /// Critères de pagination pour [`WorkflowRepository::list`].
 #[derive(Debug, Clone, Copy)]
@@ -52,46 +62,43 @@ pub struct WorkflowPage {
     pub total: usize,
 }
 
-/// Contrat de persistance d'un workflow.
+/// Contrat de persistance d'un workflow. Toutes les opérations portent sur
+/// l'espace d'ids de `owner` : un workflow d'un autre espace n'existe pas
+/// pour elles. Aucun contrôle d'accès ici — l'appelant choisit l'espace
+/// (API : celui de l'utilisateur authentifié).
 #[async_trait]
 pub trait WorkflowRepository: Send + Sync {
-    /// Crée un workflow appartenant à `owner` (`None` = sans propriétaire,
-    /// réservé aux outils internes/tests). `Err` si l'`id` existe déjà.
-    async fn create(&self, workflow: WorkflowGraph, owner: Option<&str>) -> Result<()>;
+    /// Crée un workflow dans l'espace de `owner`. `Err` (message contenant
+    /// « déjà ») si l'`id` existe déjà **dans cet espace**.
+    async fn create(&self, owner: &str, workflow: WorkflowGraph) -> Result<()>;
 
-    /// Charge un workflow par id. `Ok(None)` si inconnu. **Sans contrôle
-    /// d'accès** : réservé au worker et aux handlers qui ont déjà vérifié
-    /// [`Self::owner_of`].
-    async fn get(&self, id: &WorkflowId) -> Result<Option<WorkflowGraph>>;
+    /// Charge le workflow `id` de l'espace de `owner`. `Ok(None)` si inconnu.
+    async fn get(&self, owner: &str, id: &WorkflowId) -> Result<Option<WorkflowGraph>>;
 
-    /// Propriétaire du workflow. `Ok(None)` si le workflow est inconnu **ou**
-    /// sans propriétaire — dans les deux cas, inaccessible à un utilisateur
-    /// ordinaire.
-    async fn owner_of(&self, id: &WorkflowId) -> Result<Option<String>>;
+    /// Liste paginée de l'espace de `owner`, ordre stable par `WorkflowId`.
+    async fn list(&self, owner: &str, paging: Pagination) -> Result<WorkflowPage>;
 
-    /// Liste paginée, ordre stable par `WorkflowId`. `owner = Some(u)`
-    /// restreint aux workflows de `u` (`total` compris) ; `None` = tous.
-    async fn list(&self, owner: Option<&str>, paging: Pagination) -> Result<WorkflowPage>;
+    /// Met à jour un workflow existant de l'espace de `owner`. `Err` si
+    /// inconnu. L'`id` du `WorkflowGraph` désigne le workflow.
+    async fn update(&self, owner: &str, workflow: WorkflowGraph) -> Result<()>;
 
-    /// Met à jour un workflow existant. `Err` si inconnu.
-    /// L'`id` du `WorkflowGraph` doit correspondre.
-    async fn update(&self, workflow: WorkflowGraph) -> Result<()>;
-
-    /// Supprime un workflow. `Ok(false)` si inconnu (idempotent côté caller).
-    async fn delete(&self, id: &WorkflowId) -> Result<bool>;
+    /// Supprime un workflow de l'espace de `owner`. `Ok(false)` si inconnu
+    /// (idempotent côté caller).
+    async fn delete(&self, owner: &str, id: &WorkflowId) -> Result<bool>;
 }
 
-/// Workflow stocké + son propriétaire.
-#[derive(Debug, Clone)]
-struct Stored {
-    graph: WorkflowGraph,
-    owner: Option<String>,
+/// Clé de stockage : `(propriétaire, id)`. `BTreeMap` ⇒ itération triée par
+/// propriétaire puis par id.
+type Key = (String, String);
+
+fn key(owner: &str, id: &str) -> Key {
+    (owner.to_string(), id.to_string())
 }
 
-/// Impl in-process, thread-safe (`Mutex<HashMap>`). Pour tests + dev.
+/// Impl in-process, thread-safe (`Mutex<BTreeMap>`). Pour tests + dev.
 #[derive(Debug, Default)]
 pub struct InMemoryWorkflowRepository {
-    inner: Mutex<HashMap<String, Stored>>,
+    inner: Mutex<BTreeMap<Key, WorkflowGraph>>,
 }
 
 impl InMemoryWorkflowRepository {
@@ -99,92 +106,59 @@ impl InMemoryWorkflowRepository {
     pub fn new() -> Self {
         Self::default()
     }
+
+    fn lock(&self) -> Result<std::sync::MutexGuard<'_, BTreeMap<Key, WorkflowGraph>>> {
+        self.inner
+            .lock()
+            .map_err(|_| Error::Invalid("workflow repo lock empoisonné".into()))
+    }
 }
 
 #[async_trait]
 impl WorkflowRepository for InMemoryWorkflowRepository {
-    async fn create(&self, workflow: WorkflowGraph, owner: Option<&str>) -> Result<()> {
-        let mut map = self
-            .inner
-            .lock()
-            .map_err(|_| Error::Invalid("workflow repo lock empoisonné".into()))?;
-        if map.contains_key(&workflow.id.0) {
+    async fn create(&self, owner: &str, workflow: WorkflowGraph) -> Result<()> {
+        let mut map = self.lock()?;
+        let k = key(owner, &workflow.id.0);
+        if map.contains_key(&k) {
             return Err(Error::Invalid(format!(
                 "workflow : id '{}' déjà existant",
                 workflow.id.0
             )));
         }
-        map.insert(
-            workflow.id.0.clone(),
-            Stored {
-                graph: workflow,
-                owner: owner.map(str::to_string),
-            },
-        );
+        map.insert(k, workflow);
         Ok(())
     }
 
-    async fn get(&self, id: &WorkflowId) -> Result<Option<WorkflowGraph>> {
-        Ok(self
-            .inner
-            .lock()
-            .map_err(|_| Error::Invalid("workflow repo lock empoisonné".into()))?
-            .get(&id.0)
-            .map(|s| s.graph.clone()))
+    async fn get(&self, owner: &str, id: &WorkflowId) -> Result<Option<WorkflowGraph>> {
+        Ok(self.lock()?.get(&key(owner, &id.0)).cloned())
     }
 
-    async fn owner_of(&self, id: &WorkflowId) -> Result<Option<String>> {
-        Ok(self
-            .inner
-            .lock()
-            .map_err(|_| Error::Invalid("workflow repo lock empoisonné".into()))?
-            .get(&id.0)
-            .and_then(|s| s.owner.clone()))
-    }
-
-    async fn list(&self, owner: Option<&str>, paging: Pagination) -> Result<WorkflowPage> {
-        let map = self
-            .inner
-            .lock()
-            .map_err(|_| Error::Invalid("workflow repo lock empoisonné".into()))?;
-        let mut all: Vec<WorkflowGraph> = map
-            .values()
-            .filter(|s| owner.is_none() || s.owner.as_deref() == owner)
-            .map(|s| s.graph.clone())
-            .collect();
-        let total = all.len();
-        // Tri stable par id pour des résultats reproductibles.
-        all.sort_by(|a, b| a.id.0.cmp(&b.id.0));
-        let items = all
-            .into_iter()
+    async fn list(&self, owner: &str, paging: Pagination) -> Result<WorkflowPage> {
+        let map = self.lock()?;
+        let mine = map.iter().filter(|((o, _), _)| o == owner);
+        let total = mine.clone().count();
+        let items = mine
             .skip(paging.offset)
             .take(paging.limit)
+            .map(|(_, graph)| graph.clone())
             .collect();
         Ok(WorkflowPage { items, total })
     }
 
-    async fn update(&self, workflow: WorkflowGraph) -> Result<()> {
-        let mut map = self
-            .inner
-            .lock()
-            .map_err(|_| Error::Invalid("workflow repo lock empoisonné".into()))?;
-        // Le propriétaire est conservé : seul le graphe est remplacé.
-        let Some(stored) = map.get_mut(&workflow.id.0) else {
+    async fn update(&self, owner: &str, workflow: WorkflowGraph) -> Result<()> {
+        let mut map = self.lock()?;
+        let Some(stored) = map.get_mut(&key(owner, &workflow.id.0)) else {
             return Err(Error::Invalid(format!(
                 "workflow : id '{}' inconnu",
                 workflow.id.0
             )));
         };
-        stored.graph = workflow;
+        *stored = workflow;
         Ok(())
     }
 
-    async fn delete(&self, id: &WorkflowId) -> Result<bool> {
-        let mut map = self
-            .inner
-            .lock()
-            .map_err(|_| Error::Invalid("workflow repo lock empoisonné".into()))?;
-        Ok(map.remove(&id.0).is_some())
+    async fn delete(&self, owner: &str, id: &WorkflowId) -> Result<bool> {
+        Ok(self.lock()?.remove(&key(owner, &id.0)).is_some())
     }
 }
 
@@ -193,6 +167,8 @@ mod tests {
     use super::*;
     use crate::workflow::{Node, NodeKind};
     use crate::NodeId;
+
+    const ME: &str = "alice";
 
     fn sample(id: &str) -> WorkflowGraph {
         WorkflowGraph {
@@ -210,26 +186,30 @@ mod tests {
         }
     }
 
+    fn wid(id: &str) -> WorkflowId {
+        WorkflowId::new(id)
+    }
+
     #[tokio::test]
     async fn create_then_get_round_trips() {
         let repo = InMemoryWorkflowRepository::new();
         let w = sample("wf-1");
-        repo.create(w.clone(), None).await.unwrap();
-        let loaded = repo.get(&WorkflowId::new("wf-1")).await.unwrap().unwrap();
+        repo.create(ME, w.clone()).await.unwrap();
+        let loaded = repo.get(ME, &wid("wf-1")).await.unwrap().unwrap();
         assert_eq!(loaded, w);
     }
 
     #[tokio::test]
     async fn get_unknown_returns_none() {
         let repo = InMemoryWorkflowRepository::new();
-        assert!(repo.get(&WorkflowId::new("nope")).await.unwrap().is_none());
+        assert!(repo.get(ME, &wid("nope")).await.unwrap().is_none());
     }
 
     #[tokio::test]
-    async fn duplicate_create_errors() {
+    async fn duplicate_create_in_the_same_namespace_errors() {
         let repo = InMemoryWorkflowRepository::new();
-        repo.create(sample("wf-1"), None).await.unwrap();
-        let err = repo.create(sample("wf-1"), None).await.unwrap_err();
+        repo.create(ME, sample("wf-1")).await.unwrap();
+        let err = repo.create(ME, sample("wf-1")).await.unwrap_err();
         assert!(matches!(err, Error::Invalid(ref m) if m.contains("déjà")));
     }
 
@@ -237,11 +217,10 @@ mod tests {
     async fn list_returns_all_sorted() {
         let repo = InMemoryWorkflowRepository::new();
         for id in ["zeta", "alpha", "mu"] {
-            repo.create(sample(id), None).await.unwrap();
+            repo.create(ME, sample(id)).await.unwrap();
         }
-        let page = repo.list(None, Pagination::default()).await.unwrap();
+        let page = repo.list(ME, Pagination::default()).await.unwrap();
         assert_eq!(page.total, 3);
-        assert_eq!(page.items.len(), 3);
         let ids: Vec<&str> = page.items.iter().map(|w| w.id.0.as_str()).collect();
         assert_eq!(ids, vec!["alpha", "mu", "zeta"]);
     }
@@ -250,13 +229,13 @@ mod tests {
     async fn list_pagination_skips_and_limits() {
         let repo = InMemoryWorkflowRepository::new();
         for i in 0..10 {
-            repo.create(sample(&format!("wf-{i:02}")), None)
+            repo.create(ME, sample(&format!("wf-{i:02}")))
                 .await
                 .unwrap();
         }
         let page = repo
             .list(
-                None,
+                ME,
                 Pagination {
                     offset: 3,
                     limit: 4,
@@ -265,7 +244,6 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(page.total, 10, "total ignore pagination");
-        assert_eq!(page.items.len(), 4);
         let ids: Vec<&str> = page.items.iter().map(|w| w.id.0.as_str()).collect();
         assert_eq!(ids, vec!["wf-03", "wf-04", "wf-05", "wf-06"]);
     }
@@ -273,10 +251,10 @@ mod tests {
     #[tokio::test]
     async fn list_with_offset_beyond_total_returns_empty() {
         let repo = InMemoryWorkflowRepository::new();
-        repo.create(sample("only"), None).await.unwrap();
+        repo.create(ME, sample("only")).await.unwrap();
         let page = repo
             .list(
-                None,
+                ME,
                 Pagination {
                     offset: 100,
                     limit: 50,
@@ -291,33 +269,33 @@ mod tests {
     #[tokio::test]
     async fn update_replaces_existing() {
         let repo = InMemoryWorkflowRepository::new();
-        repo.create(sample("wf-1"), None).await.unwrap();
+        repo.create(ME, sample("wf-1")).await.unwrap();
         let mut modified = sample("wf-1");
         modified.name = "renamed".into();
-        repo.update(modified.clone()).await.unwrap();
-        let loaded = repo.get(&WorkflowId::new("wf-1")).await.unwrap().unwrap();
+        repo.update(ME, modified).await.unwrap();
+        let loaded = repo.get(ME, &wid("wf-1")).await.unwrap().unwrap();
         assert_eq!(loaded.name, "renamed");
     }
 
     #[tokio::test]
     async fn update_unknown_errors() {
         let repo = InMemoryWorkflowRepository::new();
-        let err = repo.update(sample("nope")).await.unwrap_err();
+        let err = repo.update(ME, sample("nope")).await.unwrap_err();
         assert!(matches!(err, Error::Invalid(ref m) if m.contains("inconnu")));
     }
 
     #[tokio::test]
     async fn delete_existing_returns_true() {
         let repo = InMemoryWorkflowRepository::new();
-        repo.create(sample("wf-1"), None).await.unwrap();
-        assert!(repo.delete(&WorkflowId::new("wf-1")).await.unwrap());
-        assert!(repo.get(&WorkflowId::new("wf-1")).await.unwrap().is_none());
+        repo.create(ME, sample("wf-1")).await.unwrap();
+        assert!(repo.delete(ME, &wid("wf-1")).await.unwrap());
+        assert!(repo.get(ME, &wid("wf-1")).await.unwrap().is_none());
     }
 
     #[tokio::test]
     async fn delete_unknown_returns_false() {
         let repo = InMemoryWorkflowRepository::new();
-        assert!(!repo.delete(&WorkflowId::new("nope")).await.unwrap());
+        assert!(!repo.delete(ME, &wid("nope")).await.unwrap());
     }
 
     #[tokio::test]
@@ -326,53 +304,58 @@ mod tests {
         assert_send_sync::<InMemoryWorkflowRepository>();
     }
 
-    // ───── Propriétaire (backlog BOLA) ─────
+    // ───── Espaces de noms (#188) ─────
 
     #[tokio::test]
-    async fn owner_is_recorded_and_listing_is_scoped() {
+    async fn same_id_lives_independently_in_each_namespace() {
         let repo = InMemoryWorkflowRepository::new();
-        repo.create(sample("a-1"), Some("alice")).await.unwrap();
-        repo.create(sample("a-2"), Some("alice")).await.unwrap();
-        repo.create(sample("b-1"), Some("bob")).await.unwrap();
-        repo.create(sample("legacy"), None).await.unwrap();
+        let mut a = sample("wf-draft");
+        a.name = "chez alice".into();
+        let mut b = sample("wf-draft");
+        b.name = "chez bob".into();
+        repo.create("alice", a).await.unwrap();
+        repo.create("bob", b).await.unwrap();
 
-        assert_eq!(
-            repo.owner_of(&WorkflowId::new("a-1"))
-                .await
-                .unwrap()
-                .as_deref(),
-            Some("alice")
-        );
-        assert_eq!(
-            repo.owner_of(&WorkflowId::new("legacy")).await.unwrap(),
-            None
-        );
-        assert_eq!(repo.owner_of(&WorkflowId::new("nope")).await.unwrap(), None);
+        let get = |o: &'static str| {
+            let repo = &repo;
+            async move { repo.get(o, &wid("wf-draft")).await.unwrap().unwrap().name }
+        };
+        assert_eq!(get("alice").await, "chez alice");
+        assert_eq!(get("bob").await, "chez bob");
 
-        let alice = repo
-            .list(Some("alice"), Pagination::default())
-            .await
-            .unwrap();
-        assert_eq!(alice.total, 2);
-        let ids: Vec<&str> = alice.items.iter().map(|w| w.id.0.as_str()).collect();
-        assert_eq!(ids, vec!["a-1", "a-2"]);
-        let all = repo.list(None, Pagination::default()).await.unwrap();
-        assert_eq!(all.total, 4);
+        let mut renamed = sample("wf-draft");
+        renamed.name = "alice v2".into();
+        repo.update("alice", renamed).await.unwrap();
+        assert_eq!(get("bob").await, "chez bob", "l'autre espace est intact");
+
+        assert!(repo.delete("bob", &wid("wf-draft")).await.unwrap());
+        assert_eq!(get("alice").await, "alice v2");
+        assert!(repo.get("bob", &wid("wf-draft")).await.unwrap().is_none());
     }
 
     #[tokio::test]
-    async fn update_keeps_the_owner() {
+    async fn listing_and_lookups_are_confined_to_the_namespace() {
         let repo = InMemoryWorkflowRepository::new();
-        repo.create(sample("wf"), Some("alice")).await.unwrap();
-        let mut renamed = sample("wf");
-        renamed.name = "renamed".into();
-        repo.update(renamed).await.unwrap();
-        assert_eq!(
-            repo.owner_of(&WorkflowId::new("wf"))
-                .await
-                .unwrap()
-                .as_deref(),
-            Some("alice")
-        );
+        repo.create("alice", sample("a-1")).await.unwrap();
+        repo.create("alice", sample("a-2")).await.unwrap();
+        repo.create("bob", sample("b-1")).await.unwrap();
+        repo.create(LEGACY_NAMESPACE, sample("legacy"))
+            .await
+            .unwrap();
+
+        let alice = repo.list("alice", Pagination::default()).await.unwrap();
+        assert_eq!(alice.total, 2);
+        let ids: Vec<&str> = alice.items.iter().map(|w| w.id.0.as_str()).collect();
+        assert_eq!(ids, vec!["a-1", "a-2"]);
+        let legacy = repo
+            .list(LEGACY_NAMESPACE, Pagination::default())
+            .await
+            .unwrap();
+        assert_eq!(legacy.total, 1);
+
+        assert!(repo.get("alice", &wid("b-1")).await.unwrap().is_none());
+        assert!(repo.update("alice", sample("b-1")).await.is_err());
+        assert!(!repo.delete("alice", &wid("b-1")).await.unwrap());
+        assert!(repo.get("bob", &wid("b-1")).await.unwrap().is_some());
     }
 }

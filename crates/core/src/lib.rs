@@ -46,7 +46,7 @@ pub use scheduler::{
 pub use secrets::{EnvelopeCipher, InMemoryKeyProvider, KeyProvider};
 pub use trigger::{Trigger, TriggerEvent};
 pub use workflow::repo::{
-    InMemoryWorkflowRepository, Pagination, WorkflowPage, WorkflowRepository,
+    InMemoryWorkflowRepository, Pagination, WorkflowPage, WorkflowRepository, LEGACY_NAMESPACE,
 };
 pub use workflow::{Edge, Node, NodeKind, WorkflowGraph, WorkflowId};
 

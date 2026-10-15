@@ -119,6 +119,24 @@ impl AuthState {
         )
     }
 
+    /// Espace d'ids de workflow visé par une requête (#188) : celui de
+    /// l'appelant, ou `requested` (`?owner=`) pour un super-admin (`*`).
+    /// Viser l'espace d'autrui sans `*` ⇒ 403, que la ressource existe ou non.
+    pub async fn namespace(
+        &self,
+        user: &AuthenticatedUser,
+        requested: Option<&str>,
+    ) -> Result<String, AuthError> {
+        match requested {
+            None => Ok(user.user_id().to_string()),
+            Some(owner) if owner == user.user_id() => Ok(owner.to_string()),
+            Some(owner) => match self.owner_scope(user).await? {
+                OwnerScope::All => Ok(owner.to_string()),
+                OwnerScope::Owner(_) => Err(AuthError::Forbidden(PERM_WILDCARD.to_string())),
+            },
+        }
+    }
+
     /// Vérifie que `user` possède la permission `needed`. À appeler depuis
     /// un handler axum après extraction de [`AuthenticatedUser`] (F6.5.b).
     ///

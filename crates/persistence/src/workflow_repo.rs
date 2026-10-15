@@ -4,7 +4,8 @@
 //! Le `WorkflowGraph` complet est sérialisé en `jsonb` dans
 //! `workflow_versions.graph` ; `workflows.current_version` pointe la version
 //! servie par `get`/`list`. `update` publie une nouvelle version (historique
-//! conservé). IDs logiques en TEXT (migration `0009`).
+//! conservé). IDs logiques en TEXT (migration `0009`), namespacés par
+//! propriétaire : clé `(owner_id, id)` (migration `0014`, #188).
 
 use async_trait::async_trait;
 use autome_core::{Error, Pagination, WorkflowGraph, WorkflowId, WorkflowPage, WorkflowRepository};
@@ -30,11 +31,7 @@ impl PgWorkflowRepository {
 
 #[async_trait]
 impl WorkflowRepository for PgWorkflowRepository {
-    async fn create(
-        &self,
-        workflow: WorkflowGraph,
-        owner: Option<&str>,
-    ) -> autome_core::Result<()> {
+    async fn create(&self, owner: &str, workflow: WorkflowGraph) -> autome_core::Result<()> {
         let id = workflow.id.0.clone();
         let graph = serde_json::to_value(&workflow)?;
         let mut client = self.pool.get().await.map_err(|e| storage_err("pool", e))?;
@@ -43,13 +40,12 @@ impl WorkflowRepository for PgWorkflowRepository {
             .await
             .map_err(|e| storage_err("begin", e))?;
 
-        // `ON CONFLICT DO NOTHING` + contrôle du nombre de lignes : permet de
-        // détecter le doublon sans 23505 brut.
+        // Conflit seulement dans l'espace de `owner` (clé `(owner_id, id)`).
         let inserted = tx
             .execute(
-                "INSERT INTO workflows (id, name, current_version, owner_id) \
-                 VALUES ($1, $2, 1, $3) ON CONFLICT (id) DO NOTHING",
-                &[&id, &workflow.name, &owner],
+                "INSERT INTO workflows (owner_id, id, name, current_version) \
+                 VALUES ($1, $2, $3, 1) ON CONFLICT (owner_id, id) DO NOTHING",
+                &[&owner, &id, &workflow.name],
             )
             .await
             .map_err(|e| storage_err("create", e))?;
@@ -57,8 +53,9 @@ impl WorkflowRepository for PgWorkflowRepository {
             return Err(Error::Invalid(format!("workflow déjà existant : {id}")));
         }
         tx.execute(
-            "INSERT INTO workflow_versions (workflow_id, version, graph) VALUES ($1, 1, $2)",
-            &[&id, &graph],
+            "INSERT INTO workflow_versions (owner_id, workflow_id, version, graph) \
+             VALUES ($1, $2, 1, $3)",
+            &[&owner, &id, &graph],
         )
         .await
         .map_err(|e| storage_err("create version", e))?;
@@ -66,15 +63,20 @@ impl WorkflowRepository for PgWorkflowRepository {
         Ok(())
     }
 
-    async fn get(&self, id: &WorkflowId) -> autome_core::Result<Option<WorkflowGraph>> {
+    async fn get(
+        &self,
+        owner: &str,
+        id: &WorkflowId,
+    ) -> autome_core::Result<Option<WorkflowGraph>> {
         let client = self.pool.get().await.map_err(|e| storage_err("pool", e))?;
         let row = client
             .query_opt(
                 "SELECT v.graph FROM workflows w \
                  JOIN workflow_versions v \
-                   ON v.workflow_id = w.id AND v.version = w.current_version \
-                 WHERE w.id = $1",
-                &[&id.0],
+                   ON v.owner_id = w.owner_id AND v.workflow_id = w.id \
+                  AND v.version = w.current_version \
+                 WHERE w.owner_id = $1 AND w.id = $2",
+                &[&owner, &id.0],
             )
             .await
             .map_err(|e| storage_err("get", e))?;
@@ -87,25 +89,11 @@ impl WorkflowRepository for PgWorkflowRepository {
         }
     }
 
-    async fn owner_of(&self, id: &WorkflowId) -> autome_core::Result<Option<String>> {
+    async fn list(&self, owner: &str, paging: Pagination) -> autome_core::Result<WorkflowPage> {
         let client = self.pool.get().await.map_err(|e| storage_err("pool", e))?;
-        let row = client
-            .query_opt("SELECT owner_id FROM workflows WHERE id = $1", &[&id.0])
-            .await
-            .map_err(|e| storage_err("owner_of", e))?;
-        Ok(row.and_then(|r| r.get::<_, Option<String>>(0)))
-    }
-
-    async fn list(
-        &self,
-        owner: Option<&str>,
-        paging: Pagination,
-    ) -> autome_core::Result<WorkflowPage> {
-        let client = self.pool.get().await.map_err(|e| storage_err("pool", e))?;
-        // `$1 IS NULL` ⇒ pas de filtre propriétaire (super-admin).
         let total: i64 = client
             .query_one(
-                "SELECT count(*) FROM workflows WHERE ($1::text IS NULL OR owner_id = $1)",
+                "SELECT count(*) FROM workflows WHERE owner_id = $1",
                 &[&owner],
             )
             .await
@@ -117,8 +105,9 @@ impl WorkflowRepository for PgWorkflowRepository {
             .query(
                 "SELECT v.graph FROM workflows w \
                  JOIN workflow_versions v \
-                   ON v.workflow_id = w.id AND v.version = w.current_version \
-                 WHERE ($1::text IS NULL OR w.owner_id = $1) \
+                   ON v.owner_id = w.owner_id AND v.workflow_id = w.id \
+                  AND v.version = w.current_version \
+                 WHERE w.owner_id = $1 \
                  ORDER BY w.id LIMIT $2 OFFSET $3",
                 &[&owner, &limit, &offset],
             )
@@ -134,7 +123,7 @@ impl WorkflowRepository for PgWorkflowRepository {
         })
     }
 
-    async fn update(&self, workflow: WorkflowGraph) -> autome_core::Result<()> {
+    async fn update(&self, owner: &str, workflow: WorkflowGraph) -> autome_core::Result<()> {
         let id = workflow.id.0.clone();
         let graph = serde_json::to_value(&workflow)?;
         let mut client = self.pool.get().await.map_err(|e| storage_err("pool", e))?;
@@ -143,11 +132,14 @@ impl WorkflowRepository for PgWorkflowRepository {
             .await
             .map_err(|e| storage_err("begin", e))?;
 
-        // Version suivante = current_version + 1 (historique conservé).
+        // `FOR UPDATE` : deux mises à jour concurrentes du même workflow se
+        // sérialisent au lieu de calculer la même version suivante (conflit de
+        // clé primaire ⇒ 500).
         let next: Option<i32> = tx
             .query_opt(
-                "SELECT current_version + 1 FROM workflows WHERE id = $1",
-                &[&id],
+                "SELECT current_version + 1 FROM workflows \
+                 WHERE owner_id = $1 AND id = $2 FOR UPDATE",
+                &[&owner, &id],
             )
             .await
             .map_err(|e| storage_err("update lookup", e))?
@@ -156,14 +148,16 @@ impl WorkflowRepository for PgWorkflowRepository {
             return Err(Error::Invalid(format!("workflow inconnu : {id}")));
         };
         tx.execute(
-            "INSERT INTO workflow_versions (workflow_id, version, graph) VALUES ($1, $2, $3)",
-            &[&id, &next, &graph],
+            "INSERT INTO workflow_versions (owner_id, workflow_id, version, graph) \
+             VALUES ($1, $2, $3, $4)",
+            &[&owner, &id, &next, &graph],
         )
         .await
         .map_err(|e| storage_err("update version", e))?;
         tx.execute(
-            "UPDATE workflows SET name = $2, current_version = $3 WHERE id = $1",
-            &[&id, &workflow.name, &next],
+            "UPDATE workflows SET name = $3, current_version = $4 \
+             WHERE owner_id = $1 AND id = $2",
+            &[&owner, &id, &workflow.name, &next],
         )
         .await
         .map_err(|e| storage_err("update", e))?;
@@ -171,10 +165,13 @@ impl WorkflowRepository for PgWorkflowRepository {
         Ok(())
     }
 
-    async fn delete(&self, id: &WorkflowId) -> autome_core::Result<bool> {
+    async fn delete(&self, owner: &str, id: &WorkflowId) -> autome_core::Result<bool> {
         let client = self.pool.get().await.map_err(|e| storage_err("pool", e))?;
         let n = client
-            .execute("DELETE FROM workflows WHERE id = $1", &[&id.0])
+            .execute(
+                "DELETE FROM workflows WHERE owner_id = $1 AND id = $2",
+                &[&owner, &id.0],
+            )
             .await
             .map_err(|e| storage_err("delete", e))?;
         Ok(n > 0)
