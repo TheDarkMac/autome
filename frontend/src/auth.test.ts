@@ -6,6 +6,7 @@ import {
   isTokenExpired,
   login,
   logout,
+  logoutAll,
   refresh,
   signup,
   tokenExpiresAtMs,
@@ -220,6 +221,33 @@ describe("logout", () => {
   it("remonte une erreur serveur", async () => {
     const fetchImpl = vi.fn().mockResolvedValue(jsonResponse({}, 500));
     await expect(logout(PAIR, fetchImpl)).rejects.toMatchObject({ status: 500 });
+  });
+});
+
+describe("logoutAll", () => {
+  it("POST /auth/logout-all via le fetch authentifié", async () => {
+    const fetchImpl = vi.fn().mockResolvedValue(new Response(null, { status: 204 }));
+    await logoutAll(fetchImpl);
+    const [url, init] = fetchImpl.mock.calls[0]!;
+    expect(url).toMatch(/\/auth\/logout-all$/);
+    expect(init.method).toBe("POST");
+  });
+
+  it("traduit un 401 en session expirée", async () => {
+    const fetchImpl = vi.fn().mockResolvedValue(jsonResponse({}, 401));
+    await expect(logoutAll(fetchImpl)).rejects.toMatchObject({
+      status: 401,
+      message: /session expirée/,
+    });
+  });
+
+  it("remonte une erreur serveur ou transport", async () => {
+    await expect(
+      logoutAll(vi.fn().mockResolvedValue(jsonResponse({}, 500))),
+    ).rejects.toMatchObject({ status: 500 });
+    await expect(
+      logoutAll(vi.fn().mockRejectedValue(new Error("offline"))),
+    ).rejects.toThrow(/injoignable/);
   });
 });
 

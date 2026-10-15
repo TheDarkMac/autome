@@ -45,6 +45,29 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/auth/logout-all": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * `POST /auth/logout-all` — ferme toutes les sessions de l'utilisateur
+         *     authentifié, sur tous les appareils, y compris celle de la requête.
+         * @description Incrémente sa version de session : tous ses access et refresh tokens émis
+         *     jusqu'ici sont refusés (401) ; une nouvelle connexion ouvre une session
+         *     valide. Réponse 204.
+         */
+        post: operations["logout_all"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/auth/refresh": {
         parameters: {
             query?: never;
@@ -438,6 +461,31 @@ export interface operations {
                 content?: never;
             };
             /** @description Refresh invalide ou expiré */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    logout_all: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Toutes les sessions sont fermées */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Access token absent, invalide ou déjà révoqué */
             401: {
                 headers: {
                     [name: string]: unknown;

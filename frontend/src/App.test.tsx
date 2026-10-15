@@ -26,12 +26,19 @@ function b64url(obj: unknown): string {
 }
 
 /** Session authentifiée prête à l'emploi (access token longue durée). */
-function authedSession(sub = "user-1"): UseSessionOptions {
+function authedSession(
+  sub = "user-1",
+  extra: Partial<UseSessionOptions> = {},
+): UseSessionOptions {
   const pair: TokenPair = {
     accessToken: `h.${b64url({ sub, exp: 9_999_999_999 })}.s`,
     refreshToken: "r.e.f",
   };
-  return { store: memorySessionStore(pair) };
+  return {
+    store: memorySessionStore(pair),
+    logoutImpl: vi.fn().mockResolvedValue(undefined),
+    ...extra,
+  };
 }
 
 describe("<App />", () => {
@@ -151,5 +158,54 @@ describe("<App />", () => {
     fireEvent.click(screen.getByRole("button", { name: "Se déconnecter" }));
     expect(screen.getByRole("form", { name: "Connexion" })).toBeInTheDocument();
     await act(async () => undefined);
+  });
+
+  describe("déconnecter tous les appareils", () => {
+    afterEach(() => vi.restoreAllMocks());
+
+    it("après confirmation, ferme toutes les sessions et revient au login", async () => {
+      globalThis.fetch = vi.fn().mockResolvedValue(jsonResponse(sampleSpec)) as typeof fetch;
+      vi.spyOn(window, "confirm").mockReturnValue(true);
+      const logoutAllImpl = vi.fn().mockResolvedValue(undefined);
+      render(<App sessionOptions={authedSession("user-1", { logoutAllImpl })} />);
+
+      fireEvent.click(
+        screen.getByRole("button", { name: "Déconnecter tous les appareils" }),
+      );
+
+      expect(
+        await screen.findByRole("form", { name: "Connexion" }),
+      ).toBeInTheDocument();
+      expect(logoutAllImpl).toHaveBeenCalledOnce();
+    });
+
+    it("sans confirmation, ne fait rien", async () => {
+      globalThis.fetch = vi.fn().mockResolvedValue(jsonResponse(sampleSpec)) as typeof fetch;
+      vi.spyOn(window, "confirm").mockReturnValue(false);
+      const logoutAllImpl = vi.fn().mockResolvedValue(undefined);
+      render(<App sessionOptions={authedSession("user-1", { logoutAllImpl })} />);
+
+      fireEvent.click(
+        screen.getByRole("button", { name: "Déconnecter tous les appareils" }),
+      );
+      await act(async () => undefined);
+
+      expect(logoutAllImpl).not.toHaveBeenCalled();
+      expect(screen.getByRole("heading", { name: "Autome" })).toBeInTheDocument();
+    });
+
+    it("affiche l'échec et garde la session ouverte", async () => {
+      globalThis.fetch = vi.fn().mockResolvedValue(jsonResponse(sampleSpec)) as typeof fetch;
+      vi.spyOn(window, "confirm").mockReturnValue(true);
+      const logoutAllImpl = vi.fn().mockRejectedValue(new Error("backend injoignable"));
+      render(<App sessionOptions={authedSession("user-1", { logoutAllImpl })} />);
+
+      fireEvent.click(
+        screen.getByRole("button", { name: "Déconnecter tous les appareils" }),
+      );
+
+      expect(await screen.findByText(/Échec de la déconnexion des appareils/)).toBeInTheDocument();
+      expect(screen.getByTestId("current-user")).toHaveTextContent("user-1");
+    });
   });
 });

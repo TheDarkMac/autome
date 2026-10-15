@@ -100,6 +100,33 @@ describe("useSession", () => {
     expect(store.read()).toBeNull();
   });
 
+  it("logoutAll ferme les sessions côté serveur via authFetch puis vide la session", async () => {
+    const store = memorySessionStore(mkPair("user-1", 10_000));
+    const logoutAllImpl = vi.fn().mockResolvedValue(undefined);
+    const { result } = renderHook(() => useSession({ store, logoutAllImpl }));
+
+    await act(async () => {
+      await result.current.logoutAll();
+    });
+
+    expect(logoutAllImpl).toHaveBeenCalledWith(result.current.authFetch);
+    expect(result.current.session).toBeNull();
+    expect(store.read()).toBeNull();
+  });
+
+  it("logoutAll garde la session locale si le serveur n'a pas confirmé", async () => {
+    const store = memorySessionStore(mkPair("user-1", 10_000));
+    const logoutAllImpl = vi.fn().mockRejectedValue(new Error("offline"));
+    const { result } = renderHook(() => useSession({ store, logoutAllImpl }));
+
+    await act(async () => {
+      await expect(result.current.logoutAll()).rejects.toThrow("offline");
+    });
+
+    expect(result.current.session?.userId).toBe("user-1");
+    expect(store.read()).not.toBeNull();
+  });
+
   it("logout sans session n'appelle pas le serveur", () => {
     const logoutImpl = vi.fn().mockResolvedValue(undefined);
     const { result } = renderHook(() =>

@@ -12,6 +12,7 @@
 //   - POST /auth/signup   { email, password }      → TokenPair
 //   - POST /auth/refresh  { refresh_token }        → TokenPair
 //   - POST /auth/logout   { refresh_token } (+ Bearer access) → 204
+//   - POST /auth/logout-all (Bearer access)        → 204
 //   - GET  /auth/whoami   (Bearer access)          → "hello <sub>"
 //
 // `fetchImpl` est injectable partout pour les tests.
@@ -92,6 +93,30 @@ export async function logout(
   );
   if (!res.ok && res.status !== 401) {
     throw new ApiError(`POST /auth/logout a échoué (${res.status})`, res.status);
+  }
+}
+
+/**
+ * Ferme toutes les sessions de l'utilisateur, sur tous ses appareils (#186) :
+ * tous ses jetons, y compris ceux de la session courante, sont refusés
+ * ensuite. `fetchImpl` doit porter le Bearer (l'`authFetch` de la session).
+ */
+export async function logoutAll(fetchImpl: typeof fetch): Promise<void> {
+  let res: Response;
+  try {
+    res = await fetchImpl(`${apiBaseUrl()}/auth/logout-all`, {
+      method: "POST",
+      headers: { Accept: "application/json" },
+    });
+  } catch (e) {
+    throw new ApiError(`backend injoignable : ${(e as Error).message}`);
+  }
+  if (res.status === 401) throw new ApiError("session expirée", 401);
+  if (!res.ok) {
+    throw new ApiError(
+      `POST /auth/logout-all a échoué (${res.status})`,
+      res.status,
+    );
   }
 }
 

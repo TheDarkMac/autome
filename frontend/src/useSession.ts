@@ -3,7 +3,8 @@
 // Source de vérité de l'authentification côté SPA :
 //   - charge la session depuis le `SessionStore` au montage ;
 //   - expose `login` / `signup` / `logout` (qui ferme aussi la session
-//     côté serveur, au mieux — #184) ;
+//     côté serveur, au mieux — #184) et `logoutAll` (toutes les sessions,
+//     tous appareils — #186) ;
 //   - rafraîchit l'access token de manière proactive (timer réarmé à
 //     `skewMs` avant l'expiration) et sur échec, déconnecte proprement.
 //
@@ -15,6 +16,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import {
   login as apiLogin,
   logout as apiLogout,
+  logoutAll as apiLogoutAll,
   refresh as apiRefresh,
   signup as apiSignup,
   type Credentials,
@@ -39,6 +41,7 @@ export interface UseSessionOptions {
   signupImpl?: typeof apiSignup;
   refreshImpl?: typeof apiRefresh;
   logoutImpl?: typeof apiLogout;
+  logoutAllImpl?: typeof apiLogoutAll;
 }
 
 export interface UseSessionResult {
@@ -49,6 +52,12 @@ export interface UseSessionResult {
   login: (creds: Credentials) => Promise<void>;
   signup: (creds: Credentials) => Promise<void>;
   logout: () => void;
+  /**
+   * Ferme toutes les sessions de l'utilisateur côté serveur puis la session
+   * locale. Rejette (session locale conservée) si le serveur n'a pas
+   * confirmé : les autres appareils seraient encore connectés.
+   */
+  logoutAll: () => Promise<void>;
   /**
    * `fetch` authentifié (F8.7.c) : injecte le Bearer courant et, sur 401,
    * rafraîchit le token puis rejoue la requête. Identité **stable** — sûr à
@@ -68,6 +77,7 @@ export function useSession(options: UseSessionOptions = {}): UseSessionResult {
     signupImpl = apiSignup,
     refreshImpl = apiRefresh,
     logoutImpl = apiLogout,
+    logoutAllImpl = apiLogoutAll,
   } = options;
 
   // Le store ne doit pas changer entre les rendus : on le fige au montage.
@@ -134,6 +144,11 @@ export function useSession(options: UseSessionOptions = {}): UseSessionResult {
     }
   }, [apply, logoutImpl]);
 
+  const logoutAll = useCallback(async () => {
+    await logoutAllImpl(authFetch);
+    apply(null);
+  }, [apply, authFetch, logoutAllImpl]);
+
   const login = useCallback(
     async (creds: Credentials) => {
       apply(await loginImpl(creds));
@@ -175,6 +190,7 @@ export function useSession(options: UseSessionOptions = {}): UseSessionResult {
     login,
     signup,
     logout,
+    logoutAll,
     authFetch,
   };
 }
