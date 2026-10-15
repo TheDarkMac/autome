@@ -45,7 +45,7 @@
             "description": "Identifiants invalides"
           },
           "429": {
-            "description": "Trop d'échecs — voir `Retry-After`"
+            "description": "Trop d'échecs (compte ou adresse IP) — voir `Retry-After`"
           }
         }
       }
@@ -182,6 +182,9 @@
           },
           "409": {
             "description": "Email déjà enregistré"
+          },
+          "429": {
+            "description": "Trop d'inscriptions depuis cette adresse — voir `Retry-After`"
           }
         }
       }

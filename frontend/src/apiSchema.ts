@@ -431,7 +431,7 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description Trop d'échecs — voir `Retry-After` */
+            /** @description Trop d'échecs (compte ou adresse IP) — voir `Retry-After` */
             429: {
                 headers: {
                     [name: string]: unknown;
@@ -559,6 +559,13 @@ export interface operations {
             };
             /** @description Email déjà enregistré */
             409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Trop d'inscriptions depuis cette adresse — voir `Retry-After` */
+            429: {
                 headers: {
                     [name: string]: unknown;
                 };

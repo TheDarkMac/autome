@@ -164,6 +164,20 @@ describe("login / signup", () => {
     expect(fetchImpl.mock.calls[0]![0]).toMatch(/\/auth\/signup$/);
   });
 
+  it("traduit un 429 en délai d'attente lisible", async () => {
+    const limited = new Response("too many attempts", {
+      status: 429,
+      headers: { "Retry-After": "61" },
+    });
+    await expect(
+      login({ email: "a@b.io", password: "longenough" }, vi.fn().mockResolvedValue(limited)),
+    ).rejects.toMatchObject({ status: 429, message: /réessayez dans 2 min/ });
+    const noHeader = new Response("", { status: 429 });
+    await expect(
+      signup({ email: "a@b.io", password: "longenough" }, vi.fn().mockResolvedValue(noHeader)),
+    ).rejects.toMatchObject({ status: 429, message: /réessayez plus tard/ });
+  });
+
   it("rejette une paire mal formée", async () => {
     const fetchImpl = vi
       .fn()
