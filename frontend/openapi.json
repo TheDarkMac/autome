@@ -92,6 +92,29 @@
         }
       }
     },
+    "/auth/logout-all": {
+      "post": {
+        "tags": [
+          "auth"
+        ],
+        "summary": "`POST /auth/logout-all` — ferme toutes les sessions de l'utilisateur\nauthentifié, sur tous les appareils, y compris celle de la requête.",
+        "description": "Incrémente sa version de session : tous ses access et refresh tokens émis\njusqu'ici sont refusés (401) ; une nouvelle connexion ouvre une session\nvalide. Réponse 204.",
+        "operationId": "logout_all",
+        "responses": {
+          "204": {
+            "description": "Toutes les sessions sont fermées"
+          },
+          "401": {
+            "description": "Access token absent, invalide ou déjà révoqué"
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
     "/auth/refresh": {
       "post": {
         "tags": [

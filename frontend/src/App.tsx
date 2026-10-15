@@ -38,8 +38,31 @@ export interface AppProps {
 const DRAFT_WORKFLOW_ID = "wf-draft";
 
 export function App({ sessionOptions }: AppProps = {}): JSX.Element {
-  const { session, loading: sessionLoading, login, signup, logout, authFetch } =
-    useSession(sessionOptions);
+  const {
+    session,
+    loading: sessionLoading,
+    login,
+    signup,
+    logout,
+    logoutAll,
+    authFetch,
+  } = useSession(sessionOptions);
+  const [logoutAllError, setLogoutAllError] = useState<string | null>(null);
+
+  // Ferme la session sur tous les appareils (#186) — action destructrice,
+  // confirmée ; en cas d'échec, la session locale reste ouverte et l'erreur
+  // est affichée (les autres appareils seraient encore connectés).
+  const onLogoutAll = useCallback(async () => {
+    if (!window.confirm("Fermer la session sur tous vos appareils ?")) return;
+    setLogoutAllError(null);
+    try {
+      await logoutAll();
+    } catch (e) {
+      setLogoutAllError(
+        `Échec de la déconnexion des appareils : ${(e as Error).message}`,
+      );
+    }
+  }, [logoutAll]);
 
   // Client API typé adossé à l'`authFetch` (F8.7) — identité stable car
   // `authFetch` l'est ; les vues de runs y branchent leurs lectures.
@@ -142,6 +165,18 @@ export function App({ sessionOptions }: AppProps = {}): JSX.Element {
           >
             Se déconnecter
           </button>
+          <button
+            type="button"
+            onClick={() => void onLogoutAll()}
+            className="rounded-md border border-neutral-200 px-3 py-1.5 text-neutral-700 hover:bg-neutral-50"
+          >
+            Déconnecter tous les appareils
+          </button>
+          {logoutAllError && (
+            <span className="text-rose-700" role="alert">
+              {logoutAllError}
+            </span>
+          )}
         </div>
       </header>
 
