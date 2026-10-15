@@ -74,6 +74,10 @@ assert_count "workflow_versions"   "SELECT count(*) FROM workflow_versions;"    
 assert_count "run_steps"           "SELECT count(*) FROM run_steps;"            2
 assert_count "current_version FK"  \
   "SELECT current_version FROM workflows WHERE name='Demo : Webhook -> HTTP';" 1
+assert_count "wf-demo du compte de dev" \
+  "SELECT count(*) FROM workflows w JOIN workflow_versions v
+     ON v.owner_id = w.owner_id AND v.workflow_id = w.id
+   WHERE w.owner_id = '00000000-0000-0000-0000-000000000001';" 1
 assert_count "graph jsonb lisible" \
   "SELECT graph->'nodes'->0->>'kind' FROM workflow_versions WHERE version=1;" trigger
 
