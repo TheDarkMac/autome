@@ -8,6 +8,7 @@
 //! | POST    | `/auth/signup`  | `{ email, password }`   | 201 + [`TokenResponse`]     |
 //! | POST    | `/auth/login`   | `{ email, password }`   | 200 + [`TokenResponse`]     |
 //! | POST    | `/auth/refresh` | `{ refresh_token }`     | 200 + [`TokenResponse`]     |
+//! | POST    | `/auth/logout`  | `{ refresh_token }`     | 204                         |
 //!
 //! Contrat aligné sur le frontend (`frontend/src/auth.ts`) : 400 saisie
 //! invalide, 401 identifiants/jeton refusés, 409 email déjà pris, 429 trop
@@ -25,21 +26,27 @@
 //!   **partagé** par toutes les répliques et survit aux redémarrages (#182) ;
 //!   une erreur du compteur refuse la connexion (fail closed).
 //! - Le refresh réutilise [`autome_core::TokenService::rotate`] : le refresh
-//!   présenté est révoqué, un rejeu est refusé.
-//! - Chaque inscription/connexion produit un event d'audit `auth.signup` /
-//!   `auth.login`.
+//!   présenté est révoqué, un rejeu est refusé — y compris entre requêtes
+//!   concurrentes (révocation atomique `revoke_once`, #184).
+//! - Le logout (#184) révoque côté serveur le refresh présenté et, s'il est
+//!   fourni en `Authorization: Bearer`, l'access token de la même session :
+//!   vider le stockage du client ne suffit pas, un jeton copié resterait
+//!   valide jusqu'à son expiration.
+//! - Chaque inscription/connexion/déconnexion produit un event d'audit
+//!   `auth.signup` / `auth.login` / `auth.logout`.
 
 use std::collections::HashSet;
 use std::sync::Arc;
 
 use autome_core::{
     normalize_email, validate_email, validate_password, AuditEvent, AuditOutcome, CreateUser,
-    InMemoryLoginThrottle, LoginAttempt, LoginThrottleStore, PasswordHasher, Role, UserStore,
+    InMemoryLoginThrottle, LoginAttempt, LoginThrottleStore, PasswordHasher, Role, TokenKind,
+    UserStore,
 };
 pub use autome_core::{LOGIN_WINDOW_SECONDS, MAX_LOGIN_FAILURES};
 use axum::{
     extract::State,
-    http::{header, StatusCode},
+    http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::post,
     Json, Router,
@@ -47,7 +54,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
-use crate::auth::AuthState;
+use crate::auth::{bearer_token, AuthState};
 
 /// Durée de vie d'un access token (15 min).
 pub const ACCESS_TTL_SECONDS: i64 = 15 * 60;
@@ -110,7 +117,7 @@ pub struct CredentialsBody {
     pub password: String,
 }
 
-/// Body de `/auth/refresh`.
+/// Body de `/auth/refresh` et `/auth/logout`.
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct RefreshBody {
     /// Refresh token obtenu au login/signup ou au refresh précédent.
@@ -341,13 +348,68 @@ pub async fn refresh(
     }))
 }
 
-/// Sous-router public `/signup`, `/login`, `/refresh` — à imbriquer sous
+/// `POST /auth/logout` — ferme la session côté serveur.
+///
+/// Révoque le refresh présenté (plus de rotation possible) et, s'il est fourni
+/// en `Authorization: Bearer`, l'access token **du même utilisateur** (refusé
+/// partout jusqu'à son expiration). Idempotent : un refresh déjà révoqué
+/// répond aussi 204. Un Bearer absent, invalide ou d'un autre utilisateur
+/// n'empêche pas la déconnexion : il est simplement ignoré.
+#[utoipa::path(
+    post,
+    path = "/auth/logout",
+    tag = "auth",
+    request_body = RefreshBody,
+    params(
+        ("Authorization" = Option<String>, Header,
+         description = "`Bearer <access_token>` de la session, révoqué aussi s'il est fourni")
+    ),
+    responses(
+        (status = 204, description = "Session fermée (ou déjà fermée)"),
+        (status = 401, description = "Refresh invalide ou expiré")
+    )
+)]
+pub async fn logout(
+    State(state): State<AccountsState>,
+    headers: HeaderMap,
+    Json(body): Json<RefreshBody>,
+) -> Result<StatusCode, AccountError> {
+    let now = state.auth.clock.now_unix_seconds();
+    let svc = &state.auth.token_service;
+    let refresh = match svc.verify(&body.refresh_token, now) {
+        Ok(claims) if claims.kind == TokenKind::Refresh => claims,
+        _ => return Err(AccountError::Unauthorized),
+    };
+    let revocation = &state.auth.revocation;
+    revocation
+        .revoke(&refresh.jti, refresh.exp.saturating_mul(1_000))
+        .await
+        .map_err(internal)?;
+
+    if let Ok(token) = bearer_token(&headers) {
+        match svc.verify(token, now) {
+            Ok(access) if access.kind == TokenKind::Access && access.sub == refresh.sub => {
+                revocation
+                    .revoke(&access.jti, access.exp.saturating_mul(1_000))
+                    .await
+                    .map_err(internal)?;
+            }
+            _ => tracing::debug!("logout : Bearer ignoré (invalide ou autre utilisateur)"),
+        }
+    }
+
+    audit(&state, &refresh.sub, "auth.logout", AuditOutcome::Success).await;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Sous-router public `/signup`, `/login`, `/refresh`, `/logout` — à imbriquer sous
 /// `/auth` avec [`crate::auth::protected_router`].
 pub fn accounts_router(state: AccountsState) -> Router {
     Router::new()
         .route("/signup", post(signup))
         .route("/login", post(login))
         .route("/refresh", post(refresh))
+        .route("/logout", post(logout))
         .with_state(state)
 }
 
@@ -441,6 +503,37 @@ mod tests {
             )
             .await
             .unwrap()
+    }
+
+    async fn post_bearer(
+        app: &Router,
+        path: &str,
+        bearer: &str,
+        body: serde_json::Value,
+    ) -> Response {
+        app.clone()
+            .oneshot(
+                Request::post(path)
+                    .header("content-type", "application/json")
+                    .header("Authorization", format!("Bearer {bearer}"))
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    async fn whoami_status(app: &Router, access: &str) -> StatusCode {
+        app.clone()
+            .oneshot(
+                Request::get("/whoami")
+                    .header("Authorization", format!("Bearer {access}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status()
     }
 
     async fn tokens(resp: Response) -> TokenResponse {
@@ -635,6 +728,158 @@ mod tests {
         assert_eq!(with_access.status(), StatusCode::UNAUTHORIZED);
         let garbage = post(&h.app, "/refresh", json!({ "refresh_token": "x.y.z" })).await;
         assert_eq!(garbage.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn logout_revokes_refresh_and_access_of_the_session() {
+        let h = harness();
+        let pair =
+            tokens(post(&h.app, "/signup", creds("kim@example.io", "correct-horse")).await).await;
+        assert_eq!(
+            whoami_status(&h.app, &pair.access_token).await,
+            StatusCode::OK
+        );
+
+        let resp = post_bearer(
+            &h.app,
+            "/logout",
+            &pair.access_token,
+            json!({ "refresh_token": pair.refresh_token }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+        assert_eq!(
+            whoami_status(&h.app, &pair.access_token).await,
+            StatusCode::UNAUTHORIZED
+        );
+        let refresh = post(
+            &h.app,
+            "/refresh",
+            json!({ "refresh_token": pair.refresh_token }),
+        )
+        .await;
+        assert_eq!(refresh.status(), StatusCode::UNAUTHORIZED);
+
+        // Une nouvelle connexion ouvre une nouvelle session.
+        let again =
+            tokens(post(&h.app, "/login", creds("kim@example.io", "correct-horse")).await).await;
+        assert_eq!(
+            whoami_status(&h.app, &again.access_token).await,
+            StatusCode::OK
+        );
+    }
+
+    #[tokio::test]
+    async fn logout_is_idempotent() {
+        let h = harness();
+        let pair =
+            tokens(post(&h.app, "/signup", creds("lea@example.io", "correct-horse")).await).await;
+        let body = json!({ "refresh_token": pair.refresh_token });
+        assert_eq!(
+            post(&h.app, "/logout", body.clone()).await.status(),
+            StatusCode::NO_CONTENT
+        );
+        assert_eq!(
+            post(&h.app, "/logout", body).await.status(),
+            StatusCode::NO_CONTENT
+        );
+    }
+
+    #[tokio::test]
+    async fn logout_without_bearer_revokes_only_the_refresh() {
+        let h = harness();
+        let pair =
+            tokens(post(&h.app, "/signup", creds("max@example.io", "correct-horse")).await).await;
+        let resp = post(
+            &h.app,
+            "/logout",
+            json!({ "refresh_token": pair.refresh_token }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        let refresh = post(
+            &h.app,
+            "/refresh",
+            json!({ "refresh_token": pair.refresh_token }),
+        )
+        .await;
+        assert_eq!(refresh.status(), StatusCode::UNAUTHORIZED);
+        // L'access non présenté reste valide jusqu'à son expiration (15 min).
+        assert_eq!(
+            whoami_status(&h.app, &pair.access_token).await,
+            StatusCode::OK
+        );
+    }
+
+    #[tokio::test]
+    async fn logout_ignores_a_bearer_of_another_user() {
+        let h = harness();
+        let alice =
+            tokens(post(&h.app, "/signup", creds("ann@example.io", "correct-horse")).await).await;
+        let bob =
+            tokens(post(&h.app, "/signup", creds("bob@example.io", "correct-horse")).await).await;
+        let resp = post_bearer(
+            &h.app,
+            "/logout",
+            &bob.access_token,
+            json!({ "refresh_token": alice.refresh_token }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        assert_eq!(
+            whoami_status(&h.app, &bob.access_token).await,
+            StatusCode::OK
+        );
+        // Un Bearer illisible n'empêche pas non plus la déconnexion.
+        let resp = post_bearer(
+            &h.app,
+            "/logout",
+            "x.y.z",
+            json!({ "refresh_token": bob.refresh_token }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn logout_rejects_what_is_not_a_valid_refresh() {
+        let h = harness();
+        let pair =
+            tokens(post(&h.app, "/signup", creds("ned@example.io", "correct-horse")).await).await;
+        for bad in [pair.access_token.as_str(), "x.y.z", ""] {
+            let resp = post(&h.app, "/logout", json!({ "refresh_token": bad })).await;
+            assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "{bad:?}");
+        }
+        // Refresh expiré : plus rien à révoquer, refusé comme invalide.
+        h.clock.advance(REFRESH_TTL_SECONDS + 1);
+        let resp = post(
+            &h.app,
+            "/logout",
+            json!({ "refresh_token": pair.refresh_token }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        let events = h.audit.list().await.unwrap();
+        assert!(!events.iter().any(|e| e.action == "auth.logout"));
+    }
+
+    #[tokio::test]
+    async fn logout_is_audited_under_the_user() {
+        let h = harness();
+        let pair =
+            tokens(post(&h.app, "/signup", creds("oli@example.io", "correct-horse")).await).await;
+        post(
+            &h.app,
+            "/logout",
+            json!({ "refresh_token": pair.refresh_token }),
+        )
+        .await;
+        let user = verify(&pair.access_token).sub;
+        let events = h.audit.list().await.unwrap();
+        assert!(events.iter().any(|e| e.action == "auth.logout"
+            && e.actor == user
+            && e.outcome == AuditOutcome::Success));
     }
 
     #[tokio::test]

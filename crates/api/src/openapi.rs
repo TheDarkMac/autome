@@ -33,6 +33,7 @@ use utoipa::{
         crate::accounts::signup,
         crate::accounts::login,
         crate::accounts::refresh,
+        crate::accounts::logout,
         // workflows (F7.1)
         crate::workflows::list_workflows,
         crate::workflows::create_workflow,
