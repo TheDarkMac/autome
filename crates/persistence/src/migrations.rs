@@ -79,6 +79,10 @@ pub const MIGRATIONS: &[(&str, &str)] = &[
         "0014_workflow_namespaces.sql",
         include_str!("../../../migrations/0014_workflow_namespaces.sql"),
     ),
+    (
+        "0015_throttle_keys.sql",
+        include_str!("../../../migrations/0015_throttle_keys.sql"),
+    ),
 ];
 
 fn storage_err(context: &str, e: impl std::fmt::Display) -> Error {

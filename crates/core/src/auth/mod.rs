@@ -24,8 +24,8 @@ pub use jwt::{Claims, TokenKind, TokenService};
 pub use password::{Argon2PasswordHasher, PasswordHasher};
 pub use revocation::{InMemoryRevocationStore, RevocationStore, TokenState};
 pub use throttle::{
-    InMemoryLoginThrottle, LoginAttempt, LoginThrottleStore, LOGIN_WINDOW_SECONDS,
-    MAX_LOGIN_FAILURES,
+    email_throttle_key, InMemoryLoginThrottle, LoginAttempt, LoginThrottleStore,
+    LOGIN_WINDOW_SECONDS, MAX_LOGIN_FAILURES,
 };
 pub use users::{
     normalize_email, validate_email, validate_password, CreateUser, InMemoryUserStore, UserRecord,

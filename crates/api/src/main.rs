@@ -6,9 +6,10 @@
 //! du domaine 7 (F7.*). Le middleware d'authentification (F6.1.c) vit dans
 //! [`autome_api::auth`].
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 
-use autome_api::accounts::{accounts_router, AccountsState};
+use autome_api::accounts::{accounts_router, AccountsState, IpThrottle};
 use autome_api::auth::protected_router;
 use autome_api::credentials::{credentials_router, CredentialsState};
 use autome_api::metrics::{metrics_router, with_metrics, Metrics};
@@ -80,14 +81,19 @@ fn build_router(backends: &Backends, accounts: AccountsState, metrics: Arc<Metri
     with_request_tracing(with_metrics(router, metrics))
 }
 
-/// État des endpoints de comptes : Argon2id sur les stores de `backends`.
-fn accounts_state(backends: &Backends) -> autome_core::Result<AccountsState> {
+/// État des endpoints de comptes : Argon2id sur les stores de `backends`,
+/// anti-bruteforce par email et par adresse IP (#190).
+fn accounts_state(
+    backends: &Backends,
+    ip_throttle: IpThrottle,
+) -> autome_core::Result<AccountsState> {
     Ok(AccountsState::new(
         backends.auth.clone(),
         backends.users.clone(),
         Arc::new(Argon2PasswordHasher::new()),
     )?
-    .with_throttle(backends.login_throttle.clone()))
+    .with_throttle(backends.login_throttle.clone())
+    .with_ip_throttle(ip_throttle))
 }
 
 #[tokio::main]
@@ -147,7 +153,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    let accounts = accounts_state(&backends)?;
+    // Anti-bruteforce par IP (#190) : configuration invalide ⇒ refus de démarrer.
+    let ip_throttle = IpThrottle::from_env(&config)?;
+    tracing::info!(
+        login_max = ip_throttle.login_max,
+        signup_max = ip_throttle.signup_max,
+        "limitation des tentatives par adresse IP"
+    );
+    let accounts = accounts_state(&backends, ip_throttle)?;
     let metrics = Arc::new(Metrics::new());
     let app = build_router(&backends, accounts, metrics);
 
@@ -162,7 +175,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let addr: std::net::SocketAddr = config.http_addr.parse()?;
             tracing::info!(profile = ?config.profile, %addr, tls = true, "autome-api en écoute (https)");
             axum_server::bind_rustls(addr, tls_config)
-                .serve(app.into_make_service())
+                // Adresse du pair : IP cliente de l'anti-bruteforce (#190).
+                .serve(app.into_make_service_with_connect_info::<SocketAddr>())
                 .await?;
         }
         (None, None) => {
@@ -173,7 +187,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 tls = false,
                 "autome-api en écoute (http)"
             );
-            axum::serve(listener, app).await?;
+            // Adresse du pair : IP cliente de l'anti-bruteforce (#190).
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await?;
         }
         _ => {
             return Err(
@@ -203,7 +222,8 @@ mod tests {
         let queue = std::sync::Arc::new(autome_core::InMemoryQueue::new());
         let backends =
             build_backends(&config, PersistenceMode::Memory, queue).expect("backends in-memory");
-        let accounts = accounts_state(&backends).expect("état comptes");
+        let ip_throttle = IpThrottle::from_source(&config, |_| None).expect("défauts");
+        let accounts = accounts_state(&backends, ip_throttle).expect("état comptes");
         let _app: Router = build_router(&backends, accounts, Arc::new(Metrics::new()));
     }
 }

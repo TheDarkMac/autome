@@ -13,7 +13,7 @@
 //!
 //! Contrat aligné sur le frontend (`frontend/src/auth.ts`) : 400 saisie
 //! invalide, 401 identifiants/jeton refusés, 409 email déjà pris, 429 trop
-//! d'échecs de connexion.
+//! de tentatives (`Retry-After`).
 //!
 //! Choix de sécurité :
 //! - **Argon2id** ([`PasswordHasher`]) exécuté dans `spawn_blocking` : ~50 ms
@@ -26,6 +26,14 @@
 //!   fenêtre, 429 jusqu'à sa fin. En mode `postgres`, le compteur est
 //!   **partagé** par toutes les répliques et survit aux redémarrages (#182) ;
 //!   une erreur du compteur refuse la connexion (fail closed).
+//! - **Anti-bruteforce par IP** ([`IpThrottle`], #190) : le compteur par email
+//!   ne voit ni la pulvérisation de mots de passe (quelques essais sur beaucoup
+//!   d'emails), ni le bourrage d'identifiants (un essai par email), ni
+//!   l'épuisement CPU (Argon2 sur des emails aléatoires). Par adresse IP
+//!   cliente : échecs de connexion (une connexion réussie rend sa tentative)
+//!   et tentatives d'inscription, chacun avec son quota. L'IP n'est ni stockée
+//!   ni journalisée : le compteur est indexé par un HMAC à clé secrète
+//!   (cf. [`crate::client_ip`]).
 //! - Le refresh réutilise [`autome_core::TokenService::rotate`] : le refresh
 //!   présenté est révoqué, un rejeu est refusé — y compris entre requêtes
 //!   concurrentes (révocation atomique `revoke_once`, #184).
@@ -42,16 +50,17 @@
 //!   `auth.signup` / `auth.login` / `auth.logout` / `auth.logout_all`.
 
 use std::collections::HashSet;
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use autome_core::{
-    normalize_email, validate_email, validate_password, AuditEvent, AuditOutcome, CreateUser,
-    InMemoryLoginThrottle, LoginAttempt, LoginThrottleStore, PasswordHasher, Role, TokenKind,
-    UserStore,
+    email_throttle_key, normalize_email, validate_email, validate_password, AuditEvent,
+    AuditOutcome, Config, CreateUser, InMemoryLoginThrottle, LoginAttempt, LoginThrottleStore,
+    PasswordHasher, Role, TokenKind, UserStore,
 };
 pub use autome_core::{LOGIN_WINDOW_SECONDS, MAX_LOGIN_FAILURES};
 use axum::{
-    extract::{FromRef, State},
+    extract::{ConnectInfo, FromRef, State},
     http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::post,
@@ -61,6 +70,7 @@ use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
 use crate::auth::{bearer_token, AuthState, AuthenticatedUser};
+use crate::client_ip::{ClientIpPolicy, IpKeyer};
 
 /// Durée de vie d'un access token (15 min).
 pub const ACCESS_TTL_SECONDS: i64 = 15 * 60;
@@ -68,6 +78,61 @@ pub const ACCESS_TTL_SECONDS: i64 = 15 * 60;
 pub const REFRESH_TTL_SECONDS: i64 = 7 * 24 * 3600;
 /// Mot de passe du hash leurre (jamais attribué à un compte).
 const DUMMY_PASSWORD: &str = "autome-dummy-password-for-timing";
+
+/// Quota par défaut des échecs de connexion par adresse IP et par fenêtre.
+pub const DEFAULT_LOGIN_IP_MAX_ATTEMPTS: u32 = 50;
+/// Quota par défaut des tentatives d'inscription par adresse IP et par fenêtre.
+pub const DEFAULT_SIGNUP_IP_MAX_ATTEMPTS: u32 = 10;
+
+/// Anti-bruteforce par adresse IP cliente (#190). Un quota à 0 désactive le
+/// compteur correspondant.
+#[derive(Debug, Clone)]
+pub struct IpThrottle {
+    /// Résolution de l'IP cliente (proxys de confiance).
+    pub policy: ClientIpPolicy,
+    /// Pseudonymisation de l'IP en clé de compteur.
+    pub keyer: IpKeyer,
+    /// Échecs de connexion tolérés par IP et par fenêtre.
+    pub login_max: u32,
+    /// Tentatives d'inscription tolérées par IP et par fenêtre.
+    pub signup_max: u32,
+}
+
+impl IpThrottle {
+    /// Depuis l'environnement : `AUTOME_TRUSTED_PROXIES`,
+    /// `AUTOME_LOGIN_IP_MAX_ATTEMPTS` (défaut 50), `AUTOME_SIGNUP_IP_MAX_ATTEMPTS`
+    /// (défaut 10) ; clé HMAC dérivée d'`ENCRYPTION_KEY`.
+    pub fn from_env(config: &Config) -> Result<Self, String> {
+        Self::from_source(config, |name| std::env::var(name).ok())
+    }
+
+    /// Comme [`from_env`](Self::from_env), variables lues via `get` (tests).
+    pub fn from_source(
+        config: &Config,
+        get: impl Fn(&str) -> Option<String>,
+    ) -> Result<Self, String> {
+        let quota = |name: &str, default: u32| match get(name) {
+            None => Ok(default),
+            Some(v) if v.trim().is_empty() => Ok(default),
+            Some(v) => v
+                .trim()
+                .parse::<u32>()
+                .map_err(|_| format!("{name} : entier ≥ 0 attendu, obtenu `{v}`")),
+        };
+        Ok(Self {
+            policy: ClientIpPolicy::parse(&get("AUTOME_TRUSTED_PROXIES").unwrap_or_default())?,
+            keyer: IpKeyer::from_config(config),
+            login_max: quota(
+                "AUTOME_LOGIN_IP_MAX_ATTEMPTS",
+                DEFAULT_LOGIN_IP_MAX_ATTEMPTS,
+            )?,
+            signup_max: quota(
+                "AUTOME_SIGNUP_IP_MAX_ATTEMPTS",
+                DEFAULT_SIGNUP_IP_MAX_ATTEMPTS,
+            )?,
+        })
+    }
+}
 
 /// État des handlers de comptes.
 #[derive(Clone)]
@@ -81,6 +146,8 @@ pub struct AccountsState {
     /// Anti-bruteforce du login (en mémoire par défaut ; partagé en
     /// PostgreSQL via [`with_throttle`](Self::with_throttle)).
     pub throttle: Arc<dyn LoginThrottleStore>,
+    /// Anti-bruteforce par IP (#190) ; `None` = désactivé (tests unitaires).
+    pub ip_throttle: Option<IpThrottle>,
     /// Permissions accordées à l'inscription (rôle `editor` par défaut).
     pub signup_permissions: HashSet<String>,
     /// Hash leurre vérifié quand l'email est inconnu (égalisation du temps).
@@ -101,6 +168,7 @@ impl AccountsState {
             users,
             hasher,
             throttle: Arc::new(InMemoryLoginThrottle::new()),
+            ip_throttle: None,
             signup_permissions: Role::editor().permissions,
             dummy_hash: dummy_hash.into(),
         })
@@ -110,6 +178,12 @@ impl AccountsState {
     /// répliques).
     pub fn with_throttle(mut self, throttle: Arc<dyn LoginThrottleStore>) -> Self {
         self.throttle = throttle;
+        self
+    }
+
+    /// Active l'anti-bruteforce par adresse IP (#190).
+    pub fn with_ip_throttle(mut self, ip_throttle: IpThrottle) -> Self {
+        self.ip_throttle = Some(ip_throttle);
         self
     }
 }
@@ -178,7 +252,7 @@ impl IntoResponse for AccountError {
             AccountError::TooManyAttempts(secs) => (
                 StatusCode::TOO_MANY_REQUESTS,
                 [(header::RETRY_AFTER, secs.to_string())],
-                "too many failed login attempts",
+                "too many attempts",
             )
                 .into_response(),
             AccountError::Internal(msg) => {
@@ -210,6 +284,66 @@ async fn audit(state: &AccountsState, actor: &str, action: &str, outcome: AuditO
         tracing::error!(action, error = %e, "événement d'audit non enregistré");
     }
 }
+
+/// Compteur IP `scope` de la requête : `(clé, quota)`, ou `None` si la
+/// limitation par IP est désactivée (quota 0) ou l'adresse du pair inconnue.
+fn ip_counter(
+    state: &AccountsState,
+    scope: &str,
+    peer: Option<SocketAddr>,
+    headers: &HeaderMap,
+) -> Option<(String, u32)> {
+    let ip = state.ip_throttle.as_ref()?;
+    let max = if scope == LOGIN_IP_SCOPE {
+        ip.login_max
+    } else {
+        ip.signup_max
+    };
+    if max == 0 {
+        return None;
+    }
+    let Some(peer) = peer else {
+        // Serveur monté sans `into_make_service_with_connect_info` : rien à
+        // compter. Le binaire le monte toujours.
+        tracing::warn!(
+            scope,
+            "adresse du pair inconnue : limitation par IP inactive"
+        );
+        return None;
+    };
+    let client = ip.policy.client_ip(peer.ip(), headers);
+    Some((ip.keyer.key(scope, client), max))
+}
+
+/// Réserve une tentative sur le compteur IP ; `Err(429)` si son quota est
+/// atteint. Ne journalise jamais l'adresse.
+async fn check_ip(
+    state: &AccountsState,
+    counter: &Option<(String, u32)>,
+    action: &str,
+    email: &str,
+    now: i64,
+) -> Result<(), AccountError> {
+    let Some((key, max)) = counter else {
+        return Ok(());
+    };
+    match state
+        .throttle
+        .begin_attempt(key, *max, now)
+        .await
+        .map_err(internal)?
+    {
+        LoginAttempt::Allowed => Ok(()),
+        LoginAttempt::Blocked { retry_after_secs } => {
+            tracing::info!(action, "quota de tentatives de l'adresse IP atteint");
+            audit(state, email, action, AuditOutcome::Denied).await;
+            Err(AccountError::TooManyAttempts(retry_after_secs))
+        }
+    }
+}
+
+const LOGIN_IP_SCOPE: &str = "login-ip";
+const SIGNUP_IP_SCOPE: &str = "signup-ip";
 
 fn token_response(access_token: String, refresh_token: String) -> TokenResponse {
     TokenResponse {
@@ -246,16 +380,24 @@ async fn issue_pair(state: &AccountsState, user_id: &str) -> Result<TokenRespons
     responses(
         (status = 201, description = "Compte créé", body = TokenResponse),
         (status = 400, description = "Email ou mot de passe invalide"),
-        (status = 409, description = "Email déjà enregistré")
+        (status = 409, description = "Email déjà enregistré"),
+        (status = 429, description = "Trop d'inscriptions depuis cette adresse — voir `Retry-After`")
     )
 )]
 pub async fn signup(
     State(state): State<AccountsState>,
+    peer: Option<ConnectInfo<SocketAddr>>,
+    headers: HeaderMap,
     Json(body): Json<CredentialsBody>,
 ) -> Result<(StatusCode, Json<TokenResponse>), AccountError> {
     let email = normalize_email(&body.email);
     validate_email(&email).map_err(|e| AccountError::BadRequest(e.to_string()))?;
     validate_password(&body.password).map_err(|e| AccountError::BadRequest(e.to_string()))?;
+    // Toute inscription compte (réussie ou non) : création de comptes en masse
+    // et Argon2 à volonté. Avant le hash, fail closed.
+    let ip = ip_counter(&state, SIGNUP_IP_SCOPE, peer.map(|c| c.0), &headers);
+    let now = state.auth.clock.now_unix_seconds();
+    check_ip(&state, &ip, "auth.signup", &email, now).await?;
 
     let hasher = Arc::clone(&state.hasher);
     let password = body.password;
@@ -289,19 +431,25 @@ pub async fn signup(
     responses(
         (status = 200, description = "Connecté", body = TokenResponse),
         (status = 401, description = "Identifiants invalides"),
-        (status = 429, description = "Trop d'échecs — voir `Retry-After`")
+        (status = 429, description = "Trop d'échecs (compte ou adresse IP) — voir `Retry-After`")
     )
 )]
 pub async fn login(
     State(state): State<AccountsState>,
+    peer: Option<ConnectInfo<SocketAddr>>,
+    headers: HeaderMap,
     Json(body): Json<CredentialsBody>,
 ) -> Result<Json<TokenResponse>, AccountError> {
     let email = normalize_email(&body.email);
+    let email_key = email_throttle_key(&email);
     let now = state.auth.clock.now_unix_seconds();
-    // Fail closed : sans compteur, pas de vérification de mot de passe.
+    // Fail closed : sans compteurs, pas de vérification de mot de passe. L'IP
+    // d'abord : un attaquant bloqué n'use plus les compteurs des emails visés.
+    let ip = ip_counter(&state, LOGIN_IP_SCOPE, peer.map(|c| c.0), &headers);
+    check_ip(&state, &ip, "auth.login", &email, now).await?;
     if let LoginAttempt::Blocked { retry_after_secs } = state
         .throttle
-        .begin_attempt(&email, now)
+        .begin_attempt(&email_key, MAX_LOGIN_FAILURES, now)
         .await
         .map_err(internal)?
     {
@@ -325,8 +473,15 @@ pub async fn login(
         Some(user) if matches => {
             // La connexion a réussi : un compteur non remis à zéro ne doit pas
             // la faire échouer (il expirera avec sa fenêtre).
-            if let Err(e) = state.throttle.reset(&email).await {
+            if let Err(e) = state.throttle.reset(&email_key).await {
                 tracing::warn!(error = %e, "remise à zéro du compteur de connexion impossible");
+            }
+            // Une connexion réussie ne compte pas dans le quota de son IP (NAT
+            // d'entreprise) ; seule sa propre réservation est rendue.
+            if let Some((key, _)) = &ip {
+                if let Err(e) = state.throttle.refund(key).await {
+                    tracing::warn!(error = %e, "remboursement du compteur IP impossible");
+                }
             }
             audit(&state, &user.id, "auth.login", AuditOutcome::Success).await;
             Ok(Json(issue_pair(&state, &user.id).await?))
@@ -532,6 +687,13 @@ mod tests {
     }
 
     fn harness_with(hasher: Arc<dyn PasswordHasher + Send + Sync>) -> Harness {
+        harness_full(hasher, None)
+    }
+
+    fn harness_full(
+        hasher: Arc<dyn PasswordHasher + Send + Sync>,
+        ip_throttle: Option<IpThrottle>,
+    ) -> Harness {
         let clock = Arc::new(MovableClock(Mutex::new(START)));
         let perms = Arc::new(InMemoryPermissionStore::new());
         let users = Arc::new(InMemoryUserStore::new(perms.clone()));
@@ -543,7 +705,10 @@ mod tests {
             audit.clone(),
         )
         .with_clock(clock.clone());
-        let accounts = AccountsState::new(auth.clone(), users.clone(), hasher).unwrap();
+        let mut accounts = AccountsState::new(auth.clone(), users.clone(), hasher).unwrap();
+        if let Some(ip) = ip_throttle {
+            accounts = accounts.with_ip_throttle(ip);
+        }
         let app = protected_router(auth).merge(accounts_router(accounts));
         Harness {
             app,
@@ -556,6 +721,35 @@ mod tests {
 
     fn harness() -> Harness {
         harness_with(Arc::new(PlainHasher))
+    }
+
+    /// Harness avec anti-bruteforce par IP (#190).
+    fn harness_ip(login_max: u32, signup_max: u32, trusted: &str) -> Harness {
+        let ip = IpThrottle {
+            policy: ClientIpPolicy::parse(trusted).unwrap(),
+            keyer: IpKeyer::new(b"test-ip-key"),
+            login_max,
+            signup_max,
+        };
+        harness_full(Arc::new(PlainHasher), Some(ip))
+    }
+
+    /// POST depuis le pair `peer`, avec un `X-Forwarded-For` éventuel.
+    async fn post_from(
+        app: &Router,
+        path: &str,
+        peer: &str,
+        xff: Option<&str>,
+        body: serde_json::Value,
+    ) -> Response {
+        let mut req = Request::post(path).header("content-type", "application/json");
+        if let Some(xff) = xff {
+            req = req.header("x-forwarded-for", xff);
+        }
+        let mut req = req.body(Body::from(body.to_string())).unwrap();
+        req.extensions_mut()
+            .insert(ConnectInfo(SocketAddr::new(peer.parse().unwrap(), 40_000)));
+        app.clone().oneshot(req).await.unwrap()
     }
 
     async fn post(app: &Router, path: &str, body: serde_json::Value) -> Response {
@@ -1058,6 +1252,315 @@ mod tests {
         assert!(events.iter().any(|e| e.action == "auth.logout_all"
             && e.actor == user
             && e.outcome == AuditOutcome::Success));
+    }
+
+    // ───── Anti-bruteforce par adresse IP (#190) ─────
+
+    const IP_A: &str = "198.51.100.7";
+    const IP_B: &str = "203.0.113.9";
+
+    #[tokio::test]
+    async fn password_spraying_from_one_ip_is_blocked_across_emails() {
+        let h = harness_ip(3, 50, "");
+        for i in 0..3 {
+            let r = post_from(
+                &h.app,
+                "/login",
+                IP_A,
+                None,
+                creds(&format!("victim{i}@example.io"), "Password123!"),
+            )
+            .await;
+            assert_eq!(r.status(), StatusCode::UNAUTHORIZED);
+        }
+        // Nouvel email, aucun échec sur ce compte : l'IP est bloquée.
+        let r = post_from(
+            &h.app,
+            "/login",
+            IP_A,
+            None,
+            creds("victim9@example.io", "Password123!"),
+        )
+        .await;
+        assert_eq!(r.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(r.headers().contains_key(header::RETRY_AFTER));
+        // Une autre adresse n'est pas concernée.
+        let r = post_from(
+            &h.app,
+            "/login",
+            IP_B,
+            None,
+            creds("victim9@example.io", "Password123!"),
+        )
+        .await;
+        assert_eq!(r.status(), StatusCode::UNAUTHORIZED);
+        // La fenêtre passée, l'adresse retrouve son quota.
+        h.clock.advance(LOGIN_WINDOW_SECONDS);
+        let r = post_from(
+            &h.app,
+            "/login",
+            IP_A,
+            None,
+            creds("victim9@example.io", "Password123!"),
+        )
+        .await;
+        assert_eq!(r.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn successful_logins_do_not_consume_the_ip_quota() {
+        let h = harness_ip(2, 50, "");
+        post_from(
+            &h.app,
+            "/signup",
+            IP_B,
+            None,
+            creds("nat@example.io", "correct-horse"),
+        )
+        .await;
+        // Bureau derrière un NAT : beaucoup de connexions réussies, une IP.
+        for _ in 0..10 {
+            let r = post_from(
+                &h.app,
+                "/login",
+                IP_A,
+                None,
+                creds("nat@example.io", "correct-horse"),
+            )
+            .await;
+            assert_eq!(r.status(), StatusCode::OK);
+        }
+        // Les échecs, eux, comptent — et un succès n'efface pas les précédents.
+        for _ in 0..2 {
+            let r = post_from(
+                &h.app,
+                "/login",
+                IP_A,
+                None,
+                creds("x@example.io", "wrong-horse"),
+            )
+            .await;
+            assert_eq!(r.status(), StatusCode::UNAUTHORIZED);
+        }
+        let r = post_from(
+            &h.app,
+            "/login",
+            IP_A,
+            None,
+            creds("nat@example.io", "correct-horse"),
+        )
+        .await;
+        assert_eq!(r.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[tokio::test]
+    async fn signup_is_limited_per_ip() {
+        let h = harness_ip(50, 2, "");
+        // Saisie invalide : refusée avant le compteur, ne compte pas.
+        let r = post_from(
+            &h.app,
+            "/signup",
+            IP_A,
+            None,
+            creds("not-an-email", "correct-horse"),
+        )
+        .await;
+        assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+        for i in 0..2 {
+            let r = post_from(
+                &h.app,
+                "/signup",
+                IP_A,
+                None,
+                creds(&format!("bulk{i}@example.io"), "correct-horse"),
+            )
+            .await;
+            assert_eq!(r.status(), StatusCode::CREATED);
+        }
+        let r = post_from(
+            &h.app,
+            "/signup",
+            IP_A,
+            None,
+            creds("bulk9@example.io", "correct-horse"),
+        )
+        .await;
+        assert_eq!(r.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(h
+            .users
+            .find_by_email("bulk9@example.io")
+            .await
+            .unwrap()
+            .is_none());
+        let r = post_from(
+            &h.app,
+            "/signup",
+            IP_B,
+            None,
+            creds("bulk9@example.io", "correct-horse"),
+        )
+        .await;
+        assert_eq!(r.status(), StatusCode::CREATED);
+        // Quotas séparés : l'inscription n'use pas celui de la connexion.
+        let r = post_from(
+            &h.app,
+            "/login",
+            IP_A,
+            None,
+            creds("bulk0@example.io", "correct-horse"),
+        )
+        .await;
+        assert_eq!(r.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn a_forged_forwarded_for_does_not_reset_the_quota() {
+        let h = harness_ip(1, 50, "");
+        let r = post_from(
+            &h.app,
+            "/login",
+            IP_A,
+            Some("1.1.1.1"),
+            creds("a@example.io", "nope-nope"),
+        )
+        .await;
+        assert_eq!(r.status(), StatusCode::UNAUTHORIZED);
+        // Le pair n'est pas un proxy de confiance : l'en-tête est ignoré.
+        let r = post_from(
+            &h.app,
+            "/login",
+            IP_A,
+            Some("2.2.2.2"),
+            creds("b@example.io", "nope-nope"),
+        )
+        .await;
+        assert_eq!(r.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[tokio::test]
+    async fn behind_a_trusted_proxy_each_client_has_its_own_quota() {
+        let h = harness_ip(1, 50, "10.0.0.0/8");
+        let ingress = "10.0.0.5";
+        let r = post_from(
+            &h.app,
+            "/login",
+            ingress,
+            Some(IP_A),
+            creds("a@example.io", "nope-nope"),
+        )
+        .await;
+        assert_eq!(r.status(), StatusCode::UNAUTHORIZED);
+        let r = post_from(
+            &h.app,
+            "/login",
+            ingress,
+            Some(IP_A),
+            creds("b@example.io", "nope-nope"),
+        )
+        .await;
+        assert_eq!(r.status(), StatusCode::TOO_MANY_REQUESTS);
+        // Autre client derrière le même ingress : non bloqué.
+        let r = post_from(
+            &h.app,
+            "/login",
+            ingress,
+            Some(IP_B),
+            creds("c@example.io", "nope-nope"),
+        )
+        .await;
+        assert_eq!(r.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn a_zero_quota_disables_the_ip_counter() {
+        let h = harness_ip(0, 0, "");
+        for i in 0..20 {
+            let r = post_from(
+                &h.app,
+                "/signup",
+                IP_A,
+                None,
+                creds(&format!("z{i}@example.io"), "correct-horse"),
+            )
+            .await;
+            assert_eq!(r.status(), StatusCode::CREATED);
+        }
+    }
+
+    #[tokio::test]
+    async fn the_ip_address_never_reaches_the_audit_trail() {
+        let h = harness_ip(1, 1, "");
+        post_from(
+            &h.app,
+            "/signup",
+            IP_A,
+            None,
+            creds("p1@example.io", "correct-horse"),
+        )
+        .await;
+        post_from(
+            &h.app,
+            "/signup",
+            IP_A,
+            None,
+            creds("p2@example.io", "correct-horse"),
+        )
+        .await;
+        post_from(
+            &h.app,
+            "/login",
+            IP_A,
+            None,
+            creds("p1@example.io", "wrong-horse"),
+        )
+        .await;
+        post_from(
+            &h.app,
+            "/login",
+            IP_A,
+            None,
+            creds("p1@example.io", "wrong-horse"),
+        )
+        .await;
+        let events = h.audit.list().await.unwrap();
+        assert!(events
+            .iter()
+            .any(|e| e.action == "auth.signup" && e.outcome == AuditOutcome::Denied));
+        assert!(events
+            .iter()
+            .any(|e| e.action == "auth.login" && e.outcome == AuditOutcome::Denied));
+        let dump = format!("{events:?}");
+        assert!(!dump.contains("198.51.100"), "IP présente dans l'audit");
+    }
+
+    #[test]
+    fn ip_throttle_configuration_from_the_environment() {
+        let config = Config::load(|_| None).unwrap();
+        let defaults = IpThrottle::from_source(&config, |_| None).unwrap();
+        assert_eq!(
+            (defaults.login_max, defaults.signup_max),
+            (
+                DEFAULT_LOGIN_IP_MAX_ATTEMPTS,
+                DEFAULT_SIGNUP_IP_MAX_ATTEMPTS
+            )
+        );
+        let custom = IpThrottle::from_source(&config, |name| match name {
+            "AUTOME_LOGIN_IP_MAX_ATTEMPTS" => Some("100".into()),
+            "AUTOME_SIGNUP_IP_MAX_ATTEMPTS" => Some(" 0 ".into()),
+            "AUTOME_TRUSTED_PROXIES" => Some("10.0.0.0/8".into()),
+            _ => None,
+        })
+        .unwrap();
+        assert_eq!((custom.login_max, custom.signup_max), (100, 0));
+        for (name, value) in [
+            ("AUTOME_LOGIN_IP_MAX_ATTEMPTS", "-1"),
+            ("AUTOME_SIGNUP_IP_MAX_ATTEMPTS", "lots"),
+            ("AUTOME_TRUSTED_PROXIES", "10.0.0.0/33"),
+        ] {
+            let err = IpThrottle::from_source(&config, |n| (n == name).then(|| value.into()))
+                .unwrap_err();
+            assert!(err.contains(name), "{err}");
+        }
     }
 
     #[tokio::test]

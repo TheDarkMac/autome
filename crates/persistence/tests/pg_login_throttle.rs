@@ -1,8 +1,9 @@
 //! Test d'intégration de [`PgLoginThrottle`] contre un **vrai** PostgreSQL.
 //! Gaté par `TEST_DATABASE_URL` (skip-pass sinon). Cf. `pg_revocation.rs`.
 //!
-//! Schéma créé depuis la migration réelle `0012`. Les tests partagent la table
-//! et tournent en parallèle : chacun utilise ses propres emails.
+//! Schéma créé depuis les migrations réelles `0012` et `0015`. Les tests
+//! partagent la table et tournent en parallèle : chacun utilise ses propres
+//! clés.
 
 use std::sync::Arc;
 
@@ -21,11 +22,17 @@ async fn setup() -> Option<(PgLoginThrottle, PgLoginThrottle)> {
     let replica_b = connect(&url).expect("pool b");
     SCHEMA
         .get_or_init(|| async {
-            let ddl = MIGRATIONS
+            let ddl: String = ["0012_login_attempts.sql", "0015_throttle_keys.sql"]
                 .iter()
-                .find(|(name, _)| *name == "0012_login_attempts.sql")
-                .map(|(_, sql)| *sql)
-                .expect("migration 0012 embarquée");
+                .map(|wanted| {
+                    MIGRATIONS
+                        .iter()
+                        .find(|(name, _)| name == wanted)
+                        .map(|(_, sql)| *sql)
+                        .expect("migration embarquée")
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
             replica_a
                 .get()
                 .await
@@ -57,7 +64,7 @@ async fn concurrent_burst_across_replicas_never_exceeds_the_quota() {
         };
         tasks.push(tokio::spawn(async move {
             store
-                .begin_attempt("burst@example.io", START)
+                .begin_attempt("burst@example.io", MAX_LOGIN_FAILURES, START)
                 .await
                 .unwrap()
         }));
@@ -74,7 +81,7 @@ async fn concurrent_burst_across_replicas_never_exceeds_the_quota() {
     );
     // L'autre réplique voit le même blocage.
     assert_eq!(
-        b.begin_attempt("burst@example.io", START + 60)
+        b.begin_attempt("burst@example.io", MAX_LOGIN_FAILURES, START + 60)
             .await
             .unwrap(),
         LoginAttempt::Blocked {
@@ -90,40 +97,109 @@ async fn window_expiry_reset_and_gc() {
         return;
     };
     for _ in 0..=MAX_LOGIN_FAILURES {
-        a.begin_attempt("win@example.io", START).await.unwrap();
+        a.begin_attempt("win@example.io", MAX_LOGIN_FAILURES, START)
+            .await
+            .unwrap();
     }
     assert!(matches!(
-        a.begin_attempt("win@example.io", START + 1).await.unwrap(),
+        a.begin_attempt("win@example.io", MAX_LOGIN_FAILURES, START + 1)
+            .await
+            .unwrap(),
         LoginAttempt::Blocked { .. }
     ));
     // Fenêtre écoulée : nouveau départ, les refus ne l'ont pas prolongée.
     assert_eq!(
-        b.begin_attempt("win@example.io", START + LOGIN_WINDOW_SECONDS)
-            .await
-            .unwrap(),
+        b.begin_attempt(
+            "win@example.io",
+            MAX_LOGIN_FAILURES,
+            START + LOGIN_WINDOW_SECONDS
+        )
+        .await
+        .unwrap(),
         LoginAttempt::Allowed
     );
 
     // Connexion réussie sur une réplique ⇒ compteur remis à zéro pour toutes.
     for _ in 0..=MAX_LOGIN_FAILURES {
-        a.begin_attempt("reset@example.io", START).await.unwrap();
+        a.begin_attempt("reset@example.io", MAX_LOGIN_FAILURES, START)
+            .await
+            .unwrap();
     }
     b.reset("reset@example.io").await.unwrap();
     assert_eq!(
-        a.begin_attempt("reset@example.io", START).await.unwrap(),
+        a.begin_attempt("reset@example.io", MAX_LOGIN_FAILURES, START)
+            .await
+            .unwrap(),
         LoginAttempt::Allowed
     );
 
     // Purge : seule la fenêtre expirée disparaît.
-    a.begin_attempt("gc-old@example.io", START - LOGIN_WINDOW_SECONDS)
+    a.begin_attempt(
+        "gc-old@example.io",
+        MAX_LOGIN_FAILURES,
+        START - LOGIN_WINDOW_SECONDS,
+    )
+    .await
+    .unwrap();
+    a.begin_attempt("gc-new@example.io", MAX_LOGIN_FAILURES, START)
         .await
         .unwrap();
-    a.begin_attempt("gc-new@example.io", START).await.unwrap();
     let removed = a.gc(START).await.unwrap();
     assert!(removed >= 1, "fenêtre expirée purgée");
     assert_eq!(
-        a.begin_attempt("gc-new@example.io", START).await.unwrap(),
+        a.begin_attempt("gc-new@example.io", MAX_LOGIN_FAILURES, START)
+            .await
+            .unwrap(),
         LoginAttempt::Allowed,
         "fenêtre courante conservée (2ᵉ tentative)"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn quota_per_call_and_concurrent_refunds_across_replicas() {
+    let Some((a, b)) = setup().await else {
+        eprintln!("TEST_DATABASE_URL absent → test PostgreSQL sauté");
+        return;
+    };
+    // Compteur d'IP (#190) : quota plus large que celui d'un email.
+    let key = "login-ip:test-refund";
+    for _ in 0..10 {
+        assert_eq!(
+            a.begin_attempt(key, 10, START).await.unwrap(),
+            LoginAttempt::Allowed
+        );
+    }
+    assert!(matches!(
+        b.begin_attempt(key, 10, START).await.unwrap(),
+        LoginAttempt::Blocked { .. }
+    ));
+
+    // 30 remboursements concurrents sur deux répliques : le compteur (11)
+    // redescend à 0 et jamais en dessous (contrainte `attempts >= 0`).
+    let (a, b) = (Arc::new(a), Arc::new(b));
+    let tasks: Vec<_> = (0..30)
+        .map(|i| {
+            let store = if i % 2 == 0 {
+                Arc::clone(&a)
+            } else {
+                Arc::clone(&b)
+            };
+            tokio::spawn(async move { store.refund(key).await.unwrap() })
+        })
+        .collect();
+    for t in tasks {
+        t.await.unwrap();
+    }
+    for _ in 0..10 {
+        assert_eq!(
+            a.begin_attempt(key, 10, START).await.unwrap(),
+            LoginAttempt::Allowed
+        );
+    }
+    assert!(matches!(
+        b.begin_attempt(key, 10, START).await.unwrap(),
+        LoginAttempt::Blocked { .. }
+    ));
+    // Rembourser une clé inconnue ne crée rien.
+    a.refund("login-ip:absent").await.unwrap();
 }
