@@ -54,6 +54,21 @@ impl RevocationStore for PgRevocationStore {
         Ok(())
     }
 
+    async fn revoke_once(&self, jti: &str, exp_ms: i64) -> autome_core::Result<bool> {
+        let client = self.pool.get().await.map_err(|e| storage_err("pool", e))?;
+        // Une seule instruction : la contrainte de clé primaire départage les
+        // appels concurrents, y compris d'une réplique à l'autre (#184).
+        let inserted = client
+            .execute(
+                "INSERT INTO revoked_tokens (jti, exp_ms) VALUES ($1, $2) \
+                 ON CONFLICT (jti) DO NOTHING",
+                &[&jti, &exp_ms],
+            )
+            .await
+            .map_err(|e| storage_err("revoke_once", e))?;
+        Ok(inserted == 1)
+    }
+
     async fn gc(&self, now_ms: i64) -> autome_core::Result<usize> {
         let client = self.pool.get().await.map_err(|e| storage_err("pool", e))?;
         let n = client
