@@ -11,6 +11,7 @@ pub mod action;
 pub mod audit;
 pub mod auth;
 pub mod config;
+pub mod health;
 pub mod queue;
 pub mod rbac;
 pub mod run_dispatch;
@@ -30,6 +31,7 @@ pub use auth::{
     TokenState, UserRecord, UserStore, LOGIN_WINDOW_SECONDS, MAX_LOGIN_FAILURES,
 };
 pub use config::{Config, Profile, Secret};
+pub use health::HealthCheck;
 pub use queue::{dlq_of, BoundedQueue, Delivery, DeliveryId, InMemoryQueue, Message, Nack, Queue};
 pub use rbac::{
     has_permission, InMemoryPermissionStore, Permission, PermissionStore, Role,

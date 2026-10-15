@@ -122,3 +122,17 @@ async fn reconnects_after_losing_the_connection_and_ignores_stale_acks() {
     assert_eq!(seen, vec![(1, 1), (2, 0)], "1 redélivré, 2 neuf");
     assert_eq!(q.depth(&name).await.unwrap(), 0);
 }
+
+/// Sonde de disponibilité (#192) : `ping` fait un aller-retour réel et rouvre
+/// la connexion perdue, comme les autres opérations.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ping_round_trips_and_reconnects_after_a_lost_connection() {
+    let Some(url) = std::env::var("TEST_AMQP_URL").ok() else {
+        eprintln!("TEST_AMQP_URL absent → test RabbitMQ sauté");
+        return;
+    };
+    let queue = RabbitMqQueue::connect(&url).await.expect("connexion");
+    queue.ping().await.expect("ping nominal");
+    queue.close_connection_for_tests().await;
+    queue.ping().await.expect("ping après reconnexion");
+}
