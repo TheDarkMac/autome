@@ -9,6 +9,7 @@
 //! | POST    | `/auth/login`   | `{ email, password }`   | 200 + [`TokenResponse`]     |
 //! | POST    | `/auth/refresh` | `{ refresh_token }`     | 200 + [`TokenResponse`]     |
 //! | POST    | `/auth/logout`  | `{ refresh_token }`     | 204                         |
+//! | POST    | `/auth/logout-all` | — (Bearer requis)    | 204                         |
 //!
 //! Contrat aligné sur le frontend (`frontend/src/auth.ts`) : 400 saisie
 //! invalide, 401 identifiants/jeton refusés, 409 email déjà pris, 429 trop
@@ -32,8 +33,13 @@
 //!   fourni en `Authorization: Bearer`, l'access token de la même session :
 //!   vider le stockage du client ne suffit pas, un jeton copié resterait
 //!   valide jusqu'à son expiration.
+//! - Le logout-all (#186) ferme **toutes** les sessions de l'utilisateur, sur
+//!   tous les appareils : il incrémente sa version de session, que portent
+//!   tous ses jetons (claim `sv`) ; ceux émis avant sont refusés partout,
+//!   access comme refresh. Les jetons sont toujours émis à la version
+//!   courante.
 //! - Chaque inscription/connexion/déconnexion produit un event d'audit
-//!   `auth.signup` / `auth.login` / `auth.logout`.
+//!   `auth.signup` / `auth.login` / `auth.logout` / `auth.logout_all`.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -45,7 +51,7 @@ use autome_core::{
 };
 pub use autome_core::{LOGIN_WINDOW_SECONDS, MAX_LOGIN_FAILURES};
 use axum::{
-    extract::State,
+    extract::{FromRef, State},
     http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::post,
@@ -54,7 +60,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
-use crate::auth::{bearer_token, AuthState};
+use crate::auth::{bearer_token, AuthState, AuthenticatedUser};
 
 /// Durée de vie d'un access token (15 min).
 pub const ACCESS_TTL_SECONDS: i64 = 15 * 60;
@@ -105,6 +111,13 @@ impl AccountsState {
     pub fn with_throttle(mut self, throttle: Arc<dyn LoginThrottleStore>) -> Self {
         self.throttle = throttle;
         self
+    }
+}
+
+// Permet l'extracteur [`AuthenticatedUser`] sur `/auth/logout-all`.
+impl FromRef<AccountsState> for AuthState {
+    fn from_ref(input: &AccountsState) -> Self {
+        input.auth.clone()
     }
 }
 
@@ -198,19 +211,30 @@ async fn audit(state: &AccountsState, actor: &str, action: &str, outcome: AuditO
     }
 }
 
-fn issue_pair(state: &AccountsState, user_id: &str) -> Result<TokenResponse, AccountError> {
-    let now = state.auth.clock.now_unix_seconds();
-    let svc = &state.auth.token_service;
-    Ok(TokenResponse {
-        access_token: svc
-            .issue_access(user_id, ACCESS_TTL_SECONDS, now)
-            .map_err(internal)?,
-        refresh_token: svc
-            .issue_refresh(user_id, REFRESH_TTL_SECONDS, now)
-            .map_err(internal)?,
+fn token_response(access_token: String, refresh_token: String) -> TokenResponse {
+    TokenResponse {
+        access_token,
+        refresh_token,
         token_type: "Bearer".into(),
         expires_in: ACCESS_TTL_SECONDS,
-    })
+    }
+}
+
+/// Émet une paire à la version de session courante de l'utilisateur (#186).
+async fn issue_pair(state: &AccountsState, user_id: &str) -> Result<TokenResponse, AccountError> {
+    let sv = state
+        .auth
+        .revocation
+        .session_version(user_id)
+        .await
+        .map_err(internal)?;
+    let now = state.auth.clock.now_unix_seconds();
+    let (access, refresh) = state
+        .auth
+        .token_service
+        .issue_pair(user_id, sv, ACCESS_TTL_SECONDS, REFRESH_TTL_SECONDS, now)
+        .map_err(internal)?;
+    Ok(token_response(access, refresh))
 }
 
 /// `POST /auth/signup` — crée un compte (rôle `editor`) et le connecte.
@@ -250,7 +274,10 @@ pub async fn signup(
         }
     };
     audit(&state, &user.id, "auth.signup", AuditOutcome::Success).await;
-    Ok((StatusCode::CREATED, Json(issue_pair(&state, &user.id)?)))
+    Ok((
+        StatusCode::CREATED,
+        Json(issue_pair(&state, &user.id).await?),
+    ))
 }
 
 /// `POST /auth/login` — échange email + mot de passe contre une paire de jetons.
@@ -302,7 +329,7 @@ pub async fn login(
                 tracing::warn!(error = %e, "remise à zéro du compteur de connexion impossible");
             }
             audit(&state, &user.id, "auth.login", AuditOutcome::Success).await;
-            Ok(Json(issue_pair(&state, &user.id)?))
+            Ok(Json(issue_pair(&state, &user.id).await?))
         }
         _ => {
             audit(&state, &email, "auth.login", AuditOutcome::Failure).await;
@@ -340,12 +367,7 @@ pub async fn refresh(
         )
         .await
         .map_err(|_| AccountError::Unauthorized)?;
-    Ok(Json(TokenResponse {
-        access_token,
-        refresh_token,
-        token_type: "Bearer".into(),
-        expires_in: ACCESS_TTL_SECONDS,
-    }))
+    Ok(Json(token_response(access_token, refresh_token)))
 }
 
 /// `POST /auth/logout` — ferme la session côté serveur.
@@ -402,7 +424,49 @@ pub async fn logout(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// Sous-router public `/signup`, `/login`, `/refresh`, `/logout` — à imbriquer sous
+/// `POST /auth/logout-all` — ferme toutes les sessions de l'utilisateur
+/// authentifié, sur tous les appareils, y compris celle de la requête.
+///
+/// Incrémente sa version de session : tous ses access et refresh tokens émis
+/// jusqu'ici sont refusés (401) ; une nouvelle connexion ouvre une session
+/// valide. Réponse 204.
+#[utoipa::path(
+    post,
+    path = "/auth/logout-all",
+    tag = "auth",
+    responses(
+        (status = 204, description = "Toutes les sessions sont fermées"),
+        (status = 401, description = "Access token absent, invalide ou déjà révoqué")
+    ),
+    security(("bearer" = []))
+)]
+pub async fn logout_all(
+    user: AuthenticatedUser,
+    State(state): State<AccountsState>,
+) -> Result<StatusCode, AccountError> {
+    let version = state
+        .auth
+        .revocation
+        .bump_session_version(user.user_id())
+        .await
+        .map_err(internal)?;
+    tracing::info!(
+        user_id = user.user_id(),
+        session_version = version,
+        "toutes les sessions fermées"
+    );
+    audit(
+        &state,
+        user.user_id(),
+        "auth.logout_all",
+        AuditOutcome::Success,
+    )
+    .await;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Sous-router `/signup`, `/login`, `/refresh`, `/logout` (publics) et
+/// `/logout-all` (Bearer) — à imbriquer sous
 /// `/auth` avec [`crate::auth::protected_router`].
 pub fn accounts_router(state: AccountsState) -> Router {
     Router::new()
@@ -410,6 +474,7 @@ pub fn accounts_router(state: AccountsState) -> Router {
         .route("/login", post(login))
         .route("/refresh", post(refresh))
         .route("/logout", post(logout))
+        .route("/logout-all", post(logout_all))
         .with_state(state)
 }
 
@@ -878,6 +943,119 @@ mod tests {
         let user = verify(&pair.access_token).sub;
         let events = h.audit.list().await.unwrap();
         assert!(events.iter().any(|e| e.action == "auth.logout"
+            && e.actor == user
+            && e.outcome == AuditOutcome::Success));
+    }
+
+    async fn refresh_status(app: &Router, refresh_token: &str) -> StatusCode {
+        post(app, "/refresh", json!({ "refresh_token": refresh_token }))
+            .await
+            .status()
+    }
+
+    #[tokio::test]
+    async fn logout_all_closes_every_session_of_the_user() {
+        let h = harness();
+        let laptop =
+            tokens(post(&h.app, "/signup", creds("pia@example.io", "correct-horse")).await).await;
+        let phone =
+            tokens(post(&h.app, "/login", creds("pia@example.io", "correct-horse")).await).await;
+        // Session rafraîchie avant la déconnexion générale : concernée aussi.
+        let rotated = tokens(
+            post(
+                &h.app,
+                "/refresh",
+                json!({ "refresh_token": phone.refresh_token }),
+            )
+            .await,
+        )
+        .await;
+        let bob =
+            tokens(post(&h.app, "/signup", creds("bob@example.io", "correct-horse")).await).await;
+
+        let resp = post_bearer(&h.app, "/logout-all", &laptop.access_token, json!({})).await;
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+        for pair in [&laptop, &rotated] {
+            assert_eq!(
+                whoami_status(&h.app, &pair.access_token).await,
+                StatusCode::UNAUTHORIZED
+            );
+            assert_eq!(
+                refresh_status(&h.app, &pair.refresh_token).await,
+                StatusCode::UNAUTHORIZED
+            );
+        }
+        // Les autres utilisateurs ne sont pas touchés.
+        assert_eq!(
+            whoami_status(&h.app, &bob.access_token).await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            refresh_status(&h.app, &bob.refresh_token).await,
+            StatusCode::OK
+        );
+
+        // Une nouvelle connexion ouvre une session valide, à la nouvelle version.
+        let again =
+            tokens(post(&h.app, "/login", creds("pia@example.io", "correct-horse")).await).await;
+        assert_eq!(verify(&again.access_token).sv, 1);
+        assert_eq!(
+            whoami_status(&h.app, &again.access_token).await,
+            StatusCode::OK
+        );
+        let next = tokens(
+            post(
+                &h.app,
+                "/refresh",
+                json!({ "refresh_token": again.refresh_token }),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(verify(&next.refresh_token).sv, 1);
+        assert_eq!(
+            whoami_status(&h.app, &next.access_token).await,
+            StatusCode::OK
+        );
+    }
+
+    #[tokio::test]
+    async fn logout_all_requires_an_access_token() {
+        let h = harness();
+        let pair = tokens(
+            post(
+                &h.app,
+                "/signup",
+                creds("quinn@example.io", "correct-horse"),
+            )
+            .await,
+        )
+        .await;
+        let missing = post(&h.app, "/logout-all", json!({})).await;
+        assert_eq!(missing.status(), StatusCode::UNAUTHORIZED);
+        let with_refresh = post_bearer(&h.app, "/logout-all", &pair.refresh_token, json!({})).await;
+        assert_eq!(with_refresh.status(), StatusCode::UNAUTHORIZED);
+        // Rien n'a été fermé.
+        assert_eq!(
+            whoami_status(&h.app, &pair.access_token).await,
+            StatusCode::OK
+        );
+        // Un second logout-all avec un jeton déjà fermé est refusé.
+        post_bearer(&h.app, "/logout-all", &pair.access_token, json!({})).await;
+        let again = post_bearer(&h.app, "/logout-all", &pair.access_token, json!({})).await;
+        assert_eq!(again.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn logout_all_is_audited_under_the_user() {
+        let h = harness();
+        let pair =
+            tokens(post(&h.app, "/signup", creds("rae@example.io", "correct-horse")).await).await;
+        post_bearer(&h.app, "/logout-all", &pair.access_token, json!({})).await;
+        let user = verify(&pair.access_token).sub;
+        let events = h.audit.list().await.unwrap();
+        assert!(events.iter().any(|e| e.action == "auth.logout_all"
             && e.actor == user
             && e.outcome == AuditOutcome::Success));
     }
