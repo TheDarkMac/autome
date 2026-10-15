@@ -7,7 +7,8 @@
 //! sans risque d'accepter un token qui aurait été révoqué avant expiration.
 //!
 //! L'impl in-process [`InMemoryRevocationStore`] suffit en mode single-node
-//! et pour les tests. Une impl Redis viendra plus tard (multi-replica).
+//! et pour les tests ; `PgRevocationStore` (crate `autome-persistence`) la
+//! partage entre répliques.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -29,6 +30,15 @@ pub trait RevocationStore: Send + Sync {
     /// Marque `jti` comme révoqué jusqu'à `exp_ms` (millisecondes Unix).
     /// Idempotent : ré-appeler ne change rien si le `exp_ms` est ≤.
     async fn revoke(&self, jti: &str, exp_ms: i64) -> Result<()>;
+
+    /// Révoque `jti` jusqu'à `exp_ms` **seulement s'il ne l'était pas**, en une
+    /// opération atomique. `true` : cet appel l'a révoqué ; `false` : il l'était
+    /// déjà (entrée laissée telle quelle).
+    ///
+    /// Sert les jetons à usage unique (rotation du refresh, #184) : sur N appels
+    /// concurrents — même répartis sur plusieurs répliques — un seul obtient
+    /// `true`, là où `is_revoked` puis `revoke` laisseraient passer les N.
+    async fn revoke_once(&self, jti: &str, exp_ms: i64) -> Result<bool>;
 
     /// Supprime les entrées dont `exp_ms` est `<= now_ms` (GC manuel).
     /// Retourne le nombre d'entrées supprimées.
@@ -73,6 +83,18 @@ impl RevocationStore for InMemoryRevocationStore {
         Ok(())
     }
 
+    async fn revoke_once(&self, jti: &str, exp_ms: i64) -> Result<bool> {
+        let mut map = self
+            .inner
+            .lock()
+            .map_err(|_| Error::Invalid("revocation lock empoisonné".into()))?;
+        if map.contains_key(jti) {
+            return Ok(false);
+        }
+        map.insert(jti.to_string(), exp_ms);
+        Ok(true)
+    }
+
     async fn gc(&self, now_ms: i64) -> Result<usize> {
         let mut map = self
             .inner
@@ -113,6 +135,42 @@ mod tests {
             s.is_revoked("j").await.unwrap(),
             "exp=2000 doit survivre à gc(1500)"
         );
+    }
+
+    #[tokio::test]
+    async fn revoke_once_succeeds_only_the_first_time() {
+        let s = InMemoryRevocationStore::new();
+        assert!(s.revoke_once("j", 1_000).await.unwrap());
+        assert!(s.is_revoked("j").await.unwrap());
+        assert!(!s.revoke_once("j", 2_000).await.unwrap());
+        // Déjà révoqué par `revoke` : `revoke_once` ne réussit pas non plus.
+        s.revoke("k", 1_000).await.unwrap();
+        assert!(!s.revoke_once("k", 1_000).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn revoke_once_leaves_existing_entry_untouched() {
+        let s = InMemoryRevocationStore::new();
+        s.revoke("j", 1_000).await.unwrap();
+        assert!(!s.revoke_once("j", 9_000).await.unwrap());
+        s.gc(1_000).await.unwrap();
+        assert!(!s.is_revoked("j").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn concurrent_revoke_once_has_a_single_winner() {
+        let s = std::sync::Arc::new(InMemoryRevocationStore::new());
+        let tasks: Vec<_> = (0..16)
+            .map(|_| {
+                let s = s.clone();
+                tokio::spawn(async move { s.revoke_once("j", 1_000).await.unwrap() })
+            })
+            .collect();
+        let mut winners = 0;
+        for t in tasks {
+            winners += usize::from(t.await.unwrap());
+        }
+        assert_eq!(winners, 1);
     }
 
     #[tokio::test]

@@ -154,15 +154,17 @@ impl TokenService {
                 "rotation : un access token n'est pas rotable".into(),
             ));
         }
-        if store.is_revoked(&claims.jti).await? {
+        // Vérification et révocation en une seule opération atomique : de N
+        // rotations concurrentes du même refresh, une seule passe (#184).
+        // exp en ms = exp (secondes) * 1000
+        if !store
+            .revoke_once(&claims.jti, claims.exp.saturating_mul(1_000))
+            .await?
+        {
             return Err(Error::Invalid(
                 "rotation : refresh token déjà révoqué".into(),
             ));
         }
-        // exp en ms = exp (secondes) * 1000
-        store
-            .revoke(&claims.jti, claims.exp.saturating_mul(1_000))
-            .await?;
         let access = self.issue_access(&claims.sub, access_ttl_seconds, now)?;
         let refresh = self.issue_refresh(&claims.sub, refresh_ttl_seconds, now)?;
         Ok((access, refresh))
@@ -278,6 +280,28 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, Error::Invalid(ref m) if m.contains("révoqué")));
+    }
+
+    #[tokio::test]
+    async fn concurrent_rotations_of_one_refresh_have_a_single_winner() {
+        let s = std::sync::Arc::new(svc());
+        let store = std::sync::Arc::new(InMemoryRevocationStore::new());
+        let refresh = s.issue_refresh("u", 3_600, NOW).unwrap();
+        let tasks: Vec<_> = (0..16)
+            .map(|_| {
+                let (s, store, refresh) = (s.clone(), store.clone(), refresh.clone());
+                tokio::spawn(async move {
+                    s.rotate(&refresh, store.as_ref(), 900, 3_600, NOW + 10)
+                        .await
+                        .is_ok()
+                })
+            })
+            .collect();
+        let mut winners = 0;
+        for t in tasks {
+            winners += usize::from(t.await.unwrap());
+        }
+        assert_eq!(winners, 1, "un refresh ne sert qu'une fois");
     }
 
     #[tokio::test]

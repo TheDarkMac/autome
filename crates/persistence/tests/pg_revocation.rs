@@ -10,6 +10,8 @@
 //!   cargo test -p autome-persistence --test pg_revocation
 //! ```
 
+use std::sync::Arc;
+
 use autome_core::RevocationStore;
 use autome_persistence::{connect, PgRevocationStore};
 
@@ -29,7 +31,7 @@ async fn setup() -> Option<PgRevocationStore> {
 }
 
 #[tokio::test]
-async fn revoke_is_revoked_idempotence_and_gc() {
+async fn revoke_is_revoked_idempotence_gc_and_revoke_once() {
     let Some(store) = setup().await else {
         eprintln!("TEST_DATABASE_URL absent → test PostgreSQL sauté");
         return;
@@ -55,4 +57,36 @@ async fn revoke_is_revoked_idempotence_and_gc() {
 
     assert_eq!(store.gc(10_000).await.unwrap(), 1);
     assert!(!store.is_revoked("jti-a").await.unwrap());
+
+    // `revoke_once` (#184) : réussit une seule fois, ne touche pas une entrée
+    // existante.
+    assert!(store.revoke_once("jti-once", 4_000).await.unwrap());
+    assert!(store.is_revoked("jti-once").await.unwrap());
+    assert!(!store.revoke_once("jti-once", 9_000).await.unwrap());
+    store.gc(4_000).await.unwrap();
+    assert!(
+        !store.is_revoked("jti-once").await.unwrap(),
+        "exp_ms d'origine conservé"
+    );
+
+    // Rafale concurrente répartie sur deux pools (deux répliques de l'API) :
+    // un seul gagnant — c'est ce qui garantit l'usage unique d'un refresh.
+    let url = std::env::var("TEST_DATABASE_URL").unwrap();
+    let other = Arc::new(PgRevocationStore::new(connect(&url).expect("pool")));
+    let store = Arc::new(store);
+    let tasks: Vec<_> = (0..20)
+        .map(|i| {
+            let s: Arc<PgRevocationStore> = if i % 2 == 0 {
+                store.clone()
+            } else {
+                other.clone()
+            };
+            tokio::spawn(async move { s.revoke_once("jti-race", 9_000).await.unwrap() })
+        })
+        .collect();
+    let mut winners = 0;
+    for t in tasks {
+        winners += usize::from(t.await.unwrap());
+    }
+    assert_eq!(winners, 1);
 }
