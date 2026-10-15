@@ -14,9 +14,11 @@
 //!
 //! **Isolation par propriétaire** (backlog BOLA) : un run appartient au
 //! propriétaire de son workflow au moment du dispatch (`RunCheckpoint::owner_id`).
-//! Démarrer un run sur le workflow d'autrui ou lire le run d'autrui répond 404 ;
-//! la liste ne contient que les runs de l'appelant (vide pour le workflow
-//! d'autrui, comme pour un workflow inconnu). Super-admin (`*`) : tout.
+//! Les routes `/workflows/{id}/runs` opèrent dans l'espace d'ids de workflow
+//! de l'appelant (#188, cf. [`crate::workflows`]) : démarrer un run vise son
+//! propre workflow `id`, la liste ne contient que ses runs. Lire le run
+//! d'autrui répond 404. Un super-admin (`*`) vise l'espace d'un autre avec
+//! `?owner=<user_id>` et lit tout run par son id.
 
 use std::sync::Arc;
 
@@ -36,6 +38,7 @@ use serde_json::Value;
 use utoipa::{IntoParams, ToSchema};
 
 use crate::auth::{AuthError, AuthState, AuthenticatedUser};
+use crate::workflows::NamespaceQuery;
 
 /// État partagé par les handlers runs : auth + dispatcher + stores.
 #[derive(Clone)]
@@ -99,7 +102,7 @@ pub struct CreateRunResponse {
     pub status: String,
 }
 
-/// Paramètres de query pour la pagination (`?offset=0&limit=50`).
+/// Paramètres de query de la liste (`?offset=0&limit=50&owner=`).
 #[derive(Debug, Deserialize, IntoParams)]
 pub struct ListQuery {
     /// Offset, défaut 0.
@@ -108,6 +111,10 @@ pub struct ListQuery {
     /// Limite, défaut 50.
     #[serde(default)]
     pub limit: Option<usize>,
+    /// Espace d'ids de workflow d'un autre utilisateur (super-admin
+    /// seulement) — cf. [`NamespaceQuery`].
+    #[serde(default)]
+    pub owner: Option<String>,
 }
 
 /// Réponse JSON de la liste paginée.
@@ -170,13 +177,16 @@ async fn audit_event(
     post,
     path = "/workflows/{id}/runs",
     tag = "runs",
-    params(("id" = String, Path, description = "Identifiant du workflow à exécuter")),
+    params(
+        ("id" = String, Path, description = "Identifiant du workflow à exécuter"),
+        NamespaceQuery
+    ),
     request_body(content = CreateRunBody, description = "Payload initial + version optionnelle"),
     responses(
         (status = 202, description = "Run accepté en queue", body = CreateRunResponse),
         (status = 401, description = "Token absent ou invalide"),
-        (status = 403, description = "Manque `runs.execute`"),
-        (status = 404, description = "Workflow inconnu")
+        (status = 403, description = "Manque `runs.execute`, ou `owner` d'autrui sans `*`"),
+        (status = 404, description = "Workflow inconnu dans cet espace")
     ),
     security(("bearer" = []))
 )]
@@ -184,6 +194,7 @@ pub async fn create_run(
     user: AuthenticatedUser,
     State(state): State<RunsState>,
     Path(workflow_id): Path<String>,
+    Query(q): Query<NamespaceQuery>,
     body: Option<Json<CreateRunBody>>,
 ) -> Result<(StatusCode, Json<CreateRunResponse>), RunError> {
     state
@@ -191,22 +202,15 @@ pub async fn create_run(
         .require_permission(&user, PERM_RUNS_EXECUTE)
         .await?;
 
-    // 1. Vérifie que le workflow existe et appartient à l'appelant — sinon 404
-    //    (le workflow d'autrui est traité comme inconnu).
-    let id = WorkflowId::new(&workflow_id);
-    let scope = state.auth.owner_scope(&user).await?;
-    let owner = state
+    // 1. Le workflow doit exister dans l'espace visé (celui de l'appelant,
+    //    sauf `?owner=` d'un super-admin) — sinon 404.
+    let ns = state.auth.namespace(&user, q.owner.as_deref()).await?;
+    let exists = state
         .workflows
-        .owner_of(&id)
+        .get(&ns, &WorkflowId::new(&workflow_id))
         .await
-        .map_err(|e| RunError::Internal(e.to_string()))?;
-    let exists = scope.allows(owner.as_deref())
-        && state
-            .workflows
-            .get(&id)
-            .await
-            .map_err(|e| RunError::Internal(e.to_string()))?
-            .is_some();
+        .map_err(|e| RunError::Internal(e.to_string()))?
+        .is_some();
     if !exists {
         audit_event(
             &state,
@@ -230,9 +234,10 @@ pub async fn create_run(
         trigger_type: "manual".into(),
         payload: body.payload,
         now_ms,
-        // Le run appartient au propriétaire du workflow, même s'il est
-        // déclenché par un super-admin.
-        owner_id: owner,
+        // Le run appartient au propriétaire du workflow (l'espace visé), même
+        // s'il est déclenché par un super-admin ; le worker relit le workflow
+        // dans cet espace.
+        owner_id: Some(ns),
     };
     let outcome = state
         .dispatcher
@@ -334,7 +339,7 @@ pub async fn get_run(
     responses(
         (status = 200, description = "Page de runs (plus récent en premier)", body = ListRunsResponse),
         (status = 401, description = "Token absent ou invalide"),
-        (status = 403, description = "Manque `runs.read`")
+        (status = 403, description = "Manque `runs.read`, ou `owner` d'autrui sans `*`")
     ),
     security(("bearer" = []))
 )]
@@ -349,10 +354,10 @@ pub async fn list_runs(
         offset: q.offset.unwrap_or(0),
         limit: q.limit.unwrap_or(50),
     };
-    let scope = state.auth.owner_scope(&user).await?;
+    let ns = state.auth.namespace(&user, q.owner.as_deref()).await?;
     let RunListPage { items, total } = state
         .runs
-        .list_by_workflow(&workflow_id, scope.filter(), paging)
+        .list_by_workflow(&workflow_id, Some(&ns), paging)
         .await
         .map_err(|e| RunError::Internal(e.to_string()))?;
     audit_event(
@@ -488,7 +493,7 @@ mod tests {
         let (state, svc, perms, _, workflows, runs_store) = make_test_state();
         perms.assign_role("alice", &Role::editor()).unwrap();
         workflows
-            .create(sample_workflow("wf-1"), Some("alice"))
+            .create("alice", sample_workflow("wf-1"))
             .await
             .unwrap();
         let token = svc.issue_access("alice", 900, FIXED_NOW).unwrap();
@@ -513,7 +518,7 @@ mod tests {
         let (state, svc, perms, _, workflows, _) = make_test_state();
         perms.assign_role("alice", &Role::editor()).unwrap();
         workflows
-            .create(sample_workflow("wf-1"), Some("alice"))
+            .create("alice", sample_workflow("wf-1"))
             .await
             .unwrap();
         let token = svc.issue_access("alice", 900, FIXED_NOW).unwrap();
@@ -548,7 +553,7 @@ mod tests {
         let (state, svc, perms, _, workflows, runs_store) = make_test_state();
         perms.assign_role("alice", &Role::editor()).unwrap();
         workflows
-            .create(sample_workflow("wf-1"), Some("alice"))
+            .create("alice", sample_workflow("wf-1"))
             .await
             .unwrap();
         let token = svc.issue_access("alice", 900, FIXED_NOW).unwrap();
@@ -693,7 +698,7 @@ mod tests {
         let (state, svc, perms, _, workflows, _) = make_test_state();
         perms.assign_role("alice", &Role::viewer()).unwrap();
         workflows
-            .create(sample_workflow("wf-1"), Some("alice"))
+            .create("alice", sample_workflow("wf-1"))
             .await
             .unwrap();
         let token = svc.issue_access("alice", 900, FIXED_NOW).unwrap();
@@ -725,7 +730,7 @@ mod tests {
         let (state, svc, perms, audit, workflows, _) = make_test_state();
         perms.assign_role("alice", &Role::editor()).unwrap();
         workflows
-            .create(sample_workflow("wf-1"), Some("alice"))
+            .create("alice", sample_workflow("wf-1"))
             .await
             .unwrap();
         let token = svc.issue_access("alice", 900, FIXED_NOW).unwrap();
@@ -791,7 +796,7 @@ mod tests {
         let (state, svc, perms, _, workflows, runs_store) = make_test_state();
         perms.assign_role("alice", &Role::editor()).unwrap();
         workflows
-            .create(sample_workflow("wf-1"), Some("alice"))
+            .create("alice", sample_workflow("wf-1"))
             .await
             .unwrap();
         let token = svc.issue_access("alice", 900, FIXED_NOW).unwrap();
@@ -809,7 +814,7 @@ mod tests {
         let (state, svc, perms, audit, workflows, runs_store) = make_test_state();
         perms.assign_role("bob", &Role::editor()).unwrap();
         workflows
-            .create(sample_workflow("wf-1"), Some("alice"))
+            .create("alice", sample_workflow("wf-1"))
             .await
             .unwrap();
         let token = svc.issue_access("bob", 900, FIXED_NOW).unwrap();
@@ -893,17 +898,37 @@ mod tests {
         assert_eq!(body["total"], 1);
         assert_eq!(body["items"][0]["run_id"], "b1");
 
+        // Super-admin : son propre espace par défaut, celui d'un autre avec
+        // `?owner=` (#188).
         let root = svc.issue_access("root", 900, FIXED_NOW).unwrap();
-        let body: serde_json::Value = serde_json::from_str(
-            &body_string(
-                app.oneshot(auth_req("GET", "/workflows/wf-1/runs", &root, None))
-                    .await
-                    .unwrap(),
-            )
-            .await,
-        )
-        .unwrap();
-        assert_eq!(body["total"], 3, "super-admin : tous les runs");
+        let total = |uri: &'static str| {
+            let (app, root) = (app.clone(), root.clone());
+            async move {
+                let body: serde_json::Value = serde_json::from_str(
+                    &body_string(
+                        app.oneshot(auth_req("GET", uri, &root, None))
+                            .await
+                            .unwrap(),
+                    )
+                    .await,
+                )
+                .unwrap();
+                body["total"].clone()
+            }
+        };
+        assert_eq!(total("/workflows/wf-1/runs").await, 0);
+        assert_eq!(total("/workflows/wf-1/runs?owner=alice").await, 2);
+        // Un utilisateur ordinaire ne vise pas l'espace d'autrui.
+        let r = app
+            .oneshot(auth_req(
+                "GET",
+                "/workflows/wf-1/runs?owner=alice",
+                &bob,
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::FORBIDDEN);
     }
 
     #[tokio::test]
@@ -915,7 +940,7 @@ mod tests {
             .with_owner(Some("alice".into()));
         runs_store.checkpoint(&old).await.unwrap();
         workflows
-            .create(sample_workflow("wf-1"), Some("bob"))
+            .create("bob", sample_workflow("wf-1"))
             .await
             .unwrap();
         let app = runs_router(state);
@@ -943,16 +968,59 @@ mod tests {
         let (state, svc, perms, _, workflows, runs_store) = make_test_state();
         perms.assign_role("root", &Role::super_admin()).unwrap();
         workflows
-            .create(sample_workflow("wf-1"), Some("alice"))
+            .create("alice", sample_workflow("wf-1"))
             .await
             .unwrap();
         let root = svc.issue_access("root", 900, FIXED_NOW).unwrap();
-        let r = runs_router(state)
+        let app = runs_router(state);
+        // Sans `owner`, root vise son propre espace, où `wf-1` n'existe pas.
+        let r = app
+            .clone()
             .oneshot(auth_req("POST", "/workflows/wf-1/runs", &root, Some("{}")))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::NOT_FOUND);
+        let r = app
+            .oneshot(auth_req(
+                "POST",
+                "/workflows/wf-1/runs?owner=alice",
+                &root,
+                Some("{}"),
+            ))
             .await
             .unwrap();
         assert_eq!(r.status(), StatusCode::ACCEPTED);
         let snap = runs_store.load("fixed-run").await.unwrap().unwrap();
         assert_eq!(snap.owner_id.as_deref(), Some("alice"));
+    }
+
+    #[tokio::test]
+    async fn same_workflow_id_runs_in_each_owners_namespace() {
+        let (state, svc, perms, _, workflows, runs_store) = make_test_state();
+        perms.assign_role("bob", &Role::editor()).unwrap();
+        // `wf-1` existe chez alice ; bob n'en a pas encore.
+        workflows
+            .create("alice", sample_workflow("wf-1"))
+            .await
+            .unwrap();
+        let app = runs_router(state);
+        let bob = svc.issue_access("bob", 900, FIXED_NOW).unwrap();
+        let post = || {
+            let (app, bob) = (app.clone(), bob.clone());
+            async move {
+                app.oneshot(auth_req("POST", "/workflows/wf-1/runs", &bob, Some("{}")))
+                    .await
+                    .unwrap()
+                    .status()
+            }
+        };
+        assert_eq!(post().await, StatusCode::NOT_FOUND, "le wf-1 d'alice");
+        workflows
+            .create("bob", sample_workflow("wf-1"))
+            .await
+            .unwrap();
+        assert_eq!(post().await, StatusCode::ACCEPTED);
+        let snap = runs_store.load("fixed-run").await.unwrap().unwrap();
+        assert_eq!(snap.owner_id.as_deref(), Some("bob"));
     }
 }

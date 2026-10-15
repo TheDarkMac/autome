@@ -4,7 +4,8 @@
 //! Il promeut en production la logique éprouvée par le test e2e (F9.4) :
 //!
 //! ```text
-//! message {run_id, workflow_id}  →  WorkflowRepository.get
+//! message {run_id, workflow_id}  →  RunStateStore.load (propriétaire)
+//!                                →  WorkflowRepository.get (espace du propriétaire)
 //!                                →  RunStateStore.try_claim (Queued → Running, atomique)
 //!                                →  Engine.run (DAG + node runner)
 //!                                →  RunStateStore (sorties + Succeeded/Failed)
@@ -44,6 +45,7 @@ use async_trait::async_trait;
 use autome_connectors::{EgressPolicy, HttpAction, HttpClient, ReqwestHttpClient};
 use autome_core::{
     Action, Delivery, Node, NodeKind, RunStateStore, RunStatus, WorkflowId, WorkflowRepository,
+    LEGACY_NAMESPACE,
 };
 use autome_engine::{Dag, Engine, RunContext, StepStatus};
 use tracing::{debug, error, info, warn, Instrument};
@@ -246,8 +248,28 @@ where
 {
     /// Exécute le run `run_id` de `workflow_id` (dans le span du run).
     async fn execute(&self, run_id: &str, workflow_id: &str) -> HandlerVerdict {
-        // Charge le workflow puis le checkpoint courant.
-        let workflow = match self.repo.get(&WorkflowId::new(workflow_id)).await {
+        // Le workflow vit dans l'espace d'ids de son propriétaire (#188), qui
+        // est aussi celui du run (fixé au dispatch, immuable) : on lit d'abord
+        // le run, sans le réclamer, pour savoir où chercher.
+        let namespace = match self.store.load(run_id).await {
+            // Livraison dupliquée d'un run déjà pris ou terminé : rien à
+            // exécuter, inutile de relire le workflow (peut-être supprimé).
+            Ok(Some(cp)) if cp.status != RunStatus::Queued => return self.unclaimed(run_id).await,
+            Ok(Some(cp)) => cp.owner_id.unwrap_or_else(|| LEGACY_NAMESPACE.to_string()),
+            Ok(None) => {
+                error!(verdict = "dead_letter", "run introuvable");
+                return HandlerVerdict::DeadLetter;
+            }
+            Err(e) => {
+                warn!(error = %e, verdict = "retry", "lecture du run impossible");
+                return HandlerVerdict::Retry;
+            }
+        };
+        let workflow = match self
+            .repo
+            .get(&namespace, &WorkflowId::new(workflow_id))
+            .await
+        {
             Ok(Some(wf)) => wf,
             Ok(None) => {
                 error!(verdict = "dead_letter", "workflow introuvable");
@@ -494,7 +516,9 @@ mod tests {
         owner: Option<&str>,
     ) {
         let wf_id = wf.id.0.clone();
-        repo.create(wf, owner).await.unwrap();
+        repo.create(owner.unwrap_or(LEGACY_NAMESPACE), wf)
+            .await
+            .unwrap();
         store
             .checkpoint(
                 &RunCheckpoint::queued(run_id, &wf_id, 1, "manual", NOW)
@@ -701,7 +725,9 @@ mod tests {
     #[tokio::test]
     async fn unknown_run_dead_letters() {
         let repo = Arc::new(InMemoryWorkflowRepository::new());
-        repo.create(trigger_only("wf-u"), None).await.unwrap();
+        repo.create(LEGACY_NAMESPACE, trigger_only("wf-u"))
+            .await
+            .unwrap();
         let exec = RunExecutor::new(repo, Arc::new(InMemoryRunStateStore::new()), resolver());
         assert_eq!(
             exec.handle(&delivery("run-ghost", "wf-u")).await,
@@ -796,6 +822,53 @@ mod tests {
         assert_eq!(
             exec.handle(&delivery("run-x", "wf-missing")).await,
             HandlerVerdict::DeadLetter
+        );
+    }
+
+    #[tokio::test]
+    async fn run_never_executes_a_homonymous_workflow_of_another_namespace() {
+        let repo = Arc::new(InMemoryWorkflowRepository::new());
+        let store = Arc::new(InMemoryRunStateStore::new());
+        // `wf-s` n'existe que chez alice ; le run appartient à bob (#188).
+        repo.create("alice", slack_workflow("wf-s")).await.unwrap();
+        store
+            .checkpoint(
+                &RunCheckpoint::queued("run-bob", "wf-s", 1, "manual", NOW)
+                    .with_owner(Some("bob".into())),
+            )
+            .await
+            .unwrap();
+        let http = RecordingHttp::default();
+        let exec =
+            RunExecutor::with_http(repo, Arc::clone(&store) as Arc<_>, resolver(), http.clone());
+        assert_eq!(
+            exec.handle(&delivery("run-bob", "wf-s")).await,
+            HandlerVerdict::DeadLetter
+        );
+        assert!(http.sent.lock().unwrap().is_empty(), "rien n'est exécuté");
+    }
+
+    #[tokio::test]
+    async fn duplicate_delivery_is_acked_even_if_the_workflow_was_deleted() {
+        let repo = Arc::new(InMemoryWorkflowRepository::new());
+        let store = Arc::new(InMemoryRunStateStore::new());
+        seed_owned(&repo, &store, trigger_only("wf-g"), "run-g", Some("alice")).await;
+        let exec = RunExecutor::new(
+            Arc::clone(&repo) as Arc<_>,
+            Arc::clone(&store) as Arc<_>,
+            resolver(),
+        );
+        assert_eq!(
+            exec.handle(&delivery("run-g", "wf-g")).await,
+            HandlerVerdict::Ok
+        );
+        repo.delete("alice", &WorkflowId::new("wf-g"))
+            .await
+            .unwrap();
+        // Avant : workflow introuvable ⇒ lettre morte pour un run déjà terminé.
+        assert_eq!(
+            exec.handle(&delivery("run-g", "wf-g")).await,
+            HandlerVerdict::Ok
         );
     }
 

@@ -1,8 +1,11 @@
 //! Test d'intégration de [`PgWorkflowRepository`] contre un vrai PostgreSQL.
 //! Gaté par `TEST_DATABASE_URL` (skip-pass sinon). Applique les migrations.
 
+use std::sync::Arc;
+
 use autome_core::{
     Edge, Node, NodeId, NodeKind, Pagination, WorkflowGraph, WorkflowId, WorkflowRepository,
+    LEGACY_NAMESPACE,
 };
 use autome_persistence::{connect, run_migrations, PgWorkflowRepository};
 use serde_json::Value;
@@ -41,68 +44,90 @@ async fn setup() -> Option<PgWorkflowRepository> {
     Some(PgWorkflowRepository::new(pool))
 }
 
+fn id(s: &str) -> WorkflowId {
+    WorkflowId::new(s)
+}
+
+const PAGING: Pagination = Pagination {
+    offset: 0,
+    limit: 10,
+};
+
 #[tokio::test]
-async fn crud_roundtrip() {
+async fn crud_namespaces_and_concurrent_updates() {
     let Some(repo) = setup().await else {
         eprintln!("TEST_DATABASE_URL absent → test PostgreSQL sauté");
         return;
     };
 
     // Inconnu.
-    assert!(repo.get(&WorkflowId::new("a")).await.unwrap().is_none());
+    assert!(repo.get("alice", &id("a")).await.unwrap().is_none());
 
     // Create + get.
-    repo.create(wf("a", "Alpha"), Some("alice")).await.unwrap();
-    let got = repo.get(&WorkflowId::new("a")).await.unwrap().unwrap();
+    repo.create("alice", wf("a", "Alpha")).await.unwrap();
+    let got = repo.get("alice", &id("a")).await.unwrap().unwrap();
     assert_eq!(got.name, "Alpha");
     assert_eq!(got.nodes.len(), 1);
 
-    // Doublon rejeté.
-    assert!(repo.create(wf("a", "dup"), Some("bob")).await.is_err());
-
-    // Update (nouvelle version, get renvoie la courante).
-    repo.update(wf("a", "Alpha v2")).await.unwrap();
+    // Doublon rejeté dans le même espace seulement (#188) : le même id est
+    // libre dans l'espace de bob.
+    let dup = repo.create("alice", wf("a", "dup")).await.unwrap_err();
+    assert!(dup.to_string().contains("déjà"));
+    repo.create("bob", wf("a", "Alpha de bob")).await.unwrap();
     assert_eq!(
-        repo.get(&WorkflowId::new("a")).await.unwrap().unwrap().name,
+        repo.get("alice", &id("a")).await.unwrap().unwrap().name,
+        "Alpha"
+    );
+    assert_eq!(
+        repo.get("bob", &id("a")).await.unwrap().unwrap().name,
+        "Alpha de bob"
+    );
+
+    // Update (nouvelle version, get renvoie la courante), confiné à l'espace.
+    repo.update("alice", wf("a", "Alpha v2")).await.unwrap();
+    assert_eq!(
+        repo.get("alice", &id("a")).await.unwrap().unwrap().name,
         "Alpha v2"
     );
-    // Update d'un inconnu → erreur.
-    assert!(repo.update(wf("ghost", "x")).await.is_err());
-
-    // Propriétaire : posé à la création, conservé par l'update, inchangé par
-    // un doublon refusé.
     assert_eq!(
-        repo.owner_of(&WorkflowId::new("a"))
-            .await
-            .unwrap()
-            .as_deref(),
-        Some("alice")
+        repo.get("bob", &id("a")).await.unwrap().unwrap().name,
+        "Alpha de bob"
     );
-    assert_eq!(
-        repo.owner_of(&WorkflowId::new("ghost")).await.unwrap(),
-        None
-    );
+    assert!(repo.update("alice", wf("ghost", "x")).await.is_err());
+    assert!(repo.update("carol", wf("a", "x")).await.is_err());
 
-    // List paginée, filtrable par propriétaire.
-    repo.create(wf("b", "Beta"), Some("bob")).await.unwrap();
-    repo.create(wf("c", "Legacy"), None).await.unwrap();
-    assert_eq!(repo.owner_of(&WorkflowId::new("c")).await.unwrap(), None);
-    let paging = Pagination {
-        offset: 0,
-        limit: 10,
-    };
-    let page = repo.list(None, paging).await.unwrap();
-    assert_eq!(page.total, 3);
-    assert_eq!(page.items.len(), 3);
-    let alice = repo.list(Some("alice"), paging).await.unwrap();
+    // List paginée par espace ; espace des workflows sans propriétaire.
+    repo.create("bob", wf("b", "Beta")).await.unwrap();
+    repo.create(LEGACY_NAMESPACE, wf("c", "Legacy"))
+        .await
+        .unwrap();
+    let alice = repo.list("alice", PAGING).await.unwrap();
     assert_eq!(alice.total, 1);
-    assert_eq!(alice.items[0].id, WorkflowId::new("a"));
-    let nobody = repo.list(Some("nobody"), paging).await.unwrap();
-    assert_eq!(nobody.total, 0);
-    assert!(nobody.items.is_empty());
+    assert_eq!(alice.items[0].name, "Alpha v2");
+    let bob = repo.list("bob", PAGING).await.unwrap();
+    assert_eq!(bob.total, 2);
+    let ids: Vec<&str> = bob.items.iter().map(|w| w.id.0.as_str()).collect();
+    assert_eq!(ids, vec!["a", "b"]);
+    assert_eq!(repo.list(LEGACY_NAMESPACE, PAGING).await.unwrap().total, 1);
+    assert_eq!(repo.list("nobody", PAGING).await.unwrap().total, 0);
 
-    // Delete (idempotent).
-    assert!(repo.delete(&WorkflowId::new("a")).await.unwrap());
-    assert!(!repo.delete(&WorkflowId::new("a")).await.unwrap());
-    assert!(repo.get(&WorkflowId::new("a")).await.unwrap().is_none());
+    // Mises à jour concurrentes du même workflow : toutes passent, chacune
+    // publie sa version (avant le verrou de ligne : conflit de clé ⇒ erreur).
+    let repo = Arc::new(repo);
+    let tasks: Vec<_> = (0..10)
+        .map(|i| {
+            let repo = repo.clone();
+            tokio::spawn(async move { repo.update("bob", wf("b", &format!("Beta {i}"))).await })
+        })
+        .collect();
+    for t in tasks {
+        t.await.unwrap().expect("mise à jour concurrente");
+    }
+
+    // Delete (idempotent), confiné à l'espace.
+    assert!(!repo.delete("carol", &id("a")).await.unwrap());
+    assert!(repo.delete("alice", &id("a")).await.unwrap());
+    assert!(!repo.delete("alice", &id("a")).await.unwrap());
+    assert!(repo.get("alice", &id("a")).await.unwrap().is_none());
+    assert!(repo.get("bob", &id("a")).await.unwrap().is_some());
 }

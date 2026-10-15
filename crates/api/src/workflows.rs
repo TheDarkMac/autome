@@ -12,13 +12,18 @@
 //!
 //! Toutes les routes sont protégées par [`crate::auth::AuthenticatedUser`].
 //! Chaque appel enregistre un event audit `workflows.<verb>` via
-//! [`autome_core::AuditSink`] avec actor + resource = workflow_id.
+//! [`autome_core::AuditSink`] avec actor + resource = workflow_id
+//! (`<owner>/<id>` quand un super-admin vise l'espace d'autrui).
 //!
-//! **Isolation par propriétaire** (backlog BOLA) : un workflow appartient à
-//! l'utilisateur qui l'a créé. La liste est filtrée sur lui ; lire, modifier
-//! ou supprimer le workflow d'un autre répond **comme s'il n'existait pas**
-//! (404, ou 204 pour le DELETE idempotent) — pas de 403 qui confirmerait son
-//! existence. Seul un super-admin (`*`) voit tous les workflows.
+//! **Espaces d'ids par propriétaire** (#188) : chaque utilisateur a son propre
+//! espace d'ids de workflow ; toutes les routes opèrent dans celui de
+//! l'appelant. Le workflow d'un autre n'y existe pas : le lire répond 404, et
+//! créer le même id **réussit** (409 seulement pour un doublon dans son propre
+//! espace) — l'existence des workflows d'autrui n'est jamais révélée. Un
+//! super-admin (`*`) vise l'espace d'un autre avec `?owner=<user_id>` (vide :
+//! workflows antérieurs à la migration `0010`, sans propriétaire) ; un
+//! utilisateur ordinaire qui le tente reçoit 403, quelle que soit l'existence
+//! de la ressource.
 
 use std::sync::Arc;
 
@@ -36,7 +41,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use utoipa::{IntoParams, ToSchema};
 
-use crate::auth::{AuthError, AuthState, AuthenticatedUser, OwnerScope};
+use crate::auth::{AuthError, AuthState, AuthenticatedUser};
 
 /// État partagé par les handlers workflows : auth + repo + audit.
 #[derive(Clone)]
@@ -62,7 +67,7 @@ impl FromRef<WorkflowsState> for AuthState {
     }
 }
 
-/// Paramètres de query pour la pagination (`?offset=0&limit=50`).
+/// Paramètres de query de la liste (`?offset=0&limit=50&owner=`).
 #[derive(Debug, Deserialize, IntoParams)]
 pub struct ListQuery {
     /// Offset, défaut 0.
@@ -71,6 +76,20 @@ pub struct ListQuery {
     /// Limite, défaut 50.
     #[serde(default)]
     pub limit: Option<usize>,
+    /// Espace d'un autre utilisateur (super-admin seulement) — cf.
+    /// [`NamespaceQuery`].
+    #[serde(default)]
+    pub owner: Option<String>,
+}
+
+/// Espace d'ids visé (#188) : absent = celui de l'appelant. Un autre espace
+/// (`?owner=<user_id>`, vide = workflows sans propriétaire) est réservé aux
+/// super-admins (403 sinon).
+#[derive(Debug, Default, Deserialize, IntoParams)]
+pub struct NamespaceQuery {
+    /// Propriétaire de l'espace visé.
+    #[serde(default)]
+    pub owner: Option<String>,
 }
 
 /// Réponse JSON de [`list_workflows`].
@@ -122,24 +141,18 @@ impl IntoResponse for WorkflowError {
     }
 }
 
-/// `true` si `user` peut accéder au workflow `id` : il en est propriétaire, ou
-/// il est super-admin. Un workflow inconnu est inaccessible à un utilisateur
-/// ordinaire (même réponse qu'un workflow d'autrui).
-async fn can_access(
-    state: &WorkflowsState,
-    user: &AuthenticatedUser,
-    id: &str,
-) -> Result<bool, WorkflowError> {
-    let scope = state.auth.owner_scope(user).await?;
-    if scope == OwnerScope::All {
-        return Ok(true);
+/// Ressource d'audit : l'id, préfixé du propriétaire quand l'espace visé
+/// n'est pas celui de l'appelant (super-admin).
+fn resource(user: &AuthenticatedUser, ns: &str, id: &str) -> String {
+    if ns == user.user_id() {
+        id.to_string()
+    } else {
+        format!("{ns}/{id}")
     }
-    let owner = state
-        .repo
-        .owner_of(&WorkflowId::new(id))
-        .await
-        .map_err(|e| WorkflowError::Internal(e.to_string()))?;
-    Ok(scope.allows(owner.as_deref()))
+}
+
+fn internal(e: impl std::fmt::Display) -> WorkflowError {
+    WorkflowError::Internal(e.to_string())
 }
 
 async fn audit_event(
@@ -165,7 +178,7 @@ async fn audit_event(
     responses(
         (status = 200, description = "Page de workflows", body = ListResponse),
         (status = 401, description = "Token absent ou invalide"),
-        (status = 403, description = "Manque `workflows.read`")
+        (status = 403, description = "Manque `workflows.read`, ou `owner` d'autrui sans `*`")
     ),
     security(("bearer" = []))
 )]
@@ -182,17 +195,13 @@ pub async fn list_workflows(
         offset: q.offset.unwrap_or(0),
         limit: q.limit.unwrap_or(50),
     };
-    let scope = state.auth.owner_scope(&user).await?;
-    let WorkflowPage { items, total } = state
-        .repo
-        .list(scope.filter(), paging)
-        .await
-        .map_err(|e| WorkflowError::Internal(e.to_string()))?;
+    let ns = state.auth.namespace(&user, q.owner.as_deref()).await?;
+    let WorkflowPage { items, total } = state.repo.list(&ns, paging).await.map_err(internal)?;
     audit_event(
         &state,
         user.user_id(),
         "workflows.list",
-        "*",
+        &resource(&user, &ns, "*"),
         AuditOutcome::Success,
     )
     .await;
@@ -204,42 +213,41 @@ pub async fn list_workflows(
     }))
 }
 
-/// `POST /workflows` — création (201 Created, perm `workflows.write`).
+/// `POST /workflows` — création (201 Created, perm `workflows.write`) dans
+/// l'espace de l'appelant (ou `?owner=` pour un super-admin).
 #[utoipa::path(
     post,
     path = "/workflows",
     tag = "workflows",
+    params(NamespaceQuery),
     request_body(content = serde_json::Value, description = "Workflow graph complet"),
     responses(
         (status = 201, description = "Créé", body = serde_json::Value),
         (status = 401, description = "Token absent ou invalide"),
-        (status = 403, description = "Manque `workflows.write`"),
-        (status = 409, description = "Workflow déjà existant")
+        (status = 403, description = "Manque `workflows.write`, ou `owner` d'autrui sans `*`"),
+        (status = 409, description = "Id déjà utilisé dans cet espace")
     ),
     security(("bearer" = []))
 )]
 pub async fn create_workflow(
     user: AuthenticatedUser,
     State(state): State<WorkflowsState>,
+    Query(q): Query<NamespaceQuery>,
     Json(workflow): Json<WorkflowGraph>,
 ) -> Result<(StatusCode, Json<WorkflowGraph>), WorkflowError> {
     state
         .auth
         .require_permission(&user, PERM_WORKFLOWS_WRITE)
         .await?;
-    let workflow_id = workflow.id.0.clone();
-    // Le créateur devient propriétaire (y compris un super-admin).
-    match state
-        .repo
-        .create(workflow.clone(), Some(user.user_id()))
-        .await
-    {
+    let ns = state.auth.namespace(&user, q.owner.as_deref()).await?;
+    let res = resource(&user, &ns, &workflow.id.0);
+    match state.repo.create(&ns, workflow.clone()).await {
         Ok(()) => {
             audit_event(
                 &state,
                 user.user_id(),
                 "workflows.create",
-                &workflow_id,
+                &res,
                 AuditOutcome::Success,
             )
             .await;
@@ -251,10 +259,11 @@ pub async fn create_workflow(
                 &state,
                 user.user_id(),
                 "workflows.create",
-                &workflow_id,
+                &res,
                 AuditOutcome::Failure,
             )
             .await;
+            // Doublon dans l'espace visé seulement : l'id d'autrui est libre.
             if msg.contains("déjà") {
                 Err(WorkflowError::Conflict(msg))
             } else {
@@ -269,12 +278,12 @@ pub async fn create_workflow(
     get,
     path = "/workflows/{id}",
     tag = "workflows",
-    params(("id" = String, Path, description = "Identifiant du workflow")),
+    params(("id" = String, Path, description = "Identifiant du workflow"), NamespaceQuery),
     responses(
         (status = 200, description = "Détail", body = serde_json::Value),
         (status = 401, description = "Token absent ou invalide"),
-        (status = 403, description = "Manque `workflows.read`"),
-        (status = 404, description = "Workflow inconnu")
+        (status = 403, description = "Manque `workflows.read`, ou `owner` d'autrui sans `*`"),
+        (status = 404, description = "Workflow inconnu dans cet espace")
     ),
     security(("bearer" = []))
 )]
@@ -282,51 +291,34 @@ pub async fn get_workflow(
     user: AuthenticatedUser,
     State(state): State<WorkflowsState>,
     Path(id): Path<String>,
+    Query(q): Query<NamespaceQuery>,
 ) -> Result<Json<WorkflowGraph>, WorkflowError> {
     state
         .auth
         .require_permission(&user, PERM_WORKFLOWS_READ)
         .await?;
-    if !can_access(&state, &user, &id).await? {
-        audit_event(
-            &state,
-            user.user_id(),
-            "workflows.get",
-            &id,
-            AuditOutcome::Denied,
-        )
-        .await;
-        return Err(WorkflowError::NotFound(format!("workflow '{id}' inconnu")));
-    }
-    match state
+    let ns = state.auth.namespace(&user, q.owner.as_deref()).await?;
+    let found = state
         .repo
-        .get(&WorkflowId::new(&id))
+        .get(&ns, &WorkflowId::new(&id))
         .await
-        .map_err(|e| WorkflowError::Internal(e.to_string()))?
-    {
-        Some(w) => {
-            audit_event(
-                &state,
-                user.user_id(),
-                "workflows.get",
-                &id,
-                AuditOutcome::Success,
-            )
-            .await;
-            Ok(Json(w))
-        }
-        None => {
-            audit_event(
-                &state,
-                user.user_id(),
-                "workflows.get",
-                &id,
-                AuditOutcome::Failure,
-            )
-            .await;
-            Err(WorkflowError::NotFound(format!("workflow '{id}' inconnu")))
-        }
-    }
+        .map_err(internal)?;
+    let outcome = if found.is_some() {
+        AuditOutcome::Success
+    } else {
+        AuditOutcome::Failure
+    };
+    audit_event(
+        &state,
+        user.user_id(),
+        "workflows.get",
+        &resource(&user, &ns, &id),
+        outcome,
+    )
+    .await;
+    found
+        .map(Json)
+        .ok_or_else(|| WorkflowError::NotFound(format!("workflow '{id}' inconnu")))
 }
 
 /// `PUT /workflows/{id}` — remplacement complet (perm `workflows.write`).
@@ -335,14 +327,14 @@ pub async fn get_workflow(
     put,
     path = "/workflows/{id}",
     tag = "workflows",
-    params(("id" = String, Path, description = "Identifiant du workflow")),
+    params(("id" = String, Path, description = "Identifiant du workflow"), NamespaceQuery),
     request_body(content = serde_json::Value, description = "Workflow graph complet"),
     responses(
         (status = 200, description = "Remplacé", body = serde_json::Value),
         (status = 400, description = "id path ≠ id body"),
         (status = 401, description = "Token absent ou invalide"),
-        (status = 403, description = "Manque `workflows.write`"),
-        (status = 404, description = "Workflow inconnu")
+        (status = 403, description = "Manque `workflows.write`, ou `owner` d'autrui sans `*`"),
+        (status = 404, description = "Workflow inconnu dans cet espace")
     ),
     security(("bearer" = []))
 )]
@@ -350,6 +342,7 @@ pub async fn update_workflow(
     user: AuthenticatedUser,
     State(state): State<WorkflowsState>,
     Path(id): Path<String>,
+    Query(q): Query<NamespaceQuery>,
     Json(workflow): Json<WorkflowGraph>,
 ) -> Result<Json<WorkflowGraph>, WorkflowError> {
     state
@@ -362,26 +355,15 @@ pub async fn update_workflow(
             workflow.id.0
         )));
     }
-    if !can_access(&state, &user, &id).await? {
-        audit_event(
-            &state,
-            user.user_id(),
-            "workflows.update",
-            &id,
-            AuditOutcome::Denied,
-        )
-        .await;
-        return Err(WorkflowError::NotFound(format!(
-            "workflow : id '{id}' inconnu"
-        )));
-    }
-    match state.repo.update(workflow.clone()).await {
+    let ns = state.auth.namespace(&user, q.owner.as_deref()).await?;
+    let res = resource(&user, &ns, &id);
+    match state.repo.update(&ns, workflow.clone()).await {
         Ok(()) => {
             audit_event(
                 &state,
                 user.user_id(),
                 "workflows.update",
-                &id,
+                &res,
                 AuditOutcome::Success,
             )
             .await;
@@ -393,7 +375,7 @@ pub async fn update_workflow(
                 &state,
                 user.user_id(),
                 "workflows.update",
-                &id,
+                &res,
                 AuditOutcome::Failure,
             )
             .await;
@@ -411,11 +393,11 @@ pub async fn update_workflow(
     delete,
     path = "/workflows/{id}",
     tag = "workflows",
-    params(("id" = String, Path, description = "Identifiant du workflow")),
+    params(("id" = String, Path, description = "Identifiant du workflow"), NamespaceQuery),
     responses(
         (status = 204, description = "Supprimé (idempotent)"),
         (status = 401, description = "Token absent ou invalide"),
-        (status = 403, description = "Manque `workflows.write`")
+        (status = 403, description = "Manque `workflows.write`, ou `owner` d'autrui sans `*`")
     ),
     security(("bearer" = []))
 )]
@@ -423,35 +405,29 @@ pub async fn delete_workflow(
     user: AuthenticatedUser,
     State(state): State<WorkflowsState>,
     Path(id): Path<String>,
+    Query(q): Query<NamespaceQuery>,
 ) -> Result<StatusCode, WorkflowError> {
     state
         .auth
         .require_permission(&user, PERM_WORKFLOWS_WRITE)
         .await?;
-    // Workflow d'autrui : 204 sans rien supprimer — même réponse qu'un id
-    // inconnu (DELETE idempotent), l'existence n'est pas révélée.
-    if !can_access(&state, &user, &id).await? {
-        audit_event(
-            &state,
-            user.user_id(),
-            "workflows.delete",
-            &id,
-            AuditOutcome::Denied,
-        )
-        .await;
-        return Ok(StatusCode::NO_CONTENT);
-    }
-    let _existed = state
+    let ns = state.auth.namespace(&user, q.owner.as_deref()).await?;
+    let existed = state
         .repo
-        .delete(&WorkflowId::new(&id))
+        .delete(&ns, &WorkflowId::new(&id))
         .await
-        .map_err(|e| WorkflowError::Internal(e.to_string()))?;
+        .map_err(internal)?;
+    let outcome = if existed {
+        AuditOutcome::Success
+    } else {
+        AuditOutcome::Failure
+    };
     audit_event(
         &state,
         user.user_id(),
         "workflows.delete",
-        &id,
-        AuditOutcome::Success,
+        &resource(&user, &ns, &id),
+        outcome,
     )
     .await;
     Ok(StatusCode::NO_CONTENT)
@@ -475,7 +451,7 @@ mod tests {
     use super::*;
     use autome_core::{
         AuditSink, InMemoryAuditSink, InMemoryPermissionStore, InMemoryRevocationStore, NodeId,
-        NodeKind, PermissionStore, RevocationStore, Role, TokenService,
+        NodeKind, PermissionStore, RevocationStore, Role, TokenService, LEGACY_NAMESPACE,
     };
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
@@ -601,16 +577,18 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::CREATED);
         // Repo a bien stocké
-        assert!(repo.get(&WorkflowId::new("wf-1")).await.unwrap().is_some());
+        assert!(repo
+            .get("alice", &WorkflowId::new("wf-1"))
+            .await
+            .unwrap()
+            .is_some());
     }
 
     #[tokio::test]
     async fn get_returns_200_when_workflow_exists() {
         let (state, svc, perms, _, repo) = make_test_state();
         perms.assign_role("alice", &Role::viewer()).unwrap();
-        repo.create(sample_workflow("wf-1"), Some("alice"))
-            .await
-            .unwrap();
+        repo.create("alice", sample_workflow("wf-1")).await.unwrap();
         let token = svc.issue_access("alice", 900, FIXED_NOW).unwrap();
         let app = workflows_router(state);
         let response = app
@@ -639,9 +617,7 @@ mod tests {
     async fn update_returns_200_with_updated_workflow() {
         let (state, svc, perms, _, repo) = make_test_state();
         perms.assign_role("alice", &Role::editor()).unwrap();
-        repo.create(sample_workflow("wf-1"), Some("alice"))
-            .await
-            .unwrap();
+        repo.create("alice", sample_workflow("wf-1")).await.unwrap();
         let token = svc.issue_access("alice", 900, FIXED_NOW).unwrap();
         let app = workflows_router(state);
         let mut new_payload = sample_workflow_json("wf-1");
@@ -657,7 +633,7 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(
-            repo.get(&WorkflowId::new("wf-1"))
+            repo.get("alice", &WorkflowId::new("wf-1"))
                 .await
                 .unwrap()
                 .unwrap()
@@ -670,9 +646,7 @@ mod tests {
     async fn delete_returns_204_and_removes_workflow() {
         let (state, svc, perms, _, repo) = make_test_state();
         perms.assign_role("alice", &Role::editor()).unwrap();
-        repo.create(sample_workflow("wf-1"), Some("alice"))
-            .await
-            .unwrap();
+        repo.create("alice", sample_workflow("wf-1")).await.unwrap();
         let token = svc.issue_access("alice", 900, FIXED_NOW).unwrap();
         let app = workflows_router(state);
         let response = app
@@ -680,7 +654,11 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
-        assert!(repo.get(&WorkflowId::new("wf-1")).await.unwrap().is_none());
+        assert!(repo
+            .get("alice", &WorkflowId::new("wf-1"))
+            .await
+            .unwrap()
+            .is_none());
     }
 
     // ───── erreurs métier ─────
@@ -689,9 +667,7 @@ mod tests {
     async fn create_duplicate_returns_409() {
         let (state, svc, perms, _, repo) = make_test_state();
         perms.assign_role("alice", &Role::editor()).unwrap();
-        repo.create(sample_workflow("wf-1"), Some("alice"))
-            .await
-            .unwrap();
+        repo.create("alice", sample_workflow("wf-1")).await.unwrap();
         let token = svc.issue_access("alice", 900, FIXED_NOW).unwrap();
         let app = workflows_router(state);
         let payload = sample_workflow_json("wf-1").to_string();
@@ -720,9 +696,7 @@ mod tests {
     async fn update_with_mismatched_id_returns_400() {
         let (state, svc, perms, _, repo) = make_test_state();
         perms.assign_role("alice", &Role::editor()).unwrap();
-        repo.create(sample_workflow("wf-1"), Some("alice"))
-            .await
-            .unwrap();
+        repo.create("alice", sample_workflow("wf-1")).await.unwrap();
         let token = svc.issue_access("alice", 900, FIXED_NOW).unwrap();
         let app = workflows_router(state);
         // body id != path id
@@ -818,7 +792,7 @@ mod tests {
         let (state, svc, perms, _, repo) = make_test_state();
         perms.assign_role("alice", &Role::editor()).unwrap();
         for i in 0..5 {
-            repo.create(sample_workflow(&format!("wf-{i}")), Some("alice"))
+            repo.create("alice", sample_workflow(&format!("wf-{i}")))
                 .await
                 .unwrap();
         }
@@ -836,10 +810,10 @@ mod tests {
         assert_eq!(body["limit"], 2);
     }
 
-    // ───── Backlog BOLA — isolation par propriétaire ─────
+    // ───── Espaces d'ids par propriétaire (#188) ─────
 
-    /// État avec alice et bob (editor) + root (super-admin), et `wf-a`
-    /// appartenant à alice.
+    /// État avec alice et bob (editor) + root (super-admin), et `wf-a` dans
+    /// l'espace d'alice.
     async fn two_users() -> (
         Router,
         TokenService,
@@ -850,9 +824,7 @@ mod tests {
         perms.assign_role("alice", &Role::editor()).unwrap();
         perms.assign_role("bob", &Role::editor()).unwrap();
         perms.assign_role("root", &Role::super_admin()).unwrap();
-        repo.create(sample_workflow("wf-a"), Some("alice"))
-            .await
-            .unwrap();
+        repo.create("alice", sample_workflow("wf-a")).await.unwrap();
         (workflows_router(state), svc, audit, repo)
     }
 
@@ -860,8 +832,35 @@ mod tests {
         svc.issue_access(sub, 900, FIXED_NOW).unwrap()
     }
 
+    fn wid(id: &str) -> WorkflowId {
+        WorkflowId::new(id)
+    }
+
+    async fn call(
+        app: &Router,
+        method: &str,
+        uri: &str,
+        who: &str,
+        svc: &TokenService,
+    ) -> Response {
+        app.clone()
+            .oneshot(auth_req(method, uri, &token(svc, who), None))
+            .await
+            .unwrap()
+    }
+
+    fn ids(body: String) -> Vec<String> {
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        v["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|w| w["id"].as_str().unwrap().to_string())
+            .collect()
+    }
+
     #[tokio::test]
-    async fn create_records_the_caller_as_owner() {
+    async fn create_stores_in_the_callers_namespace() {
         let (state, svc, perms, _, repo) = make_test_state();
         perms.assign_role("alice", &Role::editor()).unwrap();
         let payload = sample_workflow_json("wf-new").to_string();
@@ -870,77 +869,75 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(r.status(), StatusCode::CREATED);
+        assert!(repo.get("alice", &wid("wf-new")).await.unwrap().is_some());
+        assert!(repo.get("bob", &wid("wf-new")).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn an_id_taken_by_someone_else_is_free_no_409() {
+        let (app, svc, _, repo) = two_users().await;
+        let mut mine = sample_workflow_json("wf-a");
+        mine["name"] = serde_json::json!("wf-a de bob");
+        let create = |body: String| {
+            let (app, t) = (app.clone(), token(&svc, "bob"));
+            async move {
+                app.oneshot(auth_req("POST", "/", &t, Some(&body)))
+                    .await
+                    .unwrap()
+                    .status()
+            }
+        };
+        // Avant #188 : 409, qui révélait le workflow d'alice.
+        assert_eq!(create(mine.to_string()).await, StatusCode::CREATED);
+        // Le doublon dans son propre espace reste un conflit.
+        assert_eq!(create(mine.to_string()).await, StatusCode::CONFLICT);
+
+        let bob = call(&app, "GET", "/wf-a", "bob", &svc).await;
+        let v: serde_json::Value = serde_json::from_str(&body_string(bob).await).unwrap();
+        assert_eq!(v["name"], "wf-a de bob");
+        let alice = repo.get("alice", &wid("wf-a")).await.unwrap().unwrap();
         assert_eq!(
-            repo.owner_of(&WorkflowId::new("wf-new"))
-                .await
-                .unwrap()
-                .as_deref(),
-            Some("alice")
+            alice.name, "workflow wf-a",
+            "le workflow d'alice est intact"
         );
     }
 
     #[tokio::test]
-    async fn list_only_returns_the_callers_workflows() {
+    async fn list_shows_only_the_callers_namespace() {
         let (app, svc, _, repo) = two_users().await;
-        repo.create(sample_workflow("wf-b"), Some("bob"))
+        repo.create("bob", sample_workflow("wf-b")).await.unwrap();
+        repo.create(LEGACY_NAMESPACE, sample_workflow("wf-legacy"))
             .await
             .unwrap();
-        repo.create(sample_workflow("wf-legacy"), None)
-            .await
-            .unwrap();
-        let ids = |body: String| -> Vec<String> {
-            let v: serde_json::Value = serde_json::from_str(&body).unwrap();
-            v["items"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|w| w["id"].as_str().unwrap().to_string())
-                .collect()
+        let list = |uri: &'static str, who: &'static str| {
+            let (app, svc) = (app.clone(), &svc);
+            async move { ids(body_string(call(&app, "GET", uri, who, svc).await).await) }
         };
-        let bob = app
-            .clone()
-            .oneshot(auth_req("GET", "/", &token(&svc, "bob"), None))
-            .await
-            .unwrap();
-        assert_eq!(ids(body_string(bob).await), vec!["wf-b"]);
-        let root = app
-            .oneshot(auth_req("GET", "/", &token(&svc, "root"), None))
-            .await
-            .unwrap();
-        assert_eq!(ids(body_string(root).await).len(), 3, "super-admin : tout");
+        assert_eq!(list("/", "bob").await, vec!["wf-b"]);
+        // Le super-admin a lui aussi son propre espace (vide ici)…
+        assert!(list("/", "root").await.is_empty());
+        // … et vise celui d'un autre explicitement.
+        assert_eq!(list("/?owner=alice", "root").await, vec!["wf-a"]);
+        assert_eq!(list("/?owner=", "root").await, vec!["wf-legacy"]);
     }
 
     #[tokio::test]
-    async fn cannot_read_someone_elses_workflow() {
-        let (app, svc, audit, _) = two_users().await;
-        let r = app
-            .clone()
-            .oneshot(auth_req("GET", "/wf-a", &token(&svc, "bob"), None))
-            .await
-            .unwrap();
+    async fn someone_elses_workflow_does_not_exist_in_my_namespace() {
+        let (app, svc, audit, repo) = two_users().await;
+        let r = call(&app, "GET", "/wf-a", "bob", &svc).await;
         assert_eq!(r.status(), StatusCode::NOT_FOUND);
         // Même réponse que pour un id inconnu : l'existence n'est pas révélée.
-        let unknown = app
-            .oneshot(auth_req("GET", "/wf-zzz", &token(&svc, "bob"), None))
-            .await
-            .unwrap();
+        let unknown = call(&app, "GET", "/wf-zzz", "bob", &svc).await;
         assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
         assert_eq!(
             body_string(r).await.replace("wf-a", "ID"),
             body_string(unknown).await.replace("wf-zzz", "ID")
         );
-        let events = audit.list().await.unwrap();
-        assert!(events
-            .iter()
-            .any(|e| e.action == "workflows.get" && e.outcome == AuditOutcome::Denied));
-    }
 
-    #[tokio::test]
-    async fn cannot_update_someone_elses_workflow() {
-        let (app, svc, _, repo) = two_users().await;
         let mut hijack = sample_workflow_json("wf-a");
         hijack["name"] = serde_json::json!("pwned");
-        let r = app
+        let put = app
+            .clone()
             .oneshot(auth_req(
                 "PUT",
                 "/wf-a",
@@ -949,56 +946,88 @@ mod tests {
             ))
             .await
             .unwrap();
-        assert_eq!(r.status(), StatusCode::NOT_FOUND);
-        let kept = repo.get(&WorkflowId::new("wf-a")).await.unwrap().unwrap();
+        assert_eq!(put.status(), StatusCode::NOT_FOUND);
+        // DELETE idempotent : 204, mais rien n'est supprimé chez alice.
+        let del = call(&app, "DELETE", "/wf-a", "bob", &svc).await;
+        assert_eq!(del.status(), StatusCode::NO_CONTENT);
+        let kept = repo.get("alice", &wid("wf-a")).await.unwrap().unwrap();
         assert_eq!(kept.name, "workflow wf-a");
-    }
 
-    #[tokio::test]
-    async fn cannot_delete_someone_elses_workflow() {
-        let (app, svc, audit, repo) = two_users().await;
-        let r = app
-            .oneshot(auth_req("DELETE", "/wf-a", &token(&svc, "bob"), None))
-            .await
-            .unwrap();
-        // 204 comme pour un id inconnu, mais rien n'est supprimé.
-        assert_eq!(r.status(), StatusCode::NO_CONTENT);
-        assert!(repo.get(&WorkflowId::new("wf-a")).await.unwrap().is_some());
         let events = audit.list().await.unwrap();
-        assert!(events
-            .iter()
-            .any(|e| e.action == "workflows.delete" && e.outcome == AuditOutcome::Denied));
-    }
-
-    #[tokio::test]
-    async fn owner_and_super_admin_keep_full_access() {
-        let (app, svc, _, repo) = two_users().await;
-        for who in ["alice", "root"] {
-            let r = app
-                .clone()
-                .oneshot(auth_req("GET", "/wf-a", &token(&svc, who), None))
-                .await
-                .unwrap();
-            assert_eq!(r.status(), StatusCode::OK, "{who} doit lire wf-a");
+        for action in ["workflows.get", "workflows.update", "workflows.delete"] {
+            assert!(events.iter().any(|e| e.action == action
+                && e.actor == "bob"
+                && e.outcome == AuditOutcome::Failure));
         }
-        let r = app
-            .oneshot(auth_req("DELETE", "/wf-a", &token(&svc, "root"), None))
-            .await
-            .unwrap();
-        assert_eq!(r.status(), StatusCode::NO_CONTENT);
-        assert!(repo.get(&WorkflowId::new("wf-a")).await.unwrap().is_none());
     }
 
     #[tokio::test]
-    async fn workflow_without_owner_is_hidden_from_regular_users() {
+    async fn targeting_another_namespace_requires_super_admin() {
+        let (app, svc, _, _) = two_users().await;
+        // 403 que le workflow existe ou non : rien n'est révélé.
+        for uri in [
+            "/wf-a?owner=alice",
+            "/wf-zzz?owner=alice",
+            "/?owner=alice",
+            "/wf-legacy?owner=",
+        ] {
+            let r = call(&app, "GET", uri, "bob", &svc).await;
+            assert_eq!(r.status(), StatusCode::FORBIDDEN, "{uri}");
+        }
+        // Viser explicitement son propre espace est permis.
+        assert_eq!(
+            call(&app, "GET", "/wf-a?owner=alice", "alice", &svc)
+                .await
+                .status(),
+            StatusCode::OK
+        );
+    }
+
+    #[tokio::test]
+    async fn super_admin_reaches_another_namespace_with_owner() {
+        let (app, svc, audit, repo) = two_users().await;
+        assert_eq!(
+            call(&app, "GET", "/wf-a", "root", &svc).await.status(),
+            StatusCode::NOT_FOUND,
+            "sans `owner`, root est dans son propre espace"
+        );
+        assert_eq!(
+            call(&app, "GET", "/wf-a?owner=alice", "root", &svc)
+                .await
+                .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            call(&app, "DELETE", "/wf-a?owner=alice", "root", &svc)
+                .await
+                .status(),
+            StatusCode::NO_CONTENT
+        );
+        assert!(repo.get("alice", &wid("wf-a")).await.unwrap().is_none());
+        let events = audit.list().await.unwrap();
+        assert!(events.iter().any(|e| e.action == "workflows.delete"
+            && e.actor == "root"
+            && e.resource.as_deref() == Some("alice/wf-a")
+            && e.outcome == AuditOutcome::Success));
+    }
+
+    #[tokio::test]
+    async fn workflows_without_owner_are_reserved_to_super_admins() {
         let (app, svc, _, repo) = two_users().await;
-        repo.create(sample_workflow("wf-legacy"), None)
+        repo.create(LEGACY_NAMESPACE, sample_workflow("wf-legacy"))
             .await
             .unwrap();
-        let r = app
-            .oneshot(auth_req("GET", "/wf-legacy", &token(&svc, "alice"), None))
-            .await
-            .unwrap();
-        assert_eq!(r.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            call(&app, "GET", "/wf-legacy", "alice", &svc)
+                .await
+                .status(),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            call(&app, "GET", "/wf-legacy?owner=", "root", &svc)
+                .await
+                .status(),
+            StatusCode::OK
+        );
     }
 }

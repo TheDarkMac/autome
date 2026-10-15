@@ -165,7 +165,7 @@ async fn each_run_uses_its_owner_token_from_postgres() {
     let repo = Arc::new(InMemoryWorkflowRepository::new());
     let runs = Arc::new(InMemoryRunStateStore::new());
     for (owner, wf, run) in [("alice", "wf-a", "run-a"), ("bob", "wf-b", "run-b")] {
-        repo.create(github_workflow(wf), Some(owner)).await.unwrap();
+        repo.create(owner, github_workflow(wf)).await.unwrap();
         runs.checkpoint(
             &RunCheckpoint::queued(run, wf, 1, "manual", 0).with_owner(Some(owner.into())),
         )
@@ -242,7 +242,7 @@ async fn expired_token_is_refreshed_and_persisted_in_postgres() {
     wf.nodes[1].params = json!({ "to": "a@b.c", "subject": "s", "body": "b" });
     let repo = Arc::new(InMemoryWorkflowRepository::new());
     let runs = Arc::new(InMemoryRunStateStore::new());
-    repo.create(wf, Some("alice")).await.unwrap();
+    repo.create("alice", wf).await.unwrap();
     runs.checkpoint(
         &RunCheckpoint::queued("run-g", "wf-g", 1, "manual", 0).with_owner(Some("alice".into())),
     )

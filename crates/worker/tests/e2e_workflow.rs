@@ -25,7 +25,7 @@ use std::time::{Duration, Instant};
 use autome_core::{
     dlq_of, DispatchRequest, InMemoryQueue, InMemoryRunStateStore, InMemoryWorkflowRepository,
     Node, NodeId, NodeKind, Queue, QueueRunDispatcher, RunDispatcher, RunStateStore, RunStatus,
-    WorkflowGraph, WorkflowId, WorkflowRepository,
+    WorkflowGraph, WorkflowId, WorkflowRepository, LEGACY_NAMESPACE,
 };
 use autome_engine::{Dag, Engine, NodeRunner, RunStatus as EngineRunStatus, StepStatus};
 use autome_worker::{
@@ -133,14 +133,6 @@ impl Handler for RunExecutor {
         let run_id = body["run_id"].as_str().expect("run_id dans le message");
         let workflow_id = body["workflow_id"].as_str().expect("workflow_id");
 
-        let workflow = self
-            .repo
-            .get(&WorkflowId::new(workflow_id))
-            .await
-            .expect("repo get")
-            .expect("workflow connu");
-        let dag = Dag::from_workflow(&workflow).expect("DAG valide");
-
         // Transition Queued → Running.
         let mut checkpoint = self
             .store
@@ -148,6 +140,16 @@ impl Handler for RunExecutor {
             .await
             .expect("load")
             .expect("run connu");
+
+        // Le workflow vit dans l'espace d'ids du propriétaire du run (#188).
+        let namespace = checkpoint.owner_id.as_deref().unwrap_or(LEGACY_NAMESPACE);
+        let workflow = self
+            .repo
+            .get(namespace, &WorkflowId::new(workflow_id))
+            .await
+            .expect("repo get")
+            .expect("workflow connu");
+        let dag = Dag::from_workflow(&workflow).expect("DAG valide");
         checkpoint.status = RunStatus::Running;
         checkpoint.started_at_ms = Some(NOW_MS);
         self.store
@@ -258,7 +260,7 @@ async fn dispatched_workflow_runs_to_completion_with_persisted_outputs() {
     let stack = Stack::new();
     stack
         .repo
-        .create(pipeline_workflow("wf-pipe"), None)
+        .create(LEGACY_NAMESPACE, pipeline_workflow("wf-pipe"))
         .await
         .unwrap();
 
@@ -298,7 +300,7 @@ async fn failing_node_marks_run_failed_and_dead_letters_message() {
     // Workflow dont le second node échoue (`name == "boom"`).
     let mut wf = pipeline_workflow("wf-boom");
     wf.nodes[1].name = "boom".into();
-    stack.repo.create(wf, None).await.unwrap();
+    stack.repo.create(LEGACY_NAMESPACE, wf).await.unwrap();
 
     let run_id = stack.dispatch("wf-boom").await;
     let pool = stack.pool(1);
@@ -325,7 +327,7 @@ async fn concurrent_pool_drains_all_dispatched_runs_to_success() {
     let stack = Stack::new();
     stack
         .repo
-        .create(pipeline_workflow("wf-pipe"), None)
+        .create(LEGACY_NAMESPACE, pipeline_workflow("wf-pipe"))
         .await
         .unwrap();
 
@@ -376,7 +378,7 @@ async fn duplicate_delivery_is_deduplicated_and_executes_once() {
     let stack = Stack::new();
     stack
         .repo
-        .create(pipeline_workflow("wf-pipe"), None)
+        .create(LEGACY_NAMESPACE, pipeline_workflow("wf-pipe"))
         .await
         .unwrap();
 
