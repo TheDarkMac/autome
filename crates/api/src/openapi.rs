@@ -34,6 +34,7 @@ use utoipa::{
         crate::accounts::login,
         crate::accounts::refresh,
         crate::accounts::logout,
+        crate::accounts::logout_all,
         // workflows (F7.1)
         crate::workflows::list_workflows,
         crate::workflows::create_workflow,
