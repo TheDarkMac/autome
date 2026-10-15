@@ -190,6 +190,40 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/livez": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** `GET /livez` — le process répond (aucune dépendance vérifiée). */
+        get: operations["livez"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/readyz": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** `GET /readyz` — prêt à servir : PostgreSQL et broker joignables. */
+        get: operations["readyz"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/runs/{run_id}": {
         parameters: {
             query?: never;
@@ -373,6 +407,15 @@ export interface components {
             provider_id: string;
             /** @description Scopes demandés. */
             scopes: string[];
+        };
+        /** @description Réponse de `/readyz`. */
+        ReadyzResponse: {
+            /** @description Par vérification (`postgres`, `rabbitmq`) : `ok` ou `error`. */
+            checks: {
+                [key: string]: string;
+            };
+            /** @description `ready` ou `unavailable`. */
+            status: string;
         };
         /** @description Body de `/auth/refresh` et `/auth/logout`. */
         RefreshBody: {
@@ -766,6 +809,55 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content?: never;
+            };
+        };
+    };
+    livez: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Vivant */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "text/plain": string;
+                };
+            };
+        };
+    };
+    readyz: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Prêt */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ReadyzResponse"];
+                };
+            };
+            /** @description Une dépendance au moins est indisponible */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ReadyzResponse"];
+                };
             };
         };
     };

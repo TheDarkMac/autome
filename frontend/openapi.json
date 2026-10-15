@@ -392,6 +392,58 @@
         ]
       }
     },
+    "/livez": {
+      "get": {
+        "tags": [
+          "probes"
+        ],
+        "summary": "`GET /livez` — le process répond (aucune dépendance vérifiée).",
+        "operationId": "livez",
+        "responses": {
+          "200": {
+            "description": "Vivant",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/readyz": {
+      "get": {
+        "tags": [
+          "probes"
+        ],
+        "summary": "`GET /readyz` — prêt à servir : PostgreSQL et broker joignables.",
+        "operationId": "readyz",
+        "responses": {
+          "200": {
+            "description": "Prêt",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReadyzResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Une dépendance au moins est indisponible",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReadyzResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/runs/{run_id}": {
       "get": {
         "tags": [
@@ -1135,6 +1187,30 @@
           }
         }
       },
+      "ReadyzResponse": {
+        "type": "object",
+        "description": "Réponse de `/readyz`.",
+        "required": [
+          "status",
+          "checks"
+        ],
+        "properties": {
+          "checks": {
+            "type": "object",
+            "description": "Par vérification (`postgres`, `rabbitmq`) : `ok` ou `error`.",
+            "additionalProperties": {
+              "type": "string"
+            },
+            "propertyNames": {
+              "type": "string"
+            }
+          },
+          "status": {
+            "type": "string",
+            "description": "`ready` ou `unavailable`."
+          }
+        }
+      },
       "RefreshBody": {
         "type": "object",
         "description": "Body de `/auth/refresh` et `/auth/logout`.",
@@ -1188,6 +1264,10 @@
     }
   },
   "tags": [
+    {
+      "name": "probes",
+      "description": "Sondes de l'orchestrateur : vivant (`/livez`) et prêt (`/readyz`)."
+    },
     {
       "name": "auth",
       "description": "Comptes : inscription, connexion, rotation des jetons."
