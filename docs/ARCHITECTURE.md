@@ -140,10 +140,10 @@ flowchart TB
     direction TB
     ING["Ingress NGINX<br/>autome.local / api.autome.local<br/>(TLS cert-manager = cible)"]
     subgraph apiD["Deployment: api (2 réplicas)"]
-      A1["api pod<br/>/health · /metrics"]
+      A1["api pod<br/>/livez · /readyz · /metrics"]
     end
     subgraph wkD["Deployment: worker (HPA = cible)"]
-      W1["worker pod"]
+      W1["worker pod<br/>:9091 /livez · /readyz"]
     end
     subgraph feD["Deployment: frontend (nginx, 2 réplicas)"]
       F1["frontend pod"]
