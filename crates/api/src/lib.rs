@@ -14,6 +14,7 @@
 
 pub mod accounts;
 pub mod auth;
+pub mod client_ip;
 pub mod credentials;
 pub mod metrics;
 pub mod observability;

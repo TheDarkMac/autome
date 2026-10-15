@@ -38,6 +38,8 @@ serde_json = "1"
 sha2 = "0.10"
 hmac = "0.12"
 hex = "0.4"
+# Plages CIDR des proxys de confiance (#190) ; déjà tiré par reqwest
+ipnet = "2"
 # Auth utilisateur (F6.1)
 jsonwebtoken = "9"
 argon2 = "0.5"
