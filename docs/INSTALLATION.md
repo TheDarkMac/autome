@@ -405,9 +405,19 @@ comptes sont publics ; tout le reste exige `Authorization: Bearer <access_token>
 - **Isolation par propriétaire** : un workflow appartient à son créateur, un run
   au propriétaire de son workflow. Les listes ne montrent que ses propres
   ressources ; lire, modifier, lancer ou supprimer la ressource d'autrui répond
-  comme si elle n'existait pas (404, ou 204 pour `DELETE`). Seul un super-admin
-  (permission `*`) voit tout. Les lignes antérieures à la migration `0010`
-  (sans propriétaire) ne sont visibles que des super-admins.
+  comme si elle n'existait pas (404, ou 204 pour `DELETE`).
+- **Ids de workflow par utilisateur** : chaque compte a son propre espace d'ids
+  (clé `(owner_id, id)`, migration `0014`). Deux comptes peuvent créer chacun
+  un workflow `wf-draft` ; `POST /workflows` ne répond 409 que si l'id existe
+  déjà **dans son propre espace** — l'existence des workflows d'autrui n'est
+  jamais révélée. Les runs d'un workflow sont exécutés avec la version de
+  l'espace de leur propriétaire.
+- **Super-admin** (permission `*`) : travaille lui aussi dans son propre espace
+  par défaut ; il vise celui d'un autre compte avec `?owner=<user_id>` sur
+  `/workflows`, `/workflows/{id}` et `/workflows/{id}/runs` (et lit tout run
+  par son id). `?owner=` vide désigne les workflows antérieurs à la migration
+  `0010`, sans propriétaire. Un utilisateur ordinaire qui vise l'espace d'autrui
+  reçoit 403, que la ressource existe ou non.
 
 ```bash
 curl -s -H 'content-type: application/json' \
