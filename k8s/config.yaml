@@ -25,6 +25,15 @@ data:
   # Anti-SSRF : hôtes internes autorisés en sortie (vide = destinations
   # publiques uniquement). Ex. "keycloak.autome.svc.cluster.local".
   AUTOME_EGRESS_ALLOWLIST: ""
+  # Anti-bruteforce par IP (#190). Le pair de l'API est le contrôleur
+  # ingress-nginx : son `X-Forwarded-For` n'est cru que s'il vient de ces
+  # plages. Défaut large (réseaux privés) : RESTREINDRE au CIDR des pods de
+  # l'ingress de votre cluster — tout pod d'une plage listée peut sinon choisir
+  # l'IP sous laquelle ses tentatives sont comptées.
+  AUTOME_TRUSTED_PROXIES: "10.0.0.0/8,172.16.0.0/12,192.168.0.0/16"
+  # Quotas par IP et par fenêtre de 15 min (0 = désactivé).
+  AUTOME_LOGIN_IP_MAX_ATTEMPTS: "50"
+  AUTOME_SIGNUP_IP_MAX_ATTEMPTS: "10"
 ---
 # Secrets (F10.3) — VALEURS DE DÉMONSTRATION, à remplacer impérativement
 # avant tout usage réel (SealedSecrets / External Secrets / Vault…).
