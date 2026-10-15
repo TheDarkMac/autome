@@ -4,6 +4,84 @@
  */
 
 export interface paths {
+    "/auth/login": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** `POST /auth/login` — échange email + mot de passe contre une paire de jetons. */
+        post: operations["login"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/auth/logout": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * `POST /auth/logout` — ferme la session côté serveur.
+         * @description Révoque le refresh présenté (plus de rotation possible) et, s'il est fourni
+         *     en `Authorization: Bearer`, l'access token **du même utilisateur** (refusé
+         *     partout jusqu'à son expiration). Idempotent : un refresh déjà révoqué
+         *     répond aussi 204. Un Bearer absent, invalide ou d'un autre utilisateur
+         *     n'empêche pas la déconnexion : il est simplement ignoré.
+         */
+        post: operations["logout"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/auth/refresh": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * `POST /auth/refresh` — rotation : le refresh présenté est révoqué et une
+         *     nouvelle paire est émise. Un refresh déjà utilisé est refusé (rejeu).
+         */
+        post: operations["refresh"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/auth/signup": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** `POST /auth/signup` — crée un compte (rôle `editor`) et le connecte. */
+        post: operations["signup"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/credentials": {
         parameters: {
             query?: never;
@@ -224,6 +302,13 @@ export interface components {
             /** @description Scopes effectivement accordés (verbatim). */
             scope?: string | null;
         };
+        /** @description Body de `/auth/signup` et `/auth/login`. */
+        CredentialsBody: {
+            /** @description Adresse email (normalisée côté serveur : trim + minuscules). */
+            email: string;
+            /** @description Mot de passe en clair (8 à 1024 caractères). */
+            password: string;
+        };
         /** @description Réponse de `GET /credentials`. */
         ListCredentialsResponse: {
             /** @description Credentials du user courant, tri lexical par `provider_id`. */
@@ -263,6 +348,25 @@ export interface components {
             /** @description Scopes demandés. */
             scopes: string[];
         };
+        /** @description Body de `/auth/refresh` et `/auth/logout`. */
+        RefreshBody: {
+            /** @description Refresh token obtenu au login/signup ou au refresh précédent. */
+            refresh_token: string;
+        };
+        /** @description Paire de jetons émise par signup/login/refresh. */
+        TokenResponse: {
+            /** @description JWT d'accès, à présenter en `Authorization: Bearer`. */
+            access_token: string;
+            /**
+             * Format: int64
+             * @description Durée de vie de l'access token, en secondes.
+             */
+            expires_in: number;
+            /** @description JWT de rafraîchissement (usage unique). */
+            refresh_token: string;
+            /** @description Toujours `Bearer`. */
+            token_type: string;
+        };
     };
     responses: never;
     parameters: never;
@@ -272,6 +376,145 @@ export interface components {
 }
 export type $defs = Record<string, never>;
 export interface operations {
+    login: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CredentialsBody"];
+            };
+        };
+        responses: {
+            /** @description Connecté */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TokenResponse"];
+                };
+            };
+            /** @description Identifiants invalides */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Trop d'échecs — voir `Retry-After` */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    logout: {
+        parameters: {
+            query?: never;
+            header?: {
+                /** @description `Bearer <access_token>` de la session, révoqué aussi s'il est fourni */
+                Authorization?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RefreshBody"];
+            };
+        };
+        responses: {
+            /** @description Session fermée (ou déjà fermée) */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Refresh invalide ou expiré */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    refresh: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RefreshBody"];
+            };
+        };
+        responses: {
+            /** @description Nouvelle paire */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TokenResponse"];
+                };
+            };
+            /** @description Refresh invalide, expiré ou déjà utilisé */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    signup: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CredentialsBody"];
+            };
+        };
+        responses: {
+            /** @description Compte créé */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TokenResponse"];
+                };
+            };
+            /** @description Email ou mot de passe invalide */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Email déjà enregistré */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
     list_credentials: {
         parameters: {
             query?: never;

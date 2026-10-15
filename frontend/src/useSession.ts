@@ -2,7 +2,8 @@
 //
 // Source de vérité de l'authentification côté SPA :
 //   - charge la session depuis le `SessionStore` au montage ;
-//   - expose `login` / `signup` / `logout` ;
+//   - expose `login` / `signup` / `logout` (qui ferme aussi la session
+//     côté serveur, au mieux — #184) ;
 //   - rafraîchit l'access token de manière proactive (timer réarmé à
 //     `skewMs` avant l'expiration) et sur échec, déconnecte proprement.
 //
@@ -13,6 +14,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 
 import {
   login as apiLogin,
+  logout as apiLogout,
   refresh as apiRefresh,
   signup as apiSignup,
   type Credentials,
@@ -36,6 +38,7 @@ export interface UseSessionOptions {
   loginImpl?: typeof apiLogin;
   signupImpl?: typeof apiSignup;
   refreshImpl?: typeof apiRefresh;
+  logoutImpl?: typeof apiLogout;
 }
 
 export interface UseSessionResult {
@@ -64,6 +67,7 @@ export function useSession(options: UseSessionOptions = {}): UseSessionResult {
     loginImpl = apiLogin,
     signupImpl = apiSignup,
     refreshImpl = apiRefresh,
+    logoutImpl = apiLogout,
   } = options;
 
   // Le store ne doit pas changer entre les rendus : on le fige au montage.
@@ -115,7 +119,20 @@ export function useSession(options: UseSessionOptions = {}): UseSessionResult {
     setLoading(false);
   }, []);
 
-  const logout = useCallback(() => apply(null), [apply]);
+  // La session locale est vidée tout de suite (l'UI n'attend pas le
+  // réseau) ; la révocation serveur part en arrière-plan. Si elle échoue
+  // (backend injoignable), les jetons expirent d'eux-mêmes : access 15 min,
+  // refresh 7 j — rien de plus à faire côté client.
+  const logout = useCallback(() => {
+    const current = sessionRef.current;
+    apply(null);
+    if (current) {
+      logoutImpl({
+        accessToken: current.accessToken,
+        refreshToken: current.refreshToken,
+      }).catch(() => undefined);
+    }
+  }, [apply, logoutImpl]);
 
   const login = useCallback(
     async (creds: Credentials) => {

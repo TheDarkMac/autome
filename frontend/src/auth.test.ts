@@ -5,6 +5,7 @@ import {
   decodeJwt,
   isTokenExpired,
   login,
+  logout,
   refresh,
   signup,
   tokenExpiresAtMs,
@@ -195,6 +196,30 @@ describe("refresh", () => {
       status: 401,
       message: /invalide ou expiré/i,
     });
+  });
+});
+
+describe("logout", () => {
+  const PAIR: TokenPair = { accessToken: "a.b.c", refreshToken: "d.e.f" };
+
+  it("POST /auth/logout avec le refresh en body et l'access en Bearer", async () => {
+    const fetchImpl = vi.fn().mockResolvedValue(new Response(null, { status: 204 }));
+    await logout(PAIR, fetchImpl);
+    const [url, init] = fetchImpl.mock.calls[0]!;
+    expect(url).toMatch(/\/auth\/logout$/);
+    expect(init.method).toBe("POST");
+    expect(init.headers.Authorization).toBe("Bearer a.b.c");
+    expect(JSON.parse(init.body)).toEqual({ refresh_token: "d.e.f" });
+  });
+
+  it("un 401 (session déjà expirée) n'est pas une erreur", async () => {
+    const fetchImpl = vi.fn().mockResolvedValue(jsonResponse({}, 401));
+    await expect(logout(PAIR, fetchImpl)).resolves.toBeUndefined();
+  });
+
+  it("remonte une erreur serveur", async () => {
+    const fetchImpl = vi.fn().mockResolvedValue(jsonResponse({}, 500));
+    await expect(logout(PAIR, fetchImpl)).rejects.toMatchObject({ status: 500 });
   });
 });
 

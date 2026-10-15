@@ -71,15 +71,44 @@ describe("useSession", () => {
     expect(signupImpl).toHaveBeenCalledOnce();
   });
 
-  it("logout efface la session et le store", () => {
-    const store = memorySessionStore(mkPair("user-1", 10_000));
-    const { result } = renderHook(() => useSession({ store }));
+  it("logout efface la session et le store, et révoque côté serveur", () => {
+    const pair = mkPair("user-1", 10_000);
+    const store = memorySessionStore(pair);
+    const logoutImpl = vi.fn().mockResolvedValue(undefined);
+    const { result } = renderHook(() => useSession({ store, logoutImpl }));
     expect(result.current.authenticated).toBe(true);
 
     act(() => result.current.logout());
 
     expect(result.current.session).toBeNull();
     expect(store.read()).toBeNull();
+    expect(logoutImpl).toHaveBeenCalledOnce();
+    expect(logoutImpl).toHaveBeenCalledWith(pair);
+  });
+
+  it("logout vide la session même si la révocation échoue", async () => {
+    const store = memorySessionStore(mkPair("user-1", 10_000));
+    const logoutImpl = vi.fn().mockRejectedValue(new Error("offline"));
+    const { result } = renderHook(() => useSession({ store, logoutImpl }));
+
+    await act(async () => {
+      result.current.logout();
+      await Promise.resolve();
+    });
+
+    expect(result.current.session).toBeNull();
+    expect(store.read()).toBeNull();
+  });
+
+  it("logout sans session n'appelle pas le serveur", () => {
+    const logoutImpl = vi.fn().mockResolvedValue(undefined);
+    const { result } = renderHook(() =>
+      useSession({ store: memorySessionStore(), logoutImpl }),
+    );
+
+    act(() => result.current.logout());
+
+    expect(logoutImpl).not.toHaveBeenCalled();
   });
 
   it("rafraîchit proactivement l'access token avant l'expiration", async () => {
