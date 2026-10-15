@@ -402,6 +402,32 @@ comptes sont publics ; tout le reste exige `Authorization: Bearer <access_token>
   Si le compteur est indisponible, la connexion est refusée (pas de
   contournement). Les tentatives et les révocations de jetons expirées sont
   purgées toutes les 10 min.
+- **Anti-bruteforce par adresse IP** (#190) : le compteur par email ne voit ni
+  la pulvérisation de mots de passe (quelques essais sur beaucoup d'emails), ni
+  le bourrage d'identifiants (un essai par email), ni l'épuisement CPU (chaque
+  login ou signup coûte ~50 ms d'Argon2). Par IP cliente et par fenêtre de
+  15 min : au plus `AUTOME_LOGIN_IP_MAX_ATTEMPTS` (défaut 50) échecs de
+  connexion — une connexion réussie ne compte pas, pour les bureaux derrière un
+  même NAT — et `AUTOME_SIGNUP_IP_MAX_ATTEMPTS` (défaut 10) inscriptions ;
+  au-delà, 429 + `Retry-After`. `0` désactive un quota. Les IPv6 sont comptées
+  par préfixe `/64`. Compteurs partagés entre répliques comme celui des emails.
+- **IP réelle derrière un proxy** : `X-Forwarded-For` n'est lu que si la
+  requête vient d'un proxy listé dans `AUTOME_TRUSTED_PROXIES` (CIDR ou
+  adresses, séparés par des virgules) ; l'IP retenue est la plus à droite de la
+  chaîne qui ne soit pas un proxy de confiance. Sans proxy de confiance
+  (défaut, cas de compose), l'adresse du pair TCP fait foi et l'en-tête est
+  ignoré — un client ne peut pas choisir son IP. En k8s, l'API voit le
+  contrôleur ingress : `k8s/config.yaml` fait confiance aux réseaux privés,
+  **à restreindre au CIDR des pods de l'ingress**. Une plage trop large laisse
+  les machines qui s'y trouvent choisir l'IP sous laquelle elles sont comptées ;
+  une liste vide derrière un proxy compte tous les clients sous l'IP du proxy
+  (tout le monde bloqué ensemble).
+- Pas de plafond global : il bloquerait tous les utilisateurs au premier pic
+  (déni de service offert à l'attaquant). Pour repérer une attaque distribuée
+  sur beaucoup d'IP, surveiller
+  `autome_http_requests_total{path="/auth/login",status="429"}` et les
+  `401` de la même route sur `/metrics`. Données personnelles : voir
+  ci-dessous.
 - **Isolation par propriétaire** : un workflow appartient à son créateur, un run
   au propriétaire de son workflow. Les listes ne montrent que ses propres
   ressources ; lire, modifier, lancer ou supprimer la ressource d'autrui répond
@@ -427,6 +453,26 @@ curl -s -H 'content-type: application/json' \
 
 Base de dev seedée (`migrations/seeds/dev_seed.sql`) : compte super-admin
 `dev@autome.local` / `autome-dev-password` (à ne jamais appliquer en prod).
+
+### Données personnelles (adresses IP)
+
+Une adresse IP est une donnée personnelle (RGPD : CJUE, *Breyer*, 2016). Le
+traitement repose sur l'intérêt légitime de sécurité (art. 6.1.f, considérant 49 ;
+art. 32) et suit ces règles :
+
+- **finalité unique** : limiter les tentatives d'authentification ;
+- **minimisation** : l'IP n'est jamais stockée en clair — le compteur est
+  indexé par un HMAC-SHA256 de l'adresse, à clé secrète dérivée
+  d'`ENCRYPTION_KEY` (un simple hachage se renverserait en énumérant les IPv4),
+  lui-même haché en base ;
+- **conservation** : 15 min (fenêtre), purge automatique ;
+- **ni logs ni audit** : l'API ne journalise jamais l'IP cliente.
+
+Hors du code d'Autome : l'ingress ou le load balancer journalisent en général
+les IP de leur côté — leur durée de conservation est à régler et à documenter
+avec le reste. Mentionner ce traitement dans la politique de confidentialité et
+le registre des traitements ; le faire valider par le DPO ou un juriste avant
+une mise en production réelle.
 
 ---
 
