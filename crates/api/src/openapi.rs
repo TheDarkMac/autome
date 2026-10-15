@@ -29,6 +29,9 @@ use utoipa::{
         description = "Backend HTTP du moteur d'automatisation Autome.",
     ),
     paths(
+        // sondes (#192)
+        crate::probes::livez,
+        crate::probes::readyz,
         // comptes (backlog auth)
         crate::accounts::signup,
         crate::accounts::login,
@@ -53,6 +56,7 @@ use utoipa::{
         crate::credentials::delete_credential,
     ),
     components(schemas(
+        crate::probes::ReadyzResponse,
         crate::accounts::CredentialsBody,
         crate::accounts::RefreshBody,
         crate::accounts::TokenResponse,
@@ -68,6 +72,7 @@ use utoipa::{
         crate::credentials::ListCredentialsResponse,
     )),
     tags(
+        (name = "probes", description = "Sondes de l'orchestrateur : vivant (`/livez`) et prêt (`/readyz`)."),
         (name = "auth", description = "Comptes : inscription, connexion, rotation des jetons."),
         (name = "workflows", description = "CRUD des workflows."),
         (name = "runs", description = "Déclenchement et suivi des runs."),

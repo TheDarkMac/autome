@@ -31,7 +31,9 @@ use autome_persistence::{
 use crate::auth::{token_service_from_config, AuthState};
 
 // Sélecteurs de file/stores partagés avec le worker (dette #107).
-pub use autome_persistence::{build_queue, ensure_durable_backends, PersistenceMode, QueueMode};
+pub use autome_persistence::{
+    build_health_checks, build_queue, ensure_durable_backends, PersistenceMode, QueueMode,
+};
 
 /// Construit le service de credentials OAuth (dette #107, constat 3) :
 /// transport HTTP **réel** ([`ReqwestHttpClient`]) + `store` de tokens
