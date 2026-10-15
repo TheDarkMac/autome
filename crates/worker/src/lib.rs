@@ -51,10 +51,13 @@ use tokio::task::JoinHandle;
 
 pub mod dispatch;
 pub mod executor;
+pub mod liveness;
+pub mod probe;
 pub use dispatch::{
     ConnectorCredentialsMode, CredentialResolver, EnvCredentialResolver, OwnerCredentialResolver,
 };
 pub use executor::{reap_orphans, RunExecutor};
+pub use liveness::PoolLiveness;
 
 /// Verdict que retourne un [`Handler`] après traitement.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -159,6 +162,8 @@ pub struct WorkerPool {
     queue_name: String,
     concurrency: usize,
     poll_idle_sleep: Duration,
+    /// Battements des consommateurs, lus par la sonde de liveness (#192).
+    liveness: Arc<PoolLiveness>,
 }
 
 impl WorkerPool {
@@ -172,14 +177,21 @@ impl WorkerPool {
         queue_name: impl Into<String>,
         concurrency: usize,
     ) -> Self {
+        let concurrency = concurrency.max(1);
         Self {
             queue,
             handler,
             idempotency,
             queue_name: queue_name.into(),
-            concurrency: concurrency.max(1),
+            concurrency,
             poll_idle_sleep: Duration::from_millis(50),
+            liveness: Arc::new(PoolLiveness::new(concurrency, liveness::now_ms())),
         }
+    }
+
+    /// Battements des consommateurs (à passer à la sonde de liveness).
+    pub fn liveness(&self) -> Arc<PoolLiveness> {
+        Arc::clone(&self.liveness)
     }
 
     /// Builder : durée de pause entre deux polls quand la file est vide.
@@ -191,6 +203,12 @@ impl WorkerPool {
     /// Traite UN message si disponible. Exposée pour les tests et pour piloter
     /// le worker en mode déterministe.
     pub async fn process_one(&self) -> Result<ProcessOutcome> {
+        self.process_as(None).await
+    }
+
+    /// [`process_one`](Self::process_one) pour le consommateur `consumer`,
+    /// marqué occupé pendant le traitement du message (liveness, #192).
+    async fn process_as(&self, consumer: Option<usize>) -> Result<ProcessOutcome> {
         let Some(delivery) = self.queue.poll(&self.queue_name).await? else {
             return Ok(ProcessOutcome::Idle);
         };
@@ -203,7 +221,13 @@ impl WorkerPool {
                 return Ok(ProcessOutcome::Deduplicated);
             }
         }
+        if let Some(id) = consumer {
+            self.liveness.busy(id, liveness::now_ms());
+        }
         let verdict = self.handler.handle(&delivery).await;
+        if let Some(id) = consumer {
+            self.liveness.idle(id, liveness::now_ms());
+        }
         match &verdict {
             HandlerVerdict::Ok => self.queue.ack(&delivery.id).await?,
             HandlerVerdict::Retry => self.queue.nack(&delivery.id, Nack::Requeue).await?,
@@ -249,7 +273,8 @@ fn error_backoff(base: Duration, failures: u32) -> Duration {
 async fn worker_loop(pool: &WorkerPool, shutdown: &AtomicBool, id: usize) {
     let mut failures = 0u32;
     while !shutdown.load(Ordering::Acquire) {
-        match pool.process_one().await {
+        pool.liveness.tick(id, liveness::now_ms());
+        match pool.process_as(Some(id)).await {
             Ok(outcome) => {
                 if failures > 0 {
                     tracing::info!(consumer = id, failures, "file de nouveau disponible");
@@ -337,6 +362,51 @@ mod tests {
         let q_dyn: Arc<dyn Queue + Send + Sync> = queue;
         let pool = WorkerPool::new(q_dyn, handler, Arc::clone(&idem), "runs", 1);
         (pool, idem)
+    }
+
+    // ───── #192 — liveness des consommateurs ─────
+
+    /// Handler qui « exécute un run » pendant la durée donnée.
+    struct SlowHandler(Duration);
+
+    #[async_trait]
+    impl Handler for SlowHandler {
+        async fn handle(&self, _d: &Delivery) -> HandlerVerdict {
+            tokio::time::sleep(self.0).await;
+            HandlerVerdict::Ok
+        }
+    }
+
+    #[tokio::test]
+    async fn a_long_run_keeps_the_pool_alive_and_idle_loops_keep_beating() {
+        let q = Arc::new(InMemoryQueue::new());
+        q.publish("runs", Message::new(json!({ "n": 1 })))
+            .await
+            .unwrap();
+        let handler: Arc<dyn Handler + Send + Sync> =
+            Arc::new(SlowHandler(Duration::from_millis(400)));
+        let idem: Arc<dyn IdempotencyStore + Send + Sync> =
+            Arc::new(InMemoryIdempotencyStore::new());
+        let pool = WorkerPool::new(q.clone(), handler, idem, "runs", 2)
+            .with_idle_sleep(Duration::from_millis(10));
+        let live = pool.liveness();
+        let running = pool.start();
+
+        // Pendant le « run » (400 ms) : seuil de boucle de 100 ms dépassé pour
+        // le consommateur occupé, mais il est occupé depuis moins que la limite.
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert!(live.check(liveness::now_ms(), 100, 10_000).is_ok());
+        // Une limite de run plus courte que le traitement le signale figé.
+        assert!(live.check(liveness::now_ms(), 100, 100).is_err());
+
+        // Run terminé, file vide : les deux consommateurs bouclent et battent.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(live.check(liveness::now_ms(), 100, 200).is_ok());
+
+        running.stop().await;
+        // Pool arrêté : plus personne ne bat, la liveness finit par échouer.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(live.check(liveness::now_ms(), 100, 200).is_err());
     }
 
     // ───── F5.2.a — process_one ─────

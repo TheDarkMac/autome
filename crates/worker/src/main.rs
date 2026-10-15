@@ -23,6 +23,11 @@
 //!   expirés (refresh token stocké). Sans config, un token expiré fait échouer
 //!   le node avec une invitation à reconnecter le compte.
 //!
+//! - `AUTOME_WORKER_PROBE_ADDR` : sondes `GET /livez` (consommateurs vivants,
+//!   un run en cours comptant jusqu'à `AUTOME_RUN_TIMEOUT_SECS`) et
+//!   `GET /readyz` (base et broker joignables) — défaut `127.0.0.1:9091`,
+//!   `0.0.0.0:9091` dans l'image ; vide = désactivées (#192).
+//!
 //! Arrêt **gracieux** : sur `SIGINT`/`SIGTERM`, le pool stoppe et `await` la
 //! fin des tâches en cours (pas de message perdu en vol).
 
@@ -33,9 +38,10 @@ use autome_connectors::oauth::{OAuthClient, OAuthRegistry};
 use autome_connectors::{EgressPolicy, ReqwestHttpClient};
 use autome_core::{telemetry, Config};
 use autome_persistence::selectors::{
-    build_connector_token_store, build_queue, build_run_state_store, build_workflow_repository,
-    ensure_durable_backends, PersistenceMode, QueueMode,
+    build_connector_token_store, build_health_checks, build_queue, build_run_state_store,
+    build_workflow_repository, ensure_durable_backends, PersistenceMode, QueueMode,
 };
+use autome_worker::probe::{self, ProbeState};
 use autome_worker::{
     reap_orphans, ConnectorCredentialsMode, Handler, IdempotencyStore, InMemoryIdempotencyStore,
     RunExecutor, WorkerPool,
@@ -55,6 +61,19 @@ fn concurrency_from_env() -> usize {
 
 /// Période du balayage des runs orphelins.
 const REAP_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Adresse du serveur de sondes par défaut (#192) — l'image Docker la remplace
+/// par `0.0.0.0:9091` pour l'orchestrateur.
+const DEFAULT_PROBE_ADDR: &str = "127.0.0.1:9091";
+
+/// `AUTOME_WORKER_PROBE_ADDR` : adresse des sondes `/livez` et `/readyz` ;
+/// vide = sondes désactivées.
+fn probe_addr_from_env() -> Option<String> {
+    let addr = std::env::var("AUTOME_WORKER_PROBE_ADDR")
+        .unwrap_or_else(|_| DEFAULT_PROBE_ADDR.to_string());
+    let addr = addr.trim();
+    (!addr.is_empty()).then(|| addr.to_string())
+}
 
 /// Lit `AUTOME_RUN_TIMEOUT_SECS` en millisecondes (défaut 3600 s, plancher 60 s).
 fn run_timeout_ms_from_env() -> i64 {
@@ -88,6 +107,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Backends sélectionnés par l'environnement (partagés avec l'API).
     let queue = build_queue(&config, queue_mode).await?;
+    // Sonde `/readyz` (#192) : base et broker effectivement sélectionnés.
+    let health_checks = build_health_checks(&config, persistence, queue_mode, queue.clone())?;
     let repo = build_workflow_repository(&config, persistence)?;
     let store = build_run_state_store(&config, persistence)?;
 
@@ -139,6 +160,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     let pool = WorkerPool::new(queue, handler, idempotency, RUNS_QUEUE, concurrency);
+
+    // Sondes (#192) : adresse invalide ou déjà prise ⇒ refus de démarrer
+    // (l'orchestrateur tuerait sinon un worker sain faute de réponse).
+    let probes = match probe_addr_from_env() {
+        Some(addr) => {
+            let listener = tokio::net::TcpListener::bind(&addr)
+                .await
+                .map_err(|e| format!("AUTOME_WORKER_PROBE_ADDR `{addr}` : {e}"))?;
+            tracing::info!(%addr, "sondes /livez et /readyz en écoute");
+            let state = ProbeState::new(pool.liveness(), health_checks, run_timeout_ms);
+            Some(tokio::spawn(probe::serve(listener, Arc::new(state))))
+        }
+        None => {
+            tracing::warn!("AUTOME_WORKER_PROBE_ADDR vide : sondes désactivées");
+            None
+        }
+    };
+
     let running = pool.start();
 
     // Arrêt gracieux : SIGINT (Ctrl-C) ou SIGTERM (orchestrateur).
@@ -146,6 +185,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!("signal d'arrêt reçu : drain des tâches en cours");
     running.stop().await;
     reaper.abort();
+    if let Some(probes) = probes {
+        probes.abort();
+    }
     tracing::info!("autome-worker arrêté proprement");
     Ok(())
 }
