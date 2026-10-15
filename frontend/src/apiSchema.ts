@@ -217,7 +217,10 @@ export interface paths {
         /** `GET /workflows?offset=&limit=` — liste paginée (perm `workflows.read`). */
         get: operations["list_workflows"];
         put?: never;
-        /** `POST /workflows` — création (201 Created, perm `workflows.write`). */
+        /**
+         * `POST /workflows` — création (201 Created, perm `workflows.write`) dans
+         *     l'espace de l'appelant (ou `?owner=` pour un super-admin).
+         */
         post: operations["create_workflow"];
         delete?: never;
         options?: never;
@@ -810,6 +813,11 @@ export interface operations {
                 offset?: number | null;
                 /** @description Limite, défaut 50. */
                 limit?: number | null;
+                /**
+                 * @description Espace d'un autre utilisateur (super-admin seulement) — cf.
+                 *     [`NamespaceQuery`].
+                 */
+                owner?: string | null;
             };
             header?: never;
             path?: never;
@@ -833,7 +841,7 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description Manque `workflows.read` */
+            /** @description Manque `workflows.read`, ou `owner` d'autrui sans `*` */
             403: {
                 headers: {
                     [name: string]: unknown;
@@ -844,7 +852,10 @@ export interface operations {
     };
     create_workflow: {
         parameters: {
-            query?: never;
+            query?: {
+                /** @description Propriétaire de l'espace visé. */
+                owner?: string | null;
+            };
             header?: never;
             path?: never;
             cookie?: never;
@@ -872,14 +883,14 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description Manque `workflows.write` */
+            /** @description Manque `workflows.write`, ou `owner` d'autrui sans `*` */
             403: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content?: never;
             };
-            /** @description Workflow déjà existant */
+            /** @description Id déjà utilisé dans cet espace */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -890,7 +901,10 @@ export interface operations {
     };
     get_workflow: {
         parameters: {
-            query?: never;
+            query?: {
+                /** @description Propriétaire de l'espace visé. */
+                owner?: string | null;
+            };
             header?: never;
             path: {
                 /** @description Identifiant du workflow */
@@ -916,14 +930,14 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description Manque `workflows.read` */
+            /** @description Manque `workflows.read`, ou `owner` d'autrui sans `*` */
             403: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content?: never;
             };
-            /** @description Workflow inconnu */
+            /** @description Workflow inconnu dans cet espace */
             404: {
                 headers: {
                     [name: string]: unknown;
@@ -934,7 +948,10 @@ export interface operations {
     };
     update_workflow: {
         parameters: {
-            query?: never;
+            query?: {
+                /** @description Propriétaire de l'espace visé. */
+                owner?: string | null;
+            };
             header?: never;
             path: {
                 /** @description Identifiant du workflow */
@@ -972,14 +989,14 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description Manque `workflows.write` */
+            /** @description Manque `workflows.write`, ou `owner` d'autrui sans `*` */
             403: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content?: never;
             };
-            /** @description Workflow inconnu */
+            /** @description Workflow inconnu dans cet espace */
             404: {
                 headers: {
                     [name: string]: unknown;
@@ -990,7 +1007,10 @@ export interface operations {
     };
     delete_workflow: {
         parameters: {
-            query?: never;
+            query?: {
+                /** @description Propriétaire de l'espace visé. */
+                owner?: string | null;
+            };
             header?: never;
             path: {
                 /** @description Identifiant du workflow */
@@ -1014,7 +1034,7 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description Manque `workflows.write` */
+            /** @description Manque `workflows.write`, ou `owner` d'autrui sans `*` */
             403: {
                 headers: {
                     [name: string]: unknown;
@@ -1030,6 +1050,11 @@ export interface operations {
                 offset?: number | null;
                 /** @description Limite, défaut 50. */
                 limit?: number | null;
+                /**
+                 * @description Espace d'ids de workflow d'un autre utilisateur (super-admin
+                 *     seulement) — cf. [`NamespaceQuery`].
+                 */
+                owner?: string | null;
             };
             header?: never;
             path: {
@@ -1056,7 +1081,7 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description Manque `runs.read` */
+            /** @description Manque `runs.read`, ou `owner` d'autrui sans `*` */
             403: {
                 headers: {
                     [name: string]: unknown;
@@ -1067,7 +1092,10 @@ export interface operations {
     };
     create_run: {
         parameters: {
-            query?: never;
+            query?: {
+                /** @description Propriétaire de l'espace visé. */
+                owner?: string | null;
+            };
             header?: never;
             path: {
                 /** @description Identifiant du workflow à exécuter */
@@ -1098,14 +1126,14 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description Manque `runs.execute` */
+            /** @description Manque `runs.execute`, ou `owner` d'autrui sans `*` */
             403: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content?: never;
             };
-            /** @description Workflow inconnu */
+            /** @description Workflow inconnu dans cet espace */
             404: {
                 headers: {
                     [name: string]: unknown;
