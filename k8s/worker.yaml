@@ -1,11 +1,6 @@
-# Exécuteur de runs `autome-worker` (F10.3).
-#
-# ⚠️ État actuel : le binaire est un squelette qui exécute un run bootstrap
-# puis sort (exit 0). En Deployment (restartPolicy Always implicite), le pod
-# sera donc redémarré en boucle (CrashLoopBackOff) tant que la boucle de
-# consommation de la file (F5.1 / dette #107) n'est pas câblée. Le manifeste
-# est livré dès maintenant ; il deviendra un consommateur long-vivant sans
-# changement de structure une fois le worker branché sur la queue.
+# Exécuteur de runs `autome-worker` (F10.3) : consommateur long-vivant de la
+# file `runs` (RabbitMQ), état des runs en PostgreSQL. Pas de Service : seules
+# ses sondes écoutent (port 9091, #192).
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -33,11 +28,39 @@ spec:
         - name: worker
           image: ghcr.io/thedarkmac/autome-worker:latest
           imagePullPolicy: IfNotPresent
+          ports:
+            - name: probes
+              containerPort: 9091
           envFrom:
             - configMapRef:
                 name: autome-config
             - secretRef:
                 name: autome-secrets
+          # Sondes (#192). Démarrage : attente du broker (jusqu'à 60 s).
+          startupProbe:
+            httpGet:
+              path: /livez
+              port: probes
+            periodSeconds: 3
+            failureThreshold: 30
+          # Vivant = chaque consommateur tourne, ou traite un run depuis moins
+          # que AUTOME_RUN_TIMEOUT_SECS (+ 1 min) : un run long ne fait pas
+          # redémarrer le pod ; un consommateur figé, si.
+          livenessProbe:
+            httpGet:
+              path: /livez
+              port: probes
+            periodSeconds: 20
+            timeoutSeconds: 3
+            failureThreshold: 3
+          # Prêt = PostgreSQL et RabbitMQ joignables (déploiement progressif).
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: probes
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 2
           resources:
             requests:
               cpu: 50m
