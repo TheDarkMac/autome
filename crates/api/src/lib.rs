@@ -19,6 +19,7 @@ pub mod credentials;
 pub mod metrics;
 pub mod observability;
 pub mod openapi;
+pub mod probes;
 pub mod runs;
 pub mod runtime;
 pub mod tls;

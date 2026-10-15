@@ -14,10 +14,11 @@ use autome_api::auth::protected_router;
 use autome_api::credentials::{credentials_router, CredentialsState};
 use autome_api::metrics::{metrics_router, with_metrics, Metrics};
 use autome_api::observability::with_request_tracing;
+use autome_api::probes::{probes_router, ProbesState};
 use autome_api::runs::{runs_router, RunsState};
 use autome_api::runtime::{
-    build_backends, build_queue, ensure_durable_backends, migrate, migrate_on_boot_requested,
-    purge_expired, Backends, PersistenceMode, QueueMode,
+    build_backends, build_health_checks, build_queue, ensure_durable_backends, migrate,
+    migrate_on_boot_requested, purge_expired, Backends, PersistenceMode, QueueMode,
 };
 use autome_api::tls::load_rustls_config;
 use autome_api::workflows::{
@@ -29,12 +30,8 @@ use axum::{routing::get, Router};
 /// Période de la purge des entrées d'authentification expirées.
 const MAINTENANCE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(600);
 
-/// Handler de la sonde de santé.
-async fn health() -> &'static str {
-    "ok"
-}
-
-/// Construit le routeur racine : `/health` + `/metrics` publics,
+/// Construit le routeur racine : sondes (`/livez`, `/readyz`, `/health`) et
+/// `/metrics` publics,
 /// `/auth/signup|login|refresh` publics (émission des jetons), `/auth/whoami|admin`
 /// protégés par JWT, et le CRUD `workflows` + `runs` (domaine 7). Toutes les
 /// routes sont instrumentées par le middleware de métriques (F10.6.a).
@@ -44,7 +41,12 @@ async fn health() -> &'static str {
 /// `/workflows/:id/runs` du router runs.
 ///
 /// Isolé de `main` pour être testable sans démarrer de serveur.
-fn build_router(backends: &Backends, accounts: AccountsState, metrics: Arc<Metrics>) -> Router {
+fn build_router(
+    backends: &Backends,
+    accounts: AccountsState,
+    probes: ProbesState,
+    metrics: Arc<Metrics>,
+) -> Router {
     let wf_state = WorkflowsState::new(backends.auth.clone(), backends.workflows.clone());
     let runs_state = RunsState::new(
         backends.auth.clone(),
@@ -67,7 +69,7 @@ fn build_router(backends: &Backends, accounts: AccountsState, metrics: Arc<Metri
         CredentialsState::new(backends.auth.clone(), backends.credentials.clone());
 
     let router = Router::new()
-        .route("/health", get(health))
+        .merge(probes_router(probes))
         .nest(
             "/auth",
             protected_router(backends.auth.clone()).merge(accounts_router(accounts)),
@@ -122,6 +124,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // File de messages (dette #107) : `AUTOME_QUEUE=rabbitmq` se connecte au
     // broker (`QUEUE_URL`) ; défaut `memory`. Le dispatcher de runs publie dessus.
     let queue = build_queue(&config, queue_mode).await?;
+    // Sonde `/readyz` (#192) : base et broker effectivement sélectionnés.
+    let probes = ProbesState::new(build_health_checks(
+        &config,
+        mode,
+        queue_mode,
+        queue.clone(),
+    )?);
     let backends = build_backends(&config, mode, queue)?;
     tracing::info!(queue = ?queue_mode, persistence = ?mode, "backends prêts");
 
@@ -162,7 +171,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     let accounts = accounts_state(&backends, ip_throttle)?;
     let metrics = Arc::new(Metrics::new());
-    let app = build_router(&backends, accounts, metrics);
+    let app = build_router(&backends, accounts, probes, metrics);
 
     // F6.4 — HTTPS via rustls si `AUTOME_TLS_CERT` + `AUTOME_TLS_KEY`
     // sont positionnées ; sinon HTTP en clair. Décision all-or-nothing
@@ -208,11 +217,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 mod tests {
     use super::*;
 
-    #[tokio::test]
-    async fn health_returns_ok() {
-        assert_eq!(health().await, "ok");
-    }
-
     #[test]
     fn router_builds() {
         // Le routeur racine complet (health + auth + workflows + runs +
@@ -224,6 +228,7 @@ mod tests {
             build_backends(&config, PersistenceMode::Memory, queue).expect("backends in-memory");
         let ip_throttle = IpThrottle::from_source(&config, |_| None).expect("défauts");
         let accounts = accounts_state(&backends, ip_throttle).expect("état comptes");
-        let _app: Router = build_router(&backends, accounts, Arc::new(Metrics::new()));
+        let probes = ProbesState::new(vec![]);
+        let _app: Router = build_router(&backends, accounts, probes, Arc::new(Metrics::new()));
     }
 }
