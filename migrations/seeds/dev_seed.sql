@@ -2,6 +2,8 @@
 -- N'est PAS une migration : à appliquer explicitement sur une base de dev
 -- (jamais en prod). IDs figés pour des tests reproductibles.
 -- Schéma aligné sur le domaine (IDs logiques TEXT, *_ms) — cf. migration 0009.
+-- Le workflow et le run de démo appartiennent au compte de dev : ids de
+-- workflow namespacés par propriétaire (migration 0014, #188).
 -- Le graph respecte le schéma F1.4 (autome-core::WorkflowGraph).
 
 BEGIN;
@@ -20,11 +22,13 @@ VALUES (
 INSERT INTO user_permissions (user_id, permission)
 VALUES ('00000000-0000-0000-0000-000000000001', '*');
 
-INSERT INTO workflows (id, name, active, current_version, created_at_ms, updated_at_ms)
-VALUES ('wf-demo', 'Demo : Webhook -> HTTP', TRUE, 1, 1700000000000, 1700000000000);
+INSERT INTO workflows (owner_id, id, name, active, current_version, created_at_ms, updated_at_ms)
+VALUES ('00000000-0000-0000-0000-000000000001', 'wf-demo', 'Demo : Webhook -> HTTP', TRUE, 1,
+        1700000000000, 1700000000000);
 
-INSERT INTO workflow_versions (workflow_id, version, graph)
+INSERT INTO workflow_versions (owner_id, workflow_id, version, graph)
 VALUES (
+    '00000000-0000-0000-0000-000000000001',
     'wf-demo',
     1,
     '{
@@ -42,9 +46,10 @@ VALUES (
 );
 
 INSERT INTO runs (id, workflow_id, version, status, trigger_type,
-                  started_at_ms, finished_at_ms, created_at_ms)
+                  started_at_ms, finished_at_ms, created_at_ms, owner_id)
 VALUES ('run-demo', 'wf-demo', 1, 'succeeded', 'webhook',
-        1700000000000, 1700000060000, 1700000000000);
+        1700000000000, 1700000060000, 1700000000000,
+        '00000000-0000-0000-0000-000000000001');
 
 INSERT INTO run_steps (run_id, node_id, output)
 VALUES
