@@ -27,12 +27,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use autome_core::{
     has_permission, AuditEvent, AuditOutcome, AuditSink, Claims, Config, InMemoryPermissionStore,
-    InMemoryRevocationStore, NoopAuditSink, PermissionStore, RevocationStore, TokenService,
-    PERM_WILDCARD,
+    InMemoryRevocationStore, NoopAuditSink, PermissionStore, RevocationStore, TokenKind,
+    TokenService, PERM_WILDCARD,
 };
 use axum::{
     extract::{FromRef, FromRequestParts},
-    http::{request::Parts, StatusCode},
+    http::{header, request::Parts, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::get,
     Router,
@@ -275,6 +275,17 @@ impl IntoResponse for AuthError {
     }
 }
 
+/// Jeton du header `Authorization: Bearer <jeton>`.
+pub(crate) fn bearer_token(headers: &HeaderMap) -> Result<&str, AuthError> {
+    headers
+        .get(header::AUTHORIZATION)
+        .ok_or(AuthError::Missing)?
+        .to_str()
+        .map_err(|_| AuthError::Malformed)?
+        .strip_prefix("Bearer ")
+        .ok_or(AuthError::Malformed)
+}
+
 /// Utilisateur authentifié extrait d'une requête HTTP.
 #[derive(Debug, Clone)]
 pub struct AuthenticatedUser {
@@ -299,19 +310,18 @@ where
 
     async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
         let auth = AuthState::from_ref(state);
-        let header = parts
-            .headers
-            .get("Authorization")
-            .ok_or(AuthError::Missing)?
-            .to_str()
-            .map_err(|_| AuthError::Malformed)?;
-        let token = header.strip_prefix("Bearer ").ok_or(AuthError::Malformed)?;
+        let token = bearer_token(&parts.headers)?;
 
         let now = auth.clock.now_unix_seconds();
         let claims = auth
             .token_service
             .verify(token, now)
             .map_err(|e| AuthError::Invalid(e.to_string()))?;
+        // Un refresh token (7 j) ne vaut pas accès : il ne sert qu'à
+        // `/auth/refresh` et `/auth/logout` (#184).
+        if claims.kind != TokenKind::Access {
+            return Err(AuthError::Invalid("not an access token".into()));
+        }
 
         let revoked = auth
             .revocation
@@ -502,6 +512,16 @@ mod tests {
         token.push('X');
         let app = protected_router(state);
         let response = app.oneshot(req_with_auth(&token)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(body_string(response).await, "invalid token");
+    }
+
+    #[tokio::test]
+    async fn refresh_token_is_not_accepted_as_bearer() {
+        let (state, svc, _, _) = make_state();
+        let refresh = svc.issue_refresh("alice", 3_600, FIXED_NOW).unwrap();
+        let app = protected_router(state);
+        let response = app.oneshot(req_with_auth(&refresh)).await.unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
         assert_eq!(body_string(response).await, "invalid token");
     }
