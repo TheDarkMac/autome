@@ -366,6 +366,7 @@ comptes sont publics ; tout le reste exige `Authorization: Bearer <access_token>
 | POST | `/auth/login` | `{"email","password"}` | 200 + paire de jetons · 401 identifiants invalides · 429 trop d'échecs (`Retry-After`) |
 | POST | `/auth/refresh` | `{"refresh_token"}` | 200 + nouvelle paire · 401 refresh invalide, expiré ou déjà utilisé |
 | POST | `/auth/logout` | `{"refresh_token"}` (+ `Authorization: Bearer <access_token>` facultatif) | 204 session fermée (aussi si déjà fermée) · 401 refresh invalide ou expiré |
+| POST | `/auth/logout-all` | — (`Authorization: Bearer <access_token>` requis) | 204 toutes les sessions fermées · 401 access absent, invalide ou déjà révoqué |
 
 - Paire de jetons : `{"access_token","refresh_token","token_type":"Bearer","expires_in":900}`.
   Access valable 15 min, refresh 7 jours et **à usage unique** (rotation) : de
@@ -378,8 +379,17 @@ comptes sont publics ; tout le reste exige `Authorization: Bearer <access_token>
   sinon il est ignoré). Les deux sont refusés ensuite jusqu'à leur expiration.
   Le bouton « Se déconnecter » du frontend appelle cet endpoint puis vide la
   session locale (si l'API est injoignable, les jetons expirent d'eux-mêmes).
-  Chaque déconnexion est auditée (`auth.logout`). Pas encore de « déconnexion
-  de toutes les sessions » : les autres appareils gardent leurs jetons.
+  Chaque déconnexion est auditée (`auth.logout`). Elle ne ferme que cette
+  session : les autres appareils gardent leurs jetons.
+- **Déconnecter tous les appareils** : `/auth/logout-all` ferme **toutes** les
+  sessions de l'utilisateur, y compris celle de la requête — après une fuite de
+  jeton, un appareil perdu ou un poste partagé. Mécanisme : chaque jeton porte
+  la version de session de son utilisateur (claim `sv`) ; l'appel l'incrémente
+  (table `session_versions`, migration `0013`), et tout jeton d'une version
+  antérieure est refusé, access comme refresh, sur toutes les répliques. Une
+  nouvelle connexion ouvre une session valide. Bouton « Déconnecter tous les
+  appareils » dans le frontend ; audit `auth.logout_all`. Ne jamais supprimer
+  de ligne de `session_versions` : cela revaliderait les anciens jetons.
 - Mot de passe : 8 à 1024 caractères, haché en **Argon2id**. L'email est
   normalisé (trim + minuscules).
 - Un compte créé par `signup` reçoit le rôle **editor** (CRUD workflows, runs,
