@@ -2,10 +2,11 @@
 //!
 //! Persiste la liste de révocation des JWT (par `jti`) — survit aux
 //! redémarrages et est partagée entre répliques (dette #107, constat 2).
-//! Schéma : migration `migrations/0006_auth_revocations.sql`.
+//! Schéma : migrations `0006_auth_revocations.sql` (révocations par `jti`)
+//! et `0013_session_versions.sql` (versions de session par utilisateur, #186).
 
 use async_trait::async_trait;
-use autome_core::{Error, RevocationStore};
+use autome_core::{Error, RevocationStore, TokenState};
 
 use crate::pool::PgPool;
 
@@ -67,6 +68,52 @@ impl RevocationStore for PgRevocationStore {
             .await
             .map_err(|e| storage_err("revoke_once", e))?;
         Ok(inserted == 1)
+    }
+
+    async fn session_version(&self, user_id: &str) -> autome_core::Result<i64> {
+        let client = self.pool.get().await.map_err(|e| storage_err("pool", e))?;
+        let row = client
+            .query_opt(
+                "SELECT version FROM session_versions WHERE user_id = $1",
+                &[&user_id],
+            )
+            .await
+            .map_err(|e| storage_err("session_version", e))?;
+        Ok(row.map_or(0, |r| r.get(0)))
+    }
+
+    async fn bump_session_version(&self, user_id: &str) -> autome_core::Result<i64> {
+        let client = self.pool.get().await.map_err(|e| storage_err("pool", e))?;
+        // Upsert en une instruction : le verrou de ligne sérialise les
+        // incréments concurrents, y compris d'une réplique à l'autre.
+        let row = client
+            .query_one(
+                "INSERT INTO session_versions (user_id, version) VALUES ($1, 1) \
+                 ON CONFLICT (user_id) DO UPDATE \
+                 SET version = session_versions.version + 1 \
+                 RETURNING version",
+                &[&user_id],
+            )
+            .await
+            .map_err(|e| storage_err("bump_session_version", e))?;
+        Ok(row.get(0))
+    }
+
+    async fn token_state(&self, jti: &str, user_id: &str) -> autome_core::Result<TokenState> {
+        let client = self.pool.get().await.map_err(|e| storage_err("pool", e))?;
+        // Un seul aller-retour par requête authentifiée, comme avant #186.
+        let row = client
+            .query_one(
+                "SELECT EXISTS (SELECT 1 FROM revoked_tokens WHERE jti = $1), \
+                        COALESCE((SELECT version FROM session_versions WHERE user_id = $2), 0)",
+                &[&jti, &user_id],
+            )
+            .await
+            .map_err(|e| storage_err("token_state", e))?;
+        Ok(TokenState {
+            revoked: row.get(0),
+            session_version: row.get(1),
+        })
     }
 
     async fn gc(&self, now_ms: i64) -> autome_core::Result<usize> {

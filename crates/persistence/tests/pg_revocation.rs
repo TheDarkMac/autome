@@ -12,7 +12,7 @@
 
 use std::sync::Arc;
 
-use autome_core::RevocationStore;
+use autome_core::{RevocationStore, TokenState};
 use autome_persistence::{connect, PgRevocationStore};
 
 async fn setup() -> Option<PgRevocationStore> {
@@ -23,7 +23,10 @@ async fn setup() -> Option<PgRevocationStore> {
         .batch_execute(
             "DROP TABLE IF EXISTS revoked_tokens; \
              CREATE TABLE revoked_tokens (jti TEXT PRIMARY KEY, exp_ms BIGINT NOT NULL); \
-             CREATE INDEX idx_revoked_tokens_exp ON revoked_tokens (exp_ms);",
+             CREATE INDEX idx_revoked_tokens_exp ON revoked_tokens (exp_ms); \
+             DROP TABLE IF EXISTS session_versions; \
+             CREATE TABLE session_versions (user_id TEXT PRIMARY KEY, \
+                                            version BIGINT NOT NULL CHECK (version >= 1));",
         )
         .await
         .expect("schéma de test");
@@ -89,4 +92,49 @@ async fn revoke_is_revoked_idempotence_gc_and_revoke_once() {
         winners += usize::from(t.await.unwrap());
     }
     assert_eq!(winners, 1);
+
+    // Versions de session (#186) : 0 par défaut, incréments par utilisateur,
+    // `token_state` combine les deux lectures en une requête.
+    assert_eq!(store.session_version("u").await.unwrap(), 0);
+    assert_eq!(store.bump_session_version("u").await.unwrap(), 1);
+    assert_eq!(store.session_version("u").await.unwrap(), 1);
+    assert_eq!(store.session_version("v").await.unwrap(), 0);
+    assert_eq!(
+        store.token_state("jti-race", "u").await.unwrap(),
+        TokenState {
+            revoked: true,
+            session_version: 1
+        }
+    );
+    assert_eq!(
+        other.token_state("jti-absent", "v").await.unwrap(),
+        TokenState {
+            revoked: false,
+            session_version: 0
+        }
+    );
+
+    // Incréments concurrents depuis deux pools : aucun n'est perdu, chacun
+    // obtient une version distincte.
+    let tasks: Vec<_> = (0..20)
+        .map(|i| {
+            let s: Arc<PgRevocationStore> = if i % 2 == 0 {
+                store.clone()
+            } else {
+                other.clone()
+            };
+            tokio::spawn(async move { s.bump_session_version("w").await.unwrap() })
+        })
+        .collect();
+    let mut versions = Vec::new();
+    for t in tasks {
+        versions.push(t.await.unwrap());
+    }
+    versions.sort_unstable();
+    assert_eq!(versions, (1..=20).collect::<Vec<i64>>());
+    assert_eq!(store.session_version("w").await.unwrap(), 20);
+
+    // Le GC des révocations ne touche pas aux versions de session.
+    store.gc(i64::MAX).await.unwrap();
+    assert_eq!(other.session_version("u").await.unwrap(), 1);
 }

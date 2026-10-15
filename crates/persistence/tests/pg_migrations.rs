@@ -46,6 +46,7 @@ async fn applies_all_then_is_idempotent() {
         "revoked_tokens",
         "user_permissions",
         "audit_events",
+        "session_versions",
     ] {
         let exists: bool = client
             .query_one("SELECT to_regclass($1) IS NOT NULL", &[&table])

@@ -26,8 +26,8 @@ pub use audit::{AuditEvent, AuditOutcome, AuditSink, InMemoryAuditSink, NoopAudi
 pub use auth::{
     normalize_email, validate_email, validate_password, Argon2PasswordHasher, Claims, CreateUser,
     InMemoryLoginThrottle, InMemoryRevocationStore, InMemoryUserStore, LoginAttempt,
-    LoginThrottleStore, PasswordHasher, RevocationStore, TokenKind, TokenService, UserRecord,
-    UserStore, LOGIN_WINDOW_SECONDS, MAX_LOGIN_FAILURES,
+    LoginThrottleStore, PasswordHasher, RevocationStore, TokenKind, TokenService, TokenState,
+    UserRecord, UserStore, LOGIN_WINDOW_SECONDS, MAX_LOGIN_FAILURES,
 };
 pub use config::{Config, Profile, Secret};
 pub use queue::{dlq_of, BoundedQueue, Delivery, DeliveryId, InMemoryQueue, Message, Nack, Queue};

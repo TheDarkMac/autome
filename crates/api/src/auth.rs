@@ -323,12 +323,14 @@ where
             return Err(AuthError::Invalid("not an access token".into()));
         }
 
-        let revoked = auth
+        // Révocation du jeton (logout) et de toute la session de
+        // l'utilisateur (logout-all, #186) : un seul appel au store.
+        let token_state = auth
             .revocation
-            .is_revoked(&claims.jti)
+            .token_state(&claims.jti, &claims.sub)
             .await
             .map_err(|e| AuthError::Internal(e.to_string()))?;
-        if revoked {
+        if token_state.revoked || token_state.session_version != claims.sv {
             return Err(AuthError::Revoked);
         }
 
@@ -550,6 +552,32 @@ mod tests {
         assert_eq!(body_string(response).await, "token revoked");
     }
 
+    #[tokio::test]
+    async fn token_of_a_closed_session_returns_401_revoked() {
+        let revocation = Arc::new(InMemoryRevocationStore::new());
+        let svc = TokenService::new(SECRET);
+        let before = svc.issue_access("u", 900, FIXED_NOW).unwrap();
+        revocation.bump_session_version("u").await.unwrap();
+        let (after, _) = svc.issue_pair("u", 1, 900, 3_600, FIXED_NOW).unwrap();
+        let other = svc.issue_access("v", 900, FIXED_NOW).unwrap();
+
+        let state = AuthState::new(
+            TokenService::new(SECRET),
+            revocation,
+            Arc::new(InMemoryPermissionStore::new()),
+            Arc::new(InMemoryAuditSink::new()),
+        )
+        .with_clock(Arc::new(FixedClock(FIXED_NOW)));
+        let app = protected_router(state);
+        let response = app.clone().oneshot(req_with_auth(&before)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(body_string(response).await, "token revoked");
+        for ok in [after, other] {
+            let response = app.clone().oneshot(req_with_auth(&ok)).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+    }
+
     // ───── F6.5.b — Enforcement permission ─────
 
     fn admin_req(token: &str) -> Request<Body> {
@@ -627,6 +655,7 @@ mod tests {
             exp: 100,
             jti: "j".into(),
             kind: autome_core::TokenKind::Access,
+            sv: 0,
         };
         let user = AuthenticatedUser { claims };
         assert_eq!(user.user_id(), "bob");

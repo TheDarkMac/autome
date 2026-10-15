@@ -22,7 +22,7 @@ pub mod users;
 
 pub use jwt::{Claims, TokenKind, TokenService};
 pub use password::{Argon2PasswordHasher, PasswordHasher};
-pub use revocation::{InMemoryRevocationStore, RevocationStore};
+pub use revocation::{InMemoryRevocationStore, RevocationStore, TokenState};
 pub use throttle::{
     InMemoryLoginThrottle, LoginAttempt, LoginThrottleStore, LOGIN_WINDOW_SECONDS,
     MAX_LOGIN_FAILURES,
