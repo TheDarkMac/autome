@@ -72,7 +72,7 @@ docker compose up --build
 
 | Service | URL | Notes |
 |---|---|---|
-| API | http://localhost:8080 | `GET /health`, `GET /metrics` |
+| API | http://localhost:8080 | `GET /livez`, `GET /readyz`, `GET /metrics` |
 | Frontend | http://localhost:8081 | SPA (éditeur visuel) |
 | Grafana | http://localhost:3000 | `admin` / `admin` (dashboard *Autome — Overview*) |
 | Prometheus | http://localhost:9090 | scrape de l'API |

@@ -176,7 +176,7 @@ démarrage (`AUTOME_MIGRATE=true`). Les données survivent à un
 
 | Service | URL | Identifiants |
 |---|---|---|
-| API | http://localhost:8080 | — (`/health`, `/metrics`) |
+| API | http://localhost:8080 | — (`/livez`, `/readyz`, `/metrics`) |
 | Frontend | http://localhost:8081 | — |
 | Grafana | http://localhost:3000 | `admin` / `admin` |
 | Prometheus | http://localhost:9090 | — |
@@ -186,8 +186,9 @@ démarrage (`AUTOME_MIGRATE=true`). Les données survivent à un
 Vérification rapide :
 
 ```bash
-curl http://localhost:8080/health     # -> ok
+curl http://localhost:8080/readyz     # -> {"status":"ready","checks":{"postgres":"ok","rabbitmq":"ok"}}
 curl http://localhost:8080/metrics    # -> métriques Prometheus
+docker compose ps                     # api et worker « healthy »
 ```
 
 Vérification **de bout en bout** — compte jetable, workflow, run exécuté par
@@ -324,10 +325,41 @@ Vérification :
 
 ```bash
 kubectl -n autome port-forward svc/api 8080:8080 &
-curl http://localhost:8080/health     # -> ok
+curl http://localhost:8080/readyz     # -> {"status":"ready",…}
+kubectl -n autome get pods            # api et worker READY 1/1
 ```
 
-### C.5 Monitoring
+### C.5 Sondes : vivant et prêt (#192)
+
+« Vivant » et « prêt » sont deux questions distinctes, aux conséquences
+opposées :
+
+| Sonde | API (`:8080`) | Worker (`:9091`) | Échec ⇒ |
+|---|---|---|---|
+| **Liveness** `GET /livez` | le process répond | chaque consommateur tourne, ou traite un run depuis moins de `AUTOME_RUN_TIMEOUT_SECS` + 1 min | **redémarrage** du conteneur |
+| **Readiness** `GET /readyz` | PostgreSQL (`SELECT 1`) et RabbitMQ (aller-retour) joignables | idem | retiré du Service / déploiement suspendu, **sans** redémarrage |
+
+- La liveness ne vérifie **aucune** dépendance : une panne de base ferait
+  sinon redémarrer en boucle tous les pods sans rien réparer. Une base qui ne
+  répond plus rend les pods « pas prêts » ; ils redeviennent prêts seuls à son
+  retour.
+- Chaque vérification de `/readyz` est bornée à 2 s et elles tournent en
+  parallèle (sonde k8s : `timeoutSeconds: 5`). Réponse :
+  `{"status":"ready"|"unavailable","checks":{"postgres":"ok","rabbitmq":"error"}}`
+  (200 ou 503) ; le détail de l'erreur n'est que dans les logs.
+- Un run long ne fait pas tuer le worker : un consommateur occupé reste
+  « vivant » jusqu'au délai d'un run. Au-delà (moteur bloqué), ou si un
+  consommateur au repos ne tourne plus depuis 60 s, `/livez` répond 503 ;
+  après redémarrage, le balayage des orphelins clôt les runs interrompus.
+- Une **startup probe** (~90 s) couvre les migrations et l'attente du broker
+  au démarrage avant que la liveness ne s'applique.
+- Worker : `AUTOME_WORKER_PROBE_ADDR` (défaut `127.0.0.1:9091`, `0.0.0.0:9091`
+  dans l'image ; vide = sondes désactivées).
+- `/health` reste un alias de `/livez` (compatibilité).
+- **Compose** : healthchecks sur `/readyz` (API) et `/livez` (worker) ; le
+  worker attend que l'API soit *prête* (migrations appliquées) pour démarrer.
+
+### C.6 Monitoring
 
 Le namespace inclut **Prometheus** (scrape de l'API) et **Grafana** (datasource
 + dashboard *Autome — Overview* provisionnés) :
