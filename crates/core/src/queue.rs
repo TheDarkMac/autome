@@ -124,6 +124,13 @@ pub trait Queue: Send + Sync {
 
     /// Nombre de messages **en attente** (hors in-flight) sur `name`.
     async fn depth(&self, name: &str) -> Result<usize>;
+
+    /// Vérifie que le broker est joignable (sonde de disponibilité, #192) ;
+    /// une impl distante rouvre au besoin sa connexion. Toujours `Ok` pour
+    /// une file en mémoire.
+    async fn ping(&self) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// Convention de nommage des dead-letter queues.

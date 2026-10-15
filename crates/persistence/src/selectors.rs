@@ -8,12 +8,16 @@ use std::time::Duration;
 
 use autome_connectors::oauth::{ConnectorTokenStore, InMemoryConnectorTokenStore};
 use autome_core::{
-    Config, EnvelopeCipher, Error, InMemoryKeyProvider, InMemoryQueue, InMemoryRunStateStore,
-    InMemoryWorkflowRepository, Profile, Queue, Result, RunStateStore, WorkflowRepository,
+    Config, EnvelopeCipher, Error, HealthCheck, InMemoryKeyProvider, InMemoryQueue,
+    InMemoryRunStateStore, InMemoryWorkflowRepository, Profile, Queue, Result, RunStateStore,
+    WorkflowRepository,
 };
 use sha2::{Digest, Sha256};
 
-use crate::{connect, PgConnectorTokenStore, PgRunStateStore, PgWorkflowRepository, RabbitMqQueue};
+use crate::{
+    connect, PgConnectorTokenStore, PgRunStateStore, PgWorkflowRepository, PostgresCheck,
+    QueueCheck, RabbitMqQueue,
+};
 
 /// Backend de persistance des stores (`AUTOME_PERSISTENCE`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -126,6 +130,25 @@ pub async fn build_queue(config: &Config, mode: QueueMode) -> Result<Arc<dyn Que
             Ok(Arc::new(queue))
         }
     }
+}
+
+/// Vérifications de disponibilité des backends sélectionnés (#192) : la base
+/// en `postgres` (pool dédié, sans connexion avant le premier appel), le
+/// broker en `rabbitmq` (`queue` = la file du process). Aucune en mémoire.
+pub fn build_health_checks(
+    config: &Config,
+    persistence: PersistenceMode,
+    queue_mode: QueueMode,
+    queue: Arc<dyn Queue + Send + Sync>,
+) -> Result<Vec<Arc<dyn HealthCheck>>> {
+    let mut checks: Vec<Arc<dyn HealthCheck>> = Vec::new();
+    if persistence == PersistenceMode::Postgres {
+        checks.push(Arc::new(PostgresCheck::new(connect(&config.database_url)?)));
+    }
+    if queue_mode == QueueMode::Rabbitmq {
+        checks.push(Arc::new(QueueCheck::new(queue, "rabbitmq")));
+    }
+    Ok(checks)
 }
 
 /// Construit le store d'état des runs selon le `mode`.
@@ -276,6 +299,28 @@ mod tests {
         store.store("alice", "slack", &sample_tokens()).unwrap();
         assert_eq!(store.load("alice", "slack").unwrap(), Some(sample_tokens()));
         assert_eq!(store.load("bob", "slack").unwrap(), None);
+    }
+
+    #[test]
+    fn health_checks_follow_the_selected_backends() {
+        let config = Config::load(|_| None).unwrap();
+        let queue: Arc<dyn Queue + Send + Sync> = Arc::new(InMemoryQueue::new());
+        let names = |p, q| -> Vec<&'static str> {
+            build_health_checks(&config, p, q, queue.clone())
+                .unwrap()
+                .iter()
+                .map(|c| c.name())
+                .collect()
+        };
+        assert!(names(PersistenceMode::Memory, QueueMode::Memory).is_empty());
+        assert_eq!(
+            names(PersistenceMode::Postgres, QueueMode::Rabbitmq),
+            vec!["postgres", "rabbitmq"]
+        );
+        assert_eq!(
+            names(PersistenceMode::Postgres, QueueMode::Memory),
+            vec!["postgres"]
+        );
     }
 
     #[test]

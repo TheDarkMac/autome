@@ -32,10 +32,10 @@ use async_trait::async_trait;
 use autome_core::{dlq_of, Delivery, DeliveryId, Error, Message, Nack, Queue};
 use lapin::options::{
     BasicAckOptions, BasicGetOptions, BasicNackOptions, BasicPublishOptions, ConfirmSelectOptions,
-    QueueDeclareOptions,
+    ExchangeDeclareOptions, QueueDeclareOptions,
 };
 use lapin::types::{AMQPValue, FieldTable};
-use lapin::{BasicProperties, Channel, Connection, ConnectionProperties};
+use lapin::{BasicProperties, Channel, Connection, ConnectionProperties, ExchangeKind};
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
@@ -346,6 +346,26 @@ impl Queue for RabbitMqQueue {
             .await
             .map_err(|e| storage_err("depth", e))?;
         Ok(q.message_count() as usize)
+    }
+
+    async fn ping(&self) -> autome_core::Result<()> {
+        // Aller-retour réel avec le broker (un canal marqué ouvert peut
+        // appartenir à une connexion morte non encore détectée), sans effet de
+        // bord : déclaration passive d'un échange prédéfini par AMQP.
+        let (channel, _) = self.channel().await?;
+        channel
+            .exchange_declare(
+                "amq.direct",
+                ExchangeKind::Direct,
+                ExchangeDeclareOptions {
+                    passive: true,
+                    durable: true,
+                    ..Default::default()
+                },
+                FieldTable::default(),
+            )
+            .await
+            .map_err(|e| storage_err("ping", e))
     }
 }
 
