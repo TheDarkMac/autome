@@ -228,12 +228,12 @@ mod tests {
         let now = 1_700_000_000;
         backends
             .login_throttle
-            .begin_attempt("old@example.io", now - LOGIN_WINDOW_SECONDS)
+            .begin_attempt("email:old@example.io", 5, now - LOGIN_WINDOW_SECONDS)
             .await
             .unwrap();
         backends
             .login_throttle
-            .begin_attempt("live@example.io", now)
+            .begin_attempt("email:live@example.io", 5, now)
             .await
             .unwrap();
         backends
