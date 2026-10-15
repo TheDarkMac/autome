@@ -164,10 +164,26 @@ async function postCredentials(
   if (res.status === 409) {
     throw new ApiError("un compte existe déjà pour cet email", 409);
   }
+  if (res.status === 429) {
+    throw new ApiError(tooManyAttemptsMessage(res), 429);
+  }
   if (!res.ok) {
     throw new ApiError(`POST ${path} a échoué (${res.status})`, res.status);
   }
   return parseTokenPair(await res.json());
+}
+
+/**
+ * Message d'un 429 (anti-bruteforce par compte ou par adresse IP) : délai
+ * tiré de `Retry-After`, arrondi à la minute supérieure.
+ */
+function tooManyAttemptsMessage(res: Response): string {
+  const seconds = Number(res.headers.get("Retry-After"));
+  if (!Number.isFinite(seconds) || seconds <= 0) {
+    return "trop de tentatives : réessayez plus tard";
+  }
+  const minutes = Math.ceil(seconds / 60);
+  return `trop de tentatives : réessayez dans ${minutes} min`;
 }
 
 async function postJson(
