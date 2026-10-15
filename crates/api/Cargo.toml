@@ -33,6 +33,10 @@ axum-server = { version = "0.7", features = ["tls-rustls"] }
 utoipa = { workspace = true }
 # Logs structurés (#176)
 tracing = { workspace = true }
+# Anti-bruteforce par IP (#190) : clé HMAC de l'adresse, proxys de confiance
+hmac = { workspace = true }
+sha2 = { workspace = true }
+ipnet = { workspace = true }
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
