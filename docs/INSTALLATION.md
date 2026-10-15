@@ -365,9 +365,21 @@ comptes sont publics ; tout le reste exige `Authorization: Bearer <access_token>
 | POST | `/auth/signup` | `{"email","password"}` | 201 + paire de jetons · 400 saisie invalide · 409 email déjà pris |
 | POST | `/auth/login` | `{"email","password"}` | 200 + paire de jetons · 401 identifiants invalides · 429 trop d'échecs (`Retry-After`) |
 | POST | `/auth/refresh` | `{"refresh_token"}` | 200 + nouvelle paire · 401 refresh invalide, expiré ou déjà utilisé |
+| POST | `/auth/logout` | `{"refresh_token"}` (+ `Authorization: Bearer <access_token>` facultatif) | 204 session fermée (aussi si déjà fermée) · 401 refresh invalide ou expiré |
 
 - Paire de jetons : `{"access_token","refresh_token","token_type":"Bearer","expires_in":900}`.
-  Access valable 15 min, refresh 7 jours et **à usage unique** (rotation).
+  Access valable 15 min, refresh 7 jours et **à usage unique** (rotation) : de
+  plusieurs rotations simultanées du même refresh, même sur des répliques
+  différentes, une seule réussit.
+- Seul l'**access token** ouvre l'API : un refresh présenté en `Bearer` est
+  refusé (401).
+- **Déconnexion** : `/auth/logout` révoque le refresh et, s'il est passé en
+  `Bearer`, l'access token de la session (s'il appartient au même compte ;
+  sinon il est ignoré). Les deux sont refusés ensuite jusqu'à leur expiration.
+  Le bouton « Se déconnecter » du frontend appelle cet endpoint puis vide la
+  session locale (si l'API est injoignable, les jetons expirent d'eux-mêmes).
+  Chaque déconnexion est auditée (`auth.logout`). Pas encore de « déconnexion
+  de toutes les sessions » : les autres appareils gardent leurs jetons.
 - Mot de passe : 8 à 1024 caractères, haché en **Argon2id**. L'email est
   normalisé (trim + minuscules).
 - Un compte créé par `signup` reçoit le rôle **editor** (CRUD workflows, runs,
