@@ -11,6 +11,7 @@
 //   - POST /auth/login    { email, password }      → TokenPair
 //   - POST /auth/signup   { email, password }      → TokenPair
 //   - POST /auth/refresh  { refresh_token }        → TokenPair
+//   - POST /auth/logout   { refresh_token } (+ Bearer access) → 204
 //   - GET  /auth/whoami   (Bearer access)          → "hello <sub>"
 //
 // `fetchImpl` est injectable partout pour les tests.
@@ -73,6 +74,27 @@ export async function refresh(
   return parseTokenPair(await res.json());
 }
 
+/**
+ * Ferme la session côté serveur (#184) : révoque le refresh token et, passé
+ * en Bearer, l'access token. Sans cet appel, vider le stockage local laisse
+ * les jetons valides jusqu'à leur expiration. Un 401 (refresh déjà expiré)
+ * n'est pas une erreur : il n'y a plus de session à fermer.
+ */
+export async function logout(
+  tokens: TokenPair,
+  fetchImpl: typeof fetch = fetch,
+): Promise<void> {
+  const res = await postJson(
+    "/auth/logout",
+    { refresh_token: tokens.refreshToken },
+    fetchImpl,
+    { Authorization: `Bearer ${tokens.accessToken}` },
+  );
+  if (!res.ok && res.status !== 401) {
+    throw new ApiError(`POST /auth/logout a échoué (${res.status})`, res.status);
+  }
+}
+
 /** Récupère le `sub` de l'utilisateur courant via `/auth/whoami`. */
 export async function whoami(
   accessToken: string,
@@ -127,11 +149,16 @@ async function postJson(
   path: string,
   body: unknown,
   fetchImpl: typeof fetch,
+  extraHeaders: Record<string, string> = {},
 ): Promise<Response> {
   try {
     return await fetchImpl(`${apiBaseUrl()}${path}`, {
       method: "POST",
-      headers: { "Content-Type": "application/json", Accept: "application/json" },
+      headers: {
+        "Content-Type": "application/json",
+        Accept: "application/json",
+        ...extraHeaders,
+      },
       body: JSON.stringify(body),
     });
   } catch (e) {
