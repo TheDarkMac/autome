@@ -3,8 +3,8 @@
 # Image de l'exécuteur de runs `autome-worker` (F10.1).
 #
 # Même schéma multi-stage que `api.Dockerfile`. Le worker est *stateless* :
-# il consomme la file (F5.1) et délègue au moteur ; il ne sert pas de port
-# HTTP, d'où l'absence d'`EXPOSE`.
+# il consomme la file (F5.1) et délègue au moteur. Seul port : ses sondes
+# `/livez` et `/readyz` pour l'orchestrateur (#192).
 #
 # Build (contexte = racine du dépôt) :
 #   docker build -f docker/worker.Dockerfile -t autome-worker .
@@ -33,6 +33,10 @@ RUN apt-get update \
 COPY --from=builder /app/target/release/autome-worker /usr/local/bin/autome-worker
 
 # Configuration par environnement (QUEUE_URL, DATABASE_URL, APP_PROFILE…)
-# injectée à l'exécution par compose (F10.2) / k8s (F10.3).
+# injectée à l'exécution par compose (F10.2) / k8s (F10.3). Sondes joignables
+# hors du conteneur (le défaut `127.0.0.1:9091` ne le serait pas).
+ENV AUTOME_WORKER_PROBE_ADDR=0.0.0.0:9091
+EXPOSE 9091
+
 USER autome
 ENTRYPOINT ["autome-worker"]

@@ -25,12 +25,13 @@ WORKFLOW_ID="smoke-${SUFFIX}"
 fail() { echo "ÉCHEC : $*" >&2; exit 1; }
 json_field() { python3 -c 'import json,sys; print(json.load(sys.stdin)[sys.argv[1]])' "$1"; }
 
-echo "→ attente de l'API ($API/health)…"
+# `/readyz` (#192) : prête = migrations appliquées, base et broker joignables.
+echo "→ attente de l'API ($API/readyz)…"
 for _ in $(seq 1 "$TIMEOUT_S"); do
-  curl -fsS "$API/health" >/dev/null 2>&1 && break
+  curl -fsS "$API/readyz" >/dev/null 2>&1 && break
   sleep 1
 done
-curl -fsS "$API/health" >/dev/null || fail "API injoignable sur $API"
+curl -fsS "$API/readyz" >/dev/null || fail "API pas prête sur $API ($(curl -s "$API/readyz"))"
 
 echo "→ inscription + connexion ($EMAIL)"
 curl -fsS -H 'content-type: application/json' \

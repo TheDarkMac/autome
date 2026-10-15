@@ -70,6 +70,13 @@ services:
       ENCRYPTION_KEY: dev-insecure-encryption-key
     ports:
       - "8080:8080"
+    # Prête = migrations appliquées, base et broker joignables (#192). L'image
+    # n'a ni curl ni wget : requête HTTP brute via bash.
+    healthcheck:
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/8080 && printf 'GET /readyz HTTP/1.0\\r\\n\\r\\n' >&3 && head -n1 <&3 | grep -q ' 200 '"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
     depends_on:
       db:
         condition: service_healthy
@@ -88,14 +95,20 @@ services:
       AUTOME_QUEUE: rabbitmq
       # Même clé que l'API : le worker déchiffre les tokens OAuth des connecteurs.
       ENCRYPTION_KEY: dev-insecure-encryption-key
+    healthcheck:
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/9091 && printf 'GET /livez HTTP/1.0\\r\\n\\r\\n' >&3 && head -n1 <&3 | grep -q ' 200 '"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
     depends_on:
       db:
         condition: service_healthy
       queue:
         condition: service_healthy
-      # L'API applique les migrations au démarrage.
+      # L'API applique les migrations au démarrage : on attend qu'elle soit
+      # prête, pas seulement lancée (#192).
       api:
-        condition: service_started
+        condition: service_healthy
 
   frontend:
     build:

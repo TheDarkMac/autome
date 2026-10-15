@@ -50,18 +50,33 @@ spec:
                 name: autome-config
             - secretRef:
                 name: autome-secrets
+          # Sondes séparées (#192). Démarrage : migrations et attente du broker
+          # (jusqu'à AUTOME_QUEUE_CONNECT_TIMEOUT_SECS, 60 s) avant l'écoute —
+          # la startup probe laisse ~90 s avant que la liveness ne s'applique.
+          startupProbe:
+            httpGet:
+              path: /livez
+              port: http
+            periodSeconds: 3
+            failureThreshold: 30
+          # Prêt = PostgreSQL et RabbitMQ joignables (chaque vérification
+          # bornée à 2 s, en parallèle). Échec ⇒ retiré du Service, pas tué.
           readinessProbe:
             httpGet:
-              path: /health
+              path: /readyz
               port: http
-            initialDelaySeconds: 3
             periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 2
+          # Vivant = le process répond ; ne dépend d'aucune dépendance (une
+          # panne de base ne doit pas redémarrer tous les pods en boucle).
           livenessProbe:
             httpGet:
-              path: /health
+              path: /livez
               port: http
-            initialDelaySeconds: 10
             periodSeconds: 20
+            timeoutSeconds: 3
+            failureThreshold: 3
           resources:
             requests:
               cpu: 50m
