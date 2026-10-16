@@ -16,15 +16,36 @@
 //! Contrat d'appel : depuis un thread `spawn_blocking`, ou depuis une tâche
 //! d'un runtime **multi-thread**. Hors runtime, l'appel échoue proprement ;
 //! depuis une tâche d'un runtime `current_thread`, tokio panique.
+//!
+//! ## Verrou de rafraîchissement entre répliques (#211)
+//!
+//! [`update_locked`](ConnectorTokenStore::update_locked) ouvre une transaction
+//! et prend le **verrou de ligne** (`SELECT … FOR UPDATE`) : les autres
+//! répliques qui veulent rafraîchir la même credential attendent la fin de la
+//! transaction, puis relisent la ligne écrite — un refresh token n'est
+//! présenté qu'une fois au provider. Les lectures ordinaires (`load`) ne sont
+//! pas bloquées (MVCC). L'attente est bornée par [`LOCK_TIMEOUT`].
+//!
+//! La connexion et la transaction sont tenues entre plusieurs `block_on`
+//! successifs : la décision (appel HTTP **bloquant** au provider) s'exécute
+//! hors du contexte async, où un client bloquant serait interdit.
 
 use std::future::Future;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use autome_connectors::oauth::{open_tokens, seal_tokens, ConnectorTokenStore, TokenSet};
+use autome_connectors::oauth::{
+    open_tokens, seal_tokens, ConnectorTokenStore, CredentialInvalidation, CredentialUpdate,
+    StoredCredential, TokenSet,
+};
 use autome_core::{EnvelopeCipher, Error, KeyProvider, Result};
 use tokio::runtime::Handle;
 
 use crate::pool::PgPool;
+
+/// Attente maximale du verrou de ligne d'[`update_locked`]
+/// (`ConnectorTokenStore`) : au-delà du pire rafraîchissement concurrent
+/// (connexion 10 s + réponse 30 s du transport filtré).
+pub const LOCK_TIMEOUT: &str = "60s";
 
 /// Conversion uniforme des erreurs deadpool/tokio-postgres en `core::Error`.
 fn storage_err(context: &str, e: impl std::fmt::Display) -> Error {
@@ -71,7 +92,8 @@ impl<K: KeyProvider> ConnectorTokenStore for PgConnectorTokenStore<K> {
                     "INSERT INTO connector_tokens (user_id, provider_id, envelope, updated_at_ms) \
                      VALUES ($1, $2, $3, $4) \
                      ON CONFLICT (user_id, provider_id) DO UPDATE \
-                     SET envelope = EXCLUDED.envelope, updated_at_ms = EXCLUDED.updated_at_ms",
+                     SET envelope = EXCLUDED.envelope, updated_at_ms = EXCLUDED.updated_at_ms, \
+                         invalidated_at_ms = NULL, invalid_reason = NULL",
                     &[&user_id, &provider_id, &envelope, &updated_at_ms],
                 )
                 .await
@@ -96,6 +118,94 @@ impl<K: KeyProvider> ConnectorTokenStore for PgConnectorTokenStore<K> {
         envelope
             .map(|env| open_tokens(&self.cipher, &env))
             .transpose()
+    }
+
+    fn update_locked(
+        &self,
+        user_id: &str,
+        provider_id: &str,
+        update: &mut dyn FnMut(Option<StoredCredential>) -> CredentialUpdate,
+    ) -> Result<()> {
+        let mut client =
+            block_on(async { self.pool.get().await.map_err(|e| storage_err("pool", e)) })?;
+        let tx = block_on(async {
+            let tx = client
+                .transaction()
+                .await
+                .map_err(|e| storage_err("begin", e))?;
+            tx.batch_execute(&format!("SET LOCAL lock_timeout = '{LOCK_TIMEOUT}'"))
+                .await
+                .map_err(|e| storage_err("lock_timeout", e))?;
+            Ok(tx)
+        })?;
+        let row = block_on(async {
+            tx.query_opt(
+                "SELECT envelope, invalidated_at_ms, invalid_reason FROM connector_tokens \
+                 WHERE user_id = $1 AND provider_id = $2 FOR UPDATE",
+                &[&user_id, &provider_id],
+            )
+            .await
+            .map_err(|e| storage_err("connector_tokens.lock", e))
+        })?;
+        let current = row
+            .map(|r| {
+                let envelope: String = r.get(0);
+                let at_ms: Option<i64> = r.get(1);
+                let reason: Option<String> = r.get(2);
+                Ok::<_, Error>(StoredCredential {
+                    tokens: open_tokens(&self.cipher, &envelope)?,
+                    invalidated: at_ms
+                        .zip(reason)
+                        .map(|(at_ms, reason)| CredentialInvalidation { at_ms, reason }),
+                })
+            })
+            .transpose()?;
+        let present = current.is_some();
+
+        // Hors `block_on` : `update` peut appeler le provider en bloquant.
+        let decision = match update(current) {
+            decision if present => decision,
+            _ => CredentialUpdate::Keep,
+        };
+        // Chiffré **avant** de quitter le process, comme `store`.
+        let sealed = match &decision {
+            CredentialUpdate::Replace(tokens) => Some(seal_tokens(&self.cipher, tokens)?),
+            _ => None,
+        };
+        let updated_at_ms = now_ms();
+        block_on(async move {
+            match decision {
+                CredentialUpdate::Keep => {}
+                CredentialUpdate::Replace(_) => {
+                    tx.execute(
+                        "UPDATE connector_tokens \
+                         SET envelope = $3, updated_at_ms = $4, \
+                             invalidated_at_ms = NULL, invalid_reason = NULL \
+                         WHERE user_id = $1 AND provider_id = $2",
+                        &[&user_id, &provider_id, &sealed, &updated_at_ms],
+                    )
+                    .await
+                    .map_err(|e| storage_err("connector_tokens.replace", e))?;
+                }
+                CredentialUpdate::Invalidate(invalidation) => {
+                    tx.execute(
+                        "UPDATE connector_tokens \
+                         SET invalidated_at_ms = $3, invalid_reason = $4, updated_at_ms = $5 \
+                         WHERE user_id = $1 AND provider_id = $2",
+                        &[
+                            &user_id,
+                            &provider_id,
+                            &invalidation.at_ms,
+                            &invalidation.reason,
+                            &updated_at_ms,
+                        ],
+                    )
+                    .await
+                    .map_err(|e| storage_err("connector_tokens.invalidate", e))?;
+                }
+            }
+            tx.commit().await.map_err(|e| storage_err("commit", e))
+        })
     }
 
     fn delete(&self, user_id: &str, provider_id: &str) -> Result<()> {
