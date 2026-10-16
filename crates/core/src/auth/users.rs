@@ -11,14 +11,21 @@
 //! désignent le même compte. Les règles de saisie ([`validate_email`],
 //! [`validate_password`]) vivent ici pour être partagées par tous les points
 //! d'entrée (API, CLI d'admin éventuelle).
+//!
+//! L'administration des comptes (#208) passe aussi par ce contrat : liste
+//! paginée ([`UserStore::list`]), remplacement des permissions
+//! ([`UserStore::set_permissions`], atomique) et suspension
+//! ([`UserStore::set_disabled`]). Un compte suspendu garde ses données et ses
+//! permissions ; c'est l'API qui refuse sa connexion et ferme ses sessions.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use rand::RngCore;
 
-use crate::rbac::InMemoryPermissionStore;
+use crate::rbac::{InMemoryPermissionStore, PermissionStore};
 use crate::{Error, Result};
 
 /// Longueur minimale d'un mot de passe (alignée sur le frontend, `auth.ts`).
@@ -37,6 +44,32 @@ pub struct UserRecord {
     pub email: String,
     /// Hash PHC du mot de passe (cf. [`crate::PasswordHasher`]).
     pub password_hash: String,
+    /// Compte suspendu par un administrateur (#208) : connexion refusée.
+    pub disabled: bool,
+}
+
+/// Vue d'administration d'un compte (#208) — jamais le hash du mot de passe.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserSummary {
+    /// Identifiant stable (`claims.sub`).
+    pub id: String,
+    /// Email normalisé.
+    pub email: String,
+    /// Compte suspendu.
+    pub disabled: bool,
+    /// Création du compte, en millisecondes Unix.
+    pub created_at_ms: i64,
+    /// Permissions accordées.
+    pub permissions: HashSet<String>,
+}
+
+/// Page de [`UserStore::list`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserPage {
+    /// Comptes de la page, du plus ancien au plus récent.
+    pub items: Vec<UserSummary>,
+    /// Nombre total de comptes correspondant au filtre (hors pagination).
+    pub total: usize,
 }
 
 /// Issue d'une création de compte.
@@ -72,6 +105,22 @@ pub trait UserStore: Send + Sync {
     /// concurrents, un seul gagne (#196). `false` si le compte est inconnu ou
     /// si le mot de passe a changé entre-temps.
     async fn update_password(&self, id: &str, expected_hash: &str, new_hash: &str) -> Result<bool>;
+
+    /// Comptes triés par date de création (puis id), filtrés par `query` :
+    /// sous-chaîne de l'email, à passer déjà normalisée (#208).
+    async fn list(&self, query: Option<&str>, offset: usize, limit: usize) -> Result<UserPage>;
+
+    /// Vue d'administration d'un compte, permissions comprises. `None` si
+    /// inconnu, y compris pour un identifiant mal formé.
+    async fn summary(&self, id: &str) -> Result<Option<UserSummary>>;
+
+    /// Remplace **toutes** les permissions de `id`, atomiquement (aucun état
+    /// intermédiaire visible). `false` si le compte est inconnu.
+    async fn set_permissions(&self, id: &str, permissions: &HashSet<String>) -> Result<bool>;
+
+    /// Suspend (`true`) ou réactive (`false`) le compte. Idempotent ; `false`
+    /// si le compte est inconnu.
+    async fn set_disabled(&self, id: &str, disabled: bool) -> Result<bool>;
 }
 
 /// Normalise un email : espaces de bord retirés, minuscules.
@@ -132,11 +181,20 @@ fn fresh_user_id() -> String {
     )
 }
 
+/// Compte en mémoire : l'enregistrement et son ordre de création.
+struct StoredUser {
+    record: UserRecord,
+    created_at_ms: i64,
+    /// Rang de création : départage les comptes créés la même milliseconde.
+    seq: u64,
+}
+
 /// Impl in-process (dev, tests, single-node). Les permissions sont écrites
 /// dans le [`InMemoryPermissionStore`] fourni — le même que celui de
 /// l'`AuthState`, sans quoi le compte créé n'aurait aucun droit effectif.
 pub struct InMemoryUserStore {
-    users: Mutex<HashMap<String, UserRecord>>,
+    /// Comptes par email normalisé.
+    users: Mutex<HashMap<String, StoredUser>>,
     permissions: Arc<InMemoryPermissionStore>,
 }
 
@@ -148,6 +206,34 @@ impl InMemoryUserStore {
             permissions,
         }
     }
+
+    fn lock(&self) -> Result<std::sync::MutexGuard<'_, HashMap<String, StoredUser>>> {
+        self.users
+            .lock()
+            .map_err(|_| Error::Invalid("users lock empoisonné".into()))
+    }
+
+    /// Complète des comptes de leurs permissions (verrou des comptes relâché).
+    async fn summaries(&self, users: Vec<(UserRecord, i64)>) -> Result<Vec<UserSummary>> {
+        let mut out = Vec::with_capacity(users.len());
+        for (record, created_at_ms) in users {
+            out.push(UserSummary {
+                permissions: self.permissions.permissions_for(&record.id).await?,
+                id: record.id,
+                email: record.email,
+                disabled: record.disabled,
+                created_at_ms,
+            });
+        }
+        Ok(out)
+    }
+}
+
+fn now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 #[async_trait]
@@ -158,10 +244,7 @@ impl UserStore for InMemoryUserStore {
         password_hash: &str,
         permissions: &HashSet<String>,
     ) -> Result<CreateUser> {
-        let mut users = self
-            .users
-            .lock()
-            .map_err(|_| Error::Invalid("users lock empoisonné".into()))?;
+        let mut users = self.lock()?;
         if users.contains_key(email) {
             return Ok(CreateUser::EmailTaken);
         }
@@ -169,41 +252,100 @@ impl UserStore for InMemoryUserStore {
             id: fresh_user_id(),
             email: email.to_string(),
             password_hash: password_hash.to_string(),
+            disabled: false,
         };
         for p in permissions {
             self.permissions.grant(&record.id, p.clone())?;
         }
-        users.insert(email.to_string(), record.clone());
+        let seq = users.len() as u64;
+        users.insert(
+            email.to_string(),
+            StoredUser {
+                record: record.clone(),
+                created_at_ms: now_ms(),
+                seq,
+            },
+        );
         Ok(CreateUser::Created(record))
     }
 
     async fn find_by_email(&self, email: &str) -> Result<Option<UserRecord>> {
-        let users = self
-            .users
-            .lock()
-            .map_err(|_| Error::Invalid("users lock empoisonné".into()))?;
-        Ok(users.get(email).cloned())
+        Ok(self.lock()?.get(email).map(|u| u.record.clone()))
     }
 
     async fn find_by_id(&self, id: &str) -> Result<Option<UserRecord>> {
-        let users = self
-            .users
-            .lock()
-            .map_err(|_| Error::Invalid("users lock empoisonné".into()))?;
-        Ok(users.values().find(|u| u.id == id).cloned())
+        Ok(self
+            .lock()?
+            .values()
+            .find(|u| u.record.id == id)
+            .map(|u| u.record.clone()))
     }
 
     async fn update_password(&self, id: &str, expected_hash: &str, new_hash: &str) -> Result<bool> {
-        let mut users = self
-            .users
-            .lock()
-            .map_err(|_| Error::Invalid("users lock empoisonné".into()))?;
-        match users.values_mut().find(|u| u.id == id) {
-            Some(user) if user.password_hash == expected_hash => {
-                user.password_hash = new_hash.to_string();
+        let mut users = self.lock()?;
+        match users.values_mut().find(|u| u.record.id == id) {
+            Some(user) if user.record.password_hash == expected_hash => {
+                user.record.password_hash = new_hash.to_string();
                 Ok(true)
             }
             _ => Ok(false),
+        }
+    }
+
+    async fn list(&self, query: Option<&str>, offset: usize, limit: usize) -> Result<UserPage> {
+        let (page, total) = {
+            let users = self.lock()?;
+            let mut matching: Vec<&StoredUser> = users
+                .values()
+                .filter(|u| query.is_none_or(|q| u.record.email.contains(q)))
+                .collect();
+            matching.sort_by_key(|u| (u.created_at_ms, u.seq));
+            let total = matching.len();
+            let page: Vec<(UserRecord, i64)> = matching
+                .into_iter()
+                .skip(offset)
+                .take(limit)
+                .map(|u| (u.record.clone(), u.created_at_ms))
+                .collect();
+            (page, total)
+        };
+        Ok(UserPage {
+            items: self.summaries(page).await?,
+            total,
+        })
+    }
+
+    async fn summary(&self, id: &str) -> Result<Option<UserSummary>> {
+        let found = self
+            .lock()?
+            .values()
+            .find(|u| u.record.id == id)
+            .map(|u| (u.record.clone(), u.created_at_ms));
+        match found {
+            Some(user) => Ok(self.summaries(vec![user]).await?.pop()),
+            None => Ok(None),
+        }
+    }
+
+    async fn set_permissions(&self, id: &str, permissions: &HashSet<String>) -> Result<bool> {
+        // Verrou des comptes tenu pendant l'écriture : deux remplacements
+        // concurrents ne se mélangent pas.
+        let users = self.lock()?;
+        if !users.values().any(|u| u.record.id == id) {
+            return Ok(false);
+        }
+        self.permissions.replace(id, permissions)?;
+        Ok(true)
+    }
+
+    async fn set_disabled(&self, id: &str, disabled: bool) -> Result<bool> {
+        let mut users = self.lock()?;
+        match users.values_mut().find(|u| u.record.id == id) {
+            Some(user) => {
+                user.record.disabled = disabled;
+                Ok(true)
+            }
+            None => Ok(false),
         }
     }
 }
@@ -211,7 +353,7 @@ impl UserStore for InMemoryUserStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::rbac::{PermissionStore, Role};
+    use crate::rbac::Role;
 
     fn store() -> (InMemoryUserStore, Arc<InMemoryPermissionStore>) {
         let perms = Arc::new(InMemoryPermissionStore::new());
@@ -308,6 +450,98 @@ mod tests {
     async fn unknown_email_is_none() {
         let (users, _) = store();
         assert_eq!(users.find_by_email("x@example.io").await.unwrap(), None);
+    }
+
+    async fn created(users: &InMemoryUserStore, email: &str) -> UserRecord {
+        match users
+            .create(email, "hash", &Role::editor().permissions)
+            .await
+            .unwrap()
+        {
+            CreateUser::Created(record) => record,
+            CreateUser::EmailTaken => panic!("email déjà pris"),
+        }
+    }
+
+    #[tokio::test]
+    async fn list_is_ordered_by_creation_filtered_and_paginated() {
+        let (users, _) = store();
+        for email in ["carol@example.io", "alice@example.io", "bob@other.io"] {
+            created(&users, email).await;
+        }
+        let all = users.list(None, 0, 10).await.unwrap();
+        assert_eq!(all.total, 3);
+        let emails: Vec<&str> = all.items.iter().map(|u| u.email.as_str()).collect();
+        assert_eq!(
+            emails,
+            ["carol@example.io", "alice@example.io", "bob@other.io"],
+            "ordre de création"
+        );
+        assert_eq!(all.items[0].permissions, Role::editor().permissions);
+        assert!(!all.items[0].disabled);
+
+        let page = users.list(None, 1, 1).await.unwrap();
+        assert_eq!(page.total, 3);
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(page.items[0].email, "alice@example.io");
+
+        let filtered = users.list(Some("example.io"), 0, 10).await.unwrap();
+        assert_eq!(filtered.total, 2);
+        assert!(users
+            .list(Some("nobody"), 0, 10)
+            .await
+            .unwrap()
+            .items
+            .is_empty());
+        assert!(users.list(None, 5, 10).await.unwrap().items.is_empty());
+    }
+
+    #[tokio::test]
+    async fn set_permissions_replaces_the_whole_set() {
+        let (users, perms) = store();
+        let alice = created(&users, "alice@example.io").await;
+        assert!(users
+            .set_permissions(&alice.id, &Role::viewer().permissions)
+            .await
+            .unwrap());
+        assert_eq!(
+            perms.permissions_for(&alice.id).await.unwrap(),
+            Role::viewer().permissions
+        );
+        assert_eq!(
+            users.summary(&alice.id).await.unwrap().unwrap().permissions,
+            Role::viewer().permissions
+        );
+        assert!(!users
+            .set_permissions("inconnu", &Role::viewer().permissions)
+            .await
+            .unwrap());
+        assert!(perms.permissions_for("inconnu").await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn set_disabled_is_reported_by_lookups() {
+        let (users, _) = store();
+        let alice = created(&users, "alice@example.io").await;
+        assert!(users.set_disabled(&alice.id, true).await.unwrap());
+        assert!(
+            users.set_disabled(&alice.id, true).await.unwrap(),
+            "idempotent"
+        );
+        assert!(users.find_by_id(&alice.id).await.unwrap().unwrap().disabled);
+        assert!(
+            users
+                .find_by_email("alice@example.io")
+                .await
+                .unwrap()
+                .unwrap()
+                .disabled
+        );
+        assert!(users.summary(&alice.id).await.unwrap().unwrap().disabled);
+        assert!(users.set_disabled(&alice.id, false).await.unwrap());
+        assert!(!users.find_by_id(&alice.id).await.unwrap().unwrap().disabled);
+        assert!(!users.set_disabled("inconnu", true).await.unwrap());
+        assert_eq!(users.summary("inconnu").await.unwrap(), None);
     }
 
     #[tokio::test]

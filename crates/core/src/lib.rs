@@ -29,15 +29,16 @@ pub use auth::{
     email_throttle_key, normalize_email, validate_email, validate_password, Argon2PasswordHasher,
     Claims, CreateUser, InMemoryLoginThrottle, InMemoryRevocationStore, InMemoryUserStore,
     LoginAttempt, LoginThrottleStore, PasswordHasher, RevocationStore, TokenKind, TokenService,
-    TokenState, UserRecord, UserStore, LOGIN_WINDOW_SECONDS, MAX_LOGIN_FAILURES,
+    TokenState, UserPage, UserRecord, UserStore, UserSummary, LOGIN_WINDOW_SECONDS,
+    MAX_LOGIN_FAILURES,
 };
 pub use config::{Config, Profile, Secret};
 pub use health::HealthCheck;
 pub use queue::{dlq_of, BoundedQueue, Delivery, DeliveryId, InMemoryQueue, Message, Nack, Queue};
 pub use rbac::{
-    has_permission, InMemoryPermissionStore, Permission, PermissionStore, Role,
+    has_permission, role_of, InMemoryPermissionStore, Permission, PermissionStore, Role,
     PERM_CREDENTIALS_MANAGE, PERM_RUNS_EXECUTE, PERM_RUNS_READ, PERM_USERS_ADMIN, PERM_WILDCARD,
-    PERM_WORKFLOWS_READ, PERM_WORKFLOWS_WRITE,
+    PERM_WORKFLOWS_READ, PERM_WORKFLOWS_WRITE, ROLE_ADMIN, ROLE_CUSTOM, ROLE_EDITOR, ROLE_VIEWER,
 };
 pub use run_dispatch::{
     random_run_id, DispatchOutcome, DispatchRequest, QueueRunDispatcher, RunDispatcher,

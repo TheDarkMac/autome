@@ -108,12 +108,12 @@ impl Role {
 
     /// Convenience : rôle `admin` avec wildcard.
     pub fn super_admin() -> Self {
-        Self::new("admin").with_permissions([PERM_WILDCARD])
+        Self::new(ROLE_ADMIN).with_permissions([PERM_WILDCARD])
     }
 
     /// Convenience : rôle `editor` (CRUD workflows + run + credentials).
     pub fn editor() -> Self {
-        Self::new("editor").with_permissions([
+        Self::new(ROLE_EDITOR).with_permissions([
             PERM_WORKFLOWS_READ,
             PERM_WORKFLOWS_WRITE,
             PERM_RUNS_EXECUTE,
@@ -124,7 +124,43 @@ impl Role {
 
     /// Convenience : rôle `viewer` (lecture seule).
     pub fn viewer() -> Self {
-        Self::new("viewer").with_permissions([PERM_WORKFLOWS_READ, PERM_RUNS_READ])
+        Self::new(ROLE_VIEWER).with_permissions([PERM_WORKFLOWS_READ, PERM_RUNS_READ])
+    }
+
+    /// Rôle standard attribuable par l'administration (#208) : `admin`,
+    /// `editor` ou `viewer`. `None` pour tout autre nom.
+    pub fn standard(name: &str) -> Option<Self> {
+        match name {
+            ROLE_ADMIN => Some(Self::super_admin()),
+            ROLE_EDITOR => Some(Self::editor()),
+            ROLE_VIEWER => Some(Self::viewer()),
+            _ => None,
+        }
+    }
+}
+
+/// Nom du rôle super-admin (wildcard `*`).
+pub const ROLE_ADMIN: &str = "admin";
+/// Nom du rôle éditeur (attribué à l'inscription).
+pub const ROLE_EDITOR: &str = "editor";
+/// Nom du rôle lecteur.
+pub const ROLE_VIEWER: &str = "viewer";
+/// Rôle affiché pour un jeu de permissions qui ne correspond à aucun rôle
+/// standard (permissions accordées une à une).
+pub const ROLE_CUSTOM: &str = "custom";
+
+/// Rôle standard correspondant exactement à `permissions` : `admin` dès que
+/// le wildcard est présent, [`ROLE_CUSTOM`] si aucun rôle ne correspond.
+/// Les permissions restent la source de vérité ; le rôle n'est qu'une vue.
+pub fn role_of(permissions: &HashSet<String>) -> &'static str {
+    if permissions.contains(PERM_WILDCARD) {
+        ROLE_ADMIN
+    } else if *permissions == Role::editor().permissions {
+        ROLE_EDITOR
+    } else if *permissions == Role::viewer().permissions {
+        ROLE_VIEWER
+    } else {
+        ROLE_CUSTOM
     }
 }
 
@@ -186,6 +222,16 @@ impl InMemoryPermissionStore {
         map.entry(user_id.to_string())
             .or_default()
             .insert(permission.into());
+        Ok(())
+    }
+
+    /// Remplace **toutes** les permissions de `user_id` par `permissions`.
+    pub fn replace(&self, user_id: &str, permissions: &HashSet<String>) -> Result<()> {
+        let mut map = self
+            .inner
+            .lock()
+            .map_err(|_| Error::Invalid("rbac lock empoisonné".into()))?;
+        map.insert(user_id.to_string(), permissions.clone());
         Ok(())
     }
 
@@ -341,6 +387,42 @@ mod tests {
         let s = InMemoryPermissionStore::new();
         s.revoke("unknown", "x").unwrap();
         assert!(s.permissions_for("unknown").await.unwrap().is_empty());
+    }
+
+    #[test]
+    fn standard_roles_are_resolved_by_name() {
+        assert_eq!(Role::standard("admin"), Some(Role::super_admin()));
+        assert_eq!(Role::standard("editor"), Some(Role::editor()));
+        assert_eq!(Role::standard("viewer"), Some(Role::viewer()));
+        assert_eq!(Role::standard("root"), None);
+        assert_eq!(Role::standard("custom"), None);
+    }
+
+    #[test]
+    fn role_of_maps_permissions_back_to_a_role() {
+        assert_eq!(role_of(&Role::super_admin().permissions), ROLE_ADMIN);
+        assert_eq!(role_of(&Role::editor().permissions), ROLE_EDITOR);
+        assert_eq!(role_of(&Role::viewer().permissions), ROLE_VIEWER);
+        // Le wildcard l'emporte sur tout le reste.
+        let mut admin_plus = Role::viewer().permissions;
+        admin_plus.insert(PERM_WILDCARD.into());
+        assert_eq!(role_of(&admin_plus), ROLE_ADMIN);
+        // Rôle standard augmenté d'une permission : personnalisé.
+        let mut editor_plus = Role::editor().permissions;
+        editor_plus.insert(PERM_USERS_ADMIN.into());
+        assert_eq!(role_of(&editor_plus), ROLE_CUSTOM);
+        assert_eq!(role_of(&HashSet::new()), ROLE_CUSTOM);
+    }
+
+    #[tokio::test]
+    async fn replace_overwrites_all_permissions() {
+        let s = InMemoryPermissionStore::new();
+        s.assign_role("u", &Role::editor()).unwrap();
+        s.replace("u", &Role::viewer().permissions).unwrap();
+        assert_eq!(
+            s.permissions_for("u").await.unwrap(),
+            Role::viewer().permissions
+        );
     }
 
     #[test]
