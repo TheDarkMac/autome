@@ -97,6 +97,11 @@ flowchart TB
   (`/hooks/{token}`, #202) résout l'URL secrète vers `(propriétaire, workflow,
   nœud)` puis dispatche un run `trigger_type: "webhook"` dont le payload
   devient la sortie du nœud trigger dans le worker.
+- **Administration des utilisateurs** (#208) : `api::admin` (`/admin/users`,
+  permission `users.admin`) liste les comptes, remplace leurs permissions par un
+  rôle (transaction), les suspend (`users.disabled_at`, migration `0017`, plus
+  fermeture des sessions par version) et ferme leurs sessions. Le premier
+  administrateur naît hors HTTP : `autome-api promote-admin <email>`.
 - **Emails** : seule l'API en envoie (mot de passe oublié, #204), via un relais
   SMTP (`api::mail`, `lettre` + rustls) en tâche de fond. Les liens portent un
   jeton HMAC sans état (`api::password_reset`) : aucune table dédiée.
