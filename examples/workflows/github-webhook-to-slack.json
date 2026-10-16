@@ -9,6 +9,7 @@
       "trigger_type": "webhook",
       "params": {
         "path": "/webhooks/github",
+        "signature": "github",
         "event": "issues"
       }
     },
