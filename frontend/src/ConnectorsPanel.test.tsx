@@ -200,6 +200,69 @@ describe("<ConnectorsPanel />", () => {
     ).toBeInTheDocument();
   });
 
+  it("signale une credential révoquée et met en avant la reconnexion", async () => {
+    const fetchImpl = router([
+      [/GET .*\/credentials\/providers$/, providersResponse],
+      [
+        /GET .*\/credentials$/,
+        () =>
+          json({
+            items: [
+              {
+                provider_id: "slack",
+                has_refresh_token: true,
+                needs_reconnect: true,
+                invalidated_at_ms: 1_700_000_000_000,
+              },
+              { provider_id: "github", has_refresh_token: false },
+            ],
+          }),
+      ],
+      [
+        /POST .*\/credentials\/slack\/authorize$/,
+        () =>
+          json({
+            authorize_url: "https://slack.com/oauth?x=2",
+            state: "st-re",
+            code_verifier: "ver-re",
+          }),
+      ],
+    ]);
+    const redirect = vi.fn();
+    window.sessionStorage.clear();
+
+    render(
+      <ConnectorsPanel
+        accessToken="t"
+        fetchImpl={fetchImpl}
+        callbackSearch=""
+        storage={window.sessionStorage}
+        redirect={redirect}
+      />,
+    );
+
+    const slackRow = await screen.findByTestId("connector-slack");
+    expect(within(slackRow).getByText("À reconnecter")).toBeInTheDocument();
+    expect(within(slackRow).queryByText("connecté")).not.toBeInTheDocument();
+    expect(slackRow).toHaveTextContent(/accès refusé par le service le .+ : les workflows/i);
+    // Le compte reste supprimable ; la reconnexion est le bouton principal.
+    expect(
+      within(slackRow).getByRole("button", { name: "Déconnecter" }),
+    ).toBeInTheDocument();
+    // Une credential saine n'a ni badge ni bouton de reconnexion.
+    const githubRow = screen.getByTestId("connector-github");
+    expect(within(githubRow).getByText("connecté")).toBeInTheDocument();
+    expect(
+      within(githubRow).queryByRole("button", { name: "Reconnecter" }),
+    ).not.toBeInTheDocument();
+
+    fireEvent.click(within(slackRow).getByRole("button", { name: "Reconnecter" }));
+    await waitFor(() =>
+      expect(redirect).toHaveBeenCalledWith("https://slack.com/oauth?x=2"),
+    );
+    expect(window.sessionStorage.getItem("autome.oauth.challenge")).toContain("ver-re");
+  });
+
   it("affiche une erreur si le chargement échoue", async () => {
     const fetchImpl = router([
       [/GET .*\/credentials\/providers$/, () => json({}, 500)],

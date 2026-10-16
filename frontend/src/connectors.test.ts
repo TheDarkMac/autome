@@ -78,7 +78,27 @@ describe("fetchConnectedCredentials", () => {
         hasRefreshToken: true,
         scope: "chat:write",
         expiresAtMs: 1234,
+        needsReconnect: false,
+        invalidatedAtMs: null,
       },
+    ]);
+  });
+
+  it("parse l'état « à reconnecter » d'une credential révoquée", async () => {
+    const fetchImpl = vi.fn().mockResolvedValue(
+      json({
+        items: [
+          {
+            provider_id: "gmail",
+            has_refresh_token: true,
+            needs_reconnect: true,
+            invalidated_at_ms: 1_700_000_000_000,
+          },
+        ],
+      }),
+    );
+    expect(await fetchConnectedCredentials(TOKEN, fetchImpl)).toMatchObject([
+      { providerId: "gmail", needsReconnect: true, invalidatedAtMs: 1_700_000_000_000 },
     ]);
   });
 
@@ -92,6 +112,8 @@ describe("fetchConnectedCredentials", () => {
         hasRefreshToken: false,
         scope: null,
         expiresAtMs: null,
+        needsReconnect: false,
+        invalidatedAtMs: null,
       },
     ]);
   });

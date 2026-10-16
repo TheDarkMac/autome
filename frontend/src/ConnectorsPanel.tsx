@@ -4,7 +4,10 @@
 // courant, et pilote le flow PKCE :
 //   - « Connecter » → /authorize → persiste le challenge → redirige ;
 //   - au retour (`?code&state`) → /callback → marque connecté ;
-//   - « Déconnecter » → DELETE.
+//   - « Déconnecter » → DELETE ;
+//   - credential révoquée par le provider (`needs_reconnect`) → badge
+//     « À reconnecter » et « Reconnecter » en bouton principal (même flow que
+//     « Connecter » : la reconnexion efface la marque côté serveur).
 //
 // Les dépendances effets de bord (fetch, redirection, location, storage)
 // sont injectables pour les tests.
@@ -227,20 +230,33 @@ function ProviderRow({
   onDisconnect: () => void;
 }): JSX.Element {
   const connected = credential !== null;
+  const needsReconnect = credential?.needsReconnect === true;
+  const primary =
+    "shrink-0 rounded-md bg-neutral-900 px-3 py-1.5 text-sm font-medium text-white hover:bg-neutral-700 disabled:opacity-50";
+  const secondary =
+    "shrink-0 rounded-md border border-neutral-200 px-3 py-1.5 text-sm text-neutral-700 hover:bg-neutral-50 disabled:opacity-50";
   return (
     <li
       data-testid={`connector-${provider.providerId}`}
-      className="flex items-center justify-between gap-4 px-4 py-3"
+      className={`flex items-center justify-between gap-4 px-4 py-3 ${
+        needsReconnect ? "bg-amber-50" : ""
+      }`}
     >
       <div className="min-w-0">
         <div className="flex items-center gap-2">
           <span className="font-medium capitalize text-neutral-800">
             {provider.providerId}
           </span>
-          {connected && (
-            <span className="rounded-full bg-emerald-100 px-2 py-0.5 text-[10px] font-medium text-emerald-800">
-              connecté
+          {needsReconnect ? (
+            <span className="rounded-full bg-amber-100 px-2 py-0.5 text-[10px] font-medium text-amber-900">
+              À reconnecter
             </span>
+          ) : (
+            connected && (
+              <span className="rounded-full bg-emerald-100 px-2 py-0.5 text-[10px] font-medium text-emerald-800">
+                connecté
+              </span>
+            )
           )}
         </div>
         <p className="mt-0.5 truncate text-xs text-neutral-500">
@@ -248,26 +264,50 @@ function ProviderRow({
             ? provider.scopes.join(", ")
             : "aucun scope déclaré"}
         </p>
+        {needsReconnect && (
+          <p className="mt-1 text-xs text-amber-900">
+            {revokedNotice(credential.invalidatedAtMs)}
+          </p>
+        )}
       </div>
       {connected ? (
-        <button
-          type="button"
-          disabled={busy}
-          onClick={onDisconnect}
-          className="shrink-0 rounded-md border border-neutral-200 px-3 py-1.5 text-sm text-neutral-700 hover:bg-neutral-50 disabled:opacity-50"
-        >
-          {busy ? "…" : "Déconnecter"}
-        </button>
+        <div className="flex shrink-0 gap-2">
+          {needsReconnect && (
+            <button
+              type="button"
+              disabled={busy}
+              onClick={onConnect}
+              className={primary}
+            >
+              {busy ? "…" : "Reconnecter"}
+            </button>
+          )}
+          <button
+            type="button"
+            disabled={busy}
+            onClick={onDisconnect}
+            className={secondary}
+          >
+            {busy ? "…" : "Déconnecter"}
+          </button>
+        </div>
       ) : (
-        <button
-          type="button"
-          disabled={busy}
-          onClick={onConnect}
-          className="shrink-0 rounded-md bg-neutral-900 px-3 py-1.5 text-sm font-medium text-white hover:bg-neutral-700 disabled:opacity-50"
-        >
+        <button type="button" disabled={busy} onClick={onConnect} className={primary}>
           {busy ? "…" : "Connecter"}
         </button>
       )}
     </li>
   );
+}
+
+/** Explication d'une credential révoquée, datée si le serveur l'a fournie. */
+function revokedNotice(invalidatedAtMs: number | null): string {
+  const when =
+    invalidatedAtMs === null
+      ? ""
+      : ` le ${new Date(invalidatedAtMs).toLocaleString("fr-FR", {
+          dateStyle: "short",
+          timeStyle: "short",
+        })}`;
+  return `Accès refusé par le service${when} : les workflows qui l'utilisent échouent jusqu'à la reconnexion.`;
 }
