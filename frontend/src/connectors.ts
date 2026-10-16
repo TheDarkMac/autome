@@ -25,6 +25,10 @@ export interface ConnectedCredential {
   readonly hasRefreshToken: boolean;
   readonly scope: string | null;
   readonly expiresAtMs: number | null;
+  /** Le provider a révoqué l'accès : les runs échouent jusqu'à reconnexion. */
+  readonly needsReconnect: boolean;
+  /** Date de la révocation constatée (Unix ms), `null` sinon. */
+  readonly invalidatedAtMs: number | null;
 }
 
 /** Challenge PKCE renvoyé par `/authorize`, à conserver jusqu'au callback. */
@@ -80,6 +84,26 @@ export async function fetchProviders(
   return out;
 }
 
+/** Champs d'un `CredentialDto` ; `null` sans `provider_id` exploitable. */
+function parseCredential(
+  v: Record<string, unknown>,
+  fallbackProvider?: string,
+): ConnectedCredential | null {
+  const providerId =
+    typeof v["provider_id"] === "string" ? v["provider_id"] : fallbackProvider;
+  if (!providerId) return null;
+  return {
+    providerId,
+    hasRefreshToken: v["has_refresh_token"] === true,
+    scope: typeof v["scope"] === "string" ? v["scope"] : null,
+    expiresAtMs:
+      typeof v["expires_at_ms"] === "number" ? v["expires_at_ms"] : null,
+    needsReconnect: v["needs_reconnect"] === true,
+    invalidatedAtMs:
+      typeof v["invalidated_at_ms"] === "number" ? v["invalidated_at_ms"] : null,
+  };
+}
+
 export async function fetchConnectedCredentials(
   accessToken: string,
   fetchImpl: typeof fetch = fetch,
@@ -91,17 +115,8 @@ export async function fetchConnectedCredentials(
   const out: ConnectedCredential[] = [];
   for (const it of items) {
     if (typeof it !== "object" || it === null) continue;
-    const v = it as Record<string, unknown>;
-    const providerId =
-      typeof v["provider_id"] === "string" ? v["provider_id"] : null;
-    if (!providerId) continue;
-    out.push({
-      providerId,
-      hasRefreshToken: v["has_refresh_token"] === true,
-      scope: typeof v["scope"] === "string" ? v["scope"] : null,
-      expiresAtMs:
-        typeof v["expires_at_ms"] === "number" ? v["expires_at_ms"] : null,
-    });
+    const credential = parseCredential(it as Record<string, unknown>);
+    if (credential) out.push(credential);
   }
   return out;
 }
@@ -172,15 +187,12 @@ export async function completeAuthorize(
       res.status,
     );
   }
-  const v = (await res.json()) as Record<string, unknown>;
-  return {
-    providerId:
-      typeof v["provider_id"] === "string" ? v["provider_id"] : provider,
-    hasRefreshToken: v["has_refresh_token"] === true,
-    scope: typeof v["scope"] === "string" ? v["scope"] : null,
-    expiresAtMs:
-      typeof v["expires_at_ms"] === "number" ? v["expires_at_ms"] : null,
-  };
+  const credential = parseCredential(
+    (await res.json()) as Record<string, unknown>,
+    provider,
+  );
+  if (!credential) throw new ApiError("réponse /callback mal formée");
+  return credential;
 }
 
 export async function revokeCredential(
