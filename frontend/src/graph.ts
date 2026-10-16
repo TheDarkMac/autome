@@ -14,6 +14,7 @@
 //     pub name: String,
 //     #[serde(flatten)] pub kind: NodeKind,
 //     pub params: serde_json::Value,
+//     pub position: Option<NodePosition>,  // { x, y } — disposition (#225)
 //   }
 //
 //   pub struct Edge {
@@ -39,6 +40,8 @@ export interface WireNode {
   name: string;
   kind: WireKind;
   params: unknown;
+  /** Position sur le canvas (#225) ; absente des graphes écrits hors éditeur. */
+  position?: { x: number; y: number };
   // Champs spécifiques à certains kinds, aplatis par `#[serde(flatten)]`.
   trigger_type?: string;
   action_type?: string;
@@ -148,6 +151,9 @@ function serializeNode(n: CanvasNode): WireNode {
     kind: n.data.kind,
     params: n.data.params ?? {},
   };
+  // Une coordonnée non finie partirait en `null` dans le JSON, que le
+  // backend refuse (f64) : mieux vaut laisser le node se replacer.
+  if (isPosition(n.position)) base.position = { x: n.position.x, y: n.position.y };
   if (n.data.kind === "trigger") {
     base.trigger_type = n.data.subtype ?? "";
   } else if (n.data.kind === "action") {
@@ -166,14 +172,25 @@ function serializeEdge(e: CanvasEdge): WireEdge {
 
 // ─────────────────────────── deserialize ───────────────────────────
 
-/** Convertit un graphe reçu du backend en état canvas (positions auto). */
+/**
+ * Convertit un graphe reçu du backend en état canvas. Les nodes sans
+ * position enregistrée (graphe écrit hors éditeur) sont placés par `layout`.
+ */
 export function deserializeGraph(
   graph: WireGraph,
   layout: (id: string, idx: number) => { x: number; y: number } = defaultLayout,
 ): { nodes: CanvasNode[]; edges: CanvasEdge[] } {
-  const nodes = graph.nodes.map((n, idx) => deserializeNode(n, layout(n.id, idx)));
+  const nodes = graph.nodes.map((n, idx) =>
+    deserializeNode(n, isPosition(n.position) ? n.position : layout(n.id, idx)),
+  );
   const edges = graph.edges.map(deserializeEdge);
   return { nodes, edges };
+}
+
+function isPosition(p: unknown): p is { x: number; y: number } {
+  if (typeof p !== "object" || p === null) return false;
+  const { x, y } = p as Record<string, unknown>;
+  return typeof x === "number" && Number.isFinite(x) && typeof y === "number" && Number.isFinite(y);
 }
 
 function deserializeNode(n: WireNode, position: { x: number; y: number }): CanvasNode {
@@ -185,7 +202,7 @@ function deserializeNode(n: WireNode, position: { x: number; y: number }): Canva
     ...(subtype !== undefined && subtype.length > 0 ? { subtype } : {}),
     ...(n.params !== undefined ? { params: n.params } : {}),
   };
-  return { id: n.id, type: "default", position, data };
+  return { id: n.id, type: "default", position: { x: position.x, y: position.y }, data };
 }
 
 function deserializeEdge(e: WireEdge): CanvasEdge {

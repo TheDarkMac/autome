@@ -21,6 +21,11 @@ export interface RunsListProps {
   selectedRunId: string | null;
   onSelectRun: (runId: string | null) => void;
   pageSize?: number;
+  /**
+   * Toute nouvelle valeur recharge la page courante — ex. le statut du run
+   * suivi par polling, pour que la ligne ne reste pas « queued » (#225).
+   */
+  refreshToken?: unknown;
   /** Override pour tests. */
   fetchImpl?: typeof fetchRunsForWorkflow;
 }
@@ -38,6 +43,7 @@ export function RunsList({
   selectedRunId,
   onSelectRun,
   pageSize = DEFAULT_PAGE_SIZE,
+  refreshToken,
   fetchImpl = fetchRunsForWorkflow,
 }: RunsListProps): JSX.Element {
   const [status, setStatus] = useState<Status>({ kind: "idle" });
@@ -57,7 +63,7 @@ export function RunsList({
     return () => {
       cancelled = true;
     };
-  }, [workflowId, offset, pageSize, reloadTick, fetchImpl]);
+  }, [workflowId, offset, pageSize, reloadTick, refreshToken, fetchImpl]);
 
   // Reset de la pagination si le workflow change sous nos pieds.
   useEffect(() => {

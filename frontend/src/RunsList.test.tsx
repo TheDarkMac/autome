@@ -159,6 +159,15 @@ describe("<RunsList />", () => {
     await waitFor(() => expect(fetchImpl).toHaveBeenCalledTimes(2));
   });
 
+  it("recharge la page quand `refreshToken` change (#225)", async () => {
+    const fetchImpl = vi.fn().mockResolvedValue(page([]));
+    const props = { workflowId: "wf-x", selectedRunId: null, onSelectRun: noop, fetchImpl: fetchImpl as never };
+    const { rerender } = render(<RunsList {...props} refreshToken="Queued" />);
+    await waitFor(() => expect(fetchImpl).toHaveBeenCalledTimes(1));
+    rerender(<RunsList {...props} refreshToken="Succeeded" />);
+    await waitFor(() => expect(fetchImpl).toHaveBeenCalledTimes(2));
+  });
+
   it("affiche la pagination uniquement si total > pageSize", async () => {
     const single = vi.fn().mockResolvedValue(page([mkRun()], { total: 1 }));
     const { unmount } = render(

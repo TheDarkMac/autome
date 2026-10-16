@@ -166,22 +166,34 @@ describe("<App />", () => {
     });
   });
 
-  it("bascule vers l'onglet Exécutions et monte la RunsList (F8.5.a)", async () => {
+  it("bascule vers l'onglet Exécutions et monte la RunsList du workflow ouvert (F8.5.a, #225)", async () => {
     globalThis.fetch = vi.fn(async (input) => {
       const url = typeof input === "string" ? input : (input as Request).url;
       if (url.includes("/openapi.json")) return jsonResponse(sampleSpec);
-      if (url.includes("/workflows/wf-draft/runs")) {
+      if (url.endsWith("/workflows?offset=0&limit=100")) {
+        return jsonResponse({
+          items: [{ id: "wf-1", name: "Démo", nodes: [], edges: [] }],
+          total: 1,
+          offset: 0,
+          limit: 100,
+        });
+      }
+      if (url.endsWith("/workflows/wf-1")) {
+        return jsonResponse({ id: "wf-1", name: "Démo", nodes: [], edges: [] });
+      }
+      if (url.includes("/workflows/wf-1/runs")) {
         return jsonResponse({ items: [], total: 0, offset: 0, limit: 50 });
       }
       return new Response("", { status: 404 });
     }) as typeof fetch;
-    render(<App sessionOptions={authedSession()} />);
+    const storage = { getItem: () => "wf-1", setItem: () => undefined, removeItem: () => undefined } as unknown as Storage;
+    render(<App sessionOptions={authedSession()} editorOptions={{ storage }} />);
     await waitFor(() =>
-      expect(screen.getByRole("heading", { name: "Autome" })).toBeInTheDocument(),
+      expect(screen.getByLabelText("Nom du workflow")).toHaveValue("Démo"),
     );
     fireEvent.click(screen.getByRole("tab", { name: /Exécutions/ }));
     await waitFor(() =>
-      expect(screen.getByTestId("runs-list")).toBeInTheDocument(),
+      expect(screen.getByTestId("runs-list")).toHaveTextContent("wf-1"),
     );
     await waitFor(() =>
       expect(screen.getByText(/Aucun run pour ce workflow/)).toBeInTheDocument(),

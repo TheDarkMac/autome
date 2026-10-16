@@ -106,9 +106,14 @@ export interface ApiClient {
   logoutUser(id: string): Promise<void>;
 }
 
+/** `true` si les permissions contiennent `permission` (ou le joker `*`). */
+export function hasPermission(permissions: readonly string[], permission: string): boolean {
+  return permissions.includes("*") || permissions.includes(permission);
+}
+
 /** `true` si les permissions donnent accès à l'administration des utilisateurs. */
 export function canAdministerUsers(permissions: readonly string[]): boolean {
-  return permissions.includes("*") || permissions.includes("users.admin");
+  return hasPermission(permissions, "users.admin");
 }
 
 /**

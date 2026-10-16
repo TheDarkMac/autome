@@ -5,11 +5,12 @@
 // ce test traverse l'application assemblée (`<App />`) contre un **backend
 // `fetch` simulé avec état**, routé par URL comme un vrai serveur.
 //
-// Parcours : session authentifiée → éditeur → onglet *Exécutions* → la
-// `RunsList` affiche un run → sélection → le **polling** (`useRunPolling`)
+// Parcours : session authentifiée → l'éditeur rouvre le dernier workflow
+// enregistré (#225) → « Lancer » crée un run et bascule sur *Exécutions* →
+// la `RunsList` affiche le run sélectionné → le **polling** (`useRunPolling`)
 // surface la transition `Running → Succeeded` dans le `RunExecutionPanel`,
 // puis s'éteint sur statut terminal. C'est le flux qui relie le plus de
-// pièces (`RunsList` → `useRunPolling` → `RunExecutionPanel`).
+// pièces (éditeur → `RunsList` → `useRunPolling` → `RunExecutionPanel`).
 //
 // Le polling est piloté par les **fake timers** Vitest : on évite `waitFor`
 // (qui s'appuie sur de vrais `setTimeout`) et on flush microtasks + timers
@@ -24,8 +25,9 @@ import type { TokenPair } from "./auth";
 import { memorySessionStore } from "./session";
 import type { RunCheckpoint, RunStatus } from "./runs";
 import type { UseSessionOptions } from "./useSession";
+import { lastWorkflowKey } from "./useWorkflowEditor";
 
-const WORKFLOW_ID = "wf-draft";
+const WORKFLOW_ID = "wf-e2e";
 const RUN_ID = "run-e2e";
 
 const SAMPLE_SPEC = {
@@ -75,21 +77,42 @@ function checkpointFor(status: RunStatus): RunCheckpoint {
   };
 }
 
+const WORKFLOW = {
+  id: WORKFLOW_ID,
+  name: "Météo",
+  nodes: [
+    { id: "hook", name: "Webhook", kind: "trigger", trigger_type: "webhook", params: {}, position: { x: 0, y: 0 } },
+    { id: "fetch", name: "Fetch", kind: "action", action_type: "http_request", params: {}, position: { x: 0, y: 160 } },
+  ],
+  edges: [{ from: "hook", to: "fetch" }],
+};
+
 /**
- * Backend `fetch` simulé avec état : la lecture `GET /runs/{id}` renvoie
- * `Running` au premier appel puis `Succeeded` ensuite — on observe ainsi la
- * transition via le polling. Retourne un compteur des lectures du run.
+ * Backend `fetch` simulé avec état : un workflow enregistré ; `POST …/runs`
+ * crée le run, puis la lecture `GET /runs/{id}` renvoie `Running` au premier
+ * appel et `Succeeded` ensuite — on observe ainsi la transition via le
+ * polling. Retourne un compteur des lectures du run.
  */
-function installStatefulBackend(): { getRunCalls: () => number } {
+function installStatefulBackend(): { getRunCalls: () => number; runCreated: () => boolean } {
   let runReads = 0;
-  globalThis.fetch = vi.fn(async (input: RequestInfo | URL) => {
+  let created = false;
+  globalThis.fetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = typeof input === "string" ? input : (input as Request).url;
+    const method = init?.method ?? "GET";
     if (url.includes("/openapi.json")) return jsonResponse(SAMPLE_SPEC);
     if (url.includes("/catalog/nodes")) return new Response("", { status: 404 });
+    if (url.includes("/workflows?")) {
+      return jsonResponse({ items: [WORKFLOW], total: 1, offset: 0, limit: 100 });
+    }
+    if (url.endsWith(`/workflows/${WORKFLOW_ID}`)) return jsonResponse(WORKFLOW);
     if (url.includes(`/workflows/${WORKFLOW_ID}/runs`)) {
+      if (method === "POST") {
+        created = true;
+        return jsonResponse({ run_id: RUN_ID, status: "queued" }, 202);
+      }
       return jsonResponse({
-        items: [checkpointFor("Running")],
-        total: 1,
+        items: created ? [checkpointFor("Running")] : [],
+        total: created ? 1 : 0,
         offset: 0,
         limit: 50,
       });
@@ -100,7 +123,7 @@ function installStatefulBackend(): { getRunCalls: () => number } {
     }
     return new Response("", { status: 404 });
   }) as typeof fetch;
-  return { getRunCalls: () => runReads };
+  return { getRunCalls: () => runReads, runCreated: () => created };
 }
 
 /** Flush microtasks + timers échus (fetch résolus, effets, polling). */
@@ -121,11 +144,17 @@ describe("parcours e2e — observation du cycle de vie d'un run", () => {
     globalThis.fetch = originalFetch;
   });
 
-  it("connecté → Exécutions → run listé → polling Running puis Succeeded → arrêt", async () => {
+  it("connecté → workflow rouvert → Lancer → run listé → polling Running puis Succeeded → arrêt", async () => {
     const backend = installStatefulBackend();
-    render(<App sessionOptions={authedSession()} />);
+    const storage = {
+      getItem: (k: string) => (k === lastWorkflowKey("alice") ? WORKFLOW_ID : null),
+      setItem: () => undefined,
+      removeItem: () => undefined,
+    } as unknown as Storage;
+    render(<App sessionOptions={authedSession()} editorOptions={{ storage }} />);
 
-    // 1. Session présente → l'éditeur est monté (pas la page de login).
+    // 1. Session présente → l'éditeur est monté (pas la page de login) et
+    //    rouvre le dernier workflow enregistré.
     await flush();
     expect(
       screen.getByRole("heading", { name: "Autome" }),
@@ -133,18 +162,18 @@ describe("parcours e2e — observation du cycle de vie d'un run", () => {
     expect(
       screen.queryByRole("form", { name: "Connexion" }),
     ).not.toBeInTheDocument();
+    expect(screen.getByTestId("nodes-count")).toHaveTextContent("2 node(s)");
 
-    // 2. Bascule vers l'onglet Exécutions → la RunsList se monte et liste
-    //    le run renvoyé par le backend.
-    fireEvent.click(screen.getByRole("tab", { name: /Exécutions/ }));
+    // 2. « Lancer » → run créé, bascule vers l'onglet Exécutions : la
+    //    RunsList liste le run, déjà sélectionné.
+    fireEvent.click(screen.getByRole("button", { name: "Lancer" }));
     await flush();
+    expect(backend.runCreated()).toBe(true);
     expect(screen.getByTestId("runs-list")).toBeInTheDocument();
     expect(screen.getByTestId(`run-row-${RUN_ID}`)).toBeInTheDocument();
 
-    // 3. Sélection du run → le polling démarre. 1ʳᵉ lecture : Running,
+    // 3. Le run sélectionné est suivi par polling. 1ʳᵉ lecture : Running,
     //    surfacée dans le panneau d'exécution.
-    fireEvent.click(screen.getByTestId(`run-row-${RUN_ID}`));
-    await flush();
     expect(backend.getRunCalls()).toBe(1);
     expect(screen.getByTestId("run-execution-panel")).toHaveTextContent(
       /Run running/i,

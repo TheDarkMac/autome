@@ -31,6 +31,7 @@ describe("serializeGraph", () => {
       kind: "trigger",
       trigger_type: "webhook",
       params: {},
+      position: { x: 10, y: 20 },
     });
   });
 
@@ -62,6 +63,14 @@ describe("serializeGraph", () => {
   });
 });
 
+describe("serializeGraph — positions (#225)", () => {
+  it("omits a non-finite position instead of sending null", () => {
+    const node = buildCanvasNode({ id: "a", kind: "if", position: { x: Number.NaN, y: 3 } });
+    const wire = serializeGraph("wf-1", "demo", [node], []);
+    expect(wire.nodes[0]).not.toHaveProperty("position");
+  });
+});
+
 describe("deserializeGraph", () => {
   it("rebuilds CanvasNodes with subtype on trigger/action", () => {
     const wire: WireGraph = {
@@ -86,6 +95,26 @@ describe("deserializeGraph", () => {
     // if node sans subtype, label par défaut
     expect(nodes[2]?.data.subtype).toBeUndefined();
     expect(nodes[2]?.data.label).toBe("If");
+  });
+
+  it("restores saved positions and lays out nodes without one (#225)", () => {
+    const wire: WireGraph = {
+      id: "wf-1",
+      name: "demo",
+      nodes: [
+        { id: "t1", name: "", kind: "trigger", trigger_type: "manual", params: {}, position: { x: 412.5, y: -30 } },
+        { id: "a1", name: "", kind: "action", action_type: "http_request", params: {} },
+        // Position mal formée (graphe écrit à la main) ⇒ grille.
+        { id: "a2", name: "", kind: "action", action_type: "http_request", params: {}, position: { x: "1", y: 2 } as never },
+      ],
+      edges: [],
+    };
+    const { nodes } = deserializeGraph(wire, (_id, idx) => ({ x: idx * 1000, y: 7 }));
+    expect(nodes.map((n) => n.position)).toEqual([
+      { x: 412.5, y: -30 },
+      { x: 1000, y: 7 },
+      { x: 2000, y: 7 },
+    ]);
   });
 
   it("converts from_port back to sourceHandle", () => {
@@ -148,6 +177,12 @@ describe("round-trip serialize ↔ deserialize", () => {
     // Edges préservées (sourceHandle compris)
     expect(rebuilt.edges.map((e) => e.source)).toEqual(["t1", "i1"]);
     expect(rebuilt.edges[1]?.sourceHandle).toBe("true");
+    // Positions préservées (#225)
+    expect(rebuilt.nodes.map((n) => n.position)).toEqual([
+      { x: 0, y: 0 },
+      { x: 100, y: 0 },
+      { x: 200, y: 0 },
+    ]);
   });
 });
 
