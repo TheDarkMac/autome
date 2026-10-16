@@ -190,3 +190,104 @@ async fn try_claim_has_a_single_winner_and_fail_if_running_is_conditional() {
     assert_eq!(failed.error.as_deref(), Some("orphelin"));
     assert_eq!(failed.finished_at_ms, Some(5_000));
 }
+
+/// Écritures et lectures groupées (#198) : même sémantique qu'avant — la map
+/// des sorties fait foi — avec un nombre d'instructions constant.
+#[tokio::test]
+async fn batched_outputs_keep_the_map_authoritative() {
+    let Some((store, _serial)) = setup().await else {
+        eprintln!("TEST_DATABASE_URL absent → test PostgreSQL sauté");
+        return;
+    };
+
+    // Run large : 300 sorties écrites en un upsert.
+    let mut big = RunCheckpoint::queued("big", "wf-big", 1, "manual", 1_000);
+    for n in 0..300 {
+        big.outputs.insert(format!("n{n:03}"), json!({ "n": n }));
+    }
+    store.checkpoint(&big).await.unwrap();
+    assert_eq!(store.load("big").await.unwrap().unwrap(), big);
+
+    // Checkpoint suivant : sorties modifiées, retirées et ajoutées.
+    big.outputs
+        .insert("n000".into(), json!({ "n": "modifiée" }));
+    big.outputs.remove("n001");
+    big.outputs.retain(|k, _| k.as_str() < "n100");
+    big.outputs.insert("extra".into(), json!([1, 2, 3]));
+    store.checkpoint(&big).await.unwrap();
+    let got = store.load("big").await.unwrap().unwrap();
+    assert_eq!(got, big, "modifiées, retirées et ajoutées");
+    assert_eq!(got.outputs.len(), 100);
+
+    // Map vide : toutes les sorties disparaissent.
+    big.outputs.clear();
+    store.checkpoint(&big).await.unwrap();
+    assert!(store.load("big").await.unwrap().unwrap().outputs.is_empty());
+
+    // Valeurs JSON variées, clés à caractères spéciaux.
+    let mut odd = RunCheckpoint::queued("odd", "wf-odd", 1, "manual", 1_000);
+    for (k, v) in [
+        ("a'b", json!(null)),
+        ("é \"q\"", json!("texte")),
+        ("{x}", json!({ "nested": { "deep": [true, 1.5] } })),
+    ] {
+        odd.outputs.insert(k.into(), v);
+    }
+    store.checkpoint(&odd).await.unwrap();
+    assert_eq!(store.load("odd").await.unwrap().unwrap(), odd);
+
+    // Listes : chaque run reçoit ses propres sorties (lues en une requête),
+    // runs sans sortie compris.
+    for i in 0..30 {
+        let mut cp = RunCheckpoint::queued(format!("l{i:02}"), "wf-list", 1, "manual", i);
+        for n in 0..(i % 4) {
+            cp.outputs
+                .insert(format!("s{n}"), json!({ "run": i, "n": n }));
+        }
+        store.checkpoint(&cp).await.unwrap();
+    }
+    let page = store
+        .list_by_workflow(
+            "wf-list",
+            None,
+            Pagination {
+                offset: 5,
+                limit: 20,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(page.total, 30);
+    assert_eq!(page.items.len(), 20);
+    for run in &page.items {
+        let i: i64 = run.run_id[1..].parse().unwrap();
+        assert_eq!(run.outputs.len() as i64, i % 4, "{}", run.run_id);
+        assert!(
+            run.outputs.values().all(|v| v["run"] == json!(i)),
+            "sorties d'un autre run : {}",
+            run.run_id
+        );
+    }
+
+    // Orphelins : idem, plusieurs runs avec leurs sorties.
+    for i in 0..5 {
+        let mut cp = RunCheckpoint::queued(format!("o{i}"), "wf-orph", 1, "manual", 1);
+        cp.status = RunStatus::Running;
+        cp.started_at_ms = Some(10);
+        cp.outputs.insert("only".into(), json!(i));
+        store.checkpoint(&cp).await.unwrap();
+    }
+    let orphans = store.list_orphans(100).await.unwrap();
+    assert_eq!(orphans.len(), 5);
+    for (i, run) in orphans.iter().enumerate() {
+        assert_eq!(run.run_id, format!("o{i}"));
+        assert_eq!(run.outputs["only"], json!(i));
+    }
+
+    // Claim : renvoie le run avec ses sorties.
+    let mut queued = RunCheckpoint::queued("q", "wf-q", 1, "manual", 1);
+    queued.outputs.insert("seed".into(), json!("payload"));
+    store.checkpoint(&queued).await.unwrap();
+    let claimed = store.try_claim("q", 50).await.unwrap().unwrap();
+    assert_eq!(claimed.outputs["seed"], json!("payload"));
+}
