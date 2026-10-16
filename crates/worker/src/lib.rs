@@ -53,11 +53,13 @@ pub mod dispatch;
 pub mod executor;
 pub mod liveness;
 pub mod probe;
+pub mod shutdown;
 pub use dispatch::{
     ConnectorCredentialsMode, CredentialResolver, EnvCredentialResolver, OwnerCredentialResolver,
 };
 pub use executor::{reap_orphans, RunExecutor};
 pub use liveness::PoolLiveness;
+pub use shutdown::{drain, DrainOutcome, InFlightRuns};
 
 /// Verdict que retourne un [`Handler`] après traitement.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -319,6 +321,32 @@ impl RunningPool {
         let handles = std::mem::take(&mut self.handles);
         for handle in handles {
             let _ = handle.await;
+        }
+    }
+
+    /// Signale l'arrêt puis attend la fin des tâches pendant au plus
+    /// `timeout` (#200). `true` si toutes ont terminé ; sinon elles tournent
+    /// encore, à interrompre par [`abort`](Self::abort).
+    pub async fn stop_within(&mut self, timeout: Duration) -> bool {
+        self.shutdown.store(true, Ordering::Release);
+        let all = async {
+            for handle in self.handles.iter_mut() {
+                let _ = handle.await;
+            }
+        };
+        let done = tokio::time::timeout(timeout, all).await.is_ok();
+        if done {
+            self.handles.clear();
+        }
+        done
+    }
+
+    /// Interrompt les tâches encore en cours (après un
+    /// [`stop_within`](Self::stop_within) dépassé).
+    pub fn abort(mut self) {
+        self.shutdown.store(true, Ordering::Release);
+        for handle in self.handles.drain(..) {
+            handle.abort();
         }
     }
 

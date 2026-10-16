@@ -51,6 +51,7 @@ use autome_engine::{Dag, Engine, RunContext, StepStatus};
 use tracing::{debug, error, info, warn, Instrument};
 
 use crate::dispatch::{dispatch_action, CredentialResolver};
+use crate::shutdown::InFlightRuns;
 use crate::{Handler, HandlerVerdict};
 
 /// Handler de production : exécute un run de bout en bout et persiste son état.
@@ -66,6 +67,8 @@ pub struct RunExecutor<C = ReqwestHttpClient> {
     store: Arc<dyn RunStateStore + Send + Sync>,
     http: C,
     resolver: Arc<dyn CredentialResolver>,
+    /// Runs réclamés et pas encore terminés (arrêt borné, #200).
+    in_flight: Arc<InFlightRuns>,
 }
 
 impl RunExecutor {
@@ -101,7 +104,13 @@ where
             store,
             http,
             resolver,
+            in_flight: Arc::new(InFlightRuns::default()),
         }
+    }
+
+    /// Runs en cours d'exécution (à passer à [`crate::drain`]).
+    pub fn in_flight(&self) -> Arc<InFlightRuns> {
+        Arc::clone(&self.in_flight)
     }
 
     /// Verdict d'une livraison dont le run n'a pas pu être réclamé : inconnu
@@ -298,6 +307,9 @@ where
                 return HandlerVerdict::Retry;
             }
         };
+        // En cours jusqu'à la fin de cette fonction (ou l'interruption de la
+        // tâche) : un arrêt du worker sait quels runs clore (#200).
+        let _in_flight = self.in_flight.track(run_id);
         debug!(owner = checkpoint.owner_id.as_deref(), "run réclamé");
 
         // Exécution **synchrone + bloquante** du moteur, hors runtime tokio.
@@ -885,5 +897,153 @@ mod tests {
             redeliveries: 0,
         };
         assert_eq!(exec.handle(&bad).await, HandlerVerdict::DeadLetter);
+    }
+
+    // ───── Arrêt borné (#200) ─────
+
+    /// Transport qui met la durée donnée à répondre : un run « long ».
+    #[derive(Clone)]
+    struct SlowHttp(std::time::Duration);
+    impl HttpClient for SlowHttp {
+        fn send(&self, _req: &HttpRequest) -> Result<HttpResponse, String> {
+            std::thread::sleep(self.0);
+            Ok(HttpResponse {
+                status: 200,
+                body: json!({ "ok": true }),
+            })
+        }
+    }
+
+    fn http_workflow(id: &str) -> WorkflowGraph {
+        let mut wf = trigger_only(id);
+        wf.nodes.push(Node {
+            id: NodeId::new("call"),
+            name: "call".into(),
+            kind: NodeKind::Action {
+                action_type: "http_request".into(),
+            },
+            params: json!({ "method": "GET", "url": "https://example.com/slow" }),
+        });
+        wf.edges.push(Edge {
+            from: NodeId::new("entry"),
+            to: NodeId::new("call"),
+            from_port: None,
+        });
+        wf
+    }
+
+    /// Pool d'un consommateur avec un run « long » en file, démarré et
+    /// attendu jusqu'à ce que le run soit réclamé.
+    async fn running_pool_with_slow_run(
+        delay: std::time::Duration,
+    ) -> (
+        crate::RunningPool,
+        Arc<crate::InFlightRuns>,
+        Arc<InMemoryRunStateStore>,
+    ) {
+        use autome_core::{InMemoryQueue, Queue};
+        let repo = Arc::new(InMemoryWorkflowRepository::new());
+        let store = Arc::new(InMemoryRunStateStore::new());
+        seed(&repo, &store, http_workflow("wf-slow"), "run-slow").await;
+        let queue = Arc::new(InMemoryQueue::new());
+        queue
+            .publish("runs", delivery("run-slow", "wf-slow").message)
+            .await
+            .unwrap();
+        let exec = RunExecutor::with_http(
+            repo,
+            Arc::clone(&store) as Arc<_>,
+            resolver(),
+            SlowHttp(delay),
+        );
+        let in_flight = exec.in_flight();
+        let handler: Arc<dyn Handler + Send + Sync> = Arc::new(exec);
+        let idem: Arc<dyn crate::IdempotencyStore + Send + Sync> =
+            Arc::new(crate::InMemoryIdempotencyStore::new());
+        let running = crate::WorkerPool::new(queue, handler, idem, "runs", 1)
+            .with_idle_sleep(std::time::Duration::from_millis(10))
+            .start();
+        for _ in 0..200 {
+            if !in_flight.snapshot().is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert_eq!(in_flight.snapshot(), vec!["run-slow"], "run réclamé");
+        (running, in_flight, store)
+    }
+
+    #[tokio::test]
+    async fn drain_lets_in_flight_runs_finish_within_the_timeout() {
+        let (running, in_flight, store) =
+            running_pool_with_slow_run(std::time::Duration::from_millis(200)).await;
+        let outcome = crate::drain(
+            running,
+            &in_flight,
+            store.as_ref(),
+            std::time::Duration::from_secs(5),
+        )
+        .await;
+        assert_eq!(outcome, crate::DrainOutcome::Completed);
+        let cp = store.load("run-slow").await.unwrap().unwrap();
+        assert_eq!(cp.status, RunStatus::Succeeded);
+        assert!(in_flight.snapshot().is_empty());
+    }
+
+    #[tokio::test]
+    async fn drain_past_the_timeout_fails_the_interrupted_runs_at_once() {
+        let (running, in_flight, store) =
+            running_pool_with_slow_run(std::time::Duration::from_secs(3)).await;
+        let started = std::time::Instant::now();
+        let outcome = crate::drain(
+            running,
+            &in_flight,
+            store.as_ref(),
+            std::time::Duration::from_millis(200),
+        )
+        .await;
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "borné"
+        );
+        assert_eq!(
+            outcome,
+            crate::DrainOutcome::Interrupted {
+                failed: vec!["run-slow".into()]
+            }
+        );
+        // Clos tout de suite, avec un motif explicite — pas `running` pendant
+        // une heure jusqu'au balayage des orphelins.
+        let cp = store.load("run-slow").await.unwrap().unwrap();
+        assert_eq!(cp.status, RunStatus::Failed);
+        assert_eq!(
+            cp.error.as_deref(),
+            Some(crate::shutdown::INTERRUPTED_REASON)
+        );
+        assert!(cp.finished_at_ms.is_some());
+    }
+
+    #[tokio::test]
+    async fn redelivery_of_an_interrupted_run_is_acked_without_running() {
+        let repo = Arc::new(InMemoryWorkflowRepository::new());
+        let store = Arc::new(InMemoryRunStateStore::new());
+        seed(&repo, &store, trigger_only("wf-i"), "run-i").await;
+        store.try_claim("run-i", NOW).await.unwrap().unwrap();
+        assert!(store
+            .fail_if_running("run-i", crate::shutdown::INTERRUPTED_REASON, NOW + 1)
+            .await
+            .unwrap());
+        let http = RecordingHttp::default();
+        let exec =
+            RunExecutor::with_http(repo, Arc::clone(&store) as Arc<_>, resolver(), http.clone());
+        assert_eq!(
+            exec.handle(&delivery("run-i", "wf-i")).await,
+            HandlerVerdict::Ok
+        );
+        assert_eq!(
+            store.load("run-i").await.unwrap().unwrap().status,
+            RunStatus::Failed,
+            "pas de rejeu"
+        );
     }
 }
