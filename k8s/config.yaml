@@ -42,6 +42,9 @@ data:
   # expéditeur. Sans AUTOME_SMTP_URL (Secret), la fonction répond 503.
   AUTOME_PUBLIC_URL: "https://autome.example.com"
   AUTOME_MAIL_FROM: "Autome <no-reply@example.com>"
+  # CORS (#225) : origine(s) du frontend, servi sur un autre hôte que l'API
+  # (cf. ingress). Sans elle, le navigateur bloque tous les appels du frontend.
+  AUTOME_CORS_ORIGINS: "https://autome.example.com"
 ---
 # Secrets (F10.3) — VALEURS DE DÉMONSTRATION, à remplacer impérativement
 # avant tout usage réel (SealedSecrets / External Secrets / Vault…).

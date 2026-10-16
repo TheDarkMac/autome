@@ -68,6 +68,9 @@ services:
       AUTOME_MIGRATE: "true"
       JWT_SECRET: dev-insecure-jwt-secret
       ENCRYPTION_KEY: dev-insecure-encryption-key
+      # Le frontend (:8081) et Vite (:5173) appellent l'API depuis une autre
+      # origine : sans CORS, le navigateur bloque tout (#225).
+      AUTOME_CORS_ORIGINS: http://localhost:8081,http://localhost:5173
     ports:
       - "8080:8080"
     # Arrêt gracieux (#194) : retrait (5 s) + drain (≤ 20 s) avant SIGKILL.

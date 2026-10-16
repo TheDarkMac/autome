@@ -43,6 +43,8 @@ rand = { workspace = true }
 # trait d'envoi asynchrone
 lettre = { version = "0.11", default-features = false, features = ["builder", "hostname", "smtp-transport", "tokio1-rustls-tls"] }
 async-trait = { workspace = true }
+# CORS pour le frontend servi sur une autre origine (#225)
+tower-http = { version = "0.6", features = ["cors"] }
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

@@ -11,6 +11,7 @@ use std::sync::Arc;
 use autome_api::accounts::{accounts_router, AccountsState, IpThrottle};
 use autome_api::admin::{admin_router, promote_admin, AdminState, Promotion};
 use autome_api::auth::protected_router;
+use autome_api::cors::{allowed_origins_from_env, with_cors};
 use autome_api::credentials::{credentials_router, CredentialsState};
 use autome_api::mail::MailSettings;
 use autome_api::metrics::{metrics_router, with_metrics, Metrics};
@@ -33,6 +34,7 @@ use autome_api::workflows::{
 };
 use autome_core::{telemetry, Argon2PasswordHasher, Config};
 use autome_persistence::{connect, PgAuditSink, PgUserStore};
+use axum::http::HeaderValue;
 use axum::{routing::get, Router};
 
 /// Période de la purge des entrées d'authentification expirées.
@@ -44,7 +46,8 @@ const MAINTENANCE_INTERVAL: std::time::Duration = std::time::Duration::from_secs
 /// protégés par JWT, l'administration des utilisateurs (`/admin/users`, #208),
 /// le CRUD `workflows` + `runs` (domaine 7) et les webhooks
 /// (`/hooks/{token}` public, gestion des URL protégée — #202). Toutes les
-/// routes sont instrumentées par le middleware de métriques (F10.6.a).
+/// routes sont instrumentées par le middleware de métriques (F10.6.a) et
+/// répondent au CORS des origines `cors` (#225).
 ///
 /// Les routes workflows sont posées **à plat** (`/workflows`, `/workflows/:id`)
 /// plutôt que `nest`ées : le catch-all d'un nest entrerait en conflit avec
@@ -57,6 +60,7 @@ fn build_router(
     webhooks: WebhooksState,
     probes: ProbesState,
     metrics: Arc<Metrics>,
+    cors: Vec<HeaderValue>,
 ) -> Router {
     let wf_state = WorkflowsState::new(backends.auth.clone(), backends.workflows.clone())
         .with_webhooks(backends.webhooks.clone());
@@ -96,9 +100,9 @@ fn build_router(
         .merge(webhooks_router(webhooks))
         .merge(credentials_router(credentials_state))
         .merge(metrics_router(metrics.clone()));
-    // Traçage en couche externe (toutes les requêtes, 404 compris), métriques
-    // par route à l'intérieur.
-    with_request_tracing(with_metrics(router, metrics))
+    // Traçage en couche externe (toutes les requêtes, 404 et préflights
+    // compris), CORS ensuite, métriques par route à l'intérieur.
+    with_request_tracing(with_cors(with_metrics(router, metrics), cors))
 }
 
 /// État des webhooks (#202) : clé dérivée d'`ENCRYPTION_KEY`, quota par
@@ -289,7 +293,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     let webhooks = webhooks_state(&backends, &config, webhook_max);
     let metrics = Arc::new(Metrics::new());
-    let app = build_router(&backends, accounts, webhooks, probes, metrics);
+    // CORS (#225) : origine invalide ⇒ refus de démarrer.
+    let cors = allowed_origins_from_env(config.profile)?;
+    tracing::info!(
+        origins = ?cors.iter().filter_map(|o| o.to_str().ok()).collect::<Vec<_>>(),
+        "origines CORS autorisées"
+    );
+    let app = build_router(&backends, accounts, webhooks, probes, metrics, cors);
 
     // Arrêt gracieux (#194) : SIGTERM/SIGINT ⇒ readiness à 503, délai de
     // retrait, puis drain borné des requêtes en cours.
@@ -356,6 +366,7 @@ mod tests {
             webhooks,
             probes,
             Arc::new(Metrics::new()),
+            autome_api::cors::allowed_origins(config.profile, None).expect("défauts dev"),
         )
     }
 
@@ -390,5 +401,38 @@ mod tests {
             serde_json::from_slice(&bytes).expect("spec OpenAPI = JSON valide");
         assert!(spec["openapi"].as_str().unwrap_or("").starts_with("3."));
         assert!(spec["paths"]["/workflows"].is_object());
+    }
+
+    #[tokio::test]
+    async fn the_dev_frontend_passes_the_cors_preflight_of_the_full_router() {
+        use axum::body::Body;
+        use axum::http::{header, Method, Request, StatusCode};
+        use tower::ServiceExt;
+
+        // #225 : sans CORS, le navigateur bloquait tous les appels du
+        // frontend (préflight `OPTIONS` en 405).
+        let response = dev_router()
+            .oneshot(
+                Request::builder()
+                    .method(Method::OPTIONS)
+                    .uri("/workflows/wf-1/runs")
+                    .header(header::ORIGIN, "http://localhost:5173")
+                    .header(header::ACCESS_CONTROL_REQUEST_METHOD, "POST")
+                    .header(
+                        header::ACCESS_CONTROL_REQUEST_HEADERS,
+                        "authorization,content-type",
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()[header::ACCESS_CONTROL_ALLOW_ORIGIN],
+            "http://localhost:5173"
+        );
+        // Le traçage reste la couche externe : le préflight a son x-request-id.
+        assert!(response.headers().contains_key("x-request-id"));
     }
 }
