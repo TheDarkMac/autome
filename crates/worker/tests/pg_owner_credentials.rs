@@ -13,7 +13,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use autome_connectors::oauth::{TokenRefresher, TokenSet};
+use autome_connectors::oauth::{RefreshError, TokenRefresher, TokenSet};
 use autome_connectors::{HttpClient, HttpRequest, HttpResponse};
 use autome_core::{
     Config, Delivery, DeliveryId, Edge, InMemoryRunStateStore, InMemoryWorkflowRepository, Message,
@@ -27,7 +27,7 @@ use serde_json::json;
 /// Refresher qui ne doit jamais être appelé (tokens non expirants).
 struct NoRefresh;
 impl TokenRefresher for NoRefresh {
-    fn refresh(&self, _: &str, _: &str, _: i64) -> autome_core::Result<TokenSet> {
+    fn refresh(&self, _: &str, _: &str, _: i64) -> Result<TokenSet, RefreshError> {
         panic!("aucun rafraîchissement attendu");
     }
 }
@@ -41,7 +41,7 @@ impl TokenRefresher for FakeGoogle {
         provider: &str,
         refresh_token: &str,
         now: i64,
-    ) -> autome_core::Result<TokenSet> {
+    ) -> Result<TokenSet, RefreshError> {
         assert_eq!((provider, refresh_token), ("gmail", "rt-alice"));
         Ok(TokenSet {
             access_token: "ya29-refreshed".into(),
@@ -108,7 +108,7 @@ fn delivery(run_id: &str, workflow_id: &str) -> Delivery {
     }
 }
 
-/// Config + table `connector_tokens` neuve (DDL réel de la migration 0011).
+/// Config + table `connector_tokens` neuve (DDL réel des migrations 0011 et 0018).
 /// Les tests du binaire sont sérialisés : chacun recrée la table.
 async fn setup() -> Option<(Config, tokio::sync::MutexGuard<'static, ()>)> {
     static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -120,11 +120,17 @@ async fn setup() -> Option<(Config, tokio::sync::MutexGuard<'static, ()>)> {
         _ => None,
     })
     .unwrap();
-    let ddl = MIGRATIONS
+    let ddl: String = MIGRATIONS
         .iter()
-        .find(|(name, _)| *name == "0011_connector_tokens.sql")
+        .filter(|(name, _)| {
+            [
+                "0011_connector_tokens.sql",
+                "0018_connector_token_invalidation.sql",
+            ]
+            .contains(name)
+        })
         .map(|(_, sql)| *sql)
-        .unwrap();
+        .collect();
     connect(&config.database_url)
         .unwrap()
         .get()
@@ -270,4 +276,176 @@ async fn expired_token_is_refreshed_and_persisted_in_postgres() {
     assert_eq!(reread.access_token, "ya29-refreshed");
     assert_eq!(reread.refresh_token.as_deref(), Some("rt-alice"));
     assert_eq!(reread.scope.as_deref(), Some("gmail.send"));
+}
+
+/// Provider qui **fait tourner** le refresh token : n'accepte chaque refresh
+/// token qu'une fois (rejeu ⇒ `invalid_grant`), comme les providers à
+/// rotation stricte. Lent, pour que les répliques se chevauchent.
+struct RotatingProvider {
+    calls: Mutex<Vec<String>>,
+}
+impl TokenRefresher for RotatingProvider {
+    fn refresh(
+        &self,
+        _provider: &str,
+        refresh_token: &str,
+        now: i64,
+    ) -> Result<TokenSet, RefreshError> {
+        let n = {
+            let mut calls = self.calls.lock().unwrap();
+            if calls.iter().any(|c| c == refresh_token) {
+                return Err(RefreshError::Revoked(
+                    r#"oauth refresh : http 400 — {"error":"invalid_grant"}"#.into(),
+                ));
+            }
+            calls.push(refresh_token.to_string());
+            calls.len()
+        };
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        Ok(TokenSet {
+            access_token: format!("at-{n}"),
+            refresh_token: Some(format!("rt-{n}")),
+            expires_at_ms: Some(now + 3_600_000),
+            token_type: "Bearer".into(),
+            scope: None,
+        })
+    }
+}
+
+fn expired_rotating(refresh: &str) -> TokenSet {
+    TokenSet {
+        access_token: "at-expired".into(),
+        refresh_token: Some(refresh.into()),
+        expires_at_ms: Some(1_000),
+        token_type: "Bearer".into(),
+        scope: None,
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn replicas_on_separate_pools_refresh_a_rotating_token_once() {
+    let Some((config, _serial)) = setup().await else {
+        eprintln!("TEST_DATABASE_URL absent → test PostgreSQL sauté");
+        return;
+    };
+    build_connector_token_store(&config, PersistenceMode::Postgres)
+        .unwrap()
+        .store("alice", "gmail", &expired_rotating("rt-0"))
+        .unwrap();
+
+    // Trois « répliques » : chacune son pool PostgreSQL et son résolveur (donc
+    // son propre verrou in-process) ; seul le verrou de ligne les sérialise.
+    let provider = Arc::new(RotatingProvider {
+        calls: Mutex::new(Vec::new()),
+    });
+    let replicas: Vec<_> = (0..3)
+        .map(|_| {
+            ConnectorCredentialsMode::PerUser.resolver(
+                build_connector_token_store(&config, PersistenceMode::Postgres).unwrap(),
+                Arc::clone(&provider) as Arc<dyn TokenRefresher + Send + Sync>,
+            )
+        })
+        .collect();
+    let barrier = Arc::new(std::sync::Barrier::new(6));
+    let handles: Vec<_> = (0..6)
+        .map(|i| {
+            let replica = Arc::clone(&replicas[i % 3]);
+            let barrier = Arc::clone(&barrier);
+            // Chemin réel : résolution depuis le thread bloquant du moteur.
+            tokio::task::spawn_blocking(move || {
+                barrier.wait();
+                replica.token(Some("alice"), "gmail")
+            })
+        })
+        .collect();
+    let mut tokens = Vec::new();
+    for h in handles {
+        tokens.push(h.await.unwrap());
+    }
+
+    assert!(
+        tokens.iter().all(|t| t.as_deref() == Ok("at-1")),
+        "{tokens:?}"
+    );
+    assert_eq!(
+        provider.calls.lock().unwrap().as_slice(),
+        ["rt-0"],
+        "un seul appel au provider, jamais de rejeu"
+    );
+    let stored = build_connector_token_store(&config, PersistenceMode::Postgres)
+        .unwrap()
+        .load("alice", "gmail")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        stored.refresh_token.as_deref(),
+        Some("rt-1"),
+        "rotation gardée"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn revoked_credential_is_marked_in_postgres_until_reconnected() {
+    let Some((config, _serial)) = setup().await else {
+        eprintln!("TEST_DATABASE_URL absent → test PostgreSQL sauté");
+        return;
+    };
+    let api_store = build_connector_token_store(&config, PersistenceMode::Postgres).unwrap();
+    api_store
+        .store("alice", "gmail", &expired_rotating("rt-used"))
+        .unwrap();
+    // Le provider a déjà vu ce refresh token : il le refuse.
+    let provider = Arc::new(RotatingProvider {
+        calls: Mutex::new(vec!["rt-used".into()]),
+    });
+    let resolver = ConnectorCredentialsMode::PerUser.resolver(
+        build_connector_token_store(&config, PersistenceMode::Postgres).unwrap(),
+        Arc::clone(&provider) as Arc<dyn TokenRefresher + Send + Sync>,
+    );
+
+    let r = Arc::clone(&resolver);
+    let first = tokio::task::spawn_blocking(move || r.token(Some("alice"), "gmail"))
+        .await
+        .unwrap()
+        .unwrap_err();
+    assert!(first.contains("invalid_grant"), "{first}");
+
+    let pool = connect(&config.database_url).unwrap();
+    let marked = |pool: autome_persistence::PgPool| async move {
+        pool.get()
+            .await
+            .unwrap()
+            .query_one(
+                "SELECT invalidated_at_ms IS NOT NULL, invalid_reason FROM connector_tokens \
+                 WHERE user_id = 'alice' AND provider_id = 'gmail'",
+                &[],
+            )
+            .await
+            .unwrap()
+    };
+    let row = marked(pool.clone()).await;
+    assert!(row.get::<_, bool>(0), "marque posée en base");
+    assert!(row.get::<_, String>(1).contains("invalid_grant"));
+
+    // Run suivant : refus sans rappeler le provider (une seule entrée).
+    let r = Arc::clone(&resolver);
+    let again = tokio::task::spawn_blocking(move || r.token(Some("alice"), "gmail"))
+        .await
+        .unwrap()
+        .unwrap_err();
+    assert!(again.contains("rafraîchissement précédent"), "{again}");
+    assert_eq!(provider.calls.lock().unwrap().len(), 1);
+
+    // Reconnexion via l'API : marque effacée, rafraîchissement de nouveau possible.
+    api_store
+        .store("alice", "gmail", &expired_rotating("rt-fresh"))
+        .unwrap();
+    let row = marked(pool).await;
+    assert!(!row.get::<_, bool>(0), "marque effacée par la reconnexion");
+    let r = Arc::clone(&resolver);
+    let token = tokio::task::spawn_blocking(move || r.token(Some("alice"), "gmail"))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(token, "at-2");
 }
