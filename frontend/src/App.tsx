@@ -71,6 +71,16 @@ export function App({
     readResetToken(window.location.hash),
   );
   const [loginNotice, setLoginNotice] = useState<string | null>(null);
+  // Lien collé dans un onglet où l'app est déjà ouverte : seul le fragment
+  // change, sans rechargement.
+  useEffect(() => {
+    const onHashChange = (): void => {
+      const token = readResetToken(window.location.hash);
+      if (token) setResetToken(token);
+    };
+    window.addEventListener("hashchange", onHashChange);
+    return () => window.removeEventListener("hashchange", onHashChange);
+  }, []);
   useEffect(() => {
     if (resetToken) {
       window.history.replaceState(

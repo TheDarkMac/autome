@@ -88,6 +88,21 @@ describe("<App />", () => {
     expect(resetPasswordImpl).toHaveBeenCalledWith("uid.1.mac", "new-password");
   });
 
+  it("réagit à un lien #reset= collé dans l'onglet déjà ouvert (#204)", async () => {
+    globalThis.fetch = vi.fn().mockResolvedValue(jsonResponse(sampleSpec)) as typeof fetch;
+    window.history.replaceState(null, "", "/");
+    render(<App sessionOptions={{ store: memorySessionStore() }} />);
+    expect(screen.getByRole("form", { name: "Connexion" })).toBeInTheDocument();
+    await act(async () => {
+      window.location.hash = "#reset=uid.2.mac";
+      window.dispatchEvent(new HashChangeEvent("hashchange"));
+    });
+    expect(
+      await screen.findByRole("form", { name: "Réinitialisation du mot de passe" }),
+    ).toBeInTheDocument();
+    await waitFor(() => expect(window.location.hash).toBe(""));
+  });
+
   it("demande un lien depuis la page de connexion (#204)", async () => {
     globalThis.fetch = vi.fn().mockResolvedValue(jsonResponse(sampleSpec)) as typeof fetch;
     const requestPasswordResetImpl = vi.fn().mockResolvedValue(undefined);
