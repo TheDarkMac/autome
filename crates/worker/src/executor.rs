@@ -712,9 +712,11 @@ mod tests {
         msg.message.body["payload"] = json!({ "body": { "issue": { "title": "Bug 42" } } });
         assert_eq!(exec.handle(&msg).await, HandlerVerdict::Ok);
 
-        let sent = http.sent.lock().unwrap();
-        assert_eq!(sent.len(), 1);
-        assert_eq!(sent[0].body.as_ref().unwrap()["text"], "Bug 42");
+        {
+            let sent = http.sent.lock().unwrap();
+            assert_eq!(sent.len(), 1);
+            assert_eq!(sent[0].body.as_ref().unwrap()["text"], "Bug 42");
+        }
         let cp = store.load("run-p").await.unwrap().unwrap();
         assert_eq!(cp.status, RunStatus::Succeeded);
         assert_eq!(cp.outputs["entry"]["body"]["issue"]["title"], "Bug 42");
