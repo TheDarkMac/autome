@@ -6,7 +6,6 @@
 //! du domaine 7 (F7.*). Le middleware d'authentification (F6.1.c) vit dans
 //! [`autome_api::auth`].
 
-use std::net::SocketAddr;
 use std::sync::Arc;
 
 use autome_api::accounts::{accounts_router, AccountsState, IpThrottle};
@@ -19,6 +18,9 @@ use autome_api::runs::{runs_router, RunsState};
 use autome_api::runtime::{
     build_backends, build_health_checks, build_queue, ensure_durable_backends, migrate,
     migrate_on_boot_requested, purge_expired, Backends, PersistenceMode, QueueMode,
+};
+use autome_api::shutdown::{
+    begin_shutdown, serve_tls_until, serve_until, termination_signal, Draining, ShutdownConfig,
 };
 use autome_api::tls::load_rustls_config;
 use autome_api::workflows::{
@@ -124,13 +126,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // File de messages (dette #107) : `AUTOME_QUEUE=rabbitmq` se connecte au
     // broker (`QUEUE_URL`) ; défaut `memory`. Le dispatcher de runs publie dessus.
     let queue = build_queue(&config, queue_mode).await?;
-    // Sonde `/readyz` (#192) : base et broker effectivement sélectionnés.
+    // Sonde `/readyz` (#192) : base et broker effectivement sélectionnés ;
+    // 503 `draining` dès le début de l'arrêt gracieux (#194).
+    let draining = Draining::default();
     let probes = ProbesState::new(build_health_checks(
         &config,
         mode,
         queue_mode,
         queue.clone(),
-    )?);
+    )?)
+    .with_draining(draining.clone());
+    let shutdown = ShutdownConfig::from_env()?;
     let backends = build_backends(&config, mode, queue)?;
     tracing::info!(queue = ?queue_mode, persistence = ?mode, "backends prêts");
 
@@ -173,6 +179,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let metrics = Arc::new(Metrics::new());
     let app = build_router(&backends, accounts, probes, metrics);
 
+    // Arrêt gracieux (#194) : SIGTERM/SIGINT ⇒ readiness à 503, délai de
+    // retrait, puis drain borné des requêtes en cours.
+    tracing::info!(
+        delay_s = shutdown.delay.as_secs(),
+        timeout_s = shutdown.timeout.as_secs(),
+        "arrêt gracieux configuré"
+    );
+    let stop = begin_shutdown(termination_signal(), draining, shutdown.delay);
+
     // F6.4 — HTTPS via rustls si `AUTOME_TLS_CERT` + `AUTOME_TLS_KEY`
     // sont positionnées ; sinon HTTP en clair. Décision all-or-nothing
     // (pas de fallback silencieux qui dégraderait la sécurité).
@@ -183,10 +198,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let tls_config = load_rustls_config(&cert, &key).await?;
             let addr: std::net::SocketAddr = config.http_addr.parse()?;
             tracing::info!(profile = ?config.profile, %addr, tls = true, "autome-api en écoute (https)");
-            axum_server::bind_rustls(addr, tls_config)
-                // Adresse du pair : IP cliente de l'anti-bruteforce (#190).
-                .serve(app.into_make_service_with_connect_info::<SocketAddr>())
-                .await?;
+            serve_tls_until(addr, tls_config, app, stop, shutdown.timeout).await?;
         }
         (None, None) => {
             let listener = tokio::net::TcpListener::bind(&config.http_addr).await?;
@@ -196,12 +208,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 tls = false,
                 "autome-api en écoute (http)"
             );
-            // Adresse du pair : IP cliente de l'anti-bruteforce (#190).
-            axum::serve(
-                listener,
-                app.into_make_service_with_connect_info::<SocketAddr>(),
-            )
-            .await?;
+            serve_until(listener, app, stop, shutdown.timeout).await?;
         }
         _ => {
             return Err(
@@ -210,6 +217,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
         }
     }
+    tracing::info!("autome-api arrêtée");
     Ok(())
 }
 

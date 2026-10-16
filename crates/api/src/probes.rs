@@ -11,7 +11,8 @@
 //! ferait sinon redémarrer en boucle tous les pods, sans rien réparer. La
 //! readiness vérifie PostgreSQL et le broker, en parallèle et bornés en temps
 //! ([`autome_persistence::run_checks`]) ; elle ne publie que le nom des
-//! vérifications en échec — le détail est journalisé.
+//! vérifications en échec — le détail est journalisé. Pendant l'arrêt
+//! gracieux (#194), elle répond 503 `draining` sans rien vérifier.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -23,11 +24,14 @@ use axum::{extract::State, http::StatusCode, routing::get, Json, Router};
 use serde::Serialize;
 use utoipa::ToSchema;
 
+use crate::shutdown::Draining;
+
 /// Vérifications exécutées par `/readyz`.
 #[derive(Clone)]
 pub struct ProbesState {
     checks: Arc<Vec<Arc<dyn HealthCheck>>>,
     timeout: Duration,
+    draining: Draining,
 }
 
 impl ProbesState {
@@ -36,7 +40,14 @@ impl ProbesState {
         Self {
             checks: Arc::new(checks),
             timeout: CHECK_TIMEOUT,
+            draining: Draining::default(),
         }
+    }
+
+    /// Readiness à 503 dès que `draining` annonce l'arrêt (#194).
+    pub fn with_draining(mut self, draining: Draining) -> Self {
+        self.draining = draining;
+        self
     }
 
     /// Délai d'une vérification (tests).
@@ -49,7 +60,7 @@ impl ProbesState {
 /// Réponse de `/readyz`.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct ReadyzResponse {
-    /// `ready` ou `unavailable`.
+    /// `ready`, `unavailable` ou `draining` (arrêt en cours).
     pub status: &'static str,
     /// Par vérification (`postgres`, `rabbitmq`) : `ok` ou `error`.
     pub checks: BTreeMap<&'static str, &'static str>,
@@ -73,10 +84,19 @@ pub async fn livez() -> &'static str {
     tag = "probes",
     responses(
         (status = 200, description = "Prêt", body = ReadyzResponse),
-        (status = 503, description = "Une dépendance au moins est indisponible", body = ReadyzResponse)
+        (status = 503, description = "Une dépendance au moins est indisponible, ou arrêt en cours", body = ReadyzResponse)
     )
 )]
 pub async fn readyz(State(state): State<ProbesState>) -> (StatusCode, Json<ReadyzResponse>) {
+    if state.draining.is_draining() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ReadyzResponse {
+                status: "draining",
+                checks: BTreeMap::new(),
+            }),
+        );
+    }
     let readiness = run_checks(&state.checks, state.timeout).await;
     let checks = readiness
         .checks
