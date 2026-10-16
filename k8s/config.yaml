@@ -36,6 +36,12 @@ data:
   AUTOME_SIGNUP_IP_MAX_ATTEMPTS: "10"
   # Requêtes par URL de webhook et par fenêtre de 15 min (#202).
   AUTOME_WEBHOOK_MAX_PER_WINDOW: "1000"
+  # Mot de passe oublié (#204) : demandes par IP et par fenêtre de 15 min.
+  AUTOME_RESET_IP_MAX_ATTEMPTS: "10"
+  # URL publique du frontend (base des liens de réinitialisation) et
+  # expéditeur. Sans AUTOME_SMTP_URL (Secret), la fonction répond 503.
+  AUTOME_PUBLIC_URL: "https://autome.example.com"
+  AUTOME_MAIL_FROM: "Autome <no-reply@example.com>"
 ---
 # Secrets (F10.3) — VALEURS DE DÉMONSTRATION, à remplacer impérativement
 # avant tout usage réel (SealedSecrets / External Secrets / Vault…).
@@ -57,6 +63,8 @@ stringData:
   DATABASE_URL: "postgres://postgres:REPLACE_ME_postgres_password@postgres:5432/autome"
   # Vhost par défaut `/` = `%2f` (une barre finale seule = vhost vide, refusé).
   QUEUE_URL: "amqp://guest:guest@rabbitmq:5672/%2f"
+  # Relais SMTP du mot de passe oublié (#204) — contient un mot de passe.
+  #AUTOME_SMTP_URL: "smtps://user:REPLACE_ME@smtp.example.com"
   # Credentials des providers OAuth (#161) — à renseigner par provider listé
   # dans AUTOME_OAUTH_PROVIDERS. Exemple (décommenter + compléter) :
   #AUTOME_OAUTH_GOOGLE_CLIENT_ID: "REPLACE_ME"

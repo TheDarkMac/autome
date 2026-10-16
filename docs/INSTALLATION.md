@@ -55,6 +55,9 @@ cp .env.example .env
 | `RUST_LOG` | Niveau des logs, syntaxe `EnvFilter` (ex. `info,autome_worker=debug`) | `info` | `info` |
 | `AUTOME_WORKER_CONCURRENCY` | Worker : tâches consommatrices par process | `4` | selon charge |
 | `AUTOME_RUN_TIMEOUT_SECS` | Worker : au-delà, un run encore `running` est clos en `failed` (min. 60) | `3600` | > durée du plus long run |
+| `AUTOME_SMTP_URL` | Relais SMTP des emails (mot de passe oublié) : `smtps://user:pass@hôte` (TLS, 465) ou `smtp://hôte:587?tls=required` (STARTTLS). Contient un mot de passe : à mettre dans un secret | *(non défini : liens journalisés en `dev`)* | **requis pour le mot de passe oublié** (sinon 503) |
+| `AUTOME_MAIL_FROM` | Expéditeur des emails, ex. `Autome <no-reply@exemple.fr>` | *(non défini)* | obligatoire avec `AUTOME_SMTP_URL` |
+| `AUTOME_PUBLIC_URL` | URL publique du **frontend**, base des liens envoyés par email (jamais déduite de l'en-tête `Host`) | `http://localhost:5173` | obligatoire avec `AUTOME_SMTP_URL` |
 | `AUTOME_CONNECTOR_CREDENTIALS` | Worker : `per_user` (token du propriétaire du run) ou `single_tenant` (repli sur `AUTOME_CONNECTOR_TOKEN_<PROVIDER>`) | `per_user` | `per_user` (instance partagée) |
 
 ### Sortie réseau (anti-SSRF)
@@ -475,6 +478,8 @@ comptes sont publics ; tout le reste exige `Authorization: Bearer <access_token>
 | POST | `/auth/logout` | `{"refresh_token"}` (+ `Authorization: Bearer <access_token>` facultatif) | 204 session fermée (aussi si déjà fermée) · 401 refresh invalide ou expiré |
 | POST | `/auth/logout-all` | — (`Authorization: Bearer <access_token>` requis) | 204 toutes les sessions fermées · 401 access absent, invalide ou déjà révoqué |
 | POST | `/auth/password` | `{"current_password","new_password"}` (Bearer requis) | 200 + nouvelle paire · 400 nouveau mot de passe invalide ou identique · 403 mot de passe actuel incorrect · 409 changé entre-temps · 429 trop d'essais |
+| POST | `/auth/password/forgot` | `{"email"}` | 202 demande prise en compte (que le compte existe ou non) · 400 email invalide · 429 trop de demandes · 503 aucun envoi d'email configuré |
+| POST | `/auth/password/reset` | `{"token","new_password"}` | 204 mot de passe remplacé, sessions fermées · 400 lien invalide, expiré ou déjà utilisé, ou mot de passe invalide · 503 non configuré |
 
 - Paire de jetons : `{"access_token","refresh_token","token_type":"Bearer","expires_in":900}`.
   Access valable 15 min, refresh 7 jours et **à usage unique** (rotation) : de
@@ -506,8 +511,32 @@ comptes sont publics ; tout le reste exige `Authorization: Bearer <access_token>
   appareils, et la réponse fournit une nouvelle paire à l'appareil courant, qui
   reste connecté. Mot de passe actuel incorrect = **403** (pas 401, que le
   frontend interpréterait comme une session expirée). Onglet « Compte » du
-  frontend ; audit `auth.password_change`. Pas encore de réinitialisation par
-  email (mot de passe oublié).
+  frontend ; audit `auth.password_change`.
+- **Mot de passe oublié** (#204) : « Mot de passe oublié ? » sur la page de
+  connexion appelle `/auth/password/forgot`, qui répond **toujours 202** : la
+  recherche du compte et l'envoi de l'email ont lieu en tâche de fond, si bien
+  que ni le code ni la durée de la réponse ne révèlent si l'adresse a un
+  compte. L'email contient un lien `AUTOME_PUBLIC_URL/#reset=<jeton>` : le
+  jeton est dans le **fragment**, que le navigateur n'envoie jamais au serveur
+  du frontend (journaux d'accès) ni dans le `Referer` ; le frontend le retire
+  aussitôt de la barre d'adresse. Le jeton est **sans état** : HMAC (clé
+  dérivée d'`ENCRYPTION_KEY`) de l'identifiant du compte, de l'expiration et du
+  hash **actuel** du mot de passe — rien n'est stocké, il expire après
+  **30 min**, et il ne sert qu'**une fois** : la réinitialisation change le
+  hash (écriture conditionnelle, deux utilisations simultanées : une seule
+  réussit), comme tout changement de mot de passe, ce qui invalide les liens
+  en circulation. Changer `ENCRYPTION_KEY` les invalide aussi. Après
+  réinitialisation, **toutes les sessions sont fermées** et le blocage de
+  connexion du compte est levé ; l'utilisateur se reconnecte. Quotas : 3
+  demandes par adresse et `AUTOME_RESET_IP_MAX_ATTEMPTS` (défaut 10) par IP et
+  par fenêtre de 15 min, puis 429 (pas d'inondation d'une boîte). Audit
+  `auth.password_reset_request` / `auth.password_reset`. Envoi SMTP
+  (`AUTOME_SMTP_URL`, `AUTOME_MAIL_FROM`) ; un échec d'envoi est journalisé
+  (`envoi du lien de réinitialisation impossible`) sans changer la réponse.
+  **Sans SMTP** : en `dev` (cas de compose), le contenu de l'email — lien
+  compris — est écrit dans les journaux de l'API
+  (`docker compose logs api | grep reset=`) ; en `prod`, la fonction est
+  désactivée (503) et le frontend affiche « pas disponible sur ce serveur ».
 - Mot de passe : 8 à 1024 caractères, haché en **Argon2id**. L'email est
   normalisé (trim + minuscules).
 - Un compte créé par `signup` reçoit le rôle **editor** (CRUD workflows, runs,
@@ -526,7 +555,8 @@ comptes sont publics ; tout le reste exige `Authorization: Bearer <access_token>
   login ou signup coûte ~50 ms d'Argon2). Par IP cliente et par fenêtre de
   15 min : au plus `AUTOME_LOGIN_IP_MAX_ATTEMPTS` (défaut 50) échecs de
   connexion — une connexion réussie ne compte pas, pour les bureaux derrière un
-  même NAT — et `AUTOME_SIGNUP_IP_MAX_ATTEMPTS` (défaut 10) inscriptions ;
+  même NAT —, `AUTOME_SIGNUP_IP_MAX_ATTEMPTS` (défaut 10) inscriptions et
+  `AUTOME_RESET_IP_MAX_ATTEMPTS` (défaut 10) demandes de réinitialisation ;
   au-delà, 429 + `Retry-After`. `0` désactive un quota. Les IPv6 sont comptées
   par préfixe `/64`. Compteurs partagés entre répliques comme celui des emails.
 - **IP réelle derrière un proxy** : `X-Forwarded-For` n'est lu que si la
@@ -623,6 +653,8 @@ npm run test       # Vitest
 | Logs `connexion impossible, nouvelle tentative service="rabbitmq"` au démarrage | Broker démarré mais pas encore à l'écoute | Normal pendant quelques secondes ; au-delà de `AUTOME_QUEUE_CONNECT_TIMEOUT_SECS`, vérifier `QUEUE_URL` et le broker |
 | L'API refuse de démarrer en `prod` (`… doit être défini (non-défaut)`) | Secret laissé à la valeur de dev ou `DATABASE_URL` par défaut | Définir de vrais `JWT_SECRET` / `ENCRYPTION_KEY` / `DATABASE_URL` |
 | `TLS partiellement configuré` au démarrage | Une seule des deux variables TLS positionnée | Définir `AUTOME_TLS_CERT` **et** `AUTOME_TLS_KEY`, ou aucune |
+| « Mot de passe oublié » répond 503 / « pas disponible sur ce serveur » | Profil `prod` sans `AUTOME_SMTP_URL` | Définir `AUTOME_SMTP_URL`, `AUTOME_MAIL_FROM` et `AUTOME_PUBLIC_URL` |
+| Aucun email de réinitialisation reçu | Relais SMTP refusé/injoignable (log `envoi du lien de réinitialisation impossible`), quota atteint, ou adresse sans compte | Vérifier `AUTOME_SMTP_URL` et les journaux de l'API ; en `dev` sans SMTP, le lien est dans les journaux |
 | Port déjà utilisé (`address already in use`) | 8080/8081/3000/9090/5432/15672 occupé | Libérer le port ou ajuster `APP_HTTP_ADDR` / les mappings du compose |
 | `docker compose` échoue à joindre `db`/`queue` | Services pas encore *healthy* | Attendre les healthchecks (`depends_on … service_healthy`) puis relancer |
 | Pods `api`/`worker` en `ImagePullBackOff` | Tag/registry d'image absent | Vérifier que les images GHCR existent (CD passée) ou ajuster les `image:` |
