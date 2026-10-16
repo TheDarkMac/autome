@@ -54,7 +54,7 @@ echo "==> Application du seed de dev"
 psql_run -q < "$MIG_DIR/seeds/dev_seed.sql"
 
 echo "==> Vérifications d'invariants"
-EXPECTED_TABLES="audit_events connector_tokens credentials login_attempts revoked_tokens run_steps runs session_versions user_permissions users workflow_versions workflows"
+EXPECTED_TABLES="audit_events connector_tokens credentials login_attempts revoked_tokens run_steps runs session_versions user_permissions users webhook_endpoints workflow_versions workflows"
 GOT_TABLES=$(psql_run -tA -c \
   "SELECT string_agg(tablename,' ' ORDER BY tablename)
    FROM pg_tables WHERE schemaname='public';")
@@ -88,5 +88,9 @@ if psql_run -q -c \
   echo "ÉCHEC: doublon d'email accepté (contrainte UNIQUE manquante)"; exit 1
 fi
 echo "    OK  contrainte users_email_unique active"
+
+# Administration (#208) : le compte seedé n'est pas suspendu.
+assert_count "compte de dev actif" \
+  "SELECT count(*) FROM users WHERE disabled_at IS NULL;" 1
 
 echo "==> ✅ Schéma valide : migrations + seed appliqués, invariants OK"
