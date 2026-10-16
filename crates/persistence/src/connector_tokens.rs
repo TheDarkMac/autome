@@ -150,14 +150,7 @@ impl<K: KeyProvider> ConnectorTokenStore for PgConnectorTokenStore<K> {
         let current = row
             .map(|r| {
                 let envelope: String = r.get(0);
-                let at_ms: Option<i64> = r.get(1);
-                let reason: Option<String> = r.get(2);
-                Ok::<_, Error>(StoredCredential {
-                    tokens: open_tokens(&self.cipher, &envelope)?,
-                    invalidated: at_ms
-                        .zip(reason)
-                        .map(|(at_ms, reason)| CredentialInvalidation { at_ms, reason }),
-                })
+                stored_credential(&self.cipher, &envelope, r.get(1), r.get(2))
             })
             .transpose()?;
         let present = current.is_some();
@@ -236,6 +229,47 @@ impl<K: KeyProvider> ConnectorTokenStore for PgConnectorTokenStore<K> {
             Ok(rows.iter().map(|r| r.get(0)).collect())
         })
     }
+
+    fn load_all_by_user(&self, user_id: &str) -> Result<Vec<(String, StoredCredential)>> {
+        let rows = block_on(async {
+            let client = self.pool.get().await.map_err(|e| storage_err("pool", e))?;
+            client
+                .query(
+                    "SELECT provider_id, envelope, invalidated_at_ms, invalid_reason \
+                     FROM connector_tokens WHERE user_id = $1 ORDER BY provider_id",
+                    &[&user_id],
+                )
+                .await
+                .map_err(|e| storage_err("connector_tokens.load_all_by_user", e))
+        })?;
+        // Déchiffrement hors `block_on` : pur CPU, aucune connexion tenue.
+        rows.iter()
+            .map(|r| {
+                let provider_id: String = r.get(0);
+                let envelope: String = r.get(1);
+                Ok((
+                    provider_id,
+                    stored_credential(&self.cipher, &envelope, r.get(2), r.get(3))?,
+                ))
+            })
+            .collect()
+    }
+}
+
+/// Credential déchiffrée + marque (`invalidated_at_ms` et `invalid_reason`
+/// sont nulles ensemble ou renseignées ensemble, contrainte de `0018`).
+fn stored_credential<K: KeyProvider>(
+    cipher: &EnvelopeCipher<K>,
+    envelope: &str,
+    invalidated_at_ms: Option<i64>,
+    invalid_reason: Option<String>,
+) -> Result<StoredCredential> {
+    Ok(StoredCredential {
+        tokens: open_tokens(cipher, envelope)?,
+        invalidated: invalidated_at_ms
+            .zip(invalid_reason)
+            .map(|(at_ms, reason)| CredentialInvalidation { at_ms, reason }),
+    })
 }
 
 #[cfg(test)]
