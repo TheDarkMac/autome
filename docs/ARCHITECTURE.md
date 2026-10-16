@@ -110,7 +110,8 @@ flowchart TB
   les access tokens expirés sous le verrou de ligne PostgreSQL
   (`ConnectorTokenStore::update_locked`, #211) : un seul appel au provider par
   credential, quel que soit le nombre de répliques. Un `invalid_grant` marque la
-  credential invalide (migration `0018`) jusqu'à la reconnexion.
+  credential invalide (migration `0018`) jusqu'à la reconnexion, signalée à
+  l'utilisateur par `GET /credentials` (`needs_reconnect`, #213).
 - **engine** est agnostique : il dépend de **traits** de `core` (queue, stores,
   connecteurs) et ne connaît ni RabbitMQ ni PostgreSQL ni Slack directement.
 
