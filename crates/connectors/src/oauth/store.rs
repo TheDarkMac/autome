@@ -140,6 +140,11 @@ pub trait ConnectorTokenStore {
     /// Liste les `provider_id` pour lesquels `user_id` a au moins un
     /// credential stocké. Tri lexical ascendant pour stabilité des tests.
     fn list_by_user(&self, user_id: &str) -> Result<Vec<String>>;
+
+    /// Toutes les credentials de `user_id` (tokens + marque d'invalidation),
+    /// triées par `provider_id`, en **une** lecture du backend (pas de N+1).
+    /// Sans verrou : vue de lecture, pas de base à une décision de refresh.
+    fn load_all_by_user(&self, user_id: &str) -> Result<Vec<(String, StoredCredential)>>;
 }
 
 /// Entrée de [`InMemoryConnectorTokenStore`] : enveloppe chiffrée + marque.
@@ -267,6 +272,28 @@ impl<K: KeyProvider> ConnectorTokenStore for InMemoryConnectorTokenStore<K> {
             .collect();
         providers.sort();
         Ok(providers)
+    }
+
+    fn load_all_by_user(&self, user_id: &str) -> Result<Vec<(String, StoredCredential)>> {
+        let map = self
+            .inner
+            .lock()
+            .map_err(|_| Error::Invalid("token store lock empoisonné".into()))?;
+        let mut credentials = map
+            .iter()
+            .filter(|((u, _), _)| u == user_id)
+            .map(|((_, provider), entry)| {
+                Ok((
+                    provider.clone(),
+                    StoredCredential {
+                        tokens: open_tokens(&self.cipher, &entry.envelope)?,
+                        invalidated: entry.invalidated.clone(),
+                    },
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        credentials.sort_by(|(a, _), (b, _)| a.cmp(b));
+        Ok(credentials)
     }
 }
 
@@ -492,6 +519,30 @@ mod tests {
         store.store("alice", "google", &sample_tokens()).unwrap();
         assert_eq!(
             locked(&store, CredentialUpdate::Keep).unwrap().invalidated,
+            None
+        );
+    }
+
+    #[test]
+    fn load_all_by_user_returns_sorted_credentials_with_their_mark() {
+        let store = make_store();
+        store.store("alice", "slack", &sample_tokens()).unwrap();
+        store.store("alice", "google", &sample_tokens()).unwrap();
+        store.store("bob", "github", &sample_tokens()).unwrap();
+        locked(&store, CredentialUpdate::Invalidate(invalidation()));
+
+        let alice = store.load_all_by_user("alice").unwrap();
+        let providers: Vec<&str> = alice.iter().map(|(p, _)| p.as_str()).collect();
+        assert_eq!(providers, vec!["google", "slack"]);
+        assert_eq!(alice[0].1.invalidated, Some(invalidation()));
+        assert_eq!(alice[0].1.tokens, sample_tokens());
+        assert_eq!(alice[1].1.invalidated, None);
+        assert!(store.load_all_by_user("carol").unwrap().is_empty());
+
+        // Reconnexion : la marque disparaît de la lecture groupée aussi.
+        store.store("alice", "google", &sample_tokens()).unwrap();
+        assert_eq!(
+            store.load_all_by_user("alice").unwrap()[0].1.invalidated,
             None
         );
     }

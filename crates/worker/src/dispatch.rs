@@ -704,6 +704,9 @@ mod tests {
         fn list_by_user(&self, _: &str) -> CoreResult<Vec<String>> {
             Err(Error::Invalid("storage: down".into()))
         }
+        fn load_all_by_user(&self, _: &str) -> CoreResult<Vec<(String, StoredCredential)>> {
+            Err(Error::Invalid("storage: down".into()))
+        }
         fn update_locked(
             &self,
             _: &str,
@@ -1063,6 +1066,9 @@ mod tests {
         fn list_by_user(&self, u: &str) -> CoreResult<Vec<String>> {
             self.0.list_by_user(u)
         }
+        fn load_all_by_user(&self, u: &str) -> CoreResult<Vec<(String, StoredCredential)>> {
+            self.0.load_all_by_user(u)
+        }
         fn update_locked(
             &self,
             u: &str,
@@ -1111,6 +1117,9 @@ mod tests {
             }
             fn list_by_user(&self, u: &str) -> CoreResult<Vec<String>> {
                 self.0.list_by_user(u)
+            }
+            fn load_all_by_user(&self, u: &str) -> CoreResult<Vec<(String, StoredCredential)>> {
+                self.0.load_all_by_user(u)
             }
             fn update_locked(
                 &self,
