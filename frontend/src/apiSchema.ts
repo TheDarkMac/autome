@@ -639,6 +639,17 @@ export interface components {
             expires_at_ms?: number | null;
             /** @description `true` si un refresh token est conservé. */
             has_refresh_token: boolean;
+            /**
+             * Format: int64
+             * @description Date de ce refus (Unix ms), `null` sinon. Le motif renvoyé par le
+             *     provider n'est jamais exposé.
+             */
+            invalidated_at_ms?: number | null;
+            /**
+             * @description `true` si le provider a refusé le refresh token : les runs échouent
+             *     tant que l'utilisateur n'a pas reconnecté le compte (`/authorize`).
+             */
+            needs_reconnect: boolean;
             /** @description Provider concerné. */
             provider_id: string;
             /** @description Scopes effectivement accordés (verbatim). */
