@@ -129,9 +129,18 @@ relit au moment du run. Le `provider_id` OAuth doit être le préfixe de l'actio
   `AUTOME_OAUTH_<ID>_*` ; en k8s, déjà partagée via `envFrom`), et autoriser
   son `TOKEN_URL` en sortie si l'IdP est interne (`AUTOME_EGRESS_ALLOWLIST`).
   Sans refresh token, sans config OAuth sur le worker, ou si le provider refuse
-  (`invalid_grant`) : le node échoue en demandant de reconnecter le compte. Un
-  seul rafraîchissement à la fois par (utilisateur, provider) **par réplique**
-  de worker.
+  : le node échoue en demandant de reconnecter le compte. Un seul
+  rafraîchissement à la fois par (utilisateur, provider), **toutes répliques
+  confondues** : le worker prend le verrou de la ligne `connector_tokens`
+  (`SELECT … FOR UPDATE`, attente bornée à 60 s) et relit le jeton avant
+  d'appeler le provider — indispensable pour les providers qui font tourner le
+  refresh token (chacun n'est présenté qu'une fois). Refus **définitif** du
+  provider (`invalid_grant` : refresh token révoqué, expiré ou déjà consommé) :
+  la credential est marquée invalide (`invalidated_at_ms`, `invalid_reason`,
+  migration `0018`) et les runs suivants échouent **sans rappeler le
+  provider** ; reconnecter le compte (`/credentials/<provider>/authorize`) efface
+  la marque. Une erreur transitoire (réseau, 5xx) ne marque rien : le run
+  suivant retente.
 - **Mode mono-tenant (opt-in)** : `AUTOME_CONNECTOR_CREDENTIALS=single_tenant`
   sur le worker rétablit le repli sur un token **global** par provider
   (`AUTOME_CONNECTOR_TOKEN_SLACK`, `…_GMAIL`, `…_NOTION`, `…_GITHUB`) quand le
