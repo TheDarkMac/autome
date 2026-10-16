@@ -432,7 +432,7 @@
             }
           },
           "503": {
-            "description": "Une dépendance au moins est indisponible",
+            "description": "Une dépendance au moins est indisponible, ou arrêt en cours",
             "content": {
               "application/json": {
                 "schema": {
@@ -1207,7 +1207,7 @@
           },
           "status": {
             "type": "string",
-            "description": "`ready` ou `unavailable`."
+            "description": "`ready`, `unavailable` ou `draining` (arrêt en cours)."
           }
         }
       },
