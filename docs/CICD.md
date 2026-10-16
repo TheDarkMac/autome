@@ -15,16 +15,26 @@ Déclenchée sur **push** et **pull request** vers `main`. Reproduit la
 
 | Job | Étapes |
 |---|---|
-| **Backend (Rust)** | toolchain pinnée + cache · `cargo fmt --all --check` · `cargo clippy --workspace --all-targets -- -D warnings` · `cargo test --workspace --locked` · `cargo build --workspace --release --locked` |
+| **Backend (Rust)** | services `postgres:16-alpine` + `rabbitmq:3-management-alpine` (healthchecks) · toolchain pinnée + cache · `cargo fmt --all --check` · `cargo clippy --workspace --all-targets -- -D warnings` · `scripts/check-migrations.sh` (migrations + seed + invariants) · `cargo test --workspace --locked -- --nocapture` avec `TEST_DATABASE_URL` / `TEST_AMQP_URL` · garde-fou « aucun test réel sauté » · `cargo build --workspace --release --locked` |
 | **Frontend (Node)** | Corepack/pnpm · `pnpm install --frozen-lockfile` · `pnpm run typecheck` · `pnpm run lint` · `pnpm run test` (Vitest) |
 | **Smoke e2e (Docker Compose)** | `docker/bake-action` construit les images `api` / `worker` depuis le compose (surcharge `docker/compose.ci.yml`, cache `gha` partagé avec la CD) · `docker compose up --no-build --wait api worker` (PostgreSQL + RabbitMQ, healthchecks) · `scripts/compose-smoke.sh` · journaux des conteneurs si échec · `down --volumes` toujours — #216 |
 
 - `concurrency` avec `cancel-in-progress` (annule les runs obsolètes).
 - `permissions: contents: read` (moindre privilège).
-- Jobs `backend` et `frontend` sans service externe : tests in-process /
-  in-memory + jsdom (les tests PostgreSQL/RabbitMQ réels se sautent sans
-  `TEST_DATABASE_URL` / `TEST_AMQP_URL`).
-- Job `smoke` : seul à démarrer des services. Inscription, connexion, workflow,
+- Tests backend surtout in-process / in-memory, frontend sous jsdom.
+- Tests **réels** (#218) : `crates/persistence/tests/pg_*.rs` et `rabbitmq.rs`,
+  `crates/worker/tests/pg_owner_credentials.rs`, test PostgreSQL de
+  `crates/api/src/runtime.rs`. Ils se sautent sans `TEST_DATABASE_URL` /
+  `TEST_AMQP_URL` (en local) ; le job `backend` les fournit au niveau du job,
+  pointées sur ses services. Variable fournie mais service injoignable ⇒ ces
+  tests **échouent** (connexion en `expect`), ils ne se sautent pas.
+- Garde-fou : l'étape *Real-service tests were not skipped* échoue si la
+  sortie des tests contient un message de saut PostgreSQL/RabbitMQ, et liste
+  les binaires de tests réels exécutés (preuve dans les logs).
+- `scripts/check-migrations.sh` démarre son propre PostgreSQL jetable
+  (`postgres:16-alpine`, surchargeable par `PGIMAGE`) : schéma vierge, toutes
+  les migrations dans l'ordre + seed de dev, puis invariants (tables, contraintes).
+- Job `smoke` : images réelles sur la stack Compose. Inscription, connexion, workflow,
   run déclenché via l'API puis exécuté par le worker jusqu'à `succeeded` —
   couvre le câblage (env, migrations au démarrage, Dockerfiles, healthchecks,
   sélecteurs de backend). Borné à 45 min (compilation Rust complète des deux images
@@ -101,7 +111,8 @@ protégé + secret optionnel.
 - [x] Frontend : `typecheck` + `lint` + `test` verts.
 - [x] CI déclenchée sur push **et** PR vers `main`.
 - [x] Smoke de bout en bout sur la stack Compose (images réelles, PostgreSQL, RabbitMQ) — #216.
-- [ ] Tests PostgreSQL/RabbitMQ réels (`TEST_DATABASE_URL` / `TEST_AMQP_URL`) exécutés en CI.
+- [x] Tests PostgreSQL/RabbitMQ réels (`TEST_DATABASE_URL` / `TEST_AMQP_URL`) exécutés en CI, avec garde-fou contre le saut silencieux — #218.
+- [x] Migrations + seed validés sur un PostgreSQL vierge en CI (`scripts/check-migrations.sh`) — #218.
 
 **Livraison (CD)**
 - [x] Images `api`/`worker`/`frontend` construites et poussées sur GHCR.
@@ -127,6 +138,7 @@ protégé + secret optionnel.
 | 3 | `cargo fmt`/`clippy` sans `--locked` | ✅ **Résolu (#162)** : `--locked` ajouté à l'étape `clippy` (la CI échoue désormais si `Cargo.lock` n'est pas en phase dès le lint). |
 | 4 | **Branchement runtime** (PostgreSQL/RabbitMQ) non câblé dans les binaires | ✅ Résolu — [dette #107](https://github.com/TheDarkMac/autome/issues/107) close (API + worker branchés sur PG/RabbitMQ via `AUTOME_PERSISTENCE`/`AUTOME_QUEUE`). |
 | 5 | **Aucun smoke de bout en bout en CI** : `scripts/compose-smoke.sh` n'était lancé qu'à la main | ✅ **Résolu (#216)** : job `smoke` (images construites, `compose up --wait`, smoke, journaux si échec). Reste : la compilation Rust est refaite à chaque changement de source (`COPY . .` invalide le cache) — un étage de dépendances (cargo-chef) l'éviterait, CI et CD comprises. |
+| 6 | **Tests PostgreSQL/RabbitMQ réels jamais exécutés en CI** : gatés par `TEST_DATABASE_URL` / `TEST_AMQP_URL`, ils passaient « au vert » sans rien exécuter ; `scripts/check-migrations.sh` (deux fois réparé après coup, #186 et #208) n'était lancé qu'à la main | ✅ **Résolu (#218)** : services du job `backend`, variables au niveau du job, garde-fou sur la sortie des tests, script de migrations en CI. Reste : images des services par tag (comme `docker-compose.yml` et `k8s/`), test réseau `TEST_HTTP_URL` (connectors) toujours sauté en CI. |
 
 ---
 
