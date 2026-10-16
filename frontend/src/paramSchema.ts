@@ -61,11 +61,11 @@ export const NODE_SCHEMAS: readonly NodeSchema[] = [
     params: [
       {
         name: "path",
-        label: "Chemin",
+        label: "Libellé",
         type: "string",
-        required: true,
         placeholder: "/hooks/mon-event",
         pattern: "^/.*",
+        help: "Repère libre : l'URL réelle, secrète, est générée par le serveur.",
       },
       {
         name: "method",
@@ -73,6 +73,20 @@ export const NODE_SCHEMAS: readonly NodeSchema[] = [
         type: "enum",
         options: ["GET", "POST", "PUT", "DELETE"],
         default: "POST",
+      },
+      {
+        name: "signature",
+        label: "Signature",
+        type: "enum",
+        options: ["none", "github"],
+        help: "github : exige X-Hub-Signature-256 (secret de signature ci-dessous).",
+      },
+      {
+        name: "event",
+        label: "Événement GitHub",
+        type: "string",
+        placeholder: "issues",
+        help: "Si renseigné, les autres valeurs de X-GitHub-Event sont ignorées.",
       },
     ],
   },

@@ -29,6 +29,8 @@ export const API_PATHS = {
   workflows: "/workflows",
   workflow: "/workflows/{id}",
   workflowRuns: "/workflows/{id}/runs",
+  webhooks: "/workflows/{id}/webhooks",
+  webhookRotate: "/workflows/{id}/webhooks/{node_id}/rotate",
   run: "/runs/{run_id}",
   credentials: "/credentials",
   providers: "/credentials/providers",
@@ -64,6 +66,11 @@ export interface ApiClient {
     body?: Schemas["CreateRunBody"],
   ): Promise<Schemas["CreateRunResponse"]>;
   getRun(runId: string): Promise<RunCheckpoint>;
+
+  /** URL secrètes des nœuds webhook d'un workflow enregistré (#202). */
+  listWebhooks(workflowId: string): Promise<Schemas["WebhookList"]>;
+  /** Nouvelle URL pour un nœud webhook ; l'ancienne cesse de fonctionner. */
+  rotateWebhook(workflowId: string, nodeId: string): Promise<Schemas["WebhookInfo"]>;
 
   listProviders(): Promise<Schemas["ListProvidersResponse"]>;
   listCredentials(): Promise<Schemas["ListCredentialsResponse"]>;
@@ -135,6 +142,22 @@ export function createApiClient(fetchImpl: typeof fetch = fetch): ApiClient {
     },
     getRun(runId) {
       return fetchRun(runId, fetchImpl);
+    },
+
+    listWebhooks(workflowId) {
+      return requestJson<Schemas["WebhookList"]>(
+        fetchImpl,
+        "GET",
+        buildPath(API_PATHS.webhooks, { id: workflowId }),
+      );
+    },
+    rotateWebhook(workflowId, nodeId) {
+      return requestJson<Schemas["WebhookInfo"]>(
+        fetchImpl,
+        "POST",
+        buildPath(API_PATHS.webhookRotate, { id: workflowId, node_id: nodeId }),
+        { body: {} },
+      );
     },
 
     listProviders() {

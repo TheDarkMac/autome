@@ -18,7 +18,9 @@ describe("paramSchema — registre statique", () => {
   it("trouve le schéma trigger/webhook", () => {
     const s = findNodeSchema("trigger", "webhook");
     expect(s?.label).toBe("Webhook");
-    expect(s?.params.map((p) => p.name)).toEqual(["path", "method"]);
+    expect(s?.params.map((p) => p.name)).toEqual(["path", "method", "signature", "event"]);
+    // #202 : l'URL réelle est générée par le serveur, `path` n'est qu'un libellé.
+    expect(s?.params.find((p) => p.name === "path")?.required).toBeUndefined();
   });
 
   it("trouve le schéma if (sans subtype)", () => {
@@ -65,8 +67,8 @@ describe("validateParams", () => {
   const github = findNodeSchema("action", "github.create_issue")!;
 
   it("flag les champs required manquants", () => {
-    const errs = validateParams(webhook, {});
-    expect(errs).toMatchObject({ path: "Champ requis." });
+    const errs = validateParams(polling, {});
+    expect(errs).toMatchObject({ url: "Champ requis." });
   });
 
   it("rejette une string ne matchant pas le pattern", () => {

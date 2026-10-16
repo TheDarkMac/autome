@@ -211,6 +211,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/hooks/{token}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** `* /hooks/{token}` — déclenche le workflow du nœud webhook visé. */
+        post: operations["receive"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/livez": {
         parameters: {
             query?: never;
@@ -317,6 +334,46 @@ export interface paths {
         put?: never;
         /** `POST /workflows/{id}/runs` — démarre un run (perm `runs.execute`). */
         post: operations["create_run"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/workflows/{id}/webhooks": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * `GET /workflows/{id}/webhooks` — URL de chaque nœud webhook (créées à la
+         *     première lecture).
+         */
+        get: operations["list_webhooks"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/workflows/{id}/webhooks/{node_id}/rotate": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * `POST /workflows/{id}/webhooks/{node_id}/rotate` — nouvelle URL et nouveau
+         *     secret de signature ; les anciens cessent aussitôt de fonctionner.
+         */
+        post: operations["rotate_webhook"];
         delete?: never;
         options?: never;
         head?: never;
@@ -463,6 +520,36 @@ export interface components {
             refresh_token: string;
             /** @description Toujours `Bearer`. */
             token_type: string;
+        };
+        /** @description Réponse d'un webhook accepté. */
+        WebhookAccepted: {
+            /** @description Identifiant du run créé. */
+            run_id: string;
+            /** @description État initial (`"queued"`). */
+            status: string;
+        };
+        /** @description URL d'un nœud webhook. */
+        WebhookInfo: {
+            /** @description Méthode acceptée. */
+            method: string;
+            /** @description Libellé du nœud. */
+            name: string;
+            /** @description Nœud trigger webhook. */
+            node_id: string;
+            /** @description Chemin secret à appeler (`/hooks/{token}`), relatif à l'URL de l'API. */
+            path: string;
+            /** @description Vérification de signature configurée (`github`), absente sinon. */
+            signature?: string | null;
+            /**
+             * @description Secret de signature de l'endpoint (à saisir chez l'émetteur, ex.
+             *     « Secret » d'un webhook GitHub).
+             */
+            signing_secret: string;
+        };
+        /** @description Réponse de [`list_webhooks`]. */
+        WebhookList: {
+            /** @description Une entrée par nœud webhook du workflow. */
+            items: components["schemas"]["WebhookInfo"][];
         };
     };
     responses: never;
@@ -899,6 +986,83 @@ export interface operations {
             };
         };
     };
+    receive: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Token secret de l'URL (64 caractères hexadécimaux) */
+                token: string;
+            };
+            cookie?: never;
+        };
+        /** @description Corps libre (JSON parsé, sinon texte), ≤ 1 Mio */
+        requestBody: {
+            content: {
+                "application/json": unknown;
+            };
+        };
+        responses: {
+            /** @description Run accepté en file */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WebhookAccepted"];
+                };
+            };
+            /** @description Événement filtré par le param `event` du nœud : aucun run */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Corps JSON invalide ou non UTF-8 */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Signature absente ou invalide (nœud signé) */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description URL inconnue, workflow ou nœud supprimé */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Méthode différente du param `method` du nœud */
+            405: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Corps supérieur à 1 Mio */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Quota de l'endpoint atteint (`Retry-After`) */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
     livez: {
         parameters: {
             query?: never;
@@ -1320,6 +1484,102 @@ export interface operations {
                 content?: never;
             };
             /** @description Workflow inconnu dans cet espace */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    list_webhooks: {
+        parameters: {
+            query?: {
+                /** @description Propriétaire de l'espace visé. */
+                owner?: string | null;
+            };
+            header?: never;
+            path: {
+                /** @description Identifiant du workflow */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description URL et secrets des nœuds webhook */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WebhookList"];
+                };
+            };
+            /** @description Token absent ou invalide */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Manque `runs.execute`, ou `owner` d'autrui sans `*` */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Workflow inconnu dans cet espace */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    rotate_webhook: {
+        parameters: {
+            query?: {
+                /** @description Propriétaire de l'espace visé. */
+                owner?: string | null;
+            };
+            header?: never;
+            path: {
+                /** @description Identifiant du workflow */
+                id: string;
+                /** @description Nœud trigger webhook */
+                node_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Nouvelle URL */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WebhookInfo"];
+                };
+            };
+            /** @description Token absent ou invalide */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Manque `runs.execute`, ou `owner` d'autrui sans `*` */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Workflow ou nœud webhook inconnu */
             404: {
                 headers: {
                     [name: string]: unknown;

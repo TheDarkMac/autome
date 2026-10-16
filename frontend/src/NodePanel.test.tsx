@@ -56,9 +56,9 @@ describe("<NodePanel /> — F8.4.b : validation & defaults", () => {
   });
 
   it("affiche l'erreur « champ requis » sur les required vides", () => {
-    const node = buildCanvasNode({ id: "t-1", kind: "trigger", subtype: "webhook" });
+    const node = buildCanvasNode({ id: "t-1", kind: "trigger", subtype: "polling" });
     render(<NodePanel node={node} onChange={noop} onClose={noop} fetchCredentialsImpl={emptyCreds} />);
-    expect(screen.getByTestId("error-path")).toHaveTextContent(/Champ requis/);
+    expect(screen.getByTestId("error-url")).toHaveTextContent(/Champ requis/);
     expect(screen.getByTestId("panel-status")).toHaveTextContent(/1 erreur/);
   });
 
@@ -184,5 +184,65 @@ describe("<NodePanel /> — bouton fermer", () => {
     render(<NodePanel node={node} onChange={noop} onClose={onClose} fetchCredentialsImpl={emptyCreds} />);
     fireEvent.click(screen.getByRole("button", { name: /Fermer/ }));
     expect(onClose).toHaveBeenCalledOnce();
+  });
+});
+
+describe("<NodePanel /> — #202 : URL du webhook", () => {
+  const info = {
+    node_id: "t-1",
+    name: "Webhook",
+    method: "POST",
+    path: `/hooks/${"a".repeat(64)}`,
+    signature: null,
+    signing_secret: "s3cr3t",
+  };
+  const webhookNode = () => buildCanvasNode({ id: "t-1", kind: "trigger", subtype: "webhook" });
+
+  it("affiche l'URL complète du nœud et masque le secret jusqu'au clic", async () => {
+    const webhooks = { list: vi.fn().mockResolvedValue({ items: [info] }), rotate: vi.fn() };
+    render(<NodePanel node={webhookNode()} onChange={noop} onClose={noop} fetchCredentialsImpl={emptyCreds} webhooks={webhooks} />);
+    const url = (await screen.findByTestId("webhook-url")) as HTMLInputElement;
+    expect(url.value).toMatch(new RegExp(`${info.path}$`));
+    expect(screen.queryByTestId("webhook-secret")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Afficher" }));
+    expect(screen.getByTestId("webhook-secret")).toHaveTextContent("s3cr3t");
+  });
+
+  it("invite à enregistrer un workflow inconnu du serveur (404) ou sans ce nœud", async () => {
+    const { ApiError } = await import("./api");
+    const missing = { list: vi.fn().mockRejectedValue(new ApiError("absent", 404)), rotate: vi.fn() };
+    const { unmount } = render(
+      <NodePanel node={webhookNode()} onChange={noop} onClose={noop} fetchCredentialsImpl={emptyCreds} webhooks={missing} />,
+    );
+    expect(await screen.findByText(/Enregistrez le workflow/)).toBeInTheDocument();
+    unmount();
+    const other = { list: vi.fn().mockResolvedValue({ items: [{ ...info, node_id: "autre" }] }), rotate: vi.fn() };
+    render(<NodePanel node={webhookNode()} onChange={noop} onClose={noop} fetchCredentialsImpl={emptyCreds} webhooks={other} />);
+    expect(await screen.findByText(/Enregistrez le workflow/)).toBeInTheDocument();
+  });
+
+  it("régénère l'URL après confirmation", async () => {
+    const rotated = { ...info, path: `/hooks/${"b".repeat(64)}` };
+    const webhooks = {
+      list: vi.fn().mockResolvedValue({ items: [info] }),
+      rotate: vi.fn().mockResolvedValue(rotated),
+    };
+    const confirm = vi.spyOn(window, "confirm").mockReturnValue(true);
+    render(<NodePanel node={webhookNode()} onChange={noop} onClose={noop} fetchCredentialsImpl={emptyCreds} webhooks={webhooks} />);
+    await screen.findByTestId("webhook-url");
+    fireEvent.click(screen.getByRole("button", { name: /Régénérer/ }));
+    await waitFor(() => {
+      expect((screen.getByTestId("webhook-url") as HTMLInputElement).value).toMatch(/b{64}$/);
+    });
+    expect(webhooks.rotate).toHaveBeenCalledWith("t-1");
+    confirm.mockRestore();
+  });
+
+  it("n'affiche rien pour un autre type de nœud", () => {
+    const webhooks = { list: vi.fn(), rotate: vi.fn() };
+    const node = buildCanvasNode({ id: "p-1", kind: "trigger", subtype: "polling" });
+    render(<NodePanel node={node} onChange={noop} onClose={noop} fetchCredentialsImpl={emptyCreds} webhooks={webhooks} />);
+    expect(screen.queryByTestId("webhook-field")).toBeNull();
+    expect(webhooks.list).not.toHaveBeenCalled();
   });
 });
