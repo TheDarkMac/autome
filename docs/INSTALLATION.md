@@ -214,6 +214,18 @@ la file) :
 scripts/compose-smoke.sh
 ```
 
+La CI le rejoue à chaque push et PR vers `main` (job *Smoke e2e*, #216) sur
+les images construites depuis les Dockerfiles. Pour reproduire ce job en local
+(images taggées `:ci`, sans frontend ni monitoring) :
+
+```bash
+export COMPOSE_FILE=docker-compose.yml:docker/compose.ci.yml
+docker buildx bake -f docker-compose.yml -f docker/compose.ci.yml --load api worker
+docker compose up --no-build --wait api worker
+scripts/compose-smoke.sh
+docker compose down --volumes
+```
+
 Compte super-admin de dev (optionnel) : appliquer le seed **après** le premier
 démarrage de l'API (migrations appliquées), puis se connecter avec
 `dev@autome.local` / `autome-dev-password` — ou promouvoir son propre compte

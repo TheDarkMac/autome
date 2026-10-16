@@ -17,10 +17,18 @@ Déclenchée sur **push** et **pull request** vers `main`. Reproduit la
 |---|---|
 | **Backend (Rust)** | toolchain pinnée + cache · `cargo fmt --all --check` · `cargo clippy --workspace --all-targets -- -D warnings` · `cargo test --workspace --locked` · `cargo build --workspace --release --locked` |
 | **Frontend (Node)** | Corepack/pnpm · `pnpm install --frozen-lockfile` · `pnpm run typecheck` · `pnpm run lint` · `pnpm run test` (Vitest) |
+| **Smoke e2e (Docker Compose)** | `docker/bake-action` construit les images `api` / `worker` depuis le compose (surcharge `docker/compose.ci.yml`, cache `gha` partagé avec la CD) · `docker compose up --no-build --wait api worker` (PostgreSQL + RabbitMQ, healthchecks) · `scripts/compose-smoke.sh` · journaux des conteneurs si échec · `down --volumes` toujours — #216 |
 
 - `concurrency` avec `cancel-in-progress` (annule les runs obsolètes).
 - `permissions: contents: read` (moindre privilège).
-- Aucun service externe : tests in-process / in-memory + jsdom.
+- Jobs `backend` et `frontend` sans service externe : tests in-process /
+  in-memory + jsdom (les tests PostgreSQL/RabbitMQ réels se sautent sans
+  `TEST_DATABASE_URL` / `TEST_AMQP_URL`).
+- Job `smoke` : seul à démarrer des services. Inscription, connexion, workflow,
+  run déclenché via l'API puis exécuté par le worker jusqu'à `succeeded` —
+  couvre le câblage (env, migrations au démarrage, Dockerfiles, healthchecks,
+  sélecteurs de backend). Borné à 45 min (compilation Rust complète des deux images
+  dès qu'une source change).
 
 ### CD — `.github/workflows/cd.yml` (F10.5)
 
@@ -92,6 +100,8 @@ protégé + secret optionnel.
 - [x] `cargo build --workspace --release --locked` vert.
 - [x] Frontend : `typecheck` + `lint` + `test` verts.
 - [x] CI déclenchée sur push **et** PR vers `main`.
+- [x] Smoke de bout en bout sur la stack Compose (images réelles, PostgreSQL, RabbitMQ) — #216.
+- [ ] Tests PostgreSQL/RabbitMQ réels (`TEST_DATABASE_URL` / `TEST_AMQP_URL`) exécutés en CI.
 
 **Livraison (CD)**
 - [x] Images `api`/`worker`/`frontend` construites et poussées sur GHCR.
@@ -116,6 +126,7 @@ protégé + secret optionnel.
 | 2 | **Bases d'images par tag** (`debian:bookworm-slim`, `node:20-…`, etc.) : un tag peut bouger | ✅ **Résolu (#162)** : pinnées par **digest** `@sha256:` dans les 3 Dockerfiles (tag lisible conservé en commentaire). Mise à jour : `docker buildx imagetools inspect <image:tag>`. |
 | 3 | `cargo fmt`/`clippy` sans `--locked` | ✅ **Résolu (#162)** : `--locked` ajouté à l'étape `clippy` (la CI échoue désormais si `Cargo.lock` n'est pas en phase dès le lint). |
 | 4 | **Branchement runtime** (PostgreSQL/RabbitMQ) non câblé dans les binaires | ✅ Résolu — [dette #107](https://github.com/TheDarkMac/autome/issues/107) close (API + worker branchés sur PG/RabbitMQ via `AUTOME_PERSISTENCE`/`AUTOME_QUEUE`). |
+| 5 | **Aucun smoke de bout en bout en CI** : `scripts/compose-smoke.sh` n'était lancé qu'à la main | ✅ **Résolu (#216)** : job `smoke` (images construites, `compose up --wait`, smoke, journaux si échec). Reste : la compilation Rust est refaite à chaque changement de source (`COPY . .` invalide le cache) — un étage de dépendances (cargo-chef) l'éviterait, CI et CD comprises. |
 
 ---
 
