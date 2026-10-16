@@ -462,3 +462,59 @@ quatre chantiers sont fusionnés dans `main` par la
 | ✅ Fait · [x] | [#218](https://github.com/TheDarkMac/autome/issues/218) | **CI : tests PostgreSQL/RabbitMQ réels contre des services GitHub Actions** *(PR #220)* | Livré : job `backend` avec `services:` `postgres:16-alpine` et `rabbitmq:3-management-alpine` (healthchecks : `pg_isready` en TCP, `check_port_connectivity`), `TEST_DATABASE_URL` / `TEST_AMQP_URL` au niveau du job ⇒ les tests `pg_*` et `rabbitmq` de persistence, `pg_owner_credentials` du worker et le test PG de `api::runtime` tournent enfin en CI (ils passaient `ok` sans rien exécuter) ; `cargo test -- --nocapture` + garde-fou qui échoue sur tout message de saut PostgreSQL/RabbitMQ et liste les binaires réels exécutés ; `scripts/check-migrations.sh` en CI (PostgreSQL 16 comme compose/k8s, `PGIMAGE` surchargeable). Validé sur conteneurs locaux : 837 tests workspace, 0 saut ; variables fournies mais services KO ⇒ les 25 tests réels de persistence échouent. `docs/CICD.md` : cases cochées. Reste : images des services par tag (pas de digest), test réseau `TEST_HTTP_URL` (connectors) toujours sauté. |
 | ✅ Fait · [x] | [#219](https://github.com/TheDarkMac/autome/issues/219) | **Docker : étage de dépendances Cargo (cargo-chef) réutilisé par le cache des builds** *(PR #222)* | Livré : `docker/api.Dockerfile` et `docker/worker.Dockerfile` en quatre étages — `chef` (base `rust:1.90-bookworm` pinnée par digest, `cargo install cargo-chef --locked --version 0.1.78`), `planner` (`cargo chef prepare` → `recipe.json`, dérivée des seuls manifests et de `Cargo.lock`), `builder` (`cargo chef cook --release --locked -p <bin>`, puis `COPY . .` et `cargo build --release --locked`), `runtime` inchangé (`debian:bookworm-slim` pinnée, non-root, 97,7 / 92,5 Mo comme avant). Mesuré en local (bake, 4 cœurs, machine partagée) : rebuild après modification d'un `.rs` **386 s au lieu de 1918 s** (seuls les 6 crates du workspace recompilés), build à froid 1478 s ; `scripts/compose-smoke.sh` vert sur les nouvelles images. Docs : `CICD.md` (conteneurs, checklist, écart n°5), `INSTALLATION.md`, commentaires du job `smoke`. Reste : chaque scope `gha` (`api`, `worker`) compile ses propres dépendances ; l'édition des liens (LTO thin, `codegen-units = 1`) domine désormais le rebuild. |
 | 🟡 P2 · [~] | [#223](https://github.com/TheDarkMac/autome/issues/223) | **ROADMAP : liste priorisée des restes** *(branche `feature/backlog-roadmap-restes`)* | En cours : les restes sont éparpillés dans la colonne *Pourquoi* de chaque ligne et une partie est déjà soldée ⇒ section « Restes priorisés » revérifiée sur `main` (`e6e726f`), P1/P2/P3, fichiers et origine. |
+
+## Restes priorisés (après le backlog post-audit)
+
+Liste unique des restes encore ouverts, issue #223. Elle remplace les mentions
+« Reste : » éparpillées dans la colonne *Pourquoi* du tableau ci-dessus.
+Chaque point a été **revérifié dans le code de `main` (`e6e726f`, 2026-10-16)** ;
+les restes déjà soldés sont listés en fin de section. Une issue GitHub est
+ouverte au moment d'attaquer chaque chantier (process habituel).
+
+### P1 — bloquant produit ou conformité
+
+| # | Reste | Constat dans le code | Origine |
+|---|---|---|---|
+| 1 | **Enregistrer et lancer un workflow depuis l'éditeur** | L'éditeur travaille sur un brouillon local `wf-draft` (`frontend/src/App.tsx:50`, `NodeCanvas.tsx:83`) ; `createWorkflow` existe (`apiClient.ts:143`) mais aucun composant ne l'appelle ⇒ l'interface ne crée ni ne lance de workflow côté serveur, et les panneaux runs / webhooks visent un id inexistant. | #202 |
+| 2 | **Exécuter les déclencheurs planifiés (cron / intervalle) et à polling** | `ScheduleTrigger`, `CronSchedule` (`crates/connectors/src/schedule.rs`) et `PollingTrigger` (`polling.rs`) ne sont référencés ni par l'API ni par le worker ⇒ un workflow cron ne part jamais. Il faut un planificateur unique entre répliques : `DedupLock` n'a qu'une implémentation en mémoire (`crates/core/src/scheduler.rs:46`), branchée nulle part. | F3.3, F3.4, F5.3, #174 |
+| 3 | **Suppression de compte (RGPD, droit à l'effacement)** | Aucun endpoint ni méthode de store : effacer workflows, runs, tokens de connecteurs, webhooks, sessions ; pseudonymiser l'audit. | #208 |
+| 4 | **Vérification de l'email à l'inscription** | Aucune colonne ni flux de vérification (`/auth/signup` crée un compte actif). | #208 |
+
+### P2 — sécurité, exploitation, robustesse
+
+| # | Reste | Constat dans le code | Origine |
+|---|---|---|---|
+| 5 | **Proxy sortant : le garde-fou SSRF est contourné** | `ReqwestHttpClient` (`crates/connectors/src/reqwest_client.rs:99`) n'appelle pas `.no_proxy()` : reqwest honore `HTTP(S)_PROXY` / `ALL_PROXY`, le `GuardedResolver` ne résout alors que le proxy ⇒ l'hôte cible n'est plus filtré. Corriger : `.no_proxy()` par défaut, ou proxy explicite configuré avec filtrage des noms d'hôte côté proxy. Gravité élevée dès qu'un proxy est présent dans l'environnement du worker. | PR #168 (SSRF) |
+| 6 | **Métriques Prometheus du worker** | Le worker n'expose que ses sondes (`crates/worker/src/probe.rs`) : ni runs traités, ni durées, ni erreurs. | #192, #200 |
+| 7 | **RabbitMQ en consommation push** | `poll` fait un `basic_get` par message (`crates/persistence/src/rabbitmq.rs:305`) : passer à `basic_consume` + prefetch, mettre en cache la déclaration des queues. | #180 |
+| 8 | **Cohérence envoi ↔ enregistrement du run et reprise** | Pas d'Outbox entre le dispatch et le checkpoint ; `next_node` existe (`crates/core/src/run_state.rs:82`) mais n'est pas utilisé : un run interrompu est clos `failed` au lieu d'être repris. | AUDIT §16 n°10, #174 |
+| 9 | **Invitation / création de compte par un admin** | Absent de `api::admin`. | #208 |
+| 10 | **Liste d'administration de tous les workflows** | Le super-admin n'a plus de liste globale depuis le namespacing (`?owner=` seulement). | #188 |
+| 11 | **MFA et refus des mots de passe compromis** | Absents ; seul l'anti-bruteforce (email + IP) protège contre la pulvérisation distribuée. | #190 |
+| 12 | **Couverture chiffrée en CI** | Pas de `llvm-cov` (`.github/workflows/ci.yml`) ; la moitié « job PG réel » du point d'audit est faite (#218). | AUDIT §16 n°12 |
+| 13 | **Export OpenTelemetry** | Logs `tracing` JSON + `x-request-id` seulement, pas de traces exportées. | #176, AUDIT §18 phase 4 |
+
+### P3 — nettoyage et finitions
+
+| # | Reste | Constat dans le code | Origine |
+|---|---|---|---|
+| 14 | **Table `credentials` morte** | Créée par `migrations/0004_credentials.sql`, plus lue ni écrite (remplacée par `connector_tokens`, 0011) ; encore attendue par `scripts/check-migrations.sh:58`. Migration de suppression. | PR #168 |
+| 15 | **Micro-duplications** | `hex` (`crates/api/src/webhooks.rs:151`, `password_reset.rs:177`), `percent_encode` (`crates/connectors/src/oauth/client.rs:171` / `sdk/http.rs:8`). | AUDIT §15 n°12 |
+| 16 | **Code mort** | `ConnectorTokenStore::list_by_user` n'est plus appelé hors des tests. | #213 |
+| 17 | **CI** | Images des services du job `backend` par tag (pas de digest) ; test réseau `TEST_HTTP_URL` (connectors) toujours sauté ; un scope de cache `gha` par image ⇒ dépendances compilées deux fois ; l'édition des liens (LTO thin, `codegen-units = 1`) domine le rebuild. | #218, #219 |
+| 18 | **« À reconnecter » hors de l'onglet Connecteurs** | Ni indicateur dans l'en-tête, ni notification email. | #213 |
+| 19 | **Refresh OAuth : erreurs non standard** | `is_invalid_grant` (`crates/connectors/src/oauth/refresh.rs:62`) ne reconnaît que le `invalid_grant` RFC 6749 en 4xx ; Slack répond `ok: false` en HTTP 200. | #211 |
+| 20 | **Runs antérieurs à la migration 0010** | Absents des listes de runs (lisibles par id seulement). | #188 |
+| 21 | **Déploiement** | Ajuster `AUTOME_TRUSTED_PROXIES` au CIDR exact de l'ingress de chaque cluster ; migrer (API, `AUTOME_MIGRATE`) avant de déployer le worker. | #190, #211 |
+
+**Soldés depuis leur mention** (retirés de la liste) : anti-bruteforce partagé
+(#182) et par IP (#190), logout (#184) et logout-all (#186), administration des
+utilisateurs (#208), ids de workflow namespacés (#188), refresh des tokens côté
+worker (#170) et entre répliques (#211), état « à reconnecter » dans l'API
+(#213), compose sur PostgreSQL/RabbitMQ (#178), reconnexion au broker (#180),
+readiness/liveness (#192), arrêt gracieux de l'API (#194) et du worker (#200),
+changement (#196) et oubli (#204) de mot de passe, N+1 des runs (#198),
+fail-fast prod (#172), borne de taille des réponses HTTP
+(`MAX_RESPONSE_BYTES`), liens du README, smoke de bout en bout en CI (#216),
+tests PostgreSQL/RabbitMQ réels en CI (#218), étage de dépendances cargo-chef
+(#219).
