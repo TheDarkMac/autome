@@ -10,6 +10,7 @@
 //! | POST    | `/auth/refresh` | `{ refresh_token }`     | 200 + [`TokenResponse`]     |
 //! | POST    | `/auth/logout`  | `{ refresh_token }`     | 204                         |
 //! | POST    | `/auth/logout-all` | — (Bearer requis)    | 204                         |
+//! | POST    | `/auth/password` | `{ current_password, new_password }` (Bearer) | 200 + [`TokenResponse`] |
 //!
 //! Contrat aligné sur le frontend (`frontend/src/auth.ts`) : 400 saisie
 //! invalide, 401 identifiants/jeton refusés, 409 email déjà pris, 429 trop
@@ -46,8 +47,15 @@
 //!   tous ses jetons (claim `sv`) ; ceux émis avant sont refusés partout,
 //!   access comme refresh. Les jetons sont toujours émis à la version
 //!   courante.
-//! - Chaque inscription/connexion/déconnexion produit un event d'audit
-//!   `auth.signup` / `auth.login` / `auth.logout` / `auth.logout_all`.
+//! - Le changement de mot de passe (#196) exige le mot de passe **actuel**
+//!   (un access token volé ne suffit pas ; essais limités par compte), écrit
+//!   le nouveau hash seulement si l'ancien est toujours en place, puis ferme
+//!   **toutes** les sessions (version de session) et renvoie une nouvelle
+//!   paire à l'appareil courant. Mot de passe actuel faux : **403**, pas 401 —
+//!   le client croirait sa session expirée et se déconnecterait.
+//! - Chaque inscription/connexion/déconnexion/changement de mot de passe
+//!   produit un event d'audit `auth.signup` / `auth.login` / `auth.logout` /
+//!   `auth.logout_all` / `auth.password_change`.
 
 use std::collections::HashSet;
 use std::net::SocketAddr;
@@ -211,6 +219,15 @@ pub struct RefreshBody {
     pub refresh_token: String,
 }
 
+/// Body de `/auth/password`.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct ChangePasswordBody {
+    /// Mot de passe actuel (preuve de possession du compte).
+    pub current_password: String,
+    /// Nouveau mot de passe (8 à 1024 caractères, différent de l'actuel).
+    pub new_password: String,
+}
+
 /// Paire de jetons émise par signup/login/refresh.
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct TokenResponse {
@@ -231,10 +248,13 @@ pub enum AccountError {
     BadRequest(String),
     /// Identifiants ou jeton refusés — message volontairement générique.
     Unauthorized,
-    /// Email déjà associé à un compte.
-    Conflict,
+    /// Conflit : email déjà associé à un compte, ou mot de passe changé
+    /// entre-temps.
+    Conflict(&'static str),
     /// Trop d'échecs de connexion : réessayer après `n` secondes.
     TooManyAttempts(i64),
+    /// Authentifié mais refusé (mot de passe actuel incorrect).
+    Forbidden(&'static str),
     /// Erreur interne (store, hash).
     Internal(String),
 }
@@ -246,9 +266,8 @@ impl IntoResponse for AccountError {
             AccountError::Unauthorized => {
                 (StatusCode::UNAUTHORIZED, "invalid credentials").into_response()
             }
-            AccountError::Conflict => {
-                (StatusCode::CONFLICT, "email already registered").into_response()
-            }
+            AccountError::Conflict(msg) => (StatusCode::CONFLICT, msg).into_response(),
+            AccountError::Forbidden(msg) => (StatusCode::FORBIDDEN, msg).into_response(),
             AccountError::TooManyAttempts(secs) => (
                 StatusCode::TOO_MANY_REQUESTS,
                 [(header::RETRY_AFTER, secs.to_string())],
@@ -412,7 +431,7 @@ pub async fn signup(
         CreateUser::Created(user) => user,
         CreateUser::EmailTaken => {
             audit(&state, &email, "auth.signup", AuditOutcome::Denied).await;
-            return Err(AccountError::Conflict);
+            return Err(AccountError::Conflict("email already registered"));
         }
     };
     audit(&state, &user.id, "auth.signup", AuditOutcome::Success).await;
@@ -620,8 +639,122 @@ pub async fn logout_all(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// Sous-router `/signup`, `/login`, `/refresh`, `/logout` (publics) et
-/// `/logout-all` (Bearer) — à imbriquer sous
+/// `POST /auth/password` — change le mot de passe de l'utilisateur
+/// authentifié et ferme **toutes** ses sessions, puis renvoie une nouvelle
+/// paire de jetons pour l'appareil courant.
+#[utoipa::path(
+    post,
+    path = "/auth/password",
+    tag = "auth",
+    request_body = ChangePasswordBody,
+    responses(
+        (status = 200, description = "Mot de passe changé ; autres sessions fermées", body = TokenResponse),
+        (status = 400, description = "Nouveau mot de passe invalide ou identique à l'actuel"),
+        (status = 401, description = "Access token absent, invalide ou révoqué"),
+        (status = 403, description = "Mot de passe actuel incorrect"),
+        (status = 409, description = "Mot de passe changé entre-temps (requête concurrente)"),
+        (status = 429, description = "Trop d'essais — voir `Retry-After`")
+    ),
+    security(("bearer" = []))
+)]
+pub async fn change_password(
+    user: AuthenticatedUser,
+    State(state): State<AccountsState>,
+    Json(body): Json<ChangePasswordBody>,
+) -> Result<Json<TokenResponse>, AccountError> {
+    let user_id = user.user_id().to_string();
+    validate_password(&body.new_password).map_err(|e| AccountError::BadRequest(e.to_string()))?;
+    if body.new_password == body.current_password {
+        return Err(AccountError::BadRequest(
+            "le nouveau mot de passe doit différer de l'actuel".into(),
+        ));
+    }
+    // Un jeton volé ne doit pas permettre de deviner le mot de passe actuel :
+    // essais limités par compte, réservés avant Argon2 (fail closed).
+    let key = format!("password:{user_id}");
+    let now = state.auth.clock.now_unix_seconds();
+    if let LoginAttempt::Blocked { retry_after_secs } = state
+        .throttle
+        .begin_attempt(&key, MAX_LOGIN_FAILURES, now)
+        .await
+        .map_err(internal)?
+    {
+        audit(
+            &state,
+            &user_id,
+            "auth.password_change",
+            AuditOutcome::Denied,
+        )
+        .await;
+        return Err(AccountError::TooManyAttempts(retry_after_secs));
+    }
+    // Compte disparu (jeton d'un compte supprimé) : la session ne vaut rien.
+    let Some(account) = state.users.find_by_id(&user_id).await.map_err(internal)? else {
+        return Err(AccountError::Unauthorized);
+    };
+
+    let hasher = Arc::clone(&state.hasher);
+    let (current, phc) = (body.current_password, account.password_hash.clone());
+    let matches = blocking(move || Ok(hasher.verify(&current, &phc).unwrap_or(false))).await?;
+    if !matches {
+        audit(
+            &state,
+            &user_id,
+            "auth.password_change",
+            AuditOutcome::Failure,
+        )
+        .await;
+        return Err(AccountError::Forbidden("current password is incorrect"));
+    }
+
+    let hasher = Arc::clone(&state.hasher);
+    let new_password = body.new_password;
+    let new_hash = blocking(move || hasher.hash(&new_password)).await?;
+    if !state
+        .users
+        .update_password(&user_id, &account.password_hash, &new_hash)
+        .await
+        .map_err(internal)?
+    {
+        // Changé par une autre requête depuis la vérification.
+        audit(
+            &state,
+            &user_id,
+            "auth.password_change",
+            AuditOutcome::Failure,
+        )
+        .await;
+        return Err(AccountError::Conflict("password changed concurrently"));
+    }
+    if let Err(e) = state.throttle.reset(&key).await {
+        tracing::warn!(error = %e, "remise à zéro du compteur de mot de passe impossible");
+    }
+
+    // Toutes les sessions, y compris celle de la requête, sont fermées ; la
+    // nouvelle paire porte la nouvelle version.
+    let version = state
+        .auth
+        .revocation
+        .bump_session_version(&user_id)
+        .await
+        .map_err(internal)?;
+    tracing::info!(
+        user_id = %user_id,
+        session_version = version,
+        "mot de passe changé, sessions fermées"
+    );
+    audit(
+        &state,
+        &user_id,
+        "auth.password_change",
+        AuditOutcome::Success,
+    )
+    .await;
+    Ok(Json(issue_pair(&state, &user_id).await?))
+}
+
+/// Sous-router `/signup`, `/login`, `/refresh`, `/logout` (publics),
+/// `/logout-all` et `/password` (Bearer) — à imbriquer sous
 /// `/auth` avec [`crate::auth::protected_router`].
 pub fn accounts_router(state: AccountsState) -> Router {
     Router::new()
@@ -630,6 +763,7 @@ pub fn accounts_router(state: AccountsState) -> Router {
         .route("/refresh", post(refresh))
         .route("/logout", post(logout))
         .route("/logout-all", post(logout_all))
+        .route("/password", post(change_password))
         .with_state(state)
 }
 
@@ -1252,6 +1386,201 @@ mod tests {
         assert!(events.iter().any(|e| e.action == "auth.logout_all"
             && e.actor == user
             && e.outcome == AuditOutcome::Success));
+    }
+
+    // ───── Changement de mot de passe (#196) ─────
+
+    fn pw(current: &str, new: &str) -> serde_json::Value {
+        json!({ "current_password": current, "new_password": new })
+    }
+
+    #[tokio::test]
+    async fn changing_the_password_closes_every_session_and_returns_a_new_pair() {
+        let h = harness();
+        let laptop =
+            tokens(post(&h.app, "/signup", creds("sam@example.io", "old-password")).await).await;
+        let phone =
+            tokens(post(&h.app, "/login", creds("sam@example.io", "old-password")).await).await;
+
+        let r = post_bearer(
+            &h.app,
+            "/password",
+            &laptop.access_token,
+            pw("old-password", "new-password"),
+        )
+        .await;
+        assert_eq!(r.status(), StatusCode::OK);
+        let fresh = tokens(r).await;
+
+        // Toutes les sessions d'avant sont fermées, sur tous les appareils…
+        for pair in [&laptop, &phone] {
+            assert_eq!(
+                whoami_status(&h.app, &pair.access_token).await,
+                StatusCode::UNAUTHORIZED
+            );
+            assert_eq!(
+                refresh_status(&h.app, &pair.refresh_token).await,
+                StatusCode::UNAUTHORIZED
+            );
+        }
+        // … l'appareil courant continue avec la nouvelle paire.
+        assert_eq!(
+            whoami_status(&h.app, &fresh.access_token).await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            refresh_status(&h.app, &fresh.refresh_token).await,
+            StatusCode::OK
+        );
+        // L'ancien mot de passe ne connecte plus, le nouveau si.
+        let old = post(&h.app, "/login", creds("sam@example.io", "old-password")).await;
+        assert_eq!(old.status(), StatusCode::UNAUTHORIZED);
+        let new = post(&h.app, "/login", creds("sam@example.io", "new-password")).await;
+        assert_eq!(new.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn a_wrong_current_password_is_403_and_attempts_are_limited() {
+        let h = harness();
+        let pair =
+            tokens(post(&h.app, "/signup", creds("tia@example.io", "real-password")).await).await;
+        for _ in 0..MAX_LOGIN_FAILURES {
+            let r = post_bearer(
+                &h.app,
+                "/password",
+                &pair.access_token,
+                pw("guess-guess", "new-password"),
+            )
+            .await;
+            // 403, pas 401 : le client ne doit pas se croire déconnecté.
+            assert_eq!(r.status(), StatusCode::FORBIDDEN);
+        }
+        let r = post_bearer(
+            &h.app,
+            "/password",
+            &pair.access_token,
+            pw("real-password", "new-password"),
+        )
+        .await;
+        assert_eq!(r.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(r.headers().contains_key(header::RETRY_AFTER));
+        // Rien n'a changé, la session est intacte.
+        assert_eq!(
+            whoami_status(&h.app, &pair.access_token).await,
+            StatusCode::OK
+        );
+        // La fenêtre passée (l'access token, de même durée, a expiré : on se
+        // reconnecte), le bon mot de passe est accepté.
+        h.clock.advance(LOGIN_WINDOW_SECONDS);
+        let again =
+            tokens(post(&h.app, "/login", creds("tia@example.io", "real-password")).await).await;
+        let r = post_bearer(
+            &h.app,
+            "/password",
+            &again.access_token,
+            pw("real-password", "new-password"),
+        )
+        .await;
+        assert_eq!(r.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn invalid_requests_are_rejected_before_any_change() {
+        let h = harness();
+        let pair =
+            tokens(post(&h.app, "/signup", creds("uma@example.io", "real-password")).await).await;
+        for (body, expected) in [
+            (pw("real-password", "short"), StatusCode::BAD_REQUEST),
+            (
+                pw("real-password", "real-password"),
+                StatusCode::BAD_REQUEST,
+            ),
+        ] {
+            let r = post_bearer(&h.app, "/password", &pair.access_token, body).await;
+            assert_eq!(r.status(), expected);
+        }
+        let anonymous = post(&h.app, "/password", pw("real-password", "new-password")).await;
+        assert_eq!(anonymous.status(), StatusCode::UNAUTHORIZED);
+        let with_refresh = post_bearer(
+            &h.app,
+            "/password",
+            &pair.refresh_token,
+            pw("real-password", "new-password"),
+        )
+        .await;
+        assert_eq!(with_refresh.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            whoami_status(&h.app, &pair.access_token).await,
+            StatusCode::OK
+        );
+    }
+
+    #[tokio::test]
+    async fn a_token_of_an_unknown_account_cannot_change_a_password() {
+        let h = harness();
+        let ghost = TokenService::new(SECRET)
+            .issue_access("ghost", ACCESS_TTL_SECONDS, START)
+            .unwrap();
+        let r = post_bearer(&h.app, "/password", &ghost, pw("whatever-1", "whatever-2")).await;
+        assert_eq!(r.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn concurrent_changes_from_the_same_password_have_a_single_winner() {
+        let h = harness();
+        let pair =
+            tokens(post(&h.app, "/signup", creds("vic@example.io", "real-password")).await).await;
+        let change = |new: &'static str| {
+            let (app, access) = (h.app.clone(), pair.access_token.clone());
+            async move {
+                post_bearer(&app, "/password", &access, pw("real-password", new))
+                    .await
+                    .status()
+            }
+        };
+        let (a, b) = tokio::join!(change("first-password"), change("second-password"));
+        let statuses = [a, b];
+        assert_eq!(
+            statuses.iter().filter(|s| **s == StatusCode::OK).count(),
+            1,
+            "{statuses:?}"
+        );
+        // Le perdant : vérifié après coup (403) ou devancé à l'écriture (409).
+        assert!(statuses.iter().all(|s| [
+            StatusCode::OK,
+            StatusCode::FORBIDDEN,
+            StatusCode::CONFLICT
+        ]
+        .contains(s)));
+    }
+
+    #[tokio::test]
+    async fn password_changes_are_audited() {
+        let h = harness();
+        let pair =
+            tokens(post(&h.app, "/signup", creds("wes@example.io", "real-password")).await).await;
+        post_bearer(
+            &h.app,
+            "/password",
+            &pair.access_token,
+            pw("wrong-pass", "new-password"),
+        )
+        .await;
+        post_bearer(
+            &h.app,
+            "/password",
+            &pair.access_token,
+            pw("real-password", "new-password"),
+        )
+        .await;
+        let user = verify(&pair.access_token).sub;
+        let events = h.audit.list().await.unwrap();
+        for outcome in [AuditOutcome::Failure, AuditOutcome::Success] {
+            assert!(events.iter().any(|e| e.action == "auth.password_change"
+                && e.actor == user
+                && e.outcome == outcome));
+        }
+        assert!(!format!("{events:?}").contains("real-password"));
     }
 
     // ───── Anti-bruteforce par adresse IP (#190) ─────
