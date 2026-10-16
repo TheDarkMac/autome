@@ -250,6 +250,62 @@ describe("<App />", () => {
     expect(screen.getByTestId("current-user")).toHaveTextContent("user-1");
   });
 
+  describe("administration des utilisateurs (#208)", () => {
+    function backend(permissions: string[]): typeof fetch {
+      return vi.fn(async (input) => {
+        const url = typeof input === "string" ? input : (input as Request).url;
+        if (url.includes("/openapi.json")) return jsonResponse(sampleSpec);
+        if (url.endsWith("/auth/me")) {
+          return jsonResponse({
+            id: "user-1",
+            email: "root@example.io",
+            role: permissions.includes("*") ? "admin" : "editor",
+            permissions,
+          });
+        }
+        if (url.includes("/admin/users")) {
+          return jsonResponse({
+            items: [
+              {
+                id: "user-1",
+                email: "root@example.io",
+                role: "admin",
+                permissions: ["*"],
+                disabled: false,
+                created_at_ms: 0,
+              },
+            ],
+            total: 1,
+            offset: 0,
+            limit: 50,
+          });
+        }
+        return new Response("", { status: 404 });
+      }) as typeof fetch;
+    }
+
+    it("un administrateur voit l'onglet et la liste des comptes", async () => {
+      globalThis.fetch = backend(["*"]);
+      render(<App sessionOptions={authedSession("user-1")} />);
+      const tab = await screen.findByRole("tab", { name: "Administration" });
+      expect(screen.getByTestId("current-user")).toHaveTextContent("root@example.io");
+      fireEvent.click(tab);
+      expect(
+        await screen.findByRole("heading", { name: "Administration des utilisateurs" }),
+      ).toBeInTheDocument();
+      expect(await screen.findByText("(vous)")).toBeInTheDocument();
+    });
+
+    it("sans `users.admin`, pas d'onglet", async () => {
+      globalThis.fetch = backend(["workflows.read"]);
+      render(<App sessionOptions={authedSession("user-1")} />);
+      await waitFor(() =>
+        expect(screen.getByTestId("current-user")).toHaveTextContent("root@example.io"),
+      );
+      expect(screen.queryByRole("tab", { name: "Administration" })).not.toBeInTheDocument();
+    });
+  });
+
   describe("déconnecter tous les appareils", () => {
     afterEach(() => vi.restoreAllMocks());
 

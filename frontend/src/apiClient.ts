@@ -37,7 +37,24 @@ export const API_PATHS = {
   credential: "/credentials/{provider}",
   authorize: "/credentials/{provider}/authorize",
   callback: "/credentials/{provider}/callback",
+  me: "/auth/me",
+  adminUsers: "/admin/users",
+  adminUser: "/admin/users/{id}",
+  adminUserRole: "/admin/users/{id}/role",
+  adminUserDisable: "/admin/users/{id}/disable",
+  adminUserEnable: "/admin/users/{id}/enable",
+  adminUserLogoutAll: "/admin/users/{id}/logout-all",
 } as const;
+
+/** Rôles attribuables par l'administration (#208). */
+export type AssignableRole = "admin" | "editor" | "viewer";
+
+export interface ListUsersParams {
+  /** Filtre : sous-chaîne de l'email. */
+  q?: string;
+  offset?: number;
+  limit?: number;
+}
 
 /** Page de workflows : enveloppe `ListResponse`, items typés `WireGraph`. */
 export interface WorkflowPage {
@@ -77,6 +94,21 @@ export interface ApiClient {
   startAuthorize(provider: string): Promise<Schemas["AuthorizeResponse"]>;
   completeAuthorize(provider: string, body: Schemas["CallbackBody"]): Promise<void>;
   deleteCredential(provider: string): Promise<void>;
+
+  /** Utilisateur courant, son rôle et ses permissions (#208). */
+  me(): Promise<Schemas["MeResponse"]>;
+  /** Administration des utilisateurs (#208) — permission `users.admin`. */
+  listUsers(params?: ListUsersParams): Promise<Schemas["UserListResponse"]>;
+  setUserRole(id: string, role: AssignableRole): Promise<Schemas["AdminUser"]>;
+  disableUser(id: string): Promise<Schemas["AdminUser"]>;
+  enableUser(id: string): Promise<Schemas["AdminUser"]>;
+  /** Ferme toutes les sessions d'un autre utilisateur. */
+  logoutUser(id: string): Promise<void>;
+}
+
+/** `true` si les permissions donnent accès à l'administration des utilisateurs. */
+export function canAdministerUsers(permissions: readonly string[]): boolean {
+  return permissions.includes("*") || permissions.includes("users.admin");
 }
 
 /**
@@ -190,6 +222,56 @@ export function createApiClient(fetchImpl: typeof fetch = fetch): ApiClient {
         fetchImpl,
         "DELETE",
         buildPath(API_PATHS.credential, { provider }),
+      );
+    },
+
+    me() {
+      return requestJson<Schemas["MeResponse"]>(fetchImpl, "GET", API_PATHS.me);
+    },
+    listUsers(params = {}) {
+      return requestJson<Schemas["UserListResponse"]>(
+        fetchImpl,
+        "GET",
+        API_PATHS.adminUsers,
+        {
+          query: {
+            q: params.q?.trim() || undefined,
+            offset: params.offset,
+            limit: params.limit,
+          },
+        },
+      );
+    },
+    setUserRole(id, role) {
+      return requestJson<Schemas["AdminUser"]>(
+        fetchImpl,
+        "PUT",
+        buildPath(API_PATHS.adminUserRole, { id }),
+        { body: { role } },
+      );
+    },
+    disableUser(id) {
+      return requestJson<Schemas["AdminUser"]>(
+        fetchImpl,
+        "POST",
+        buildPath(API_PATHS.adminUserDisable, { id }),
+        { body: {} },
+      );
+    },
+    enableUser(id) {
+      return requestJson<Schemas["AdminUser"]>(
+        fetchImpl,
+        "POST",
+        buildPath(API_PATHS.adminUserEnable, { id }),
+        { body: {} },
+      );
+    },
+    logoutUser(id) {
+      return requestVoid(
+        fetchImpl,
+        "POST",
+        buildPath(API_PATHS.adminUserLogoutAll, { id }),
+        {},
       );
     },
   };

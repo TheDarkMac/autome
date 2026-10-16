@@ -161,6 +161,13 @@ describe("login / signup", () => {
     ).rejects.toMatchObject({ status: 401, message: /incorrect/i });
   });
 
+  it("traduit un 403 login en compte suspendu (#208)", async () => {
+    const fetchImpl = vi.fn().mockResolvedValue(jsonResponse({}, 403));
+    await expect(
+      login({ email: "a@b.io", password: "longenough" }, fetchImpl),
+    ).rejects.toMatchObject({ status: 403, message: /suspendu/i });
+  });
+
   it("signup POST /auth/signup et traduit un 409 en conflit", async () => {
     const fetchImpl = vi.fn().mockResolvedValue(jsonResponse({}, 409));
     await expect(
