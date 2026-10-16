@@ -152,9 +152,11 @@ jobs:
   smoke:
     name: Smoke e2e (Docker Compose)
     runs-on: ubuntu-latest
-    # Deux builds Rust release en parallèle (≈ 25 min mesurées sur 4 cœurs,
-    # compilation complète) + démarrage de la pile (≈ 45 s) : borné pour ne
-    # pas occuper un runner sur un conteneur bloqué.
+    # Deux builds Rust release en parallèle : ≈ 25 min sur 4 cœurs à froid
+    # (dépendances comprises), ≈ 6 min mesurées en local quand seul le code
+    # du workspace change (couche cargo-chef en cache, #219) ; + démarrage
+    # de la pile (≈ 45 s).
+    # Borné pour ne pas occuper un runner sur un conteneur bloqué.
     timeout-minutes: 45
     env:
       # Surcharge CI : nomme les images construites par bake (docker/compose.ci.yml).
@@ -166,8 +168,9 @@ jobs:
         uses: docker/setup-buildx-action@v3
 
       # Mêmes Dockerfiles que la CD, lus depuis le compose. Cache par couches
-      # partagé avec la CD (scopes `api` / `worker`) : base et runtime réutilisés,
-      # la compilation est refaite dès que les sources changent (`COPY . .`).
+      # partagé avec la CD (scopes `api` / `worker`, `mode=max` pour garder les
+      # étages intermédiaires) : dépendances compilées (cargo-chef, #219)
+      # réutilisées tant que Cargo.toml / Cargo.lock ne changent pas.
       - name: Build images (api, worker)
         uses: docker/bake-action@v5
         with:
