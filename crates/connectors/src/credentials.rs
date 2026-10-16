@@ -27,7 +27,7 @@ use autome_core::Result;
 
 use crate::http::HttpClient;
 use crate::oauth::client::{AuthorizationStart, OAuthClient, TokenSet};
-use crate::oauth::store::ConnectorTokenStore;
+use crate::oauth::store::{ConnectorTokenStore, StoredCredential};
 
 /// Description publique d'un provider OAuth — ne fuit aucun secret.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -53,6 +53,12 @@ pub struct CredentialSummary {
     pub scope: Option<String>,
     /// Timestamp d'expiration de l'access token (Unix ms), si connu.
     pub expires_at_ms: Option<i64>,
+    /// `true` si le provider a refusé le refresh token (`invalid_grant`) :
+    /// les runs échouent jusqu'à ce que l'utilisateur reconnecte le compte.
+    pub needs_reconnect: bool,
+    /// Horodatage de ce refus (Unix ms). Le motif brut n'est pas exposé : il
+    /// vient du provider et peut contenir des détails internes.
+    pub invalidated_at_ms: Option<i64>,
 }
 
 impl CredentialSummary {
@@ -63,6 +69,18 @@ impl CredentialSummary {
             has_refresh_token: tokens.refresh_token.is_some(),
             scope: tokens.scope.clone(),
             expires_at_ms: tokens.expires_at_ms,
+            needs_reconnect: false,
+            invalidated_at_ms: None,
+        }
+    }
+
+    /// Résumé d'une credential stockée, marque d'invalidation comprise.
+    pub fn from_stored(provider_id: impl Into<String>, credential: &StoredCredential) -> Self {
+        let invalidated_at_ms = credential.invalidated.as_ref().map(|i| i.at_ms);
+        Self {
+            needs_reconnect: invalidated_at_ms.is_some(),
+            invalidated_at_ms,
+            ..Self::from_tokens(provider_id, &credential.tokens)
         }
     }
 }
@@ -163,14 +181,12 @@ impl<C: HttpClient> CredentialService for OAuthCredentialService<C> {
     }
 
     fn list_for_user(&self, user_id: &str) -> Result<Vec<CredentialSummary>> {
-        let provider_ids = self.store.list_by_user(user_id)?;
-        let mut out = Vec::with_capacity(provider_ids.len());
-        for pid in provider_ids {
-            if let Some(tokens) = self.store.load(user_id, &pid)? {
-                out.push(CredentialSummary::from_tokens(pid, &tokens));
-            }
-        }
-        Ok(out)
+        Ok(self
+            .store
+            .load_all_by_user(user_id)?
+            .iter()
+            .map(|(pid, credential)| CredentialSummary::from_stored(pid.as_str(), credential))
+            .collect())
     }
 
     fn delete(&self, user_id: &str, provider_id: &str) -> Result<()> {
@@ -185,7 +201,9 @@ mod tests {
     use serde_json::json;
 
     use crate::oauth::provider::{OAuthProviderConfig, OAuthRegistry};
-    use crate::oauth::store::InMemoryConnectorTokenStore;
+    use crate::oauth::store::{
+        CredentialInvalidation, CredentialUpdate, InMemoryConnectorTokenStore,
+    };
     use crate::sdk::RecordingClient;
 
     fn google() -> OAuthProviderConfig {
@@ -422,6 +440,48 @@ mod tests {
             .unwrap();
         assert_eq!(svc.list_for_user("alice").unwrap().len(), 1);
         assert!(svc.list_for_user("bob").unwrap().is_empty());
+    }
+
+    #[test]
+    fn list_for_user_flags_credentials_to_reconnect_without_the_reason() {
+        let store = make_store();
+        let svc = make_service(
+            registry_with(vec![google()]),
+            RecordingClient::ok(json!({
+                "access_token": "AT", "refresh_token": "RT",
+                "expires_in": 60, "token_type": "Bearer"
+            })),
+            Arc::clone(&store),
+        );
+        let summary = svc
+            .complete_authorize("alice", "google", "c", "v", 0)
+            .unwrap();
+        assert!(!summary.needs_reconnect);
+        assert_eq!(summary.invalidated_at_ms, None);
+
+        store
+            .update_locked("alice", "google", &mut |_| {
+                CredentialUpdate::Invalidate(CredentialInvalidation {
+                    at_ms: 1_700_000_000_000,
+                    reason: "invalid_grant: Token has been expired or revoked.".into(),
+                })
+            })
+            .unwrap();
+        let listed = svc.list_for_user("alice").unwrap();
+        assert!(listed[0].needs_reconnect);
+        assert_eq!(listed[0].invalidated_at_ms, Some(1_700_000_000_000));
+        assert!(listed[0].has_refresh_token, "tokens toujours décrits");
+        assert!(
+            !format!("{listed:?}").contains("revoked"),
+            "le motif du provider ne sort pas du store"
+        );
+
+        // Reconnexion : la marque est effacée.
+        svc.complete_authorize("alice", "google", "c", "v", 0)
+            .unwrap();
+        let listed = svc.list_for_user("alice").unwrap();
+        assert!(!listed[0].needs_reconnect);
+        assert_eq!(listed[0].invalidated_at_ms, None);
     }
 
     #[test]
