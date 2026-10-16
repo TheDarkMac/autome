@@ -293,3 +293,42 @@ async fn update_locked_serializes_two_pools_on_the_row() {
         "at-2"
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn load_all_by_user_reads_tokens_and_marks_in_one_pass() {
+    let Some(pool) = setup().await else {
+        eprintln!("TEST_DATABASE_URL absent → test PostgreSQL sauté");
+        return;
+    };
+    let store = PgConnectorTokenStore::new(pool, cipher(5));
+    assert!(store.load_all_by_user("hugo").unwrap().is_empty());
+
+    store.store("hugo", "slack", &tokens("xoxb-hugo")).unwrap();
+    store.store("hugo", "gmail", &tokens("ya29-hugo")).unwrap();
+    store.store("ines", "gmail", &tokens("ya29-ines")).unwrap();
+    let invalidation = CredentialInvalidation {
+        at_ms: 1_700_000_000_000,
+        reason: "invalid_grant".into(),
+    };
+    store
+        .update_locked("hugo", "gmail", &mut |_| {
+            CredentialUpdate::Invalidate(invalidation.clone())
+        })
+        .unwrap();
+
+    let hugo = store.load_all_by_user("hugo").unwrap();
+    let providers: Vec<&str> = hugo.iter().map(|(p, _)| p.as_str()).collect();
+    assert_eq!(providers, ["gmail", "slack"], "tri par provider");
+    assert_eq!(hugo[0].1.tokens, tokens("ya29-hugo"), "déchiffré");
+    assert_eq!(hugo[0].1.invalidated, Some(invalidation));
+    assert_eq!(hugo[1].1.invalidated, None);
+    let ines = store.load_all_by_user("ines").unwrap();
+    assert_eq!(ines.len(), 1, "isolé par utilisateur");
+    assert_eq!(ines[0].1.invalidated, None);
+
+    // Reconnexion : la marque disparaît aussi de la lecture groupée.
+    store.store("hugo", "gmail", &tokens("ya29-new")).unwrap();
+    let hugo = store.load_all_by_user("hugo").unwrap();
+    assert_eq!(hugo[0].1.invalidated, None);
+    assert_eq!(hugo[0].1.tokens, tokens("ya29-new"));
+}
