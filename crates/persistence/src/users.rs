@@ -90,4 +90,72 @@ impl UserStore for PgUserStore {
             password_hash: r.get(2),
         }))
     }
+
+    async fn find_by_id(&self, id: &str) -> autome_core::Result<Option<UserRecord>> {
+        // `users.id` est un UUID : un `sub` d'une autre forme ne peut désigner
+        // aucun compte (et ferait échouer le cast).
+        if !is_uuid(id) {
+            return Ok(None);
+        }
+        let client = self.pool.get().await.map_err(|e| storage_err("pool", e))?;
+        let row = client
+            .query_opt(
+                "SELECT id::text, email, password_hash FROM users WHERE id = $1::text::uuid",
+                &[&id],
+            )
+            .await
+            .map_err(|e| storage_err("find_by_id", e))?;
+        Ok(row.map(|r| UserRecord {
+            id: r.get(0),
+            email: r.get(1),
+            password_hash: r.get(2),
+        }))
+    }
+
+    async fn update_password(
+        &self,
+        id: &str,
+        expected_hash: &str,
+        new_hash: &str,
+    ) -> autome_core::Result<bool> {
+        if !is_uuid(id) {
+            return Ok(false);
+        }
+        let client = self.pool.get().await.map_err(|e| storage_err("pool", e))?;
+        // Écriture conditionnelle sur l'ancien hash : la ligne verrouillée par
+        // le premier `UPDATE` ne correspond plus pour le second.
+        let n = client
+            .execute(
+                "UPDATE users SET password_hash = $3, updated_at = now() \
+                 WHERE id = $1::text::uuid AND password_hash = $2",
+                &[&id, &expected_hash, &new_hash],
+            )
+            .await
+            .map_err(|e| storage_err("update_password", e))?;
+        Ok(n == 1)
+    }
+}
+
+/// `true` pour un UUID textuel (`8-4-4-4-12` chiffres hexadécimaux).
+fn is_uuid(s: &str) -> bool {
+    s.len() == 36
+        && s.char_indices().all(|(i, c)| match i {
+            8 | 13 | 18 | 23 => c == '-',
+            _ => c.is_ascii_hexdigit(),
+        })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_uuid;
+
+    #[test]
+    fn uuid_shape_is_checked_before_querying() {
+        assert!(is_uuid("00000000-0000-0000-0000-000000000001"));
+        assert!(is_uuid("3F2504E0-4F89-41D3-9A0C-0305E82C3301"));
+        assert!(!is_uuid("alice"));
+        assert!(!is_uuid("00000000-0000-0000-0000-00000000000"));
+        assert!(!is_uuid("00000000_0000-0000-0000-000000000001"));
+        assert!(!is_uuid("0000000g-0000-0000-0000-000000000001"));
+    }
 }

@@ -62,6 +62,16 @@ pub trait UserStore: Send + Sync {
 
     /// Recherche un compte par email normalisé.
     async fn find_by_email(&self, email: &str) -> Result<Option<UserRecord>>;
+
+    /// Recherche un compte par identifiant (`claims.sub`). `None` si inconnu,
+    /// y compris pour un identifiant mal formé.
+    async fn find_by_id(&self, id: &str) -> Result<Option<UserRecord>>;
+
+    /// Remplace le hash du mot de passe de `id` **seulement** s'il vaut encore
+    /// `expected_hash` (celui qu'on vient de vérifier) : de deux changements
+    /// concurrents, un seul gagne (#196). `false` si le compte est inconnu ou
+    /// si le mot de passe a changé entre-temps.
+    async fn update_password(&self, id: &str, expected_hash: &str, new_hash: &str) -> Result<bool>;
 }
 
 /// Normalise un email : espaces de bord retirés, minuscules.
@@ -174,6 +184,28 @@ impl UserStore for InMemoryUserStore {
             .map_err(|_| Error::Invalid("users lock empoisonné".into()))?;
         Ok(users.get(email).cloned())
     }
+
+    async fn find_by_id(&self, id: &str) -> Result<Option<UserRecord>> {
+        let users = self
+            .users
+            .lock()
+            .map_err(|_| Error::Invalid("users lock empoisonné".into()))?;
+        Ok(users.values().find(|u| u.id == id).cloned())
+    }
+
+    async fn update_password(&self, id: &str, expected_hash: &str, new_hash: &str) -> Result<bool> {
+        let mut users = self
+            .users
+            .lock()
+            .map_err(|_| Error::Invalid("users lock empoisonné".into()))?;
+        match users.values_mut().find(|u| u.id == id) {
+            Some(user) if user.password_hash == expected_hash => {
+                user.password_hash = new_hash.to_string();
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -276,5 +308,47 @@ mod tests {
     async fn unknown_email_is_none() {
         let (users, _) = store();
         assert_eq!(users.find_by_email("x@example.io").await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn find_by_id_and_conditional_password_update() {
+        let (users, _) = store();
+        let CreateUser::Created(alice) = users
+            .create("alice@example.io", "hash-v1", &HashSet::new())
+            .await
+            .unwrap()
+        else {
+            panic!("création");
+        };
+        assert_eq!(
+            users.find_by_id(&alice.id).await.unwrap(),
+            Some(alice.clone())
+        );
+        assert_eq!(users.find_by_id("inconnu").await.unwrap(), None);
+
+        // Hash attendu périmé : rien n'est écrit.
+        assert!(!users
+            .update_password(&alice.id, "hash-v0", "hash-x")
+            .await
+            .unwrap());
+        assert!(users
+            .update_password(&alice.id, "hash-v1", "hash-v2")
+            .await
+            .unwrap());
+        // Le second de deux changements partis du même hash échoue.
+        assert!(!users
+            .update_password(&alice.id, "hash-v1", "hash-v3")
+            .await
+            .unwrap());
+        let stored = users
+            .find_by_email("alice@example.io")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.password_hash, "hash-v2");
+        assert!(!users
+            .update_password("inconnu", "hash-v2", "hash-x")
+            .await
+            .unwrap());
     }
 }

@@ -2,6 +2,7 @@
 //! Gaté par `TEST_DATABASE_URL` (skip-pass sinon). Cf. `pg_permission.rs`.
 
 use std::collections::HashSet;
+use std::sync::Arc;
 
 use autome_core::{CreateUser, PermissionStore, UserStore};
 use autome_persistence::{connect, PgPermissionStore, PgUserStore};
@@ -18,7 +19,8 @@ async fn setup() -> Option<(PgUserStore, PgPermissionStore)> {
              DROP TABLE IF EXISTS users CASCADE; \
              CREATE TABLE users (id UUID PRIMARY KEY DEFAULT gen_random_uuid(), \
                email TEXT NOT NULL UNIQUE, password_hash TEXT NOT NULL, \
-               role TEXT NOT NULL DEFAULT 'user');",
+               role TEXT NOT NULL DEFAULT 'user', \
+               updated_at TIMESTAMPTZ NOT NULL DEFAULT now());",
         )
         .await
         .expect("schéma de test");
@@ -52,9 +54,53 @@ async fn create_find_and_grant_atomically() {
     assert_eq!(again, CreateUser::EmailTaken);
 
     let found = users.find_by_email("alice@example.io").await.unwrap();
-    assert_eq!(found, Some(alice));
+    assert_eq!(found, Some(alice.clone()));
     assert_eq!(
         users.find_by_email("nobody@example.io").await.unwrap(),
         None
     );
+
+    // Changement de mot de passe (#196) : recherche par id, écriture
+    // conditionnelle sur l'ancien hash.
+    assert_eq!(
+        users.find_by_id(&alice.id).await.unwrap().map(|u| u.email),
+        Some("alice@example.io".to_string())
+    );
+    assert_eq!(
+        users.find_by_id("alice").await.unwrap(),
+        None,
+        "id non UUID"
+    );
+    assert_eq!(
+        users
+            .find_by_id("00000000-0000-0000-0000-00000000dead")
+            .await
+            .unwrap(),
+        None
+    );
+    assert!(!users
+        .update_password(&alice.id, "$argon2id$périmé", "$argon2id$x")
+        .await
+        .unwrap());
+
+    // 20 changements concurrents partis du même hash : un seul gagne.
+    let users = Arc::new(users);
+    let tasks: Vec<_> = (0..20)
+        .map(|i| {
+            let (users, id) = (Arc::clone(&users), alice.id.clone());
+            tokio::spawn(async move {
+                users
+                    .update_password(&id, "$argon2id$h1", &format!("$argon2id$new-{i}"))
+                    .await
+                    .unwrap()
+            })
+        })
+        .collect();
+    let mut winners = 0;
+    for t in tasks {
+        winners += usize::from(t.await.unwrap());
+    }
+    assert_eq!(winners, 1);
+    let stored = users.find_by_id(&alice.id).await.unwrap().unwrap();
+    assert!(stored.password_hash.starts_with("$argon2id$new-"));
 }
