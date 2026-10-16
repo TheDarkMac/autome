@@ -87,6 +87,9 @@ impl Mailer for SmtpMailer {
             .parse::<Mailbox>()
             .map_err(|e| format!("destinataire invalide : {e}"))?;
         let message = Message::builder()
+            // Sans `Message-ID`, des relais et filtres anti-spam pénalisent
+            // le message ; domaine de l'expéditeur plutôt que nom d'hôte local.
+            .message_id(Some(message_id(self.from.email.domain())))
             .from(self.from.clone())
             .to(to)
             .subject(mail.subject.clone())
@@ -99,6 +102,14 @@ impl Mailer for SmtpMailer {
             .map(|_| ())
             .map_err(|e| format!("envoi SMTP : {e}"))
     }
+}
+
+/// `Message-ID` aléatoire (128 bits) sous le domaine `domain`.
+fn message_id(domain: &str) -> String {
+    let mut bytes = [0u8; 16];
+    rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut bytes);
+    let id: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+    format!("<{id}@{domain}>")
 }
 
 /// Profil `dev` sans SMTP : le message (lien compris) est écrit dans les
@@ -241,6 +252,14 @@ mod tests {
                 .find(|(n, _)| *n == k)
                 .map(|(_, v)| v.to_string())
         }
+    }
+
+    #[test]
+    fn message_ids_are_unique_under_the_sender_domain() {
+        let (a, b) = (message_id("example.io"), message_id("example.io"));
+        assert!(a.starts_with('<') && a.ends_with("@example.io>"));
+        assert_eq!(a.len(), "<@example.io>".len() + 32);
+        assert_ne!(a, b);
     }
 
     #[test]
