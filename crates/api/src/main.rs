@@ -9,6 +9,7 @@
 use std::sync::Arc;
 
 use autome_api::accounts::{accounts_router, AccountsState, IpThrottle};
+use autome_api::admin::{admin_router, promote_admin, AdminState, Promotion};
 use autome_api::auth::protected_router;
 use autome_api::credentials::{credentials_router, CredentialsState};
 use autome_api::mail::MailSettings;
@@ -30,6 +31,7 @@ use autome_api::workflows::{
     create_workflow, delete_workflow, get_workflow, list_workflows, update_workflow, WorkflowsState,
 };
 use autome_core::{telemetry, Argon2PasswordHasher, Config};
+use autome_persistence::{connect, PgAuditSink, PgUserStore};
 use axum::{routing::get, Router};
 
 /// Période de la purge des entrées d'authentification expirées.
@@ -38,7 +40,8 @@ const MAINTENANCE_INTERVAL: std::time::Duration = std::time::Duration::from_secs
 /// Construit le routeur racine : sondes (`/livez`, `/readyz`, `/health`) et
 /// `/metrics` publics,
 /// `/auth/signup|login|refresh` publics (émission des jetons), `/auth/whoami|admin`
-/// protégés par JWT, le CRUD `workflows` + `runs` (domaine 7) et les webhooks
+/// protégés par JWT, l'administration des utilisateurs (`/admin/users`, #208),
+/// le CRUD `workflows` + `runs` (domaine 7) et les webhooks
 /// (`/hooks/{token}` public, gestion des URL protégée — #202). Toutes les
 /// routes sont instrumentées par le middleware de métriques (F10.6.a).
 ///
@@ -82,6 +85,10 @@ fn build_router(
             "/auth",
             protected_router(backends.auth.clone()).merge(accounts_router(accounts)),
         )
+        .merge(admin_router(AdminState::new(
+            backends.auth.clone(),
+            backends.users.clone(),
+        )))
         .merge(workflows_routes)
         .merge(runs_router(runs_state))
         .merge(webhooks_router(webhooks))
@@ -143,11 +150,63 @@ fn password_reset(config: &Config) -> Result<Option<PasswordReset>, String> {
     )))
 }
 
+/// `autome-api promote-admin <email>` (#208) : promeut un compte existant
+/// super-admin dans la base `DATABASE_URL`, puis s'arrête. Seul moyen de créer
+/// le premier administrateur : il exige l'accès à l'infrastructure (`kubectl
+/// exec`, `docker compose exec`), jamais l'API publique.
+async fn promote_admin_command(
+    config: &Config,
+    email: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if PersistenceMode::from_env()? != PersistenceMode::Postgres {
+        return Err("promote-admin requiert AUTOME_PERSISTENCE=postgres (les comptes en mémoire ne survivent pas au processus)".into());
+    }
+    let pool = connect(&config.database_url)?;
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_millis() as i64;
+    match promote_admin(
+        &PgUserStore::new(pool.clone()),
+        &PgAuditSink::new(pool),
+        email,
+        now_ms,
+    )
+    .await?
+    {
+        Promotion::Promoted {
+            user_id,
+            reactivated,
+        } => {
+            tracing::info!(%user_id, reactivated, "compte promu administrateur");
+            Ok(())
+        }
+        Promotion::UnknownEmail => {
+            Err(format!("aucun compte pour {email} : inscrivez-le d'abord").into())
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = Config::from_env()?;
     let log_format = telemetry::init(config.profile)?;
     tracing::debug!(log_format = ?log_format, "logs initialisés");
+
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    match args.first().map(String::as_str) {
+        None => {}
+        Some("promote-admin") => {
+            let [_, email] = args.as_slice() else {
+                return Err("usage : autome-api promote-admin <email>".into());
+            };
+            return promote_admin_command(&config, email).await;
+        }
+        Some(other) => {
+            return Err(
+                format!("commande inconnue « {other} » (seule : promote-admin <email>)").into(),
+            )
+        }
+    }
 
     // Backend de persistance (dette #107) : `AUTOME_PERSISTENCE=postgres` adosse
     // les stores d'auth à PostgreSQL ; défaut `memory` (dev/tests/single-node).

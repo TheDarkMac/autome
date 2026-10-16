@@ -7,6 +7,7 @@
 //! Modules :
 //! - [`accounts`] : inscription, connexion et rotation des jetons
 //!   (`/auth/signup|login|refresh`).
+//! - [`admin`] (#208) : administration des utilisateurs (`/admin/users`).
 //! - [`mail`] et [`password_reset`] (#204) : envoi d'emails (SMTP) et jetons
 //!   de réinitialisation du mot de passe.
 //! - [`auth`] (F6.1.c) : extractor axum `AuthenticatedUser` qui consomme
@@ -15,6 +16,7 @@
 //!   fichiers PEM (cert chain + clé privée).
 
 pub mod accounts;
+pub mod admin;
 pub mod auth;
 pub mod client_ip;
 pub mod credentials;
