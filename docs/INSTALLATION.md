@@ -378,6 +378,21 @@ doit dépasser `délai + drain` : `terminationGracePeriodSeconds: 35` dans
 suit la même séquence (`AUTOME_SHUTDOWN_DELAY_SECS=0` pour s'arrêter sans
 attendre).
 
+**Arrêt borné du worker (#200).** Sur `SIGTERM` / `SIGINT`, le worker cesse
+de prendre de nouveaux runs, `/readyz` répond 503 `draining` (`/livez` reste
+200), et les runs en cours ont `AUTOME_WORKER_SHUTDOWN_TIMEOUT_SECS` (défaut
+**25 s**) pour se terminer normalement. À l'échéance, ceux qui tournent encore
+sont **clos tout de suite en `failed`** — « worker arrêté pendant
+l'exécution : run interrompu (non rejoué, à relancer) » — au lieu de rester
+`running` jusqu'au balayage des orphelins (jusqu'à `AUTOME_RUN_TIMEOUT_SECS`).
+Ils ne sont pas rejoués : des nodes ont pu avoir déjà produit leurs effets
+(livraison *au plus une fois*) ; leur message, non acquitté, est redélivré à
+un autre worker puis acquitté sans exécution. Périodes de grâce :
+`terminationGracePeriodSeconds: 35` (`k8s/worker.yaml`),
+`stop_grace_period: 35s` (compose). **Workflows longs** : augmenter ensemble
+`AUTOME_WORKER_SHUTDOWN_TIMEOUT_SECS` et la période de grâce (grâce = délai +
+~10 s), sinon un déploiement interrompra les runs de plus de 25 s.
+
 ### C.6 Monitoring
 
 Le namespace inclut **Prometheus** (scrape de l'API) et **Grafana** (datasource
