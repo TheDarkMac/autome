@@ -38,6 +38,7 @@ use utoipa::{
         crate::accounts::refresh,
         crate::accounts::logout,
         crate::accounts::logout_all,
+        crate::accounts::change_password,
         // workflows (F7.1)
         crate::workflows::list_workflows,
         crate::workflows::create_workflow,
@@ -59,6 +60,7 @@ use utoipa::{
         crate::probes::ReadyzResponse,
         crate::accounts::CredentialsBody,
         crate::accounts::RefreshBody,
+        crate::accounts::ChangePasswordBody,
         crate::accounts::TokenResponse,
         crate::workflows::ListResponse,
         crate::runs::CreateRunBody,
