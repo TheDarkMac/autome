@@ -1728,7 +1728,8 @@
         "description": "Résumé d'un credential — jamais le token brut.",
         "required": [
           "provider_id",
-          "has_refresh_token"
+          "has_refresh_token",
+          "needs_reconnect"
         ],
         "properties": {
           "expires_at_ms": {
@@ -1742,6 +1743,18 @@
           "has_refresh_token": {
             "type": "boolean",
             "description": "`true` si un refresh token est conservé."
+          },
+          "invalidated_at_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Date de ce refus (Unix ms), `null` sinon. Le motif renvoyé par le\nprovider n'est jamais exposé."
+          },
+          "needs_reconnect": {
+            "type": "boolean",
+            "description": "`true` si le provider a refusé le refresh token : les runs échouent\ntant que l'utilisateur n'a pas reconnecté le compte (`/authorize`)."
           },
           "provider_id": {
             "type": "string",

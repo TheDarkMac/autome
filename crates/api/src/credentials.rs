@@ -111,6 +111,12 @@ pub struct CredentialDto {
     pub scope: Option<String>,
     /// Timestamp d'expiration de l'access token (Unix ms).
     pub expires_at_ms: Option<i64>,
+    /// `true` si le provider a refusé le refresh token : les runs échouent
+    /// tant que l'utilisateur n'a pas reconnecté le compte (`/authorize`).
+    pub needs_reconnect: bool,
+    /// Date de ce refus (Unix ms), `null` sinon. Le motif renvoyé par le
+    /// provider n'est jamais exposé.
+    pub invalidated_at_ms: Option<i64>,
 }
 
 impl From<autome_connectors::CredentialSummary> for CredentialDto {
@@ -120,6 +126,8 @@ impl From<autome_connectors::CredentialSummary> for CredentialDto {
             has_refresh_token: s.has_refresh_token,
             scope: s.scope,
             expires_at_ms: s.expires_at_ms,
+            needs_reconnect: s.needs_reconnect,
+            invalidated_at_ms: s.invalidated_at_ms,
         }
     }
 }
@@ -502,6 +510,14 @@ mod tests {
         fn set_complete(&self, r: CoreResult<CredentialSummary>) {
             *self.complete_result.lock().unwrap() = Some(r);
         }
+
+        /// Simule le worker qui marque la credential après `invalid_grant`.
+        fn invalidate(&self, user_id: &str, provider_id: &str, at_ms: i64) {
+            let mut map = self.stored.lock().unwrap();
+            let summary = map.get_mut(&(user_id.into(), provider_id.into())).unwrap();
+            summary.needs_reconnect = true;
+            summary.invalidated_at_ms = Some(at_ms);
+        }
     }
 
     impl CredentialService for FakeService {
@@ -537,6 +553,8 @@ mod tests {
                 has_refresh_token: true,
                 scope: Some("openid".into()),
                 expires_at_ms: Some(2_000_000_000_000),
+                needs_reconnect: false,
+                invalidated_at_ms: None,
             };
             self.stored
                 .lock()
@@ -779,6 +797,49 @@ mod tests {
         let items = body["items"].as_array().unwrap();
         assert_eq!(items.len(), 1);
         assert_eq!(items[0]["provider_id"], "slack");
+    }
+
+    #[tokio::test]
+    async fn list_credentials_flags_credentials_to_reconnect() {
+        let (state, svc, perms, _, fake) = make_test_state();
+        perms.assign_role("alice", &admin_role()).unwrap();
+        fake.complete_authorize("alice", "google", "c", "v", 0)
+            .unwrap();
+        fake.complete_authorize("alice", "slack", "c", "v", 0)
+            .unwrap();
+        fake.invalidate("alice", "google", 1_700_000_000_000);
+        let token = svc.issue_access("alice", 900, FIXED_NOW).unwrap();
+        let response = credentials_router(state)
+            .oneshot(auth_req("GET", "/credentials", &token, None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_str(&body_string(response).await).unwrap();
+        let items = body["items"].as_array().unwrap();
+        assert_eq!(items[0]["provider_id"], "google");
+        assert_eq!(items[0]["needs_reconnect"], true);
+        assert_eq!(items[0]["invalidated_at_ms"], 1_700_000_000_000_i64);
+        assert_eq!(items[1]["needs_reconnect"], false);
+        assert!(items[1]["invalidated_at_ms"].is_null());
+        // Sentinelle : le DTO ne porte que des métadonnées (aucun motif).
+        let mut keys: Vec<&str> = items[0]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "expires_at_ms",
+                "has_refresh_token",
+                "invalidated_at_ms",
+                "needs_reconnect",
+                "provider_id",
+                "scope"
+            ]
+        );
     }
 
     #[tokio::test]
