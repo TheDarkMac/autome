@@ -70,6 +70,8 @@ services:
       ENCRYPTION_KEY: dev-insecure-encryption-key
     ports:
       - "8080:8080"
+    # Arrêt gracieux (#194) : retrait (5 s) + drain (≤ 20 s) avant SIGKILL.
+    stop_grace_period: 35s
     # Prête = migrations appliquées, base et broker joignables (#192). L'image
     # n'a ni curl ni wget : requête HTTP brute via bash.
     healthcheck:

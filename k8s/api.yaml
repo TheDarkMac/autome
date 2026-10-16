@@ -34,6 +34,10 @@ spec:
         app.kubernetes.io/name: api
         app.kubernetes.io/part-of: autome
     spec:
+      # Arrêt gracieux (#194) : SIGTERM ⇒ readiness à 503, 5 s de retrait des
+      # endpoints, puis au plus 20 s de drain (AUTOME_SHUTDOWN_DELAY_SECS /
+      # AUTOME_SHUTDOWN_TIMEOUT_SECS). La grâce doit dépasser leur somme.
+      terminationGracePeriodSeconds: 35
       securityContext:
         runAsNonRoot: true
         runAsUser: 10001
