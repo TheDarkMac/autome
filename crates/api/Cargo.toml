@@ -39,6 +39,10 @@ sha2 = { workspace = true }
 ipnet = { workspace = true }
 # URL secrètes des webhooks (#202) : sel aléatoire
 rand = { workspace = true }
+# Mot de passe oublié (#204) : envoi SMTP (rustls, pas d'OpenSSL système),
+# trait d'envoi asynchrone
+lettre = { version = "0.11", default-features = false, features = ["builder", "hostname", "smtp-transport", "tokio1-rustls-tls"] }
+async-trait = { workspace = true }
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
