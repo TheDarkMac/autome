@@ -26,7 +26,11 @@
 //! ([`TokenRefresher`] : client OAuth configuré par `AUTOME_OAUTH_<ID>_*`), et
 //! le nouveau `TokenSet` est re-stocké chiffré. Impossible à rafraîchir (pas de
 //! refresh token, provider non configuré sur le worker, refus du provider) :
-//! échec explicite invitant à reconnecter le compte.
+//! échec explicite invitant à reconnecter le compte. Le rafraîchissement se
+//! fait sous le verrou du store ([`ConnectorTokenStore::update_locked`] :
+//! verrou de ligne PostgreSQL, partagé par toutes les répliques), et un refus
+//! définitif (`invalid_grant`) marque la credential invalide : les runs
+//! suivants échouent sans rappeler le provider, jusqu'à la reconnexion.
 //!
 //! Le token **global** par provider ([`EnvCredentialResolver`],
 //! `AUTOME_CONNECTOR_TOKEN_<PROVIDER>`) n'est consulté qu'en repli, et
@@ -38,7 +42,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use autome_connectors::oauth::{
-    merge_refreshed, needs_refresh, ConnectorTokenStore, TokenRefresher, TokenSet, REFRESH_SKEW_MS,
+    merge_refreshed, needs_refresh, ConnectorTokenStore, CredentialInvalidation, CredentialUpdate,
+    RefreshError, StoredCredential, TokenRefresher, TokenSet, REFRESH_SKEW_MS,
 };
 use autome_connectors::{
     GithubAuth, GithubCloseIssue, GithubCommentIssue, GithubCreateIssue, GithubCreatePull,
@@ -93,9 +98,17 @@ impl CredentialResolver for EnvCredentialResolver {
 ///
 /// Rafraîchissement : avec [`with_refresher`](Self::with_refresher), un token
 /// expiré est rafraîchi puis re-stocké. Les rafraîchissements d'un même
-/// `(propriétaire, provider)` sont **sérialisés dans le process** et le store
-/// est relu sous le verrou : N runs concurrents ⇒ un seul appel au provider
-/// (indispensable quand il fait tourner le refresh token).
+/// `(propriétaire, provider)` sont sérialisés par le verrou du store
+/// ([`ConnectorTokenStore::update_locked`], partagé entre répliques en
+/// PostgreSQL) qui relit la credential : N runs concurrents, sur une ou
+/// plusieurs répliques ⇒ un seul appel au provider (indispensable quand il fait
+/// tourner le refresh token). Un verrou **in-process** par clé précède celui du
+/// store : les runs d'une même réplique n'occupent pas chacun une connexion du
+/// pool en attendant le verrou de ligne.
+///
+/// Refus définitif du provider (`invalid_grant`) : la credential est marquée
+/// invalide ; tant que l'utilisateur ne l'a pas reconnectée, les runs échouent
+/// sans représenter le refresh token.
 pub struct OwnerCredentialResolver {
     store: Arc<dyn ConnectorTokenStore + Send + Sync>,
     fallback: Option<Arc<dyn CredentialResolver>>,
@@ -106,6 +119,17 @@ pub struct OwnerCredentialResolver {
 
 /// Verrou de rafraîchissement par `(propriétaire, provider)`.
 type RefreshLocks = HashMap<(String, String), Arc<Mutex<()>>>;
+
+/// Longueur maximale du motif d'invalidation conservé (réponse du provider).
+const MAX_REASON_CHARS: usize = 300;
+
+/// Motif d'invalidation borné à [`MAX_REASON_CHARS`] caractères.
+fn truncate_reason(reason: &str) -> String {
+    match reason.char_indices().nth(MAX_REASON_CHARS) {
+        Some((cut, _)) => format!("{}…", &reason[..cut]),
+        None => reason.to_string(),
+    }
+}
 
 /// Horodatage Unix (ms) courant — horloge par défaut.
 fn system_now_ms() -> i64 {
@@ -177,57 +201,120 @@ impl OwnerCredentialResolver {
             return Ok(Some(tokens.access_token));
         }
 
-        // Expiré : un seul rafraîchissement à la fois ; on relit sous le
-        // verrou, un run concurrent a pu rafraîchir entre-temps.
+        // Expiré : un seul rafraîchissement à la fois dans le process, puis
+        // sous le verrou du store (entre répliques), qui relit la credential.
         let lock = self.refresh_lock(owner, provider);
         let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        let Some(tokens) = self
-            .store
-            .load(owner, provider)
-            .map_err(read_err)?
-            .and_then(usable)
+        let mut outcome = None;
+        let mut refreshed = false;
+        let locked = self.store.update_locked(owner, provider, &mut |current| {
+            let (result, update) = self.refresh_decision(owner, provider, current);
+            refreshed = matches!(update, CredentialUpdate::Replace(_));
+            outcome = Some(result);
+            update
+        });
+        match (locked, outcome) {
+            (Ok(()), Some(result)) => {
+                if refreshed {
+                    tracing::info!(provider, owner, "token de connecteur rafraîchi");
+                }
+                result
+            }
+            // Le token neuf reste utilisable pour ce run ; le prochain
+            // retentera le rafraîchissement depuis l'ancien refresh token.
+            (Err(e), Some(Ok(Some(token)))) if refreshed => {
+                tracing::warn!(
+                    provider,
+                    owner,
+                    error = %e,
+                    "token de connecteur rafraîchi mais non persisté"
+                );
+                Ok(Some(token))
+            }
+            (Err(e), Some(Err(message))) => {
+                tracing::warn!(provider, owner, error = %e, "credential non mise à jour");
+                Err(message)
+            }
+            (Err(e), _) => Err(read_err(e)),
+            (Ok(()), None) => Err(format!(
+                "credential `{provider}` de `{owner}` : verrou du store relâché sans décision"
+            )),
+        }
+    }
+
+    /// Décision prise sous le verrou du store : le résultat pour le run et
+    /// l'écriture à faire. `current` est la credential relue sous le verrou —
+    /// un run concurrent (autre thread ou autre réplique) a pu la rafraîchir
+    /// ou l'invalider entre-temps.
+    fn refresh_decision(
+        &self,
+        owner: &str,
+        provider: &str,
+        current: Option<StoredCredential>,
+    ) -> (Result<Option<String>, String>, CredentialUpdate) {
+        let keep = |result| (result, CredentialUpdate::Keep);
+        let Some(StoredCredential {
+            tokens,
+            invalidated,
+        }) = current.filter(|c| !c.tokens.access_token.is_empty())
         else {
-            return Ok(None);
+            return keep(Ok(None));
         };
         let now = (self.clock)();
         if !needs_refresh(&tokens, now, REFRESH_SKEW_MS) {
-            return Ok(Some(tokens.access_token));
+            return keep(Ok(Some(tokens.access_token)));
         }
 
         let reconnect = format!("reconnecter via POST /credentials/{provider}/authorize");
+        if let Some(invalidation) = invalidated {
+            return keep(Err(format!(
+                "credential `{provider}` de `{owner}` refusée par le provider lors d'un \
+                 rafraîchissement précédent : {} ({reconnect})",
+                invalidation.reason
+            )));
+        }
         let Some(refresh_token) = tokens.refresh_token.as_deref() else {
-            return Err(format!(
+            return keep(Err(format!(
                 "credential `{provider}` de `{owner}` expirée sans refresh token ({reconnect})"
-            ));
+            )));
         };
         let Some(refresher) = &self.refresher else {
-            return Err(format!(
+            return keep(Err(format!(
                 "credential `{provider}` de `{owner}` expirée : rafraîchissement non \
                  configuré sur le worker ({reconnect})"
-            ));
+            )));
         };
-        let refreshed = refresher
-            .refresh(provider, refresh_token, now)
-            .map_err(|e| {
-                format!(
-                    "rafraîchissement de la credential `{provider}` de `{owner}` échoué : \
-                     {e} ({reconnect})"
+        match refresher.refresh(provider, refresh_token, now) {
+            Ok(fresh) => {
+                let merged = merge_refreshed(&tokens, fresh);
+                (
+                    Ok(Some(merged.access_token.clone())),
+                    CredentialUpdate::Replace(merged),
                 )
-            })?;
-        let merged = merge_refreshed(&tokens, refreshed);
-        if let Err(e) = self.store.store(owner, provider, &merged) {
-            // Le token neuf reste utilisable pour ce run ; le prochain
-            // retentera le rafraîchissement depuis l'ancien refresh token.
-            tracing::warn!(
-                provider,
-                owner,
-                error = %e,
-                "token de connecteur rafraîchi mais non persisté"
-            );
-        } else {
-            tracing::info!(provider, owner, "token de connecteur rafraîchi");
+            }
+            Err(RefreshError::Revoked(reason)) => {
+                tracing::warn!(
+                    provider,
+                    owner,
+                    "refresh token refusé par le provider : credential marquée invalide"
+                );
+                let message = format!(
+                    "rafraîchissement de la credential `{provider}` de `{owner}` refusé : \
+                     {reason} ({reconnect})"
+                );
+                (
+                    Err(message),
+                    CredentialUpdate::Invalidate(CredentialInvalidation {
+                        at_ms: now,
+                        reason: truncate_reason(&reason),
+                    }),
+                )
+            }
+            Err(RefreshError::Failed(e)) => keep(Err(format!(
+                "rafraîchissement de la credential `{provider}` de `{owner}` échoué : \
+                 {e} ({reconnect})"
+            ))),
         }
-        Ok(Some(merged.access_token))
     }
 
     fn fallback_or(
@@ -617,6 +704,14 @@ mod tests {
         fn list_by_user(&self, _: &str) -> CoreResult<Vec<String>> {
             Err(Error::Invalid("storage: down".into()))
         }
+        fn update_locked(
+            &self,
+            _: &str,
+            _: &str,
+            _: &mut dyn FnMut(Option<StoredCredential>) -> CredentialUpdate,
+        ) -> CoreResult<()> {
+            Err(Error::Invalid("storage: down".into()))
+        }
     }
 
     #[test]
@@ -715,7 +810,7 @@ mod tests {
     /// un délai optionnel (pour les courses).
     struct MockRefresher {
         calls: Mutex<Vec<(String, String)>>,
-        result: Result<TokenSet, String>,
+        result: Result<TokenSet, RefreshError>,
         delay_ms: u64,
     }
 
@@ -735,7 +830,13 @@ mod tests {
         }
         fn failing(msg: &str) -> Self {
             Self {
-                result: Err(msg.into()),
+                result: Err(RefreshError::Failed(msg.into())),
+                ..Self::ok("unused")
+            }
+        }
+        fn revoking(msg: &str) -> Self {
+            Self {
+                result: Err(RefreshError::Revoked(msg.into())),
                 ..Self::ok("unused")
             }
         }
@@ -745,13 +846,18 @@ mod tests {
     }
 
     impl TokenRefresher for MockRefresher {
-        fn refresh(&self, provider: &str, refresh_token: &str, _now: i64) -> CoreResult<TokenSet> {
+        fn refresh(
+            &self,
+            provider: &str,
+            refresh_token: &str,
+            _now: i64,
+        ) -> Result<TokenSet, RefreshError> {
             self.calls
                 .lock()
                 .unwrap()
                 .push((provider.into(), refresh_token.into()));
             std::thread::sleep(std::time::Duration::from_millis(self.delay_ms));
-            self.result.clone().map_err(Error::Invalid)
+            self.result.clone()
         }
     }
 
@@ -855,18 +961,209 @@ mod tests {
     fn failed_refresh_never_falls_back_and_keeps_the_stored_token() {
         let store = store_with_alice_gmail(Some(NOW - 1), Some("rt-alice"));
         let refresher = Arc::new(MockRefresher::failing(
-            "oauth refresh : http 400 — invalid_grant",
+            "oauth refresh : http 503 — temporarily_unavailable",
         ));
+        let r = refreshing(&store, &refresher).with_fallback(Arc::new(resolver("global-token")));
+        let err = r.token(Some("alice"), "gmail").unwrap_err();
+        assert!(
+            err.contains("échoué")
+                && err.contains("503")
+                && err.contains("/credentials/gmail/authorize"),
+            "{err}"
+        );
+        let stored = store.load("alice", "gmail").unwrap().unwrap();
+        assert_eq!(stored.access_token, "ya29-old");
+        // Échec transitoire : pas de marque, le run suivant retente.
+        assert!(r.token(Some("alice"), "gmail").is_err());
+        assert_eq!(refresher.calls().len(), 2);
+    }
+
+    /// Marque d'invalidation de la credential Gmail d'alice.
+    fn gmail_invalidation(
+        store: &Arc<dyn ConnectorTokenStore + Send + Sync>,
+    ) -> Option<CredentialInvalidation> {
+        let mut seen = None;
+        store
+            .update_locked("alice", "gmail", &mut |current| {
+                seen = current.and_then(|c| c.invalidated);
+                CredentialUpdate::Keep
+            })
+            .unwrap();
+        seen
+    }
+
+    #[test]
+    fn revoked_refresh_token_marks_the_credential_and_stops_retrying() {
+        let store = store_with_alice_gmail(Some(NOW - 1), Some("rt-alice"));
+        let refresher = Arc::new(MockRefresher::revoking(
+            r#"oauth refresh : http 400 — {"error":"invalid_grant"}"#,
+        ));
+        let r = refreshing(&store, &refresher).with_fallback(Arc::new(resolver("global-token")));
+
+        let err = r.token(Some("alice"), "gmail").unwrap_err();
+        assert!(
+            err.contains("refusé")
+                && err.contains("invalid_grant")
+                && err.contains("/credentials/gmail/authorize"),
+            "{err}"
+        );
+        let invalidation = gmail_invalidation(&store).expect("credential marquée");
+        assert_eq!(invalidation.at_ms, NOW);
+        assert!(invalidation.reason.contains("invalid_grant"));
+
+        // Runs suivants : échec explicite sans rappeler le provider, jamais
+        // le token global.
+        for _ in 0..3 {
+            let err = r.token(Some("alice"), "gmail").unwrap_err();
+            assert!(
+                err.contains("rafraîchissement précédent")
+                    && err.contains("/credentials/gmail/authorize"),
+                "{err}"
+            );
+        }
+        assert_eq!(refresher.calls().len(), 1, "un seul appel au provider");
+
+        // Reconnexion (callback OAuth ⇒ `store`) : marque effacée.
+        let reconnected = TokenSet {
+            access_token: "ya29-reconnected".into(),
+            refresh_token: Some("rt-new".into()),
+            expires_at_ms: Some(NOW + 3_600_000),
+            token_type: "Bearer".into(),
+            scope: None,
+        };
+        store.store("alice", "gmail", &reconnected).unwrap();
+        assert_eq!(gmail_invalidation(&store), None);
+        assert_eq!(r.token(Some("alice"), "gmail").unwrap(), "ya29-reconnected");
+    }
+
+    #[test]
+    fn invalidation_reason_is_truncated() {
+        // Motif borné : une réponse d'erreur géante n'est pas stockée telle quelle.
+        let store = store_with_alice_gmail(Some(NOW - 1), Some("rt-alice"));
+        let huge = format!("invalid_grant {}", "é".repeat(5_000));
+        let refresher = Arc::new(MockRefresher::revoking(&huge));
+        let _ = refreshing(&store, &refresher).token(Some("alice"), "gmail");
+        let reason = gmail_invalidation(&store).unwrap().reason;
+        assert_eq!(reason.chars().count(), MAX_REASON_CHARS + 1, "+ « … »");
+        assert!(reason.ends_with('…'));
+    }
+
+    /// Store qui exécute la décision puis échoue à l'écrire (commit perdu).
+    struct LosesWrites(Arc<dyn ConnectorTokenStore + Send + Sync>);
+    impl ConnectorTokenStore for LosesWrites {
+        fn store(&self, u: &str, p: &str, t: &TokenSet) -> CoreResult<()> {
+            self.0.store(u, p, t)
+        }
+        fn load(&self, u: &str, p: &str) -> CoreResult<Option<TokenSet>> {
+            self.0.load(u, p)
+        }
+        fn delete(&self, u: &str, p: &str) -> CoreResult<()> {
+            self.0.delete(u, p)
+        }
+        fn list_by_user(&self, u: &str) -> CoreResult<Vec<String>> {
+            self.0.list_by_user(u)
+        }
+        fn update_locked(
+            &self,
+            u: &str,
+            p: &str,
+            update: &mut dyn FnMut(Option<StoredCredential>) -> CredentialUpdate,
+        ) -> CoreResult<()> {
+            self.0.update_locked(u, p, &mut |current| {
+                update(current);
+                CredentialUpdate::Keep
+            })?;
+            Err(Error::Invalid("storage: commit perdu".into()))
+        }
+    }
+
+    #[test]
+    fn refreshed_token_is_used_even_if_it_cannot_be_persisted() {
+        let inner = store_with_alice_gmail(Some(NOW - 1), Some("rt-alice"));
+        let store: Arc<dyn ConnectorTokenStore + Send + Sync> =
+            Arc::new(LosesWrites(Arc::clone(&inner)));
+        let refresher = Arc::new(MockRefresher::ok("ya29-new"));
+        assert_eq!(
+            refreshing(&store, &refresher)
+                .token(Some("alice"), "gmail")
+                .unwrap(),
+            "ya29-new"
+        );
+        assert_eq!(
+            inner.load("alice", "gmail").unwrap().unwrap().access_token,
+            "ya29-old"
+        );
+    }
+
+    #[test]
+    fn lock_error_before_any_decision_is_a_read_error() {
+        // `load` répond (token expiré) mais le verrou échoue.
+        struct LockFails(Arc<dyn ConnectorTokenStore + Send + Sync>);
+        impl ConnectorTokenStore for LockFails {
+            fn store(&self, u: &str, p: &str, t: &TokenSet) -> CoreResult<()> {
+                self.0.store(u, p, t)
+            }
+            fn load(&self, u: &str, p: &str) -> CoreResult<Option<TokenSet>> {
+                self.0.load(u, p)
+            }
+            fn delete(&self, u: &str, p: &str) -> CoreResult<()> {
+                self.0.delete(u, p)
+            }
+            fn list_by_user(&self, u: &str) -> CoreResult<Vec<String>> {
+                self.0.list_by_user(u)
+            }
+            fn update_locked(
+                &self,
+                _: &str,
+                _: &str,
+                _: &mut dyn FnMut(Option<StoredCredential>) -> CredentialUpdate,
+            ) -> CoreResult<()> {
+                Err(Error::Invalid("storage: lock timeout".into()))
+            }
+        }
+        let store: Arc<dyn ConnectorTokenStore + Send + Sync> = Arc::new(LockFails(
+            store_with_alice_gmail(Some(NOW - 1), Some("rt-alice")),
+        ));
+        let refresher = Arc::new(MockRefresher::ok("ya29-new"));
         let err = refreshing(&store, &refresher)
             .with_fallback(Arc::new(resolver("global-token")))
             .token(Some("alice"), "gmail")
             .unwrap_err();
         assert!(
-            err.contains("invalid_grant") && err.contains("/credentials/gmail/authorize"),
+            err.contains("impossible") && err.contains("lock timeout"),
             "{err}"
         );
-        let stored = store.load("alice", "gmail").unwrap().unwrap();
-        assert_eq!(stored.access_token, "ya29-old");
+        assert!(refresher.calls().is_empty());
+    }
+
+    #[test]
+    fn replicas_sharing_a_store_refresh_only_once() {
+        // Deux résolveurs = deux répliques (verrous in-process distincts) :
+        // seul le verrou du store les sérialise.
+        let store = store_with_alice_gmail(Some(NOW - 1), Some("rt-alice"));
+        let refresher = Arc::new(MockRefresher {
+            delay_ms: 50,
+            ..MockRefresher::ok("ya29-new")
+        });
+        let replicas = [
+            refreshing(&store, &refresher),
+            refreshing(&store, &refresher),
+        ];
+        let barrier = std::sync::Barrier::new(8);
+        let tokens: Vec<String> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..8)
+                .map(|i| {
+                    let (replica, barrier) = (&replicas[i % 2], &barrier);
+                    scope.spawn(move || {
+                        barrier.wait();
+                        replica.token(Some("alice"), "gmail").unwrap()
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        assert!(tokens.iter().all(|t| t == "ya29-new"), "{tokens:?}");
+        assert_eq!(refresher.calls().len(), 1, "un seul appel au provider");
     }
 
     #[test]
