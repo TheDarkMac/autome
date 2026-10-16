@@ -19,6 +19,7 @@ pub mod accounts;
 pub mod admin;
 pub mod auth;
 pub mod client_ip;
+pub mod cors;
 pub mod credentials;
 pub mod mail;
 pub mod metrics;

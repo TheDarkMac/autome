@@ -57,6 +57,7 @@ cp .env.example .env
 | `AUTOME_RUN_TIMEOUT_SECS` | Worker : au-delà, un run encore `running` est clos en `failed` (min. 60) | `3600` | > durée du plus long run |
 | `AUTOME_SMTP_URL` | Relais SMTP des emails (mot de passe oublié) : `smtps://user:pass@hôte` (TLS, 465) ou `smtp://hôte:587?tls=required` (STARTTLS). Contient un mot de passe : à mettre dans un secret | *(non défini : liens journalisés en `dev`)* | **requis pour le mot de passe oublié** (sinon 503) |
 | `AUTOME_MAIL_FROM` | Expéditeur des emails, ex. `Autome <no-reply@exemple.fr>` | *(non défini)* | obligatoire avec `AUTOME_SMTP_URL` |
+| `AUTOME_CORS_ORIGINS` | Origines du **frontend** autorisées à appeler l'API depuis le navigateur (`scheme://hôte[:port]`, séparées par des virgules ; ni joker, ni chemin — refus de démarrer sinon). Vide = aucune | `http://localhost:5173,http://localhost:8081` | **obligatoire** si le frontend est servi sur une autre origine que l'API |
 | `AUTOME_PUBLIC_URL` | URL publique du **frontend**, base des liens envoyés par email (jamais déduite de l'en-tête `Host`) | `http://localhost:5173` | obligatoire avec `AUTOME_SMTP_URL` |
 | `AUTOME_CONNECTOR_CREDENTIALS` | Worker : `per_user` (token du propriétaire du run) ou `single_tenant` (repli sur `AUTOME_CONNECTOR_TOKEN_<PROVIDER>`) | `per_user` | `per_user` (instance partagée) |
 
@@ -300,7 +301,9 @@ npm run dev        # serveur de dev Vite (port affiché dans la console)
 ```
 
 Pour un build de production statique : `npm run build` (sortie dans `dist/`).
-L'URL du backend est injectée au build via `VITE_API_URL`.
+L'URL du backend est injectée au build via `VITE_API_URL`. Le frontend et
+l'API étant sur deux origines, l'API doit autoriser celle du frontend
+(`AUTOME_CORS_ORIGINS` ; en `dev`, `:5173` et `:8081` le sont par défaut).
 
 ### B.4 HTTPS local (optionnel)
 
@@ -747,6 +750,7 @@ npm run test       # Vitest
 | `TLS partiellement configuré` au démarrage | Une seule des deux variables TLS positionnée | Définir `AUTOME_TLS_CERT` **et** `AUTOME_TLS_KEY`, ou aucune |
 | « Mot de passe oublié » répond 503 / « pas disponible sur ce serveur » | Profil `prod` sans `AUTOME_SMTP_URL` | Définir `AUTOME_SMTP_URL`, `AUTOME_MAIL_FROM` et `AUTOME_PUBLIC_URL` |
 | Aucun email de réinitialisation reçu | Relais SMTP refusé/injoignable (log `envoi du lien de réinitialisation impossible`), quota atteint, ou adresse sans compte | Vérifier `AUTOME_SMTP_URL` et les journaux de l'API ; en `dev` sans SMTP, le lien est dans les journaux |
+| Console du navigateur : `blocked by CORS policy` / préflight `OPTIONS` en 405 ; l'interface ne charge rien | Origine du frontend absente de `AUTOME_CORS_ORIGINS` (aucune par défaut en `prod`) | Ajouter l'origine exacte du frontend (schéma + hôte + port) à `AUTOME_CORS_ORIGINS` et redémarrer l'API |
 | Port déjà utilisé (`address already in use`) | 8080/8081/3000/9090/5432/15672 occupé | Libérer le port ou ajuster `APP_HTTP_ADDR` / les mappings du compose |
 | `docker compose` échoue à joindre `db`/`queue` | Services pas encore *healthy* | Attendre les healthchecks (`depends_on … service_healthy`) puis relancer |
 | Pods `api`/`worker` en `ImagePullBackOff` | Tag/registry d'image absent | Vérifier que les images GHCR existent (CD passée) ou ajuster les `image:` |
