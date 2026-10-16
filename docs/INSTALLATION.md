@@ -359,6 +359,25 @@ opposées :
 - **Compose** : healthchecks sur `/readyz` (API) et `/livez` (worker) ; le
   worker attend que l'API soit *prête* (migrations appliquées) pour démarrer.
 
+**Arrêt gracieux de l'API (#194).** Sur `SIGTERM` (déploiement progressif,
+réduction d'échelle, éviction) ou `SIGINT` :
+
+1. `/readyz` répond aussitôt **503 `{"status":"draining"}`** ; `/livez` reste
+   200 (le pod ne doit pas être tué en plein arrêt) ;
+2. pendant `AUTOME_SHUTDOWN_DELAY_SECS` (défaut **5 s**), l'API **continue de
+   servir** normalement : k8s retire le pod des endpoints en parallèle du
+   signal, et l'ingress peut encore lui envoyer des requêtes quelques secondes ;
+3. elle cesse ensuite d'accepter des connexions et laisse finir les requêtes
+   en cours, au plus `AUTOME_SHUTDOWN_TIMEOUT_SECS` (défaut **20 s**) —
+   au-delà, elles sont interrompues (avertissement dans les logs) ;
+4. sortie avec le code 0 (`autome-api arrêtée`).
+
+HTTP et HTTPS se comportent de même. La période de grâce de l'orchestrateur
+doit dépasser `délai + drain` : `terminationGracePeriodSeconds: 35` dans
+`k8s/api.yaml`, `stop_grace_period: 35s` dans compose. En local, `Ctrl-C`
+suit la même séquence (`AUTOME_SHUTDOWN_DELAY_SECS=0` pour s'arrêter sans
+attendre).
+
 ### C.6 Monitoring
 
 Le namespace inclut **Prometheus** (scrape de l'API) et **Grafana** (datasource
