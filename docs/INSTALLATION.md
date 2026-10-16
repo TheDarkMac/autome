@@ -138,8 +138,10 @@ relit au moment du run. Le `provider_id` OAuth doit être le préfixe de l'actio
   provider (`invalid_grant` : refresh token révoqué, expiré ou déjà consommé) :
   la credential est marquée invalide (`invalidated_at_ms`, `invalid_reason`,
   migration `0018`) et les runs suivants échouent **sans rappeler le
-  provider** ; reconnecter le compte (`/credentials/<provider>/authorize`) efface
-  la marque. Une erreur transitoire (réseau, 5xx) ne marque rien : le run
+  provider** ; `GET /credentials` l'expose (`needs_reconnect`,
+  `invalidated_at_ms` — le motif brut reste en base) et l'onglet Connecteurs
+  affiche le badge « À reconnecter » ; reconnecter le compte
+  (`/credentials/<provider>/authorize`) efface la marque. Une erreur transitoire (réseau, 5xx) ne marque rien : le run
   suivant retente.
 - **Mode mono-tenant (opt-in)** : `AUTOME_CONNECTOR_CREDENTIALS=single_tenant`
   sur le worker rétablit le repli sur un token **global** par provider

@@ -333,7 +333,9 @@ Le worker ne construit jamais l'`*Auth` à partir d'un secret global : le
   le verrou exclusif du store (`ConnectorTokenStore::update_locked` : verrou de
   ligne PostgreSQL partagé par les répliques). Un `invalid_grant`
   (`RefreshError::Revoked`) marque la credential invalide jusqu'à la
-  reconnexion ; les autres échecs (`RefreshError::Failed`) sont retentés au run
+  reconnexion (`GET /credentials` renvoie alors `needs_reconnect: true` et
+  `invalidated_at_ms`, jamais le motif du provider ; l'onglet Connecteurs
+  affiche « À reconnecter », #213) ; les autres échecs (`RefreshError::Failed`) sont retentés au run
   suivant. Un token sans `expires_at_ms` n'est jamais rafraîchi. Un connecteur
   n'a donc pas à gérer l'expiration lui-même (un access token révoqué côté
   provider avant son expiration reste, lui, une erreur HTTP remontée par
