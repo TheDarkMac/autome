@@ -91,7 +91,10 @@ flowchart TB
 
 - **Deux binaires** seulement : `api` et `worker`. Le **scheduler** (F5.3) et
   l'**ingress webhook** ne sont pas des services séparés : ce sont des modules
-  (`core::scheduler`, trigger webhook) hébergés par ces binaires.
+  (`core::scheduler`, `api::webhooks`) hébergés par ces binaires. L'ingress
+  (`/hooks/{token}`, #202) résout l'URL secrète vers `(propriétaire, workflow,
+  nœud)` puis dispatche un run `trigger_type: "webhook"` dont le payload
+  devient la sortie du nœud trigger dans le worker.
 - **engine** est agnostique : il dépend de **traits** de `core` (queue, stores,
   connecteurs) et ne connaît ni RabbitMQ ni PostgreSQL ni Slack directement.
 
@@ -283,7 +286,8 @@ erDiagram
 - JWT + RBAC au niveau API (F6.1, F6.5) ; OAuth2 PKCE pour les connecteurs (F6.2).
 - Credentials chiffrés au repos (AES-256-GCM en enveloppe, F6.3), jamais
   loggués ni renvoyés en clair ; KMS managé = cible.
-- Vérification de signature des webhooks entrants (ex. GitHub, F4.4).
+- Webhooks entrants : URL secrète par nœud (seul le hash du token est stocké),
+  signature GitHub optionnelle (F4.4, #202), quota par URL.
 - Audit log des actions sensibles (F6.6).
 
 **Observabilité & livraison**

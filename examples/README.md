@@ -9,7 +9,7 @@ transport HTTP factice (aucun réseau).
 | Exemple | Graphe | Test | Feature |
 |---|---|---|---|
 | **Slack → Gmail → Notion** — lit le dernier message d'un canal Slack, en envoie un résumé par email, puis l'archive dans Notion | [`workflows/slack-to-gmail-notion.json`](workflows/slack-to-gmail-notion.json) | [`crates/engine/tests/example_slack_gmail_notion.rs`](../crates/engine/tests/example_slack_gmail_notion.rs) | F12.1 |
-| **Webhook GitHub → Slack** — authentifie un webhook GitHub (`issues/opened`) puis notifie un canal Slack | [`workflows/github-webhook-to-slack.json`](workflows/github-webhook-to-slack.json) | [`crates/engine/tests/example_github_webhook_to_slack.rs`](../crates/engine/tests/example_github_webhook_to_slack.rs) | F12.2 |
+| **Webhook GitHub → Slack** — authentifie un webhook GitHub (`issues/opened`) puis notifie un canal Slack ; déployé, le nœud `entry` reçoit son URL secrète via `GET /workflows/{id}/webhooks` (`signature: "github"`, cf. [INSTALLATION](../docs/INSTALLATION.md#déclencheurs-webhook-202)) | [`workflows/github-webhook-to-slack.json`](workflows/github-webhook-to-slack.json) | [`crates/engine/tests/example_github_webhook_to_slack.rs`](../crates/engine/tests/example_github_webhook_to_slack.rs) | F12.2 |
 | **Scheduler → fetch API → stockage** — un cron déclenche un fetch HTTP d'une API, puis stocke l'enregistrement dérivé via un POST | [`workflows/scheduler-fetch-store.json`](workflows/scheduler-fetch-store.json) | [`crates/engine/tests/example_scheduler_fetch_store.rs`](../crates/engine/tests/example_scheduler_fetch_store.rs) | F12.3 |
 
 Lancer les exemples :

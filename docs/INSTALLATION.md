@@ -421,6 +421,47 @@ niveau d'un module sans redéployer l'image : `RUST_LOG=info,autome_worker=debug
 
 ---
 
+## Déclencheurs webhook (#202)
+
+Chaque nœud `trigger_type: "webhook"` d'un workflow enregistré reçoit une
+**URL secrète** : `POST <API>/hooks/<token>` (64 caractères hexadécimaux),
+**sans** jeton Bearer — connaître l'URL suffit à déclencher le workflow.
+
+- **Obtenir l'URL** : `GET /workflows/{id}/webhooks` (Bearer, permission
+  `runs.execute`) renvoie, pour chaque nœud webhook, `path` (`/hooks/…`),
+  `method` et `signing_secret` ; le panneau du nœud dans l'éditeur l'affiche
+  aussi (copie, secret, rotation). L'URL est créée à la première lecture.
+- **Rotation** : `POST /workflows/{id}/webhooks/{node_id}/rotate` — nouvelle
+  URL et nouveau secret, les anciens cessent aussitôt de fonctionner. Retirer
+  le nœud du workflow ou supprimer le workflow supprime aussi l'URL.
+- **Paramètres du nœud** : `method` (défaut `POST`, sinon 405) ;
+  `signature: "github"` exige un `X-Hub-Signature-256` valide calculé avec le
+  `signing_secret` (à coller dans le champ « Secret » du webhook GitHub, type
+  de contenu `application/json`), sinon 401 ; `event` (ex. `issues`) : les
+  autres valeurs de `X-GitHub-Event` (dont `ping`) sont acquittées **204**
+  sans run. `path` n'est qu'un libellé.
+- **Réponses** : 202 `{ run_id, status }` ; 404 pour une URL inconnue (ou
+  dont le nœud/workflow a disparu) ; 413 au-delà de 1 Mio ; 429 +
+  `Retry-After` au-delà de `AUTOME_WEBHOOK_MAX_PER_WINDOW` requêtes
+  (défaut 1000) par URL et par fenêtre de 15 min, compteur partagé entre
+  répliques en `postgres`.
+- **Dans le workflow**, le nœud trigger produit
+  `{ node_id, method, query, headers, body }` : corps JSON parsé (sinon texte,
+  `null` si vide), en-têtes en minuscules **sans** `authorization`, `cookie`,
+  signatures ni en-têtes d'adresse IP. Exemple :
+  `{{ hook.body.issue.title }}` dans les params d'une action.
+
+```bash
+curl -X POST "$API/hooks/<token>" -H 'Content-Type: application/json' \
+  -d '{"issue": {"title": "Bug"}}'
+```
+
+**Secrets** : la base ne contient que le sel de chaque URL et le SHA-256 du
+token ; token et secret de signature sont dérivés d'`ENCRYPTION_KEY` (table
+`webhook_endpoints`, migration `0016`). Changer `ENCRYPTION_KEY` change donc
+toutes les URL (à redistribuer aux émetteurs). Les journaux affichent
+`/hooks/{token}`, jamais le token.
+
 ## Authentification (comptes & jetons)
 
 L'API émet ses propres JWT (HS256, signés avec `JWT_SECRET`). Les endpoints de

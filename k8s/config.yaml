@@ -34,6 +34,8 @@ data:
   # Quotas par IP et par fenêtre de 15 min (0 = désactivé).
   AUTOME_LOGIN_IP_MAX_ATTEMPTS: "50"
   AUTOME_SIGNUP_IP_MAX_ATTEMPTS: "10"
+  # Requêtes par URL de webhook et par fenêtre de 15 min (#202).
+  AUTOME_WEBHOOK_MAX_PER_WINDOW: "1000"
 ---
 # Secrets (F10.3) — VALEURS DE DÉMONSTRATION, à remplacer impérativement
 # avant tout usage réel (SealedSecrets / External Secrets / Vault…).
