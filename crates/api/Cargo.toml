@@ -37,6 +37,8 @@ tracing = { workspace = true }
 hmac = { workspace = true }
 sha2 = { workspace = true }
 ipnet = { workspace = true }
+# URL secrètes des webhooks (#202) : sel aléatoire
+rand = { workspace = true }
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

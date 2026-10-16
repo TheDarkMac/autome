@@ -19,13 +19,15 @@ use autome_connectors::{
 };
 use autome_core::{
     Config, InMemoryLoginThrottle, InMemoryPermissionStore, InMemoryRevocationStore,
-    InMemoryRunStateStore, InMemoryUserStore, InMemoryWorkflowRepository, LoginThrottleStore,
-    NoopAuditSink, Queue, QueueRunDispatcher, Result, RevocationStore, RunDispatcher,
-    RunStateStore, UserStore, WorkflowRepository,
+    InMemoryRunStateStore, InMemoryUserStore, InMemoryWebhookEndpointStore,
+    InMemoryWorkflowRepository, LoginThrottleStore, NoopAuditSink, Queue, QueueRunDispatcher,
+    Result, RevocationStore, RunDispatcher, RunStateStore, UserStore, WebhookEndpointStore,
+    WorkflowRepository,
 };
 use autome_persistence::{
     connect, connector_cipher, run_migrations, PgAuditSink, PgConnectorTokenStore, PgLoginThrottle,
-    PgPermissionStore, PgRevocationStore, PgRunStateStore, PgUserStore, PgWorkflowRepository,
+    PgPermissionStore, PgRevocationStore, PgRunStateStore, PgUserStore, PgWebhookEndpointStore,
+    PgWorkflowRepository,
 };
 
 use crate::auth::{token_service_from_config, AuthState};
@@ -74,6 +76,8 @@ pub struct Backends {
     /// Compteur anti-bruteforce du login (partagé entre répliques en
     /// `postgres`, #182).
     pub login_throttle: Arc<dyn LoginThrottleStore>,
+    /// Endpoints des déclencheurs webhook (#202).
+    pub webhooks: Arc<dyn WebhookEndpointStore>,
 }
 
 /// Assemble les backends. En `Postgres`, **un seul pool** est partagé par tous
@@ -106,6 +110,7 @@ pub fn build_backends(
                 )))?,
                 users: Arc::new(InMemoryUserStore::new(permissions)),
                 login_throttle: Arc::new(InMemoryLoginThrottle::new()),
+                webhooks: Arc::new(InMemoryWebhookEndpointStore::new()),
             })
         }
         PersistenceMode::Postgres => {
@@ -130,6 +135,7 @@ pub fn build_backends(
                     connector_cipher(config),
                 )))?,
                 login_throttle: Arc::new(PgLoginThrottle::new(pool.clone())),
+                webhooks: Arc::new(PgWebhookEndpointStore::new(pool.clone())),
                 users: Arc::new(PgUserStore::new(pool)),
             })
         }

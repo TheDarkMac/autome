@@ -24,4 +24,5 @@ pub mod runs;
 pub mod runtime;
 pub mod shutdown;
 pub mod tls;
+pub mod webhooks;
 pub mod workflows;
