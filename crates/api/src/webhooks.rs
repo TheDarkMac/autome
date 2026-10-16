@@ -793,6 +793,7 @@ mod tests {
             name: id.into(),
             nodes: vec![
                 Node {
+                    position: None,
                     id: NodeId::new("hook"),
                     name: "Webhook GitHub".into(),
                     kind: NodeKind::Trigger {
@@ -801,6 +802,7 @@ mod tests {
                     params,
                 },
                 Node {
+                    position: None,
                     id: NodeId::new("manual"),
                     name: "manuel".into(),
                     kind: NodeKind::Trigger {

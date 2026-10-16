@@ -75,6 +75,7 @@ fn github_workflow(id: &str) -> WorkflowGraph {
         name: id.into(),
         nodes: vec![
             Node {
+                position: None,
                 id: NodeId::new("entry"),
                 name: "entry".into(),
                 kind: NodeKind::Trigger {
@@ -83,6 +84,7 @@ fn github_workflow(id: &str) -> WorkflowGraph {
                 params: serde_json::Value::Null,
             },
             Node {
+                position: None,
                 id: NodeId::new("issue"),
                 name: "issue".into(),
                 kind: NodeKind::Action {

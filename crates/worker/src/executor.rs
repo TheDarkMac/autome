@@ -465,6 +465,7 @@ mod tests {
     fn slack_workflow(id: &str) -> WorkflowGraph {
         let mut wf = trigger_only(id);
         wf.nodes.push(Node {
+            position: None,
             id: NodeId::new("notify"),
             name: "notify".into(),
             kind: NodeKind::Action {
@@ -485,6 +486,7 @@ mod tests {
             id: WorkflowId::new(id),
             name: id.into(),
             nodes: vec![Node {
+                position: None,
                 id: NodeId::new("entry"),
                 name: "entry".into(),
                 kind: NodeKind::Trigger {
@@ -499,6 +501,7 @@ mod tests {
     fn unsupported_action(id: &str) -> WorkflowGraph {
         let mut wf = trigger_only(id);
         wf.nodes.push(Node {
+            position: None,
             id: NodeId::new("act"),
             name: "act".into(),
             kind: NodeKind::Action {
@@ -594,6 +597,7 @@ mod tests {
         // cible avant toute connexion : le run échoue avec le motif SSRF.
         let mut wf = trigger_only("wf-ssrf");
         wf.nodes.push(Node {
+            position: None,
             id: NodeId::new("act"),
             name: "act".into(),
             kind: NodeKind::Action {
@@ -963,6 +967,7 @@ mod tests {
     fn http_workflow(id: &str) -> WorkflowGraph {
         let mut wf = trigger_only(id);
         wf.nodes.push(Node {
+            position: None,
             id: NodeId::new("call"),
             name: "call".into(),
             kind: NodeKind::Action {

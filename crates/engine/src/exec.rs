@@ -746,6 +746,7 @@ mod tests {
 
     fn n(id: &str) -> Node {
         Node {
+            position: None,
             id: NodeId::new(id),
             name: id.into(),
             kind: NodeKind::Action {
@@ -756,6 +757,7 @@ mod tests {
     }
     fn trig(id: &str) -> Node {
         Node {
+            position: None,
             id: NodeId::new(id),
             name: id.into(),
             kind: NodeKind::Trigger {
@@ -845,6 +847,7 @@ mod tests {
 
     fn ctrl(id: &str, kind: NodeKind, params: Value) -> Node {
         Node {
+            position: None,
             id: NodeId::new(id),
             name: id.into(),
             kind,
@@ -1229,6 +1232,7 @@ mod tests {
     #[test]
     fn runner_receives_resolved_params() {
         let action = Node {
+            position: None,
             id: NodeId::new("a"),
             name: "a".into(),
             kind: NodeKind::Action {
@@ -1257,6 +1261,7 @@ mod tests {
     // --- F2.7 : gestion d'erreurs ---------------------------------------
     fn act_p(id: &str, params: Value) -> Node {
         Node {
+            position: None,
             id: NodeId::new(id),
             name: id.into(),
             kind: NodeKind::Action {

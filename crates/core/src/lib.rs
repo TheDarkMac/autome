@@ -55,7 +55,7 @@ pub use webhook::{
 pub use workflow::repo::{
     InMemoryWorkflowRepository, Pagination, WorkflowPage, WorkflowRepository, LEGACY_NAMESPACE,
 };
-pub use workflow::{Edge, Node, NodeKind, WorkflowGraph, WorkflowId};
+pub use workflow::{Edge, Node, NodeKind, NodePosition, WorkflowGraph, WorkflowId};
 
 use thiserror::Error;
 

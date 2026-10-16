@@ -163,6 +163,7 @@ mod tests {
     fn resolves_nested_params() {
         let c = ctx();
         let node = Node {
+            position: None,
             id: NodeId::new("a"),
             name: "a".into(),
             kind: NodeKind::Action {

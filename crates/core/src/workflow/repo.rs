@@ -175,6 +175,7 @@ mod tests {
             id: WorkflowId::new(id),
             name: format!("workflow {id}"),
             nodes: vec![Node {
+                position: None,
                 id: NodeId::new("entry"),
                 name: "entry".into(),
                 kind: NodeKind::Trigger {
