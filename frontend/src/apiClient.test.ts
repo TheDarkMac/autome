@@ -4,7 +4,7 @@ import { resolve } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 
 import { ApiError } from "./api";
-import { API_PATHS, buildPath, createApiClient } from "./apiClient";
+import { API_PATHS, buildPath, canAdministerUsers, createApiClient } from "./apiClient";
 import type { WireGraph } from "./graph";
 
 interface Call {
@@ -187,5 +187,71 @@ describe("createApiClient — runs & credentials", () => {
     const authFetch = vi.fn(async () => json({ items: [] })) as unknown as typeof fetch;
     await createApiClient(authFetch).listCredentials();
     expect(authFetch).toHaveBeenCalledOnce();
+  });
+});
+
+describe("createApiClient — administration (#208)", () => {
+  const ALICE = {
+    id: "u-1",
+    email: "alice@example.io",
+    role: "viewer",
+    permissions: ["runs.read", "workflows.read"],
+    disabled: false,
+    created_at_ms: 0,
+  };
+
+  it("me : GET /auth/me", async () => {
+    const me = { id: "u-1", email: "a@b.io", role: "admin", permissions: ["*"] };
+    const { fetchImpl, calls } = mockFetch([json(me)]);
+    expect(await createApiClient(fetchImpl).me()).toEqual(me);
+    expect(calls[0]!.url).toMatch(/\/auth\/me$/);
+  });
+
+  it("listUsers : GET /admin/users avec filtre rogné et pagination", async () => {
+    const { fetchImpl, calls } = mockFetch([
+      json({ items: [ALICE], total: 1, offset: 0, limit: 10 }),
+      json({ items: [], total: 0, offset: 0, limit: 50 }),
+    ]);
+    const client = createApiClient(fetchImpl);
+    const page = await client.listUsers({ q: " ali ", offset: 0, limit: 10 });
+    expect(calls[0]!.url).toContain("/admin/users?q=ali&offset=0&limit=10");
+    expect(page.items[0]!.email).toBe("alice@example.io");
+    await client.listUsers({ q: "  " });
+    expect(calls[1]!.url).toMatch(/\/admin\/users$/);
+  });
+
+  it("setUserRole / disableUser / enableUser / logoutUser", async () => {
+    const { fetchImpl, calls } = mockFetch([
+      json(ALICE),
+      json({ ...ALICE, disabled: true }),
+      json(ALICE),
+      new Response(null, { status: 204 }),
+    ]);
+    const client = createApiClient(fetchImpl);
+    await client.setUserRole("u/1", "viewer");
+    expect(calls[0]!.init.method).toBe("PUT");
+    expect(calls[0]!.url).toContain("/admin/users/u%2F1/role");
+    expect(JSON.parse(String(calls[0]!.init.body))).toEqual({ role: "viewer" });
+    expect((await client.disableUser("u-1")).disabled).toBe(true);
+    expect(calls[1]!.url).toContain("/admin/users/u-1/disable");
+    await client.enableUser("u-1");
+    expect(calls[2]!.url).toContain("/admin/users/u-1/enable");
+    await client.logoutUser("u-1");
+    expect(calls[3]!.init.method).toBe("POST");
+    expect(calls[3]!.url).toContain("/admin/users/u-1/logout-all");
+  });
+
+  it("un refus garde son statut HTTP", async () => {
+    const { fetchImpl } = mockFetch([new Response("forbidden", { status: 409 })]);
+    await expect(createApiClient(fetchImpl).disableUser("me")).rejects.toMatchObject({
+      status: 409,
+    });
+  });
+
+  it("canAdministerUsers : `users.admin` ou `*`", () => {
+    expect(canAdministerUsers(["*"])).toBe(true);
+    expect(canAdministerUsers(["users.admin"])).toBe(true);
+    expect(canAdministerUsers(["workflows.read", "workflows.write"])).toBe(false);
+    expect(canAdministerUsers([])).toBe(false);
   });
 });

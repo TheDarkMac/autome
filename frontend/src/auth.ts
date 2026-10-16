@@ -17,6 +17,7 @@
 //   - POST /auth/password/forgot { email }          → 202 (compte existant ou non)
 //   - POST /auth/password/reset  { token, new_password } → 204
 //   - GET  /auth/whoami   (Bearer access)          → "hello <sub>"
+//   - GET  /auth/me       (Bearer access)          → { id, email, role, permissions } (cf. apiClient)
 //
 // `fetchImpl` est injectable partout pour les tests.
 
@@ -299,6 +300,9 @@ async function postCredentials(
   );
   if (res.status === 401) {
     throw new ApiError("email ou mot de passe incorrect", 401);
+  }
+  if (res.status === 403) {
+    throw new ApiError("ce compte est suspendu : contactez un administrateur", 403);
   }
   if (res.status === 409) {
     throw new ApiError("un compte existe déjà pour cet email", 409);

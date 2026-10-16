@@ -4,6 +4,120 @@
  */
 
 export interface paths {
+    "/admin/users": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** `GET /admin/users` — comptes paginés, du plus ancien au plus récent. */
+        get: operations["list_users"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/admin/users/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** `GET /admin/users/{id}` — un compte et ses permissions. */
+        get: operations["get_user"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/admin/users/{id}/disable": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * `POST /admin/users/{id}/disable` — suspend le compte et ferme toutes ses
+         *     sessions.
+         */
+        post: operations["disable_user"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/admin/users/{id}/enable": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * `POST /admin/users/{id}/enable` — réactive un compte suspendu (ses
+         *     anciennes sessions restent fermées).
+         */
+        post: operations["enable_user"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/admin/users/{id}/logout-all": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * `POST /admin/users/{id}/logout-all` — ferme toutes les sessions du
+         *     compte, sur tous ses appareils.
+         */
+        post: operations["logout_user"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/admin/users/{id}/role": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /**
+         * `PUT /admin/users/{id}/role` — remplace les permissions du compte par
+         *     celles du rôle.
+         */
+        put: operations["set_role"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/auth/login": {
         parameters: {
             query?: never;
@@ -62,6 +176,26 @@ export interface paths {
          *     valide. Réponse 204.
          */
         post: operations["logout_all"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/auth/me": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * `GET /auth/me` — l'utilisateur authentifié, son rôle et ses permissions
+         *     (le frontend en déduit les écrans à proposer, ex. l'administration).
+         */
+        get: operations["me"];
+        put?: never;
+        post?: never;
         delete?: never;
         options?: never;
         head?: never;
@@ -429,6 +563,24 @@ export interface paths {
 export type webhooks = Record<string, never>;
 export interface components {
     schemas: {
+        /** @description Compte vu par l'administration — jamais le hash du mot de passe. */
+        AdminUser: {
+            /**
+             * Format: int64
+             * @description Création du compte (millisecondes Unix).
+             */
+            created_at_ms: number;
+            /** @description Compte suspendu. */
+            disabled: boolean;
+            /** @description Email normalisé. */
+            email: string;
+            /** @description Identifiant (`claims.sub`). */
+            id: string;
+            /** @description Permissions accordées, triées. */
+            permissions: string[];
+            /** @description Rôle déduit des permissions : `admin`, `editor`, `viewer` ou `custom`. */
+            role: string;
+        };
         /**
          * @description Réponse de `POST /credentials/{provider}/authorize` (PKCE côté SPA :
          *     le caller conserve `state` + `code_verifier` jusqu'au callback).
@@ -536,6 +688,17 @@ export interface components {
             /** @description Total avant pagination. */
             total: number;
         };
+        /** @description Réponse de [`me`] : l'utilisateur authentifié et ses droits. */
+        MeResponse: {
+            /** @description Email normalisé. */
+            email: string;
+            /** @description Identifiant (`claims.sub`). */
+            id: string;
+            /** @description Permissions accordées, triées (`*` = toutes). */
+            permissions: string[];
+            /** @description Rôle déduit des permissions : `admin`, `editor`, `viewer` ou `custom`. */
+            role: string;
+        };
         /** @description Description publique d'un provider — pas de `client_secret`. */
         ProviderDto: {
             /** @description Identifiant stable du provider. */
@@ -564,6 +727,11 @@ export interface components {
             /** @description Jeton reçu par email (fragment `#reset=` du lien). */
             token: string;
         };
+        /** @description Corps de [`set_role`]. */
+        RoleBody: {
+            /** @description `admin`, `editor` ou `viewer`. */
+            role: string;
+        };
         /** @description Paire de jetons émise par signup/login/refresh. */
         TokenResponse: {
             /** @description JWT d'accès, à présenter en `Authorization: Bearer`. */
@@ -577,6 +745,17 @@ export interface components {
             refresh_token: string;
             /** @description Toujours `Bearer`. */
             token_type: string;
+        };
+        /** @description Page de [`list_users`]. */
+        UserListResponse: {
+            /** @description Comptes de la page, du plus ancien au plus récent. */
+            items: components["schemas"]["AdminUser"][];
+            /** @description Limite appliquée. */
+            limit: number;
+            /** @description Offset appliqué. */
+            offset: number;
+            /** @description Total des comptes correspondant au filtre. */
+            total: number;
         };
         /** @description Réponse d'un webhook accepté. */
         WebhookAccepted: {
@@ -617,6 +796,290 @@ export interface components {
 }
 export type $defs = Record<string, never>;
 export interface operations {
+    list_users: {
+        parameters: {
+            query?: {
+                /** @description Filtre : sous-chaîne de l'email (insensible à la casse). */
+                q?: string | null;
+                /** @description Offset, défaut 0. */
+                offset?: number | null;
+                /** @description Limite, défaut 50, maximum 200. */
+                limit?: number | null;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Page de comptes */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["UserListResponse"];
+                };
+            };
+            /** @description Token absent ou invalide */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Manque `users.admin` */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    get_user: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Identifiant du compte */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Compte */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AdminUser"];
+                };
+            };
+            /** @description Token absent ou invalide */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Manque `users.admin` */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Compte inconnu */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    disable_user: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Identifiant du compte */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Compte suspendu, sessions fermées */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AdminUser"];
+                };
+            };
+            /** @description Token absent ou invalide */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Manque `users.admin`, ou `*` pour un compte super-admin */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Compte inconnu */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Son propre compte */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    enable_user: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Identifiant du compte */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Compte réactivé */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AdminUser"];
+                };
+            };
+            /** @description Token absent ou invalide */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Manque `users.admin`, ou `*` pour un compte super-admin */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Compte inconnu */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    logout_user: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Identifiant du compte */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Sessions fermées */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Token absent ou invalide */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Manque `users.admin`, ou `*` pour un compte super-admin */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Compte inconnu */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    set_role: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Identifiant du compte */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RoleBody"];
+            };
+        };
+        responses: {
+            /** @description Rôle attribué */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AdminUser"];
+                };
+            };
+            /** @description Rôle inconnu */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Token absent ou invalide */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Manque `users.admin`, ou `*` pour le rôle `admin` ou un compte super-admin */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Compte inconnu */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Son propre rôle */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
     login: {
         parameters: {
             query?: never;
@@ -641,6 +1104,13 @@ export interface operations {
             };
             /** @description Identifiants invalides */
             401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Compte suspendu par un administrateur */
+            403: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -704,6 +1174,33 @@ export interface operations {
                 content?: never;
             };
             /** @description Access token absent, invalide ou déjà révoqué */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    me: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Utilisateur courant */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MeResponse"];
+                };
+            };
+            /** @description Access token absent, invalide, révoqué, ou compte suspendu */
             401: {
                 headers: {
                     [name: string]: unknown;

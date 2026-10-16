@@ -1,8 +1,9 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { apiBaseUrl, fetchOpenApi, type OpenApiSpec } from "./api";
-import { createApiClient } from "./apiClient";
+import { canAdministerUsers, createApiClient, type Schemas } from "./apiClient";
 import { fetchCatalog, STATIC_CATALOG, type CatalogItem } from "./catalog";
 import { AccountPanel } from "./AccountPanel";
+import { AdminPanel } from "./AdminPanel";
 import {
   readResetToken,
   requestPasswordReset as apiRequestPasswordReset,
@@ -32,7 +33,7 @@ type Status =
   | { kind: "ok"; spec: OpenApiSpec }
   | { kind: "error"; message: string };
 
-type View = "edit" | "runs" | "connectors" | "account";
+type View = "edit" | "runs" | "connectors" | "account" | "admin";
 
 export interface AppProps {
   /** Options de session (store/impls injectables pour les tests). */
@@ -117,6 +118,26 @@ export function App({
   // Client API typé adossé à l'`authFetch` (F8.7) — identité stable car
   // `authFetch` l'est ; les vues de runs y branchent leurs lectures.
   const api = useMemo(() => createApiClient(authFetch), [authFetch]);
+  // Identité et droits de l'utilisateur (#208) : l'onglet Administration
+  // n'apparaît qu'avec `users.admin`. Un échec laisse simplement l'onglet
+  // masqué (le serveur refuserait de toute façon).
+  const userId = session?.userId ?? null;
+  const [me, setMe] = useState<Schemas["MeResponse"] | null>(null);
+  useEffect(() => {
+    setMe(null);
+    if (!userId) return;
+    let cancelled = false;
+    api.me().then(
+      (m) => {
+        if (!cancelled && Array.isArray(m?.permissions)) setMe(m);
+      },
+      () => undefined,
+    );
+    return () => {
+      cancelled = true;
+    };
+  }, [api, userId]);
+  const isAdmin = me !== null && canAdministerUsers(me.permissions);
   // URL des nœuds webhook du workflow courant (#202).
   const webhooks = useMemo<WebhookActions>(
     () => ({
@@ -133,6 +154,10 @@ export function App({
   const [view, setView] = useState<View>("edit");
   const [graph, setGraph] = useState<WireGraph | null>(null);
   const [selectedRunId, setSelectedRunId] = useState<string | null>(null);
+  // Droits retirés (ou autre compte) pendant que l'onglet est ouvert.
+  useEffect(() => {
+    if (view === "admin" && !isAdmin) setView("edit");
+  }, [view, isAdmin]);
 
   // Polling du run sélectionné (F8.5.d). Inactif quand on est en mode édition.
   const { checkpoint, error: pollError } = useRunPolling(
@@ -231,7 +256,7 @@ export function App({
         </div>
         <div className="flex items-center gap-3 text-sm">
           <span className="text-neutral-500" data-testid="current-user">
-            {session.userId}
+            {me?.email ?? session.userId}
           </span>
           <button
             type="button"
@@ -268,11 +293,22 @@ export function App({
         <BackendStatus status={status} />
       </section>
 
-      <ViewTabs view={view} onChange={setView} />
+      <ViewTabs view={view} onChange={setView} showAdmin={isAdmin} />
 
-      {view === "account" ? (
+      {view === "admin" && me && isAdmin ? (
         <div className="min-h-0 flex-1 overflow-y-auto">
-          <AccountPanel changePassword={changePassword} />
+          <AdminPanel
+            api={api}
+            currentUserId={me.id}
+            superAdmin={me.permissions.includes("*")}
+          />
+        </div>
+      ) : view === "account" ? (
+        <div className="min-h-0 flex-1 overflow-y-auto">
+          <AccountPanel
+            {...(me ? { email: me.email } : {})}
+            changePassword={changePassword}
+          />
         </div>
       ) : view === "connectors" ? (
         <div className="min-h-0 flex-1 overflow-y-auto">
@@ -335,9 +371,11 @@ function computeStatuses(
 function ViewTabs({
   view,
   onChange,
+  showAdmin,
 }: {
   view: View;
   onChange: (v: View) => void;
+  showAdmin: boolean;
 }): JSX.Element {
   return (
     <nav
@@ -365,6 +403,13 @@ function ViewTabs({
         label="Compte"
         onClick={() => onChange("account")}
       />
+      {showAdmin && (
+        <ViewTab
+          active={view === "admin"}
+          label="Administration"
+          onClick={() => onChange("admin")}
+        />
+      )}
     </nav>
   );
 }
