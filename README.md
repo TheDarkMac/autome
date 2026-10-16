@@ -34,7 +34,7 @@ documentation et les exemples de workflows. Détail dans la
 - **Sécurité** : auth JWT, OAuth2 (Authorization Code + PKCE), chiffrement des
   credentials au repos (AES-256-GCM), TLS, RBAC, journal d'audit.
 - **API REST** : CRUD workflows, déclenchement manuel, gestion des
-  credentials, spec **OpenAPI** générée.
+  credentials, spec **OpenAPI** générée (`GET /openapi.json`).
 - **Éditeur visuel** : canvas drag-and-drop (React), palette de nodes,
   configuration, visualisation de l'exécution.
 - **Observabilité** : métriques **Prometheus** (`/metrics`) + dashboards
@@ -72,7 +72,7 @@ docker compose up --build
 
 | Service | URL | Notes |
 |---|---|---|
-| API | http://localhost:8080 | `GET /livez`, `GET /readyz`, `GET /metrics` |
+| API | http://localhost:8080 | `GET /livez`, `GET /readyz`, `GET /metrics`, `GET /openapi.json` |
 | Frontend | http://localhost:8081 | SPA (éditeur visuel) |
 | Grafana | http://localhost:3000 | `admin` / `admin` (dashboard *Autome — Overview*) |
 | Prometheus | http://localhost:9090 | scrape de l'API |
