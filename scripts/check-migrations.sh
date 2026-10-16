@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
 # F1.5 — Validation du schéma : applique TOUTES les migrations (ordre
 # lexicographique) puis le seed de dev sur un PostgreSQL jetable, et vérifie
-# quelques invariants. Sert de test de la feature tant que la CI (F10.4)
-# n'est pas en place.
+# quelques invariants. Exécuté par la CI (job `backend`, #218).
 #
 # Pré-requis : Docker. Aucun effet sur une base existante (conteneur dédié).
 # Usage : scripts/check-migrations.sh
@@ -11,7 +10,9 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 MIG_DIR="$ROOT/migrations"
 CONTAINER="autome-migcheck-$$"
-PGIMAGE="postgres:17-alpine"
+# Même version majeure que docker-compose.yml et k8s/postgres.yaml ;
+# surchargeable (PGIMAGE=postgres:17-alpine scripts/check-migrations.sh).
+PGIMAGE="${PGIMAGE:-postgres:16-alpine}"
 PGPASS="check"
 PGDB="autome_check"
 
