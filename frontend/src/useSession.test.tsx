@@ -127,6 +127,39 @@ describe("useSession", () => {
     expect(store.read()).not.toBeNull();
   });
 
+  it("changePassword remplace la session par la paire renvoyée", async () => {
+    const store = memorySessionStore(mkPair("user-1", 10_000));
+    const renewed = mkPair("user-1", 20_000);
+    const changePasswordImpl = vi.fn().mockResolvedValue(renewed);
+    const { result } = renderHook(() => useSession({ store, changePasswordImpl }));
+
+    await act(async () => {
+      await result.current.changePassword("old-password", "new-password");
+    });
+
+    expect(changePasswordImpl).toHaveBeenCalledWith(
+      "old-password",
+      "new-password",
+      result.current.authFetch,
+    );
+    expect(store.read()).toEqual(renewed);
+    expect(result.current.session?.accessToken).toBe(renewed.accessToken);
+  });
+
+  it("changePassword en échec ne touche pas à la session", async () => {
+    const pair = mkPair("user-1", 10_000);
+    const store = memorySessionStore(pair);
+    const changePasswordImpl = vi.fn().mockRejectedValue(new Error("refusé"));
+    const { result } = renderHook(() => useSession({ store, changePasswordImpl }));
+
+    await act(async () => {
+      await expect(
+        result.current.changePassword("old-password", "new-password"),
+      ).rejects.toThrow("refusé");
+    });
+    expect(store.read()).toEqual(pair);
+  });
+
   it("logout sans session n'appelle pas le serveur", () => {
     const logoutImpl = vi.fn().mockResolvedValue(undefined);
     const { result } = renderHook(() =>

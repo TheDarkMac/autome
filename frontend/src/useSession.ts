@@ -3,8 +3,8 @@
 // Source de vérité de l'authentification côté SPA :
 //   - charge la session depuis le `SessionStore` au montage ;
 //   - expose `login` / `signup` / `logout` (qui ferme aussi la session
-//     côté serveur, au mieux — #184) et `logoutAll` (toutes les sessions,
-//     tous appareils — #186) ;
+//     côté serveur, au mieux — #184), `logoutAll` (toutes les sessions,
+//     tous appareils — #186) et `changePassword` (#196) ;
 //   - rafraîchit l'access token de manière proactive (timer réarmé à
 //     `skewMs` avant l'expiration) et sur échec, déconnecte proprement.
 //
@@ -14,6 +14,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
 import {
+  changePassword as apiChangePassword,
   login as apiLogin,
   logout as apiLogout,
   logoutAll as apiLogoutAll,
@@ -42,6 +43,7 @@ export interface UseSessionOptions {
   refreshImpl?: typeof apiRefresh;
   logoutImpl?: typeof apiLogout;
   logoutAllImpl?: typeof apiLogoutAll;
+  changePasswordImpl?: typeof apiChangePassword;
 }
 
 export interface UseSessionResult {
@@ -58,6 +60,12 @@ export interface UseSessionResult {
    * confirmé : les autres appareils seraient encore connectés.
    */
   logoutAll: () => Promise<void>;
+  /**
+   * Change le mot de passe : les autres sessions sont fermées, la session
+   * courante continue avec la paire renvoyée. Rejette sans rien changer en
+   * local si le serveur refuse.
+   */
+  changePassword: (currentPassword: string, newPassword: string) => Promise<void>;
   /**
    * `fetch` authentifié (F8.7.c) : injecte le Bearer courant et, sur 401,
    * rafraîchit le token puis rejoue la requête. Identité **stable** — sûr à
@@ -78,6 +86,7 @@ export function useSession(options: UseSessionOptions = {}): UseSessionResult {
     refreshImpl = apiRefresh,
     logoutImpl = apiLogout,
     logoutAllImpl = apiLogoutAll,
+    changePasswordImpl = apiChangePassword,
   } = options;
 
   // Le store ne doit pas changer entre les rendus : on le fige au montage.
@@ -149,6 +158,13 @@ export function useSession(options: UseSessionOptions = {}): UseSessionResult {
     apply(null);
   }, [apply, authFetch, logoutAllImpl]);
 
+  const changePassword = useCallback(
+    async (currentPassword: string, newPassword: string) => {
+      apply(await changePasswordImpl(currentPassword, newPassword, authFetch));
+    },
+    [apply, authFetch, changePasswordImpl],
+  );
+
   const login = useCallback(
     async (creds: Credentials) => {
       apply(await loginImpl(creds));
@@ -191,6 +207,7 @@ export function useSession(options: UseSessionOptions = {}): UseSessionResult {
     signup,
     logout,
     logoutAll,
+    changePassword,
     authFetch,
   };
 }

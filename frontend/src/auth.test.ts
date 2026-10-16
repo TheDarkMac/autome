@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 
 import { ApiError } from "./api";
 import {
+  changePassword,
   decodeJwt,
   isTokenExpired,
   login,
@@ -262,6 +263,41 @@ describe("logoutAll", () => {
     await expect(
       logoutAll(vi.fn().mockRejectedValue(new Error("offline"))),
     ).rejects.toThrow(/injoignable/);
+  });
+});
+
+describe("changePassword", () => {
+  it("POST /auth/password et renvoie la nouvelle paire", async () => {
+    const fetchImpl = vi.fn().mockResolvedValue(jsonResponse(TOKENS));
+    const pair = await changePassword("old-password", "new-password", fetchImpl);
+    expect(pair).toEqual({ accessToken: "a.b.c", refreshToken: "d.e.f" });
+    const [url, init] = fetchImpl.mock.calls[0]!;
+    expect(url).toMatch(/\/auth\/password$/);
+    expect(JSON.parse(init.body)).toEqual({
+      current_password: "old-password",
+      new_password: "new-password",
+    });
+  });
+
+  it("refuse un nouveau mot de passe trop court sans appel réseau", async () => {
+    const fetchImpl = vi.fn();
+    await expect(changePassword("old-password", "short", fetchImpl)).rejects.toMatchObject({
+      status: 400,
+    });
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
+  it("traduit 403, 409 et 429", async () => {
+    const call = (res: Response) =>
+      changePassword("old-password", "new-password", vi.fn().mockResolvedValue(res));
+    await expect(call(jsonResponse({}, 403))).rejects.toMatchObject({
+      status: 403,
+      message: /actuel incorrect/,
+    });
+    await expect(call(jsonResponse({}, 409))).rejects.toMatchObject({ status: 409 });
+    await expect(
+      call(new Response("", { status: 429, headers: { "Retry-After": "120" } })),
+    ).rejects.toMatchObject({ status: 429, message: /2 min/ });
   });
 });
 

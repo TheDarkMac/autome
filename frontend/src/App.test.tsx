@@ -160,6 +160,38 @@ describe("<App />", () => {
     await act(async () => undefined);
   });
 
+  it("l'onglet Compte change le mot de passe via la session", async () => {
+    globalThis.fetch = vi.fn().mockResolvedValue(jsonResponse(sampleSpec)) as typeof fetch;
+    const renewed: TokenPair = {
+      accessToken: `h.${b64url({ sub: "user-1", exp: 9_999_999_999 })}.s2`,
+      refreshToken: "r.e.f2",
+    };
+    const changePasswordImpl = vi.fn().mockResolvedValue(renewed);
+    render(<App sessionOptions={authedSession("user-1", { changePasswordImpl })} />);
+
+    fireEvent.click(screen.getByRole("tab", { name: "Compte" }));
+    fireEvent.change(screen.getByLabelText("Mot de passe actuel"), {
+      target: { value: "old-password" },
+    });
+    fireEvent.change(screen.getByLabelText("Nouveau mot de passe"), {
+      target: { value: "new-password" },
+    });
+    fireEvent.change(screen.getByLabelText("Confirmer le nouveau mot de passe"), {
+      target: { value: "new-password" },
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Changer le mot de passe" }));
+    });
+
+    expect(changePasswordImpl).toHaveBeenCalledWith(
+      "old-password",
+      "new-password",
+      expect.any(Function),
+    );
+    expect(await screen.findByText(/autres appareils ont été déconnectés/)).toBeInTheDocument();
+    expect(screen.getByTestId("current-user")).toHaveTextContent("user-1");
+  });
+
   describe("déconnecter tous les appareils", () => {
     afterEach(() => vi.restoreAllMocks());
 

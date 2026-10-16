@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { apiBaseUrl, fetchOpenApi, type OpenApiSpec } from "./api";
 import { createApiClient } from "./apiClient";
 import { fetchCatalog, STATIC_CATALOG, type CatalogItem } from "./catalog";
+import { AccountPanel } from "./AccountPanel";
 import { ConnectorsPanel } from "./ConnectorsPanel";
 import type { CanvasNode, WireGraph } from "./graph";
 import { LoginPage } from "./LoginPage";
@@ -25,7 +26,7 @@ type Status =
   | { kind: "ok"; spec: OpenApiSpec }
   | { kind: "error"; message: string };
 
-type View = "edit" | "runs" | "connectors";
+type View = "edit" | "runs" | "connectors" | "account";
 
 export interface AppProps {
   /** Options de session (store/impls injectables pour les tests). */
@@ -45,6 +46,7 @@ export function App({ sessionOptions }: AppProps = {}): JSX.Element {
     signup,
     logout,
     logoutAll,
+    changePassword,
     authFetch,
   } = useSession(sessionOptions);
   const [logoutAllError, setLogoutAllError] = useState<string | null>(null);
@@ -195,7 +197,11 @@ export function App({ sessionOptions }: AppProps = {}): JSX.Element {
 
       <ViewTabs view={view} onChange={setView} />
 
-      {view === "connectors" ? (
+      {view === "account" ? (
+        <div className="min-h-0 flex-1 overflow-y-auto">
+          <AccountPanel changePassword={changePassword} />
+        </div>
+      ) : view === "connectors" ? (
         <div className="min-h-0 flex-1 overflow-y-auto">
           <ConnectorsPanel accessToken={session.accessToken} />
         </div>
@@ -279,6 +285,11 @@ function ViewTabs({
         active={view === "connectors"}
         label="Connecteurs"
         onClick={() => onChange("connectors")}
+      />
+      <ViewTab
+        active={view === "account"}
+        label="Compte"
+        onClick={() => onChange("account")}
       />
     </nav>
   );

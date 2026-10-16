@@ -115,6 +115,57 @@
         ]
       }
     },
+    "/auth/password": {
+      "post": {
+        "tags": [
+          "auth"
+        ],
+        "summary": "`POST /auth/password` — change le mot de passe de l'utilisateur\nauthentifié et ferme **toutes** ses sessions, puis renvoie une nouvelle\npaire de jetons pour l'appareil courant.",
+        "operationId": "change_password",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ChangePasswordBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Mot de passe changé ; autres sessions fermées",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TokenResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Nouveau mot de passe invalide ou identique à l'actuel"
+          },
+          "401": {
+            "description": "Access token absent, invalide ou révoqué"
+          },
+          "403": {
+            "description": "Mot de passe actuel incorrect"
+          },
+          "409": {
+            "description": "Mot de passe changé entre-temps (requête concurrente)"
+          },
+          "429": {
+            "description": "Trop d'essais — voir `Retry-After`"
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
     "/auth/refresh": {
       "post": {
         "tags": [
@@ -976,6 +1027,24 @@
           "state": {
             "type": "string",
             "description": "`state` retourné par le provider — anti-CSRF, identique à\ncelui renvoyé par `/authorize`."
+          }
+        }
+      },
+      "ChangePasswordBody": {
+        "type": "object",
+        "description": "Body de `/auth/password`.",
+        "required": [
+          "current_password",
+          "new_password"
+        ],
+        "properties": {
+          "current_password": {
+            "type": "string",
+            "description": "Mot de passe actuel (preuve de possession du compte)."
+          },
+          "new_password": {
+            "type": "string",
+            "description": "Nouveau mot de passe (8 à 1024 caractères, différent de l'actuel)."
           }
         }
       },

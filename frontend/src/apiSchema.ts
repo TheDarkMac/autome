@@ -68,6 +68,27 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/auth/password": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * `POST /auth/password` — change le mot de passe de l'utilisateur
+         *     authentifié et ferme **toutes** ses sessions, puis renvoie une nouvelle
+         *     paire de jetons pour l'appareil courant.
+         */
+        post: operations["change_password"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/auth/refresh": {
         parameters: {
             query?: never;
@@ -330,6 +351,13 @@ export interface components {
              */
             state: string;
         };
+        /** @description Body de `/auth/password`. */
+        ChangePasswordBody: {
+            /** @description Mot de passe actuel (preuve de possession du compte). */
+            current_password: string;
+            /** @description Nouveau mot de passe (8 à 1024 caractères, différent de l'actuel). */
+            new_password: string;
+        };
         /** @description Body JSON du POST. `payload` est libre (transmis tel quel au worker). */
         CreateRunBody: {
             /** @description Payload initial du run (entrées du workflow). `null` si absent. */
@@ -533,6 +561,65 @@ export interface operations {
             };
             /** @description Access token absent, invalide ou déjà révoqué */
             401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    change_password: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ChangePasswordBody"];
+            };
+        };
+        responses: {
+            /** @description Mot de passe changé ; autres sessions fermées */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TokenResponse"];
+                };
+            };
+            /** @description Nouveau mot de passe invalide ou identique à l'actuel */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Access token absent, invalide ou révoqué */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Mot de passe actuel incorrect */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Mot de passe changé entre-temps (requête concurrente) */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Trop d'essais — voir `Retry-After` */
+            429: {
                 headers: {
                     [name: string]: unknown;
                 };

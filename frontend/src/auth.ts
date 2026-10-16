@@ -13,6 +13,7 @@
 //   - POST /auth/refresh  { refresh_token }        → TokenPair
 //   - POST /auth/logout   { refresh_token } (+ Bearer access) → 204
 //   - POST /auth/logout-all (Bearer access)        → 204
+//   - POST /auth/password { current_password, new_password } (Bearer) → TokenPair
 //   - GET  /auth/whoami   (Bearer access)          → "hello <sub>"
 //
 // `fetchImpl` est injectable partout pour les tests.
@@ -118,6 +119,54 @@ export async function logoutAll(fetchImpl: typeof fetch): Promise<void> {
       res.status,
     );
   }
+}
+
+/**
+ * Change le mot de passe (#196) : toutes les sessions de l'utilisateur sont
+ * fermées côté serveur, et la nouvelle paire renvoyée remplace celle de
+ * l'appareil courant. `fetchImpl` doit porter le Bearer (`authFetch`).
+ */
+export async function changePassword(
+  currentPassword: string,
+  newPassword: string,
+  fetchImpl: typeof fetch,
+): Promise<TokenPair> {
+  if (newPassword.length < MIN_PASSWORD_LENGTH) {
+    throw new ApiError(
+      `le nouveau mot de passe doit faire au moins ${MIN_PASSWORD_LENGTH} caractères`,
+      400,
+    );
+  }
+  const res = await postJson(
+    "/auth/password",
+    { current_password: currentPassword, new_password: newPassword },
+    fetchImpl,
+  );
+  if (res.status === 403) {
+    throw new ApiError("mot de passe actuel incorrect", 403);
+  }
+  if (res.status === 400) {
+    throw new ApiError(
+      (await res.text()) || "nouveau mot de passe refusé",
+      400,
+    );
+  }
+  if (res.status === 409) {
+    throw new ApiError(
+      "le mot de passe vient d'être changé ailleurs : reconnectez-vous",
+      409,
+    );
+  }
+  if (res.status === 429) {
+    throw new ApiError(tooManyAttemptsMessage(res), 429);
+  }
+  if (!res.ok) {
+    throw new ApiError(
+      `POST /auth/password a échoué (${res.status})`,
+      res.status,
+    );
+  }
+  return parseTokenPair(await res.json());
 }
 
 /** Récupère le `sub` de l'utilisateur courant via `/auth/whoami`. */
@@ -226,6 +275,21 @@ function parseTokenPair(raw: unknown): TokenPair {
 // éviter un aller-retour réseau inutile.
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 export const MIN_PASSWORD_LENGTH = 8;
+
+/** Erreurs de saisie d'un changement de mot de passe, sans aller-retour réseau. */
+export function validatePasswordChange(
+  current: string,
+  next: string,
+  confirm: string,
+): string | null {
+  if (current.length === 0) return "saisissez votre mot de passe actuel";
+  if (next.length < MIN_PASSWORD_LENGTH) {
+    return `le nouveau mot de passe doit faire au moins ${MIN_PASSWORD_LENGTH} caractères`;
+  }
+  if (next === current) return "le nouveau mot de passe doit différer de l'actuel";
+  if (next !== confirm) return "la confirmation ne correspond pas";
+  return null;
+}
 
 /** Liste des erreurs de saisie (vide ⇒ OK). Pur et testable. */
 export function validateCredentials(creds: Credentials): string[] {
