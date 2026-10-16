@@ -122,3 +122,72 @@ async fn https_fails_without_root_cert_trust() {
 
     server_handle.graceful_shutdown(Some(Duration::from_secs(1)));
 }
+
+/// Arrêt gracieux en HTTPS (#194) : la requête en vol se termine, puis le
+/// serveur s'arrête dans le délai de drain.
+#[tokio::test]
+async fn https_graceful_shutdown_finishes_in_flight_requests() {
+    use autome_api::shutdown::serve_tls_until;
+
+    let (cert_f, key_f, cert_pem) = write_self_signed_pair_for("localhost");
+    let tls_config = load_rustls_config(cert_f.path(), key_f.path())
+        .await
+        .expect("load_rustls_config");
+    let app: Router = Router::new()
+        .route("/health", get(|| async { "ok" }))
+        .route(
+            "/slow",
+            get(|| async {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                "done"
+            }),
+        );
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr: SocketAddr = listener.local_addr().unwrap();
+    drop(listener);
+
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+    let server = tokio::spawn(serve_tls_until(
+        addr,
+        tls_config,
+        app,
+        async move {
+            let _ = stop_rx.await;
+        },
+        Duration::from_secs(5),
+    ));
+
+    let cert = reqwest::Certificate::from_pem(cert_pem.as_bytes()).unwrap();
+    let client = reqwest::Client::builder()
+        .add_root_certificate(cert)
+        .pool_max_idle_per_host(0)
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap();
+    let base = format!("https://localhost:{}", addr.port());
+    let mut ready = false;
+    for _ in 0..50 {
+        if client.get(format!("{base}/health")).send().await.is_ok() {
+            ready = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(ready, "serveur HTTPS prêt");
+
+    let slow = tokio::spawn({
+        let (client, base) = (client.clone(), base.clone());
+        async move { client.get(format!("{base}/slow")).send().await }
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    stop_tx.send(()).unwrap();
+
+    let slow = slow.await.unwrap().expect("requête en vol terminée");
+    assert_eq!(slow.status(), 200);
+    assert_eq!(slow.text().await.unwrap(), "done");
+    tokio::time::timeout(Duration::from_secs(3), server)
+        .await
+        .expect("serveur arrêté")
+        .unwrap()
+        .expect("drain sans erreur");
+}
