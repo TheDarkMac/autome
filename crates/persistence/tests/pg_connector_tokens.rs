@@ -2,13 +2,15 @@
 //! PostgreSQL. Gaté par `TEST_DATABASE_URL` (skip-pass sinon). Cf.
 //! `pg_revocation.rs` pour lancer un conteneur jetable.
 //!
-//! Le schéma est créé à partir de la migration **réelle** `0011` (embarquée
-//! dans [`MIGRATIONS`]) : le test valide aussi le DDL.
+//! Le schéma est créé à partir des migrations **réelles** `0011` et `0018`
+//! (embarquées dans [`MIGRATIONS`]) : le test valide aussi le DDL.
 //!
 //! Runtime **multi-thread** : le trait est synchrone et ponte vers l'async via
 //! `block_in_place` (cf. module `connector_tokens`).
 
-use autome_connectors::oauth::{ConnectorTokenStore, TokenSet};
+use autome_connectors::oauth::{
+    ConnectorTokenStore, CredentialInvalidation, CredentialUpdate, StoredCredential, TokenSet,
+};
 use autome_core::{EnvelopeCipher, InMemoryKeyProvider};
 use autome_persistence::{connect, PgConnectorTokenStore, PgPool, MIGRATIONS};
 use tokio::sync::OnceCell;
@@ -26,11 +28,21 @@ async fn setup() -> Option<PgPool> {
     let pool = connect(&url).expect("pool");
     SCHEMA
         .get_or_init(|| async {
-            let ddl = MIGRATIONS
+            let ddl: String = MIGRATIONS
                 .iter()
-                .find(|(name, _)| *name == "0011_connector_tokens.sql")
+                .filter(|(name, _)| {
+                    [
+                        "0011_connector_tokens.sql",
+                        "0018_connector_token_invalidation.sql",
+                    ]
+                    .contains(name)
+                })
                 .map(|(_, sql)| *sql)
-                .expect("migration 0011 embarquée");
+                .collect();
+            assert!(
+                ddl.contains("invalidated_at_ms"),
+                "migration 0018 embarquée"
+            );
             let client = pool.get().await.expect("connexion");
             client
                 .batch_execute(&format!("DROP TABLE IF EXISTS connector_tokens; {ddl}"))
@@ -158,4 +170,126 @@ async fn works_from_a_spawn_blocking_thread() {
     .await
     .unwrap();
     assert_eq!(loaded.unwrap().access_token, "secret_alice");
+}
+
+/// Credential relue sous le verrou, sans rien écrire.
+fn peek(
+    store: &PgConnectorTokenStore<InMemoryKeyProvider>,
+    user: &str,
+) -> Option<StoredCredential> {
+    let mut seen = None;
+    store
+        .update_locked(user, "gmail", &mut |current| {
+            seen = current;
+            CredentialUpdate::Keep
+        })
+        .unwrap();
+    seen
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn update_locked_replaces_invalidates_and_store_clears_the_mark() {
+    let Some(pool) = setup().await else {
+        eprintln!("TEST_DATABASE_URL absent → test PostgreSQL sauté");
+        return;
+    };
+    let store = PgConnectorTokenStore::new(pool.clone(), cipher(3));
+    // Absente : décision sans effet, aucune ligne créée.
+    store
+        .update_locked("frank", "gmail", &mut |current| {
+            assert!(current.is_none());
+            CredentialUpdate::Replace(tokens("at-ghost"))
+        })
+        .unwrap();
+    assert_eq!(store.load("frank", "gmail").unwrap(), None);
+
+    store.store("frank", "gmail", &tokens("at-1")).unwrap();
+    store
+        .update_locked("frank", "gmail", &mut |_| {
+            CredentialUpdate::Replace(tokens("at-2"))
+        })
+        .unwrap();
+    let seen = peek(&store, "frank").unwrap();
+    assert_eq!(seen.tokens, tokens("at-2"));
+    assert_eq!(seen.invalidated, None);
+
+    let invalidation = CredentialInvalidation {
+        at_ms: 1_700_000_000_000,
+        reason: "invalid_grant".into(),
+    };
+    store
+        .update_locked("frank", "gmail", &mut |_| {
+            CredentialUpdate::Invalidate(invalidation.clone())
+        })
+        .unwrap();
+    let seen = peek(&store, "frank").unwrap();
+    assert_eq!(seen.invalidated, Some(invalidation.clone()));
+    assert_eq!(seen.tokens, tokens("at-2"), "tokens conservés");
+
+    // La contrainte refuse une marque à moitié posée.
+    let half = pool
+        .get()
+        .await
+        .unwrap()
+        .execute(
+            "UPDATE connector_tokens SET invalid_reason = NULL WHERE user_id = 'frank'",
+            &[],
+        )
+        .await;
+    assert!(half.is_err(), "CHECK connector_tokens_invalidation_check");
+
+    // Reconnexion : marque effacée.
+    store.store("frank", "gmail", &tokens("at-3")).unwrap();
+    assert_eq!(peek(&store, "frank").unwrap().invalidated, None);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn update_locked_serializes_two_pools_on_the_row() {
+    // Deux pools = deux processus : le second attend le verrou de ligne puis
+    // voit l'écriture du premier.
+    let Some(pool) = setup().await else {
+        eprintln!("TEST_DATABASE_URL absent → test PostgreSQL sauté");
+        return;
+    };
+    let url = std::env::var("TEST_DATABASE_URL").unwrap();
+    let a = std::sync::Arc::new(PgConnectorTokenStore::new(pool, cipher(4)));
+    let b = std::sync::Arc::new(PgConnectorTokenStore::new(
+        connect(&url).unwrap(),
+        cipher(4),
+    ));
+    a.store("gina", "gmail", &tokens("at-0")).unwrap();
+
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let run = |store: std::sync::Arc<PgConnectorTokenStore<InMemoryKeyProvider>>,
+               barrier: std::sync::Arc<std::sync::Barrier>| {
+        tokio::task::spawn_blocking(move || {
+            barrier.wait();
+            let mut seen = String::new();
+            store
+                .update_locked("gina", "gmail", &mut |current| {
+                    seen = current.unwrap().tokens.access_token;
+                    // « Appel au provider » pendant que le verrou est tenu.
+                    std::thread::sleep(std::time::Duration::from_millis(300));
+                    let n: u32 = seen.trim_start_matches("at-").parse().unwrap();
+                    CredentialUpdate::Replace(tokens(&format!("at-{}", n + 1)))
+                })
+                .unwrap();
+            seen
+        })
+    };
+    let (ra, rb) = (
+        run(std::sync::Arc::clone(&a), std::sync::Arc::clone(&barrier)),
+        run(std::sync::Arc::clone(&b), barrier),
+    );
+    let mut seen = [ra.await.unwrap(), rb.await.unwrap()];
+    seen.sort();
+    assert_eq!(
+        seen,
+        ["at-0", "at-1"],
+        "le second a lu l'écriture du premier"
+    );
+    assert_eq!(
+        b.load("gina", "gmail").unwrap().unwrap().access_token,
+        "at-2"
+    );
 }

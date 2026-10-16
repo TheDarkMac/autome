@@ -286,11 +286,17 @@ mod tests {
         let config =
             Config::load(move |k| (k == "DATABASE_URL").then(|| url.clone())).expect("config");
         let pool = connect(&config.database_url).unwrap();
-        let ddl = autome_persistence::MIGRATIONS
+        let ddl: String = autome_persistence::MIGRATIONS
             .iter()
-            .find(|(name, _)| *name == "0011_connector_tokens.sql")
+            .filter(|(name, _)| {
+                [
+                    "0011_connector_tokens.sql",
+                    "0018_connector_token_invalidation.sql",
+                ]
+                .contains(name)
+            })
             .map(|(_, sql)| *sql)
-            .unwrap();
+            .collect();
         pool.get()
             .await
             .unwrap()
