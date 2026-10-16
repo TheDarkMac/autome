@@ -20,6 +20,7 @@ pub mod scheduler;
 pub mod secrets;
 pub mod telemetry;
 pub mod trigger;
+pub mod webhook;
 pub mod workflow;
 
 pub use action::Action;
@@ -47,6 +48,9 @@ pub use scheduler::{
 };
 pub use secrets::{EnvelopeCipher, InMemoryKeyProvider, KeyProvider};
 pub use trigger::{Trigger, TriggerEvent};
+pub use webhook::{
+    EndpointSecret, InMemoryWebhookEndpointStore, WebhookEndpoint, WebhookEndpointStore,
+};
 pub use workflow::repo::{
     InMemoryWorkflowRepository, Pagination, WorkflowPage, WorkflowRepository, LEGACY_NAMESPACE,
 };
