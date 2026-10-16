@@ -132,6 +132,17 @@ describe("createApiClient — runs & credentials", () => {
     expect(res).toEqual({ run_id: "run-1", status: "queued" });
   });
 
+  it("listWebhooks / rotateWebhook : chemins encodés (#202)", async () => {
+    const item = { node_id: "n 1", name: "n", method: "POST", path: "/hooks/x", signing_secret: "s" };
+    const { fetchImpl, calls } = mockFetch([json({ items: [item] }), json(item)]);
+    const client = createApiClient(fetchImpl);
+    expect((await client.listWebhooks("wf-1")).items).toEqual([item]);
+    expect(calls[0]!.url).toMatch(/\/workflows\/wf-1\/webhooks$/);
+    expect(await client.rotateWebhook("wf-1", "n 1")).toEqual(item);
+    expect(calls[1]!.url).toMatch(/\/workflows\/wf-1\/webhooks\/n%201\/rotate$/);
+    expect(calls[1]!.init.method).toBe("POST");
+  });
+
   it("listProviders : GET /credentials/providers", async () => {
     const { fetchImpl, calls } = mockFetch([
       json({ items: [{ provider_id: "slack", scopes: ["chat:write"] }] }),

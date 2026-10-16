@@ -7,7 +7,7 @@ import { ConnectorsPanel } from "./ConnectorsPanel";
 import type { CanvasNode, WireGraph } from "./graph";
 import { LoginPage } from "./LoginPage";
 import { NodeCanvas, type NodeCanvasController } from "./NodeCanvas";
-import { NodePanel } from "./NodePanel";
+import { NodePanel, type WebhookActions } from "./NodePanel";
 import { Palette } from "./Palette";
 import type { ParamValues } from "./paramSchema";
 import { RunsList } from "./RunsList";
@@ -69,6 +69,14 @@ export function App({ sessionOptions }: AppProps = {}): JSX.Element {
   // Client API typé adossé à l'`authFetch` (F8.7) — identité stable car
   // `authFetch` l'est ; les vues de runs y branchent leurs lectures.
   const api = useMemo(() => createApiClient(authFetch), [authFetch]);
+  // URL des nœuds webhook du workflow courant (#202).
+  const webhooks = useMemo<WebhookActions>(
+    () => ({
+      list: () => api.listWebhooks(DRAFT_WORKFLOW_ID),
+      rotate: (nodeId) => api.rotateWebhook(DRAFT_WORKFLOW_ID, nodeId),
+    }),
+    [api],
+  );
   const [status, setStatus] = useState<Status>({ kind: "idle" });
   const [catalog, setCatalog] = useState<readonly CatalogItem[]>(STATIC_CATALOG);
   const [catalogLoading, setCatalogLoading] = useState(true);
@@ -231,6 +239,7 @@ export function App({ sessionOptions }: AppProps = {}): JSX.Element {
               node={selectedNode}
               onChange={handlePanelChange}
               onClose={() => setSelectedNode(null)}
+              webhooks={webhooks}
             />
           ) : (
             <RunExecutionPanel

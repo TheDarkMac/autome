@@ -443,6 +443,68 @@
         ]
       }
     },
+    "/hooks/{token}": {
+      "post": {
+        "tags": [
+          "webhooks"
+        ],
+        "summary": "`* /hooks/{token}` — déclenche le workflow du nœud webhook visé.",
+        "operationId": "receive",
+        "parameters": [
+          {
+            "name": "token",
+            "in": "path",
+            "description": "Token secret de l'URL (64 caractères hexadécimaux)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "description": "Corps libre (JSON parsé, sinon texte), ≤ 1 Mio",
+          "content": {
+            "application/json": {
+              "schema": {}
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "description": "Run accepté en file",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WebhookAccepted"
+                }
+              }
+            }
+          },
+          "204": {
+            "description": "Événement filtré par le param `event` du nœud : aucun run"
+          },
+          "400": {
+            "description": "Corps JSON invalide ou non UTF-8"
+          },
+          "401": {
+            "description": "Signature absente ou invalide (nœud signé)"
+          },
+          "404": {
+            "description": "URL inconnue, workflow ou nœud supprimé"
+          },
+          "405": {
+            "description": "Méthode différente du param `method` du nœud"
+          },
+          "413": {
+            "description": "Corps supérieur à 1 Mio"
+          },
+          "429": {
+            "description": "Quota de l'endpoint atteint (`Retry-After`)"
+          }
+        }
+      }
+    },
     "/livez": {
       "get": {
         "tags": [
@@ -980,6 +1042,131 @@
           }
         ]
       }
+    },
+    "/workflows/{id}/webhooks": {
+      "get": {
+        "tags": [
+          "webhooks"
+        ],
+        "summary": "`GET /workflows/{id}/webhooks` — URL de chaque nœud webhook (créées à la\npremière lecture).",
+        "operationId": "list_webhooks",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Identifiant du workflow",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "owner",
+            "in": "query",
+            "description": "Propriétaire de l'espace visé.",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "URL et secrets des nœuds webhook",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WebhookList"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Token absent ou invalide"
+          },
+          "403": {
+            "description": "Manque `runs.execute`, ou `owner` d'autrui sans `*`"
+          },
+          "404": {
+            "description": "Workflow inconnu dans cet espace"
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/workflows/{id}/webhooks/{node_id}/rotate": {
+      "post": {
+        "tags": [
+          "webhooks"
+        ],
+        "summary": "`POST /workflows/{id}/webhooks/{node_id}/rotate` — nouvelle URL et nouveau\nsecret de signature ; les anciens cessent aussitôt de fonctionner.",
+        "operationId": "rotate_webhook",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Identifiant du workflow",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "node_id",
+            "in": "path",
+            "description": "Nœud trigger webhook",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "owner",
+            "in": "query",
+            "description": "Propriétaire de l'espace visé.",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Nouvelle URL",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WebhookInfo"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Token absent ou invalide"
+          },
+          "403": {
+            "description": "Manque `runs.execute`, ou `owner` d'autrui sans `*`"
+          },
+          "404": {
+            "description": "Workflow ou nœud webhook inconnu"
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
     }
   },
   "components": {
@@ -1321,6 +1508,80 @@
             "description": "Toujours `Bearer`."
           }
         }
+      },
+      "WebhookAccepted": {
+        "type": "object",
+        "description": "Réponse d'un webhook accepté.",
+        "required": [
+          "run_id",
+          "status"
+        ],
+        "properties": {
+          "run_id": {
+            "type": "string",
+            "description": "Identifiant du run créé."
+          },
+          "status": {
+            "type": "string",
+            "description": "État initial (`\"queued\"`)."
+          }
+        }
+      },
+      "WebhookInfo": {
+        "type": "object",
+        "description": "URL d'un nœud webhook.",
+        "required": [
+          "node_id",
+          "name",
+          "method",
+          "path",
+          "signing_secret"
+        ],
+        "properties": {
+          "method": {
+            "type": "string",
+            "description": "Méthode acceptée."
+          },
+          "name": {
+            "type": "string",
+            "description": "Libellé du nœud."
+          },
+          "node_id": {
+            "type": "string",
+            "description": "Nœud trigger webhook."
+          },
+          "path": {
+            "type": "string",
+            "description": "Chemin secret à appeler (`/hooks/{token}`), relatif à l'URL de l'API."
+          },
+          "signature": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Vérification de signature configurée (`github`), absente sinon."
+          },
+          "signing_secret": {
+            "type": "string",
+            "description": "Secret de signature de l'endpoint (à saisir chez l'émetteur, ex.\n« Secret » d'un webhook GitHub)."
+          }
+        }
+      },
+      "WebhookList": {
+        "type": "object",
+        "description": "Réponse de [`list_webhooks`].",
+        "required": [
+          "items"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/WebhookInfo"
+            },
+            "description": "Une entrée par nœud webhook du workflow."
+          }
+        }
       }
     },
     "securitySchemes": {
@@ -1348,6 +1609,10 @@
     {
       "name": "runs",
       "description": "Déclenchement et suivi des runs."
+    },
+    {
+      "name": "webhooks",
+      "description": "Déclencheurs webhook : URL secrètes publiques et leur gestion."
     },
     {
       "name": "credentials",

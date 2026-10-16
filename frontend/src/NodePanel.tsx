@@ -11,6 +11,9 @@
 // F8.4.d — Si le schéma déclare `credentialProvider`, une dropdown est
 //          chargée via `fetchCredentials(provider)`. La valeur est
 //          stockée dans `params.credential_id`.
+// #202   — Un trigger webhook affiche son URL secrète (copie), son secret de
+//          signature et un bouton de rotation, si `webhooks` est fourni et
+//          que le workflow est enregistré côté serveur.
 //
 // L'édition est **live** : chaque modification déclenche `onChange`
 // immédiatement (le parent met à jour le node dans le canvas). Pas de
@@ -18,6 +21,8 @@
 
 import { useEffect, useMemo, useState } from "react";
 
+import { ApiError, apiBaseUrl } from "./api";
+import type { Schemas } from "./apiClient";
 import { fetchCredentials, type Credential } from "./credentials";
 import type { CanvasNode } from "./graph";
 import {
@@ -39,6 +44,14 @@ export interface NodePanelProps {
   onClose: () => void;
   /** Override pour tests. */
   fetchCredentialsImpl?: typeof fetchCredentials;
+  /** URL des nœuds webhook du workflow courant (#202) ; absent = non affichées. */
+  webhooks?: WebhookActions;
+}
+
+/** Accès aux URL de webhook du workflow courant (#202). */
+export interface WebhookActions {
+  list: () => Promise<Schemas["WebhookList"]>;
+  rotate: (nodeId: string) => Promise<Schemas["WebhookInfo"]>;
 }
 
 const CREDENTIAL_KEY = "credential_id";
@@ -48,6 +61,7 @@ export function NodePanel({
   onChange,
   onClose,
   fetchCredentialsImpl = fetchCredentials,
+  webhooks,
 }: NodePanelProps): JSX.Element {
   if (!node) return <EmptyPanel />;
   const schema = findNodeSchema(node.data.kind, node.data.subtype);
@@ -62,6 +76,7 @@ export function NodePanel({
       onChange={onChange}
       onClose={onClose}
       fetchCredentialsImpl={fetchCredentialsImpl}
+      webhooks={webhooks}
     />
   );
 }
@@ -117,6 +132,7 @@ interface NodePanelFormProps {
   onChange: (nodeId: string, params: ParamValues) => void;
   onClose: () => void;
   fetchCredentialsImpl: typeof fetchCredentials;
+  webhooks: WebhookActions | undefined;
 }
 
 function NodePanelForm({
@@ -125,6 +141,7 @@ function NodePanelForm({
   onChange,
   onClose,
   fetchCredentialsImpl,
+  webhooks,
 }: NodePanelFormProps): JSX.Element {
   const initial = useMemo(
     () => initialValues(node, schema),
@@ -186,6 +203,10 @@ function NodePanelForm({
             onChange={(id) => updateValue(CREDENTIAL_KEY, id === "" ? null : id)}
             fetchImpl={fetchCredentialsImpl}
           />
+        ) : null}
+
+        {webhooks && schema.kind === "trigger" && schema.subtype === "webhook" ? (
+          <WebhookUrlField nodeId={node.id} webhooks={webhooks} />
         ) : null}
       </form>
     </aside>
@@ -417,6 +438,146 @@ function CredentialField({
           ))}
         </select>
       )}
+    </div>
+  );
+}
+
+// ─────────────── URL de webhook (#202) ───────────────
+
+type WebhookState =
+  | { kind: "loading" }
+  | { kind: "unsaved" }
+  | { kind: "error"; message: string }
+  | { kind: "ok"; info: Schemas["WebhookInfo"] };
+
+function WebhookUrlField({
+  nodeId,
+  webhooks,
+}: {
+  nodeId: string;
+  webhooks: WebhookActions;
+}): JSX.Element {
+  const [state, setState] = useState<WebhookState>({ kind: "loading" });
+  const [showSecret, setShowSecret] = useState(false);
+  const [copied, setCopied] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    setState({ kind: "loading" });
+    webhooks.list().then(
+      (list) => {
+        if (cancelled) return;
+        const info = list.items.find((i) => i.node_id === nodeId);
+        setState(info ? { kind: "ok", info } : { kind: "unsaved" });
+      },
+      (e: unknown) => {
+        if (cancelled) return;
+        setState(
+          e instanceof ApiError && e.status === 404
+            ? { kind: "unsaved" }
+            : { kind: "error", message: (e as Error).message },
+        );
+      },
+    );
+    return () => {
+      cancelled = true;
+    };
+  }, [nodeId, webhooks]);
+
+  const rotate = async (): Promise<void> => {
+    if (!window.confirm("Générer une nouvelle URL ? L'URL actuelle cessera de fonctionner.")) {
+      return;
+    }
+    try {
+      setState({ kind: "ok", info: await webhooks.rotate(nodeId) });
+      setShowSecret(false);
+      setCopied(false);
+    } catch (e) {
+      setState({ kind: "error", message: (e as Error).message });
+    }
+  };
+
+  let body: JSX.Element;
+  switch (state.kind) {
+    case "loading":
+      body = (
+        <p className="text-xs text-neutral-500" role="status">
+          Chargement de l'URL…
+        </p>
+      );
+      break;
+    case "unsaved":
+      body = (
+        <p className="text-xs text-neutral-500" role="status">
+          Enregistrez le workflow pour obtenir l'URL de ce webhook.
+        </p>
+      );
+      break;
+    case "error":
+      body = (
+        <p className="text-xs text-rose-600" role="alert">
+          {state.message}
+        </p>
+      );
+      break;
+    case "ok": {
+      const url = `${apiBaseUrl()}${state.info.path}`;
+      body = (
+        <div className="space-y-2">
+          <div className="flex gap-1">
+            <input
+              readOnly
+              value={url}
+              aria-label="URL du webhook"
+              data-testid="webhook-url"
+              className="min-w-0 flex-1 rounded-md border border-neutral-200 bg-neutral-50 px-2 py-1 font-mono text-xs"
+            />
+            <button
+              type="button"
+              onClick={() => {
+                void navigator.clipboard?.writeText(url).then(() => setCopied(true));
+              }}
+              className="rounded-md border border-neutral-200 px-2 text-xs hover:bg-neutral-100"
+            >
+              {copied ? "Copiée" : "Copier"}
+            </button>
+          </div>
+          <p className="text-xs text-neutral-500">
+            {state.info.method} · quiconque connaît cette URL peut déclencher le workflow.
+          </p>
+          <div className="text-xs">
+            <span className="font-medium text-neutral-700">Secret de signature : </span>
+            {showSecret ? (
+              <code data-testid="webhook-secret" className="break-all">
+                {state.info.signing_secret}
+              </code>
+            ) : (
+              <button
+                type="button"
+                onClick={() => setShowSecret(true)}
+                className="text-sky-700 hover:underline"
+              >
+                Afficher
+              </button>
+            )}
+          </div>
+          <button
+            type="button"
+            onClick={() => void rotate()}
+            className="rounded-md border border-rose-200 px-2 py-1 text-xs text-rose-700 hover:bg-rose-50"
+          >
+            Régénérer l'URL
+          </button>
+        </div>
+      );
+      break;
+    }
+  }
+
+  return (
+    <div data-testid="webhook-field" className="border-t border-neutral-200 pt-3">
+      <p className="mb-1 text-xs font-medium text-neutral-700">URL du webhook</p>
+      {body}
     </div>
   );
 }
