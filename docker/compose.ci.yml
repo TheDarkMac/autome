@@ -1,0 +1,17 @@
+# Surcharge CI de docker-compose.yml — smoke de bout en bout (#216).
+#
+# Nomme les images de l'api et du worker : `docker buildx bake` les construit
+# depuis le compose (cache GitHub Actions par couches) puis
+# `docker compose up --no-build` les retrouve sans rebuild. Le compose de
+# développement n'est pas modifié.
+#
+#   docker buildx bake -f docker-compose.yml -f docker/compose.ci.yml --load api worker
+#   export COMPOSE_FILE=docker-compose.yml:docker/compose.ci.yml   # lu par compose, pas par bake
+#   docker compose up --no-build --wait api worker
+#   scripts/compose-smoke.sh
+
+services:
+  api:
+    image: autome-api:ci
+  worker:
+    image: autome-worker:ci
