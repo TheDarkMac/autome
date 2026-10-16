@@ -418,6 +418,7 @@ comptes sont publics ; tout le reste exige `Authorization: Bearer <access_token>
 | POST | `/auth/refresh` | `{"refresh_token"}` | 200 + nouvelle paire · 401 refresh invalide, expiré ou déjà utilisé |
 | POST | `/auth/logout` | `{"refresh_token"}` (+ `Authorization: Bearer <access_token>` facultatif) | 204 session fermée (aussi si déjà fermée) · 401 refresh invalide ou expiré |
 | POST | `/auth/logout-all` | — (`Authorization: Bearer <access_token>` requis) | 204 toutes les sessions fermées · 401 access absent, invalide ou déjà révoqué |
+| POST | `/auth/password` | `{"current_password","new_password"}` (Bearer requis) | 200 + nouvelle paire · 400 nouveau mot de passe invalide ou identique · 403 mot de passe actuel incorrect · 409 changé entre-temps · 429 trop d'essais |
 
 - Paire de jetons : `{"access_token","refresh_token","token_type":"Bearer","expires_in":900}`.
   Access valable 15 min, refresh 7 jours et **à usage unique** (rotation) : de
@@ -441,6 +442,16 @@ comptes sont publics ; tout le reste exige `Authorization: Bearer <access_token>
   nouvelle connexion ouvre une session valide. Bouton « Déconnecter tous les
   appareils » dans le frontend ; audit `auth.logout_all`. Ne jamais supprimer
   de ligne de `session_versions` : cela revaliderait les anciens jetons.
+- **Changement de mot de passe** (#196) : `/auth/password` exige le mot de
+  passe **actuel** (un access token volé ne suffit pas ; 5 essais par compte et
+  par fenêtre de 15 min, puis 429). Le nouveau hash n'est écrit que si l'ancien
+  est toujours en place (deux changements simultanés : un seul réussit, 409
+  pour l'autre). Ensuite **toutes les sessions sont fermées**, sur tous les
+  appareils, et la réponse fournit une nouvelle paire à l'appareil courant, qui
+  reste connecté. Mot de passe actuel incorrect = **403** (pas 401, que le
+  frontend interpréterait comme une session expirée). Onglet « Compte » du
+  frontend ; audit `auth.password_change`. Pas encore de réinitialisation par
+  email (mot de passe oublié).
 - Mot de passe : 8 à 1024 caractères, haché en **Argon2id**. L'email est
   normalisé (trim + minuscules).
 - Un compte créé par `signup` reçoit le rôle **editor** (CRUD workflows, runs,
