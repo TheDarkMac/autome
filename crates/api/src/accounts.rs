@@ -13,11 +13,13 @@
 //! | POST    | `/auth/password` | `{ current_password, new_password }` (Bearer) | 200 + [`TokenResponse`] |
 //! | POST    | `/auth/password/forgot` | `{ email }`      | 202                         |
 //! | POST    | `/auth/password/reset`  | `{ token, new_password }` | 204               |
+//! | GET     | `/auth/me`      | — (Bearer requis)       | 200 + [`MeResponse`]        |
 //!
 //! Contrat aligné sur le frontend (`frontend/src/auth.ts`) : 400 saisie
-//! invalide, 401 identifiants/jeton refusés, 409 email déjà pris, 429 trop
-//! de tentatives (`Retry-After`), 503 réinitialisation indisponible (aucun
-//! envoi d'email configuré).
+//! invalide, 401 identifiants/jeton refusés, 403 compte suspendu (connexion
+//! avec le bon mot de passe), 409 email déjà pris, 429 trop de tentatives
+//! (`Retry-After`), 503 réinitialisation indisponible (aucun envoi d'email
+//! configuré).
 //!
 //! Choix de sécurité :
 //! - **Argon2id** ([`PasswordHasher`]) exécuté dans `spawn_blocking` : ~50 ms
@@ -66,6 +68,14 @@
 //!   les sessions et lève le blocage de connexion du compte ; jeton invalide,
 //!   expiré ou déjà utilisé : 400 (pas 401, qui signifie « session
 //!   expirée » pour le client).
+//! - Un compte **suspendu** par l'administration (#208, cf. [`crate::admin`])
+//!   ne se connecte plus : 403 après vérification du mot de passe (seul le
+//!   titulaire apprend la suspension), et aucun lien de réinitialisation ne
+//!   lui est envoyé. Contre une suspension concurrente, la version de session
+//!   est lue **avant** de relire le drapeau : l'administration écrit le
+//!   drapeau puis incrémente la version, si bien qu'une paire émise sans voir
+//!   le drapeau porte une version déjà périmée. Le changement de mot de passe
+//!   suit le même ordre.
 //! - Chaque inscription/connexion/déconnexion/changement ou réinitialisation
 //!   de mot de passe produit un event d'audit `auth.signup` / `auth.login` /
 //!   `auth.logout` / `auth.logout_all` / `auth.password_change` /
@@ -76,7 +86,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use autome_core::{
-    email_throttle_key, normalize_email, validate_email, validate_password, AuditEvent,
+    email_throttle_key, normalize_email, role_of, validate_email, validate_password, AuditEvent,
     AuditOutcome, Config, CreateUser, InMemoryLoginThrottle, LoginAttempt, LoginThrottleStore,
     PasswordHasher, Role, TokenKind, UserStore,
 };
@@ -85,7 +95,7 @@ use axum::{
     extract::{ConnectInfo, FromRef, State},
     http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
-    routing::post,
+    routing::{get, post},
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
@@ -293,6 +303,19 @@ pub struct TokenResponse {
     pub expires_in: i64,
 }
 
+/// Réponse de [`me`] : l'utilisateur authentifié et ses droits.
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct MeResponse {
+    /// Identifiant (`claims.sub`).
+    pub id: String,
+    /// Email normalisé.
+    pub email: String,
+    /// Rôle déduit des permissions : `admin`, `editor`, `viewer` ou `custom`.
+    pub role: String,
+    /// Permissions accordées, triées (`*` = toutes).
+    pub permissions: Vec<String>,
+}
+
 /// Erreurs des handlers de comptes.
 #[derive(Debug)]
 pub enum AccountError {
@@ -431,6 +454,9 @@ fn token_response(access_token: String, refresh_token: String) -> TokenResponse 
     }
 }
 
+/// Message du refus de connexion d'un compte suspendu (#208).
+const ACCOUNT_DISABLED: &str = "account disabled";
+
 /// Émet une paire à la version de session courante de l'utilisateur (#186).
 async fn issue_pair(state: &AccountsState, user_id: &str) -> Result<TokenResponse, AccountError> {
     let sv = state
@@ -439,6 +465,15 @@ async fn issue_pair(state: &AccountsState, user_id: &str) -> Result<TokenRespons
         .session_version(user_id)
         .await
         .map_err(internal)?;
+    issue_pair_at(state, user_id, sv)
+}
+
+/// Émet une paire à la version de session `sv`, lue par l'appelant.
+fn issue_pair_at(
+    state: &AccountsState,
+    user_id: &str,
+    sv: i64,
+) -> Result<TokenResponse, AccountError> {
     let now = state.auth.clock.now_unix_seconds();
     let (access, refresh) = state
         .auth
@@ -446,6 +481,17 @@ async fn issue_pair(state: &AccountsState, user_id: &str) -> Result<TokenRespons
         .issue_pair(user_id, sv, ACCESS_TTL_SECONDS, REFRESH_TTL_SECONDS, now)
         .map_err(internal)?;
     Ok(token_response(access, refresh))
+}
+
+/// `true` si le compte existe et n'est pas suspendu (#208). À appeler
+/// **après** avoir lu la version de session des jetons à émettre.
+async fn is_enabled(state: &AccountsState, user_id: &str) -> Result<bool, AccountError> {
+    Ok(state
+        .users
+        .find_by_id(user_id)
+        .await
+        .map_err(internal)?
+        .is_some_and(|u| !u.disabled))
 }
 
 /// `POST /auth/signup` — crée un compte (rôle `editor`) et le connecte.
@@ -508,6 +554,7 @@ pub async fn signup(
     responses(
         (status = 200, description = "Connecté", body = TokenResponse),
         (status = 401, description = "Identifiants invalides"),
+        (status = 403, description = "Compte suspendu par un administrateur"),
         (status = 429, description = "Trop d'échecs (compte ou adresse IP) — voir `Retry-After`")
     )
 )]
@@ -548,6 +595,17 @@ pub async fn login(
 
     match user {
         Some(user) if matches => {
+            // Version lue avant le drapeau de suspension (cf. doc du module).
+            let sv = state
+                .auth
+                .revocation
+                .session_version(&user.id)
+                .await
+                .map_err(internal)?;
+            if !is_enabled(&state, &user.id).await? {
+                audit(&state, &user.id, "auth.login", AuditOutcome::Denied).await;
+                return Err(AccountError::Forbidden(ACCOUNT_DISABLED));
+            }
             // La connexion a réussi : un compteur non remis à zéro ne doit pas
             // la faire échouer (il expirera avec sa fenêtre).
             if let Err(e) = state.throttle.reset(&email_key).await {
@@ -561,7 +619,7 @@ pub async fn login(
                 }
             }
             audit(&state, &user.id, "auth.login", AuditOutcome::Success).await;
-            Ok(Json(issue_pair(&state, &user.id).await?))
+            Ok(Json(issue_pair_at(&state, &user.id, sv)?))
         }
         _ => {
             audit(&state, &email, "auth.login", AuditOutcome::Failure).await;
@@ -746,8 +804,15 @@ pub async fn change_password(
         .await;
         return Err(AccountError::TooManyAttempts(retry_after_secs));
     }
-    // Compte disparu (jeton d'un compte supprimé) : la session ne vaut rien.
-    let Some(account) = state.users.find_by_id(&user_id).await.map_err(internal)? else {
+    // Compte disparu (jeton d'un compte supprimé) ou suspendu : la session ne
+    // vaut rien.
+    let Some(account) = state
+        .users
+        .find_by_id(&user_id)
+        .await
+        .map_err(internal)?
+        .filter(|a| !a.disabled)
+    else {
         return Err(AccountError::Unauthorized);
     };
 
@@ -808,7 +873,11 @@ pub async fn change_password(
         AuditOutcome::Success,
     )
     .await;
-    Ok(Json(issue_pair(&state, &user_id).await?))
+    // Suspendu entre-temps (#208) : pas de nouvelle session.
+    if !is_enabled(&state, &user_id).await? {
+        return Err(AccountError::Unauthorized);
+    }
+    Ok(Json(issue_pair_at(&state, &user_id, version)?))
 }
 
 /// Message des jetons de réinitialisation refusés (même réponse quelle que
@@ -891,6 +960,17 @@ async fn send_reset_link(state: &AccountsState, reset: &PasswordReset, email: &s
         .await;
         return;
     };
+    // Compte suspendu (#208) : le lien ne lui rendrait pas l'accès.
+    if user.disabled {
+        audit(
+            state,
+            &user.id,
+            "auth.password_reset_request",
+            AuditOutcome::Denied,
+        )
+        .await;
+        return;
+    }
     let token = reset.tokens.issue(&user.id, &user.password_hash, now);
     match reset
         .mail
@@ -1018,6 +1098,47 @@ pub async fn reset_password(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// `GET /auth/me` — l'utilisateur authentifié, son rôle et ses permissions
+/// (le frontend en déduit les écrans à proposer, ex. l'administration).
+#[utoipa::path(
+    get,
+    path = "/auth/me",
+    tag = "auth",
+    responses(
+        (status = 200, description = "Utilisateur courant", body = MeResponse),
+        (status = 401, description = "Access token absent, invalide, révoqué, ou compte suspendu")
+    ),
+    security(("bearer" = []))
+)]
+pub async fn me(
+    user: AuthenticatedUser,
+    State(state): State<AccountsState>,
+) -> Result<Json<MeResponse>, AccountError> {
+    let Some(account) = state
+        .users
+        .find_by_id(user.user_id())
+        .await
+        .map_err(internal)?
+        .filter(|a| !a.disabled)
+    else {
+        return Err(AccountError::Unauthorized);
+    };
+    let granted = state
+        .auth
+        .permissions
+        .permissions_for(&account.id)
+        .await
+        .map_err(internal)?;
+    let mut permissions: Vec<String> = granted.iter().cloned().collect();
+    permissions.sort();
+    Ok(Json(MeResponse {
+        role: role_of(&granted).to_string(),
+        id: account.id,
+        email: account.email,
+        permissions,
+    }))
+}
+
 /// Sous-router `/signup`, `/login`, `/refresh`, `/logout`,
 /// `/password/forgot`, `/password/reset` (publics), `/logout-all` et
 /// `/password` (Bearer) — à imbriquer sous `/auth` avec
@@ -1032,6 +1153,7 @@ pub fn accounts_router(state: AccountsState) -> Router {
         .route("/password", post(change_password))
         .route("/password/forgot", post(forgot_password))
         .route("/password/reset", post(reset_password))
+        .route("/me", get(me))
         .with_state(state)
 }
 
@@ -2561,6 +2683,128 @@ mod tests {
         let dump = format!("{events:?}");
         assert!(!dump.contains(&token[token.len() - 64..]), "MAC du jeton");
         assert!(!dump.contains("new-password"));
+    }
+
+    // ───── Comptes suspendus et `/auth/me` (#208) ─────
+
+    async fn get_bearer(app: &Router, path: &str, bearer: &str) -> Response {
+        app.clone()
+            .oneshot(
+                Request::get(path)
+                    .header("Authorization", format!("Bearer {bearer}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    /// Inscrit `email` puis suspend le compte ; renvoie la paire d'avant.
+    async fn disabled_account(h: &Harness, email: &str, password: &str) -> TokenResponse {
+        let pair = tokens(post(&h.app, "/signup", creds(email, password)).await).await;
+        let id = h.users.find_by_email(email).await.unwrap().unwrap().id;
+        assert!(h.users.set_disabled(&id, true).await.unwrap());
+        pair
+    }
+
+    #[tokio::test]
+    async fn a_disabled_account_cannot_log_in_and_only_its_owner_learns_why() {
+        let h = harness();
+        disabled_account(&h, "eve@example.io", "right-password").await;
+        let r = post(&h.app, "/login", creds("eve@example.io", "right-password")).await;
+        assert_eq!(r.status(), StatusCode::FORBIDDEN);
+        assert_eq!(text(r).await, ACCOUNT_DISABLED);
+        // Mauvais mot de passe : la suspension n'est pas révélée.
+        let r = post(&h.app, "/login", creds("eve@example.io", "wrong-password")).await;
+        assert_eq!(r.status(), StatusCode::UNAUTHORIZED);
+        let denied = h
+            .audit
+            .list()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.action == "auth.login" && e.outcome == AuditOutcome::Denied)
+            .count();
+        assert_eq!(denied, 1);
+
+        // Réactivé : la connexion fonctionne de nouveau.
+        let id = h
+            .users
+            .find_by_email("eve@example.io")
+            .await
+            .unwrap()
+            .unwrap()
+            .id;
+        h.users.set_disabled(&id, false).await.unwrap();
+        let r = post(&h.app, "/login", creds("eve@example.io", "right-password")).await;
+        assert_eq!(r.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn me_reports_identity_role_and_permissions() {
+        let h = harness();
+        let pair =
+            tokens(post(&h.app, "/signup", creds("fay@example.io", "some-password")).await).await;
+        let r = get_bearer(&h.app, "/me", &pair.access_token).await;
+        assert_eq!(r.status(), StatusCode::OK);
+        let bytes = r.into_body().collect().await.unwrap().to_bytes();
+        let me: MeResponse = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(me.email, "fay@example.io");
+        assert_eq!(me.id, verify(&pair.access_token).sub);
+        assert_eq!(me.role, "editor");
+        let mut expected: Vec<String> = Role::editor().permissions.into_iter().collect();
+        expected.sort();
+        assert_eq!(me.permissions, expected);
+
+        h.perms.grant(&me.id, autome_core::PERM_WILDCARD).unwrap();
+        let bytes = get_bearer(&h.app, "/me", &pair.access_token)
+            .await
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes();
+        let me: MeResponse = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(me.role, "admin");
+
+        let r = get_bearer(&h.app, "/me", "not-a-token").await;
+        assert_eq!(r.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn a_disabled_account_token_is_worthless_for_me_and_password_change() {
+        let h = harness();
+        // Jeton émis avant la suspension, sans fermeture des sessions : cas
+        // d'une suspension concurrente (l'administration incrémente aussi la
+        // version de session).
+        let pair = disabled_account(&h, "gus@example.io", "old-password").await;
+        let r = get_bearer(&h.app, "/me", &pair.access_token).await;
+        assert_eq!(r.status(), StatusCode::UNAUTHORIZED);
+        let r = post_bearer(
+            &h.app,
+            "/password",
+            &pair.access_token,
+            pw("old-password", "new-password"),
+        )
+        .await;
+        assert_eq!(r.status(), StatusCode::UNAUTHORIZED);
+        let stored = h
+            .users
+            .find_by_email("gus@example.io")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.password_hash, "plain:old-password");
+    }
+
+    #[tokio::test]
+    async fn a_disabled_account_gets_no_reset_link() {
+        let h = harness();
+        disabled_account(&h, "hal@example.io", "some-password").await;
+        let r = post(&h.app, "/password/forgot", forgot("hal@example.io")).await;
+        assert_eq!(r.status(), StatusCode::ACCEPTED, "réponse inchangée");
+        wait_audit(&h, "auth.password_reset_request", AuditOutcome::Denied).await;
+        assert!(h.mailer.sent().is_empty());
     }
 
     #[tokio::test]

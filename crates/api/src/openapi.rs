@@ -41,6 +41,14 @@ use utoipa::{
         crate::accounts::change_password,
         crate::accounts::forgot_password,
         crate::accounts::reset_password,
+        crate::accounts::me,
+        // administration des utilisateurs (#208)
+        crate::admin::list_users,
+        crate::admin::get_user,
+        crate::admin::set_role,
+        crate::admin::disable_user,
+        crate::admin::enable_user,
+        crate::admin::logout_user,
         // workflows (F7.1)
         crate::workflows::list_workflows,
         crate::workflows::create_workflow,
@@ -70,6 +78,10 @@ use utoipa::{
         crate::accounts::ForgotPasswordBody,
         crate::accounts::ResetPasswordBody,
         crate::accounts::TokenResponse,
+        crate::accounts::MeResponse,
+        crate::admin::AdminUser,
+        crate::admin::UserListResponse,
+        crate::admin::RoleBody,
         crate::workflows::ListResponse,
         crate::runs::CreateRunBody,
         crate::runs::CreateRunResponse,
@@ -87,6 +99,7 @@ use utoipa::{
     tags(
         (name = "probes", description = "Sondes de l'orchestrateur : vivant (`/livez`) et prêt (`/readyz`)."),
         (name = "auth", description = "Comptes : inscription, connexion, rotation des jetons."),
+        (name = "admin", description = "Administration des utilisateurs : liste, rôles, suspension, sessions."),
         (name = "workflows", description = "CRUD des workflows."),
         (name = "runs", description = "Déclenchement et suivi des runs."),
         (name = "webhooks", description = "Déclencheurs webhook : URL secrètes publiques et leur gestion."),
