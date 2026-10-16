@@ -29,5 +29,10 @@ pub mod store;
 pub use client::{AuthorizationStart, OAuthClient, TokenSet};
 pub use pkce::{generate_pkce, generate_state, PkcePair};
 pub use provider::{OAuthProviderConfig, OAuthRegistry};
-pub use refresh::{merge_refreshed, needs_refresh, TokenRefresher, REFRESH_SKEW_MS};
-pub use store::{open_tokens, seal_tokens, ConnectorTokenStore, InMemoryConnectorTokenStore};
+pub use refresh::{
+    is_invalid_grant, merge_refreshed, needs_refresh, RefreshError, TokenRefresher, REFRESH_SKEW_MS,
+};
+pub use store::{
+    open_tokens, seal_tokens, ConnectorTokenStore, CredentialInvalidation, CredentialUpdate,
+    InMemoryConnectorTokenStore, StoredCredential,
+};
