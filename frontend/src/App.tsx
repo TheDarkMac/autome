@@ -1,6 +1,11 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { apiBaseUrl, fetchOpenApi, type OpenApiSpec } from "./api";
-import { canAdministerUsers, createApiClient, type Schemas } from "./apiClient";
+import {
+  canAdministerUsers,
+  createApiClient,
+  hasPermission,
+  type Schemas,
+} from "./apiClient";
 import { fetchCatalog, STATIC_CATALOG, type CatalogItem } from "./catalog";
 import { AccountPanel } from "./AccountPanel";
 import { AdminPanel } from "./AdminPanel";
@@ -26,6 +31,8 @@ import {
 } from "./runs";
 import { useRunPolling } from "./useRunPolling";
 import { useSession, type UseSessionOptions } from "./useSession";
+import { useWorkflowEditor, type UseWorkflowEditorOptions } from "./useWorkflowEditor";
+import { WorkflowBar } from "./WorkflowBar";
 
 type Status =
   | { kind: "idle" }
@@ -42,17 +49,15 @@ export interface AppProps {
   requestPasswordResetImpl?: typeof apiRequestPasswordReset;
   /** Réinitialisation par jeton (#204), injectable pour les tests. */
   resetPasswordImpl?: typeof apiResetPassword;
+  /** Options du workflow ouvert (#225), injectables pour les tests. */
+  editorOptions?: UseWorkflowEditorOptions;
 }
-
-// Workflow courant : tant que F8.7 (persistence backend) n'est pas en place,
-// on opère sur un brouillon local ; la liste des runs interroge ce même
-// `workflowId` côté backend.
-const DRAFT_WORKFLOW_ID = "wf-draft";
 
 export function App({
   sessionOptions,
   requestPasswordResetImpl = apiRequestPasswordReset,
   resetPasswordImpl = apiResetPassword,
+  editorOptions,
 }: AppProps = {}): JSX.Element {
   const {
     session,
@@ -138,13 +143,28 @@ export function App({
     };
   }, [api, userId]);
   const isAdmin = me !== null && canAdministerUsers(me.permissions);
-  // URL des nœuds webhook du workflow courant (#202).
+  // Droits d'édition et de lancement (#225) : tant que `me` n'est pas
+  // chargé, on n'interdit rien (le serveur tranche).
+  const canWrite = me === null || hasPermission(me.permissions, "workflows.write");
+  const canRun = me === null || hasPermission(me.permissions, "runs.execute");
+  // Workflow ouvert dans l'éditeur, enregistré côté serveur (#225).
+  const editor = useWorkflowEditor(api, userId, editorOptions);
+  const workflowId = editor.current.id;
+  const persisted = editor.current.persisted;
+  // URL des nœuds webhook du workflow courant (#202) — relues après chaque
+  // enregistrement ; aucun appel tant que le serveur ne connaît pas l'id.
+  const revision = editor.revision;
   const webhooks = useMemo<WebhookActions>(
     () => ({
-      list: () => api.listWebhooks(DRAFT_WORKFLOW_ID),
-      rotate: (nodeId) => api.rotateWebhook(DRAFT_WORKFLOW_ID, nodeId),
+      list: () =>
+        persisted
+          ? api.listWebhooks(workflowId)
+          : Promise.resolve({ items: [] }),
+      rotate: (nodeId) => api.rotateWebhook(workflowId, nodeId),
     }),
-    [api],
+    // `revision` force une relecture des URL après chaque enregistrement.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [api, workflowId, persisted, revision],
   );
   const [status, setStatus] = useState<Status>({ kind: "idle" });
   const [catalog, setCatalog] = useState<readonly CatalogItem[]>(STATIC_CATALOG);
@@ -152,8 +172,17 @@ export function App({
   const [selectedNode, setSelectedNode] = useState<CanvasNode | null>(null);
   const [controller, setController] = useState<NodeCanvasController | null>(null);
   const [view, setView] = useState<View>("edit");
-  const [graph, setGraph] = useState<WireGraph | null>(null);
+  const graph = editor.graph;
   const [selectedRunId, setSelectedRunId] = useState<string | null>(null);
+  // Autre workflow ouvert : sa sélection et son run ne valent plus.
+  useEffect(() => {
+    setSelectedNode(null);
+    setSelectedRunId(null);
+  }, [editor.canvas.key]);
+  const onRunStarted = useCallback((runId: string) => {
+    setSelectedRunId(runId);
+    setView("runs");
+  }, []);
   // Droits retirés (ou autre compte) pendant que l'onglet est ouvert.
   useEffect(() => {
     if (view === "admin" && !isAdmin) setView("edit");
@@ -315,42 +344,62 @@ export function App({
           <ConnectorsPanel accessToken={session.accessToken} />
         </div>
       ) : (
-        <div className="flex min-h-0 flex-1">
-          {view === "edit" ? (
-            <Palette items={catalog} loading={catalogLoading} />
-          ) : (
-            <RunsList
-              workflowId={DRAFT_WORKFLOW_ID}
-              selectedRunId={selectedRunId}
-              onSelectRun={setSelectedRunId}
-              fetchImpl={api.listRuns}
-            />
-          )}
-          <section className="flex min-h-0 flex-1">
-            <NodeCanvas
-              onChange={setGraph}
-              onSelectionChange={setSelectedNode}
-              onReady={setController}
-              executionStatuses={executionStatuses}
-              workflowId={DRAFT_WORKFLOW_ID}
-            />
-          </section>
-          {view === "edit" ? (
-            <NodePanel
-              node={selectedNode}
-              onChange={handlePanelChange}
-              onClose={() => setSelectedNode(null)}
-              webhooks={webhooks}
-            />
-          ) : (
-            <RunExecutionPanel
-              checkpoint={pollError ? null : checkpoint}
-              node={selectedNode}
-              edges={graph?.edges ?? []}
-              onClose={() => setSelectedNode(null)}
-            />
-          )}
-        </div>
+        <>
+          <WorkflowBar
+            editor={editor}
+            canWrite={canWrite}
+            canRun={canRun}
+            onRunStarted={onRunStarted}
+          />
+          <div className="flex min-h-0 flex-1">
+            {view === "edit" ? (
+              <Palette items={catalog} loading={catalogLoading} />
+            ) : persisted ? (
+              <RunsList
+                workflowId={workflowId}
+                selectedRunId={selectedRunId}
+                onSelectRun={setSelectedRunId}
+                refreshToken={checkpoint?.status}
+                fetchImpl={api.listRuns}
+              />
+            ) : (
+              <aside
+                aria-label="Liste des runs"
+                className="w-80 shrink-0 border-r border-neutral-200 bg-white px-4 py-3 text-sm text-neutral-500"
+              >
+                Enregistrez le workflow pour voir ses exécutions.
+              </aside>
+            )}
+            <section className="flex min-h-0 flex-1">
+              <NodeCanvas
+                key={editor.canvas.key}
+                initialNodes={editor.canvas.nodes}
+                initialEdges={editor.canvas.edges}
+                onChange={editor.onGraphChange}
+                onSelectionChange={setSelectedNode}
+                onReady={setController}
+                executionStatuses={executionStatuses}
+                workflowId={workflowId}
+                workflowName={editor.current.name}
+              />
+            </section>
+            {view === "edit" ? (
+              <NodePanel
+                node={selectedNode}
+                onChange={handlePanelChange}
+                onClose={() => setSelectedNode(null)}
+                webhooks={webhooks}
+              />
+            ) : (
+              <RunExecutionPanel
+                checkpoint={pollError ? null : checkpoint}
+                node={selectedNode}
+                edges={graph?.edges ?? []}
+                onClose={() => setSelectedNode(null)}
+              />
+            )}
+          </div>
+        </>
       )}
     </main>
   );
