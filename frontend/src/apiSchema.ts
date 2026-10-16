@@ -414,7 +414,7 @@ export interface components {
             checks: {
                 [key: string]: string;
             };
-            /** @description `ready` ou `unavailable`. */
+            /** @description `ready`, `unavailable` ou `draining` (arrêt en cours). */
             status: string;
         };
         /** @description Body de `/auth/refresh` et `/auth/logout`. */
@@ -850,7 +850,7 @@ export interface operations {
                     "application/json": components["schemas"]["ReadyzResponse"];
                 };
             };
-            /** @description Une dépendance au moins est indisponible */
+            /** @description Une dépendance au moins est indisponible, ou arrêt en cours */
             503: {
                 headers: {
                     [name: string]: unknown;
