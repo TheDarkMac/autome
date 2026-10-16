@@ -93,7 +93,11 @@ jobs:
 
       # `--nocapture` : le message de saut des tests réels reste visible, ce
       # qui permet à l'étape suivante de vérifier qu'aucun n'a été sauté.
+      # Sans couleur : `CARGO_TERM_COLOR=always` (posé par la toolchain) glisse
+      # des codes ANSI dans « Running … » et casserait le grep du garde-fou.
       - name: Tests
+        env:
+          CARGO_TERM_COLOR: never
         run: |
           set -o pipefail
           cargo test --workspace --locked -- --nocapture 2>&1 | tee "$RUNNER_TEMP/cargo-test.log"
