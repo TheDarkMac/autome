@@ -28,8 +28,8 @@
 use std::sync::Arc;
 
 use autome_core::{
-    AuditEvent, AuditOutcome, Pagination, WorkflowGraph, WorkflowId, WorkflowPage,
-    WorkflowRepository, PERM_WORKFLOWS_READ, PERM_WORKFLOWS_WRITE,
+    AuditEvent, AuditOutcome, Pagination, WebhookEndpointStore, WorkflowGraph, WorkflowId,
+    WorkflowPage, WorkflowRepository, PERM_WORKFLOWS_READ, PERM_WORKFLOWS_WRITE,
 };
 use axum::{
     extract::{FromRef, Path, Query, State},
@@ -50,12 +50,37 @@ pub struct WorkflowsState {
     pub auth: AuthState,
     /// Repository des workflows.
     pub repo: Arc<dyn WorkflowRepository + Send + Sync>,
+    /// Endpoints de webhook (#202), purgés quand un nœud webhook ou le
+    /// workflow disparaît ; `None` = pas de purge (tests).
+    pub webhooks: Option<Arc<dyn WebhookEndpointStore>>,
 }
 
 impl WorkflowsState {
     /// Builder convenience.
     pub fn new(auth: AuthState, repo: Arc<dyn WorkflowRepository + Send + Sync>) -> Self {
-        Self { auth, repo }
+        Self {
+            auth,
+            repo,
+            webhooks: None,
+        }
+    }
+
+    /// Builder : purge des endpoints de webhook (#202).
+    pub fn with_webhooks(mut self, webhooks: Arc<dyn WebhookEndpointStore>) -> Self {
+        self.webhooks = Some(webhooks);
+        self
+    }
+
+    /// Supprime les URL de webhook des nœuds absents de `keep`. Un échec est
+    /// journalisé sans faire échouer la requête : une URL orpheline répond
+    /// déjà 404 (son nœud n'existe plus).
+    async fn prune_webhooks(&self, ns: &str, id: &str, keep: &[String]) {
+        let Some(webhooks) = &self.webhooks else {
+            return;
+        };
+        if let Err(e) = webhooks.retain(ns, id, keep).await {
+            tracing::warn!(workflow_id = id, error = %e, "purge des URL de webhook impossible");
+        }
     }
 }
 
@@ -359,6 +384,9 @@ pub async fn update_workflow(
     let res = resource(&user, &ns, &id);
     match state.repo.update(&ns, workflow.clone()).await {
         Ok(()) => {
+            state
+                .prune_webhooks(&ns, &id, &crate::webhooks::webhook_node_ids(&workflow))
+                .await;
             audit_event(
                 &state,
                 user.user_id(),
@@ -417,6 +445,7 @@ pub async fn delete_workflow(
         .delete(&ns, &WorkflowId::new(&id))
         .await
         .map_err(internal)?;
+    state.prune_webhooks(&ns, &id, &[]).await;
     let outcome = if existed {
         AuditOutcome::Success
     } else {
@@ -1029,5 +1058,56 @@ mod tests {
                 .status(),
             StatusCode::OK
         );
+    }
+
+    // ───── #202 — purge des URL de webhook ─────
+
+    #[tokio::test]
+    async fn removing_a_webhook_node_or_the_workflow_drops_its_urls() {
+        use autome_core::{EndpointSecret, InMemoryWebhookEndpointStore, WebhookEndpointStore};
+
+        let (state, svc, perms, _, repo) = make_test_state();
+        let webhooks = Arc::new(InMemoryWebhookEndpointStore::new());
+        let app = workflows_router(state.with_webhooks(webhooks.clone()));
+        perms.assign_role("alice", &Role::editor()).unwrap();
+        let token = svc.issue_access("alice", 900, FIXED_NOW).unwrap();
+
+        let mut wf = sample_workflow_json("wf-1");
+        wf["nodes"].as_array_mut().unwrap().extend([
+            serde_json::json!({ "id": "a", "name": "a", "kind": "trigger", "trigger_type": "webhook" }),
+            serde_json::json!({ "id": "b", "name": "b", "kind": "trigger", "trigger_type": "webhook" }),
+        ]);
+        repo.create("alice", serde_json::from_value(wf.clone()).unwrap())
+            .await
+            .unwrap();
+        let secret = |byte: u8| EndpointSecret {
+            salt: vec![byte; 32],
+            token_hash: vec![byte; 32],
+        };
+        for (node, byte) in [("a", 1), ("b", 2)] {
+            webhooks
+                .ensure("alice", "wf-1", node, secret(byte))
+                .await
+                .unwrap();
+        }
+
+        // Mise à jour sans le nœud `b` : seule son URL disparaît.
+        wf["nodes"].as_array_mut().unwrap().pop();
+        let r = app
+            .clone()
+            .oneshot(auth_req("PUT", "/wf-1", &token, Some(&wf.to_string())))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+        assert!(webhooks.resolve(&[1; 32]).await.unwrap().is_some());
+        assert!(webhooks.resolve(&[2; 32]).await.unwrap().is_none());
+
+        // Suppression du workflow : plus aucune URL.
+        let r = app
+            .oneshot(auth_req("DELETE", "/wf-1", &token, None))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::NO_CONTENT);
+        assert!(webhooks.resolve(&[1; 32]).await.unwrap().is_none());
     }
 }

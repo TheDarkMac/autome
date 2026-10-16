@@ -49,6 +49,10 @@ use utoipa::{
         crate::runs::create_run,
         crate::runs::get_run,
         crate::runs::list_runs,
+        // webhooks (#202)
+        crate::webhooks::receive,
+        crate::webhooks::list_webhooks,
+        crate::webhooks::rotate_webhook,
         // credentials (F7.3)
         crate::credentials::list_providers,
         crate::credentials::start_authorize,
@@ -66,6 +70,9 @@ use utoipa::{
         crate::runs::CreateRunBody,
         crate::runs::CreateRunResponse,
         crate::runs::ListRunsResponse,
+        crate::webhooks::WebhookAccepted,
+        crate::webhooks::WebhookInfo,
+        crate::webhooks::WebhookList,
         crate::credentials::ProviderDto,
         crate::credentials::ListProvidersResponse,
         crate::credentials::AuthorizeResponse,
@@ -78,6 +85,7 @@ use utoipa::{
         (name = "auth", description = "Comptes : inscription, connexion, rotation des jetons."),
         (name = "workflows", description = "CRUD des workflows."),
         (name = "runs", description = "Déclenchement et suivi des runs."),
+        (name = "webhooks", description = "Déclencheurs webhook : URL secrètes publiques et leur gestion."),
         (name = "credentials", description = "OAuth2 connecteurs tiers."),
     ),
     modifiers(&SecurityAddon),
@@ -164,6 +172,9 @@ mod tests {
         // F7.2 — runs
         assert!(paths.contains_key("/workflows/{id}/runs"));
         assert!(paths.contains_key("/runs/{run_id}"));
+        assert!(paths.contains_key("/hooks/{token}"));
+        assert!(paths.contains_key("/workflows/{id}/webhooks"));
+        assert!(paths.contains_key("/workflows/{id}/webhooks/{node_id}/rotate"));
         // F7.3 — credentials
         assert!(paths.contains_key("/credentials"));
         assert!(paths.contains_key("/credentials/providers"));
@@ -235,7 +246,7 @@ mod tests {
         let spec = fetch_spec().await;
         let tags = spec["tags"].as_array().expect("tags est une liste");
         let names: Vec<&str> = tags.iter().filter_map(|t| t["name"].as_str()).collect();
-        for expected in ["auth", "workflows", "runs", "credentials"] {
+        for expected in ["auth", "workflows", "runs", "webhooks", "credentials"] {
             assert!(
                 names.contains(&expected),
                 "tag '{expected}' attendu dans {names:?}"

@@ -54,7 +54,8 @@ async fn trace_request(request: Request, next: Next) -> Response {
         "http_request",
         request_id = %request_id,
         method = %request.method(),
-        path = %request.uri().path(),
+        // Le token d'une URL de webhook est un secret (#202).
+        path = %crate::webhooks::redact_path(request.uri().path()),
     );
 
     let started = Instant::now();

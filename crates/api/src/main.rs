@@ -23,6 +23,7 @@ use autome_api::shutdown::{
     begin_shutdown, serve_tls_until, serve_until, termination_signal, Draining, ShutdownConfig,
 };
 use autome_api::tls::load_rustls_config;
+use autome_api::webhooks::{max_per_window_from_env, webhooks_router, WebhookKeys, WebhooksState};
 use autome_api::workflows::{
     create_workflow, delete_workflow, get_workflow, list_workflows, update_workflow, WorkflowsState,
 };
@@ -35,7 +36,8 @@ const MAINTENANCE_INTERVAL: std::time::Duration = std::time::Duration::from_secs
 /// Construit le routeur racine : sondes (`/livez`, `/readyz`, `/health`) et
 /// `/metrics` publics,
 /// `/auth/signup|login|refresh` publics (émission des jetons), `/auth/whoami|admin`
-/// protégés par JWT, et le CRUD `workflows` + `runs` (domaine 7). Toutes les
+/// protégés par JWT, le CRUD `workflows` + `runs` (domaine 7) et les webhooks
+/// (`/hooks/{token}` public, gestion des URL protégée — #202). Toutes les
 /// routes sont instrumentées par le middleware de métriques (F10.6.a).
 ///
 /// Les routes workflows sont posées **à plat** (`/workflows`, `/workflows/:id`)
@@ -46,10 +48,12 @@ const MAINTENANCE_INTERVAL: std::time::Duration = std::time::Duration::from_secs
 fn build_router(
     backends: &Backends,
     accounts: AccountsState,
+    webhooks: WebhooksState,
     probes: ProbesState,
     metrics: Arc<Metrics>,
 ) -> Router {
-    let wf_state = WorkflowsState::new(backends.auth.clone(), backends.workflows.clone());
+    let wf_state = WorkflowsState::new(backends.auth.clone(), backends.workflows.clone())
+        .with_webhooks(backends.webhooks.clone());
     let runs_state = RunsState::new(
         backends.auth.clone(),
         backends.workflows.clone(),
@@ -78,11 +82,26 @@ fn build_router(
         )
         .merge(workflows_routes)
         .merge(runs_router(runs_state))
+        .merge(webhooks_router(webhooks))
         .merge(credentials_router(credentials_state))
         .merge(metrics_router(metrics.clone()));
     // Traçage en couche externe (toutes les requêtes, 404 compris), métriques
     // par route à l'intérieur.
     with_request_tracing(with_metrics(router, metrics))
+}
+
+/// État des webhooks (#202) : clé dérivée d'`ENCRYPTION_KEY`, quota par
+/// endpoint sur le compteur partagé de l'anti-bruteforce.
+fn webhooks_state(backends: &Backends, config: &Config, max_per_window: u32) -> WebhooksState {
+    WebhooksState::new(
+        backends.auth.clone(),
+        backends.workflows.clone(),
+        backends.webhooks.clone(),
+        backends.dispatcher.clone(),
+        backends.login_throttle.clone(),
+        WebhookKeys::from_config(config),
+    )
+    .with_max_per_window(max_per_window)
 }
 
 /// État des endpoints de comptes : Argon2id sur les stores de `backends`,
@@ -176,8 +195,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "limitation des tentatives par adresse IP"
     );
     let accounts = accounts_state(&backends, ip_throttle)?;
+    // Webhooks (#202) : quota invalide ⇒ refus de démarrer.
+    let webhook_max = max_per_window_from_env()?;
+    tracing::info!(
+        max_per_window = webhook_max,
+        "quota des webhooks par endpoint"
+    );
+    let webhooks = webhooks_state(&backends, &config, webhook_max);
     let metrics = Arc::new(Metrics::new());
-    let app = build_router(&backends, accounts, probes, metrics);
+    let app = build_router(&backends, accounts, webhooks, probes, metrics);
 
     // Arrêt gracieux (#194) : SIGTERM/SIGINT ⇒ readiness à 503, délai de
     // retrait, puis drain borné des requêtes en cours.
@@ -237,6 +263,13 @@ mod tests {
         let ip_throttle = IpThrottle::from_source(&config, |_| None).expect("défauts");
         let accounts = accounts_state(&backends, ip_throttle).expect("état comptes");
         let probes = ProbesState::new(vec![]);
-        let _app: Router = build_router(&backends, accounts, probes, Arc::new(Metrics::new()));
+        let webhooks = webhooks_state(&backends, &config, 10);
+        let _app: Router = build_router(
+            &backends,
+            accounts,
+            webhooks,
+            probes,
+            Arc::new(Metrics::new()),
+        );
     }
 }
