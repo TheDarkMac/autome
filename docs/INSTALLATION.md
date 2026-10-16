@@ -183,6 +183,11 @@ démarre en une commande :
 docker compose up --build
 ```
 
+Le premier build compile toutes les dépendances Rust (≈ 25 min sur 4 cœurs
+pour l'API et le worker) ; les suivants ne recompilent que les crates du
+workspace tant que `Cargo.toml` / `Cargo.lock` ne changent pas (couche
+cargo-chef en cache, #219).
+
 L'API et le worker y partagent **PostgreSQL** (`AUTOME_PERSISTENCE=postgres`)
 et **RabbitMQ** (`AUTOME_QUEUE=rabbitmq`) ; l'API applique les migrations au
 démarrage (`AUTOME_MIGRATE=true`). Les données survivent à un

@@ -37,8 +37,9 @@ Déclenchée sur **push** et **pull request** vers `main`. Reproduit la
 - Job `smoke` : images réelles sur la stack Compose. Inscription, connexion, workflow,
   run déclenché via l'API puis exécuté par le worker jusqu'à `succeeded` —
   couvre le câblage (env, migrations au démarrage, Dockerfiles, healthchecks,
-  sélecteurs de backend). Borné à 45 min (compilation Rust complète des deux images
-  dès qu'une source change).
+  sélecteurs de backend). Borné à 45 min : compilation Rust complète des deux
+  images à froid (≈ 25 min), seulement les crates du workspace quand
+  `Cargo.toml` / `Cargo.lock` n'ont pas changé (≈ 6 min, cargo-chef — #219).
 
 ### CD — `.github/workflows/cd.yml` (F10.5)
 
@@ -77,6 +78,15 @@ protégé + secret optionnel.
 
 - **Images multi-stage** : builder lourd jeté, runtime minimal non-root
   (cf. [INSTALLATION](INSTALLATION.md) / F10.1).
+- **Dépendances Cargo dans une couche à part** (#219) : étages `chef`
+  (`cargo install cargo-chef --locked --version 0.1.78`), `planner`
+  (`cargo chef prepare` → `recipe.json`, dérivée des manifests et de
+  `Cargo.lock` seulement) et `builder` (`cargo chef cook --release --locked`,
+  puis `COPY . .` et `cargo build --release --locked`). Modifier un `.rs` ne
+  change pas la recette : la couche des dépendances compilées est reprise du
+  cache (local ou `gha`, `mode=max`) et seuls les crates du workspace sont
+  recompilés. Rafraîchir cargo-chef : changer la version dans les deux
+  Dockerfiles (`docker/api.Dockerfile`, `docker/worker.Dockerfile`).
 - **Bases pinnées par digest `@sha256:`** (#162) : `rust:1.90-bookworm`,
   `debian:bookworm-slim`, `node:20-bookworm-slim`, `nginx:1.27-alpine` — le tag
   lisible reste en commentaire. Rafraîchir un digest :
@@ -126,6 +136,7 @@ protégé + secret optionnel.
 - [x] Aucun secret committé.
 - [x] Frontend : lockfile `pnpm-lock.yaml` versionné + `pnpm install --frozen-lockfile` (CI + Dockerfile) — #162.
 - [x] Images de base pinnées par **digest** `@sha256:` (CI/Docker) — #162.
+- [x] Dépendances Cargo compilées dans une couche Docker réutilisée tant que `Cargo.toml` / `Cargo.lock` ne changent pas (cargo-chef pinné) — #219.
 
 ---
 
@@ -137,7 +148,7 @@ protégé + secret optionnel.
 | 2 | **Bases d'images par tag** (`debian:bookworm-slim`, `node:20-…`, etc.) : un tag peut bouger | ✅ **Résolu (#162)** : pinnées par **digest** `@sha256:` dans les 3 Dockerfiles (tag lisible conservé en commentaire). Mise à jour : `docker buildx imagetools inspect <image:tag>`. |
 | 3 | `cargo fmt`/`clippy` sans `--locked` | ✅ **Résolu (#162)** : `--locked` ajouté à l'étape `clippy` (la CI échoue désormais si `Cargo.lock` n'est pas en phase dès le lint). |
 | 4 | **Branchement runtime** (PostgreSQL/RabbitMQ) non câblé dans les binaires | ✅ Résolu — [dette #107](https://github.com/TheDarkMac/autome/issues/107) close (API + worker branchés sur PG/RabbitMQ via `AUTOME_PERSISTENCE`/`AUTOME_QUEUE`). |
-| 5 | **Aucun smoke de bout en bout en CI** : `scripts/compose-smoke.sh` n'était lancé qu'à la main | ✅ **Résolu (#216)** : job `smoke` (images construites, `compose up --wait`, smoke, journaux si échec). Reste : la compilation Rust est refaite à chaque changement de source (`COPY . .` invalide le cache) — un étage de dépendances (cargo-chef) l'éviterait, CI et CD comprises. |
+| 5 | **Aucun smoke de bout en bout en CI** : `scripts/compose-smoke.sh` n'était lancé qu'à la main | ✅ **Résolu (#216)** : job `smoke` (images construites, `compose up --wait`, smoke, journaux si échec). La compilation des dépendances, refaite à chaque changement de source (`COPY . .` invalidait le cache), est isolée dans un étage cargo-chef réutilisé par le cache `gha` de la CI et de la CD (#219) : rebuild après modification d'un `.rs` mesuré à 386 s au lieu de 1918 s en local (4 cœurs). |
 | 6 | **Tests PostgreSQL/RabbitMQ réels jamais exécutés en CI** : gatés par `TEST_DATABASE_URL` / `TEST_AMQP_URL`, ils passaient « au vert » sans rien exécuter ; `scripts/check-migrations.sh` (deux fois réparé après coup, #186 et #208) n'était lancé qu'à la main | ✅ **Résolu (#218)** : services du job `backend`, variables au niveau du job, garde-fou sur la sortie des tests, script de migrations en CI. Reste : images des services par tag (comme `docker-compose.yml` et `k8s/`), test réseau `TEST_HTTP_URL` (connectors) toujours sauté en CI. |
 
 ---
