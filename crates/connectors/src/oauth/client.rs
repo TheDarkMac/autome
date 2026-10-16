@@ -21,6 +21,7 @@ use serde_json::Value;
 use crate::http::{HttpClient, HttpRequest};
 use crate::oauth::pkce::{generate_pkce, generate_state, PkcePair};
 use crate::oauth::provider::{OAuthProviderConfig, OAuthRegistry};
+use crate::oauth::refresh::{is_invalid_grant, RefreshError};
 
 /// Données à conserver côté serveur après [`OAuthClient::start_authorization`]
 /// jusqu'au callback du provider.
@@ -124,7 +125,22 @@ impl<C: HttpClient> OAuthClient<C> {
     /// Refresh — échange `refresh_token` contre une nouvelle `TokenSet`.
     /// Caller doit re-stocker via [`crate::oauth::ConnectorTokenStore::store`].
     pub fn refresh(&self, provider_id: &str, refresh_token: &str, now_ms: i64) -> Result<TokenSet> {
-        let provider = self.registry.get(provider_id)?;
+        Ok(self.try_refresh(provider_id, refresh_token, now_ms)?)
+    }
+
+    /// Comme [`refresh`](Self::refresh), en distinguant le refus définitif du
+    /// refresh token (`invalid_grant` ⇒ [`RefreshError::Revoked`]) des échecs
+    /// transitoires ou de configuration ([`RefreshError::Failed`]).
+    pub fn try_refresh(
+        &self,
+        provider_id: &str,
+        refresh_token: &str,
+        now_ms: i64,
+    ) -> std::result::Result<TokenSet, RefreshError> {
+        let provider = self
+            .registry
+            .get(provider_id)
+            .map_err(|e| RefreshError::Failed(e.to_string()))?;
         let form = [
             ("grant_type", "refresh_token"),
             ("client_id", provider.client_id.as_str()),
@@ -135,14 +151,16 @@ impl<C: HttpClient> OAuthClient<C> {
         let resp = self
             .transport
             .send(&req)
-            .map_err(|e| Error::Invalid(format!("oauth refresh : transport {e}")))?;
+            .map_err(|e| RefreshError::Failed(format!("oauth refresh : transport {e}")))?;
         if !(200..300).contains(&resp.status) {
-            return Err(Error::Invalid(format!(
-                "oauth refresh : http {} — {}",
-                resp.status, resp.body
-            )));
+            let message = format!("oauth refresh : http {} — {}", resp.status, resp.body);
+            return Err(if is_invalid_grant(resp.status, &resp.body) {
+                RefreshError::Revoked(message)
+            } else {
+                RefreshError::Failed(message)
+            });
         }
-        parse_token_response(&resp.body, now_ms)
+        parse_token_response(&resp.body, now_ms).map_err(|e| RefreshError::Failed(e.to_string()))
     }
 }
 
@@ -425,6 +443,46 @@ mod tests {
         let client = OAuthClient::new(registry_with_google(), RecordingClient::ok(response_body));
         let token = client.refresh("google", "rt-existing", NOW_MS).unwrap();
         assert_eq!(token.refresh_token, None, "le caller décide quoi en faire");
+    }
+
+    #[test]
+    fn try_refresh_classifies_invalid_grant_as_revoked() {
+        let client = OAuthClient::new(
+            registry_with_google(),
+            RecordingClient::with_status(
+                400,
+                json!({ "error": "invalid_grant", "error_description": "Token has been revoked." }),
+            ),
+        );
+        match client.try_refresh("google", "rt-dead", NOW_MS) {
+            Err(RefreshError::Revoked(m)) => {
+                assert!(m.contains("http 400") && m.contains("revoked"), "{m}")
+            }
+            other => panic!("Revoked attendu : {other:?}"),
+        }
+        // L'API historique garde son erreur `core` (même message).
+        let err = client.refresh("google", "rt-dead", NOW_MS).unwrap_err();
+        assert!(matches!(err, Error::Invalid(ref m) if m.contains("invalid_grant")));
+    }
+
+    #[test]
+    fn try_refresh_treats_server_and_other_client_errors_as_transient() {
+        for (status, body) in [
+            (503, json!({ "error": "temporarily_unavailable" })),
+            (401, json!({ "error": "invalid_client" })),
+        ] {
+            let client = OAuthClient::new(
+                registry_with_google(),
+                RecordingClient::with_status(status, body),
+            );
+            assert!(
+                matches!(
+                    client.try_refresh("google", "rt", NOW_MS),
+                    Err(RefreshError::Failed(_))
+                ),
+                "status {status}"
+            );
+        }
     }
 
     #[test]

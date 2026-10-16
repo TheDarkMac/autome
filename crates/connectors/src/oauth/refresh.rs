@@ -5,8 +5,15 @@
 //! un nouveau via un [`TokenRefresher`] (en production : [`OAuthClient`],
 //! `grant_type=refresh_token`), puis re-stocke le résultat fusionné par
 //! [`merge_refreshed`].
+//!
+//! Un refus **définitif** du provider (`invalid_grant`) est distingué d'un
+//! échec transitoire ([`RefreshError`]) : le worker marque alors la credential
+//! invalide au lieu de retenter à chaque run.
 
-use autome_core::Result;
+use std::fmt;
+
+use autome_core::Error;
+use serde_json::Value;
 
 use crate::http::HttpClient;
 use crate::oauth::client::{OAuthClient, TokenSet};
@@ -15,18 +22,70 @@ use crate::oauth::client::{OAuthClient, TokenSet};
 /// expire dans moins d'une minute expirerait pendant l'exécution du node.
 pub const REFRESH_SKEW_MS: i64 = 60_000;
 
+/// Échec d'un rafraîchissement.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RefreshError {
+    /// Refresh token refusé par le provider (`invalid_grant`, RFC 6749 §5.2) :
+    /// révoqué, expiré ou déjà consommé. Retenter est inutile — l'utilisateur
+    /// doit reconnecter le compte.
+    Revoked(String),
+    /// Échec transitoire (réseau, 5xx, réponse illisible) ou de configuration
+    /// (provider inconnu, client refusé) : le refresh token reste valable.
+    Failed(String),
+}
+
+impl RefreshError {
+    /// Message détaillé (réponse du provider comprise).
+    pub fn message(&self) -> &str {
+        match self {
+            Self::Revoked(m) | Self::Failed(m) => m,
+        }
+    }
+}
+
+impl fmt::Display for RefreshError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.message())
+    }
+}
+
+impl std::error::Error for RefreshError {}
+
+impl From<RefreshError> for Error {
+    fn from(e: RefreshError) -> Self {
+        Error::Invalid(e.message().to_string())
+    }
+}
+
+/// `true` si la réponse d'erreur du endpoint token est un `invalid_grant`
+/// (RFC 6749 §5.2 : 400, parfois 401 chez certains providers).
+pub fn is_invalid_grant(status: u16, body: &Value) -> bool {
+    (400..500).contains(&status)
+        && body.get("error").and_then(Value::as_str) == Some("invalid_grant")
+}
+
 /// Échange un refresh token contre un nouveau [`TokenSet`].
 ///
 /// Object-safe : le worker détient un `Arc<dyn TokenRefresher + Send + Sync>`
 /// (mock en test, [`OAuthClient`] en production).
 pub trait TokenRefresher {
     /// Rafraîchit le token de `provider_id` à partir de `refresh_token`.
-    fn refresh(&self, provider_id: &str, refresh_token: &str, now_ms: i64) -> Result<TokenSet>;
+    fn refresh(
+        &self,
+        provider_id: &str,
+        refresh_token: &str,
+        now_ms: i64,
+    ) -> Result<TokenSet, RefreshError>;
 }
 
 impl<C: HttpClient> TokenRefresher for OAuthClient<C> {
-    fn refresh(&self, provider_id: &str, refresh_token: &str, now_ms: i64) -> Result<TokenSet> {
-        OAuthClient::refresh(self, provider_id, refresh_token, now_ms)
+    fn refresh(
+        &self,
+        provider_id: &str,
+        refresh_token: &str,
+        now_ms: i64,
+    ) -> Result<TokenSet, RefreshError> {
+        self.try_refresh(provider_id, refresh_token, now_ms)
     }
 }
 
@@ -155,6 +214,34 @@ mod tests {
         let refreshed = refresher.refresh("gmail", "rt-old", NOW).unwrap();
         assert_eq!(refreshed.access_token, "at-new");
         assert_eq!(refreshed.expires_at_ms, Some(NOW + 3_600_000));
-        assert!(refresher.refresh("unknown", "rt", NOW).is_err());
+        assert!(matches!(
+            refresher.refresh("unknown", "rt", NOW),
+            Err(RefreshError::Failed(_))
+        ));
+    }
+
+    #[test]
+    fn invalid_grant_is_recognized_only_on_client_errors() {
+        let body = json!({ "error": "invalid_grant", "error_description": "revoked" });
+        assert!(is_invalid_grant(400, &body));
+        assert!(is_invalid_grant(401, &body));
+        assert!(!is_invalid_grant(500, &body));
+        assert!(!is_invalid_grant(200, &body));
+        assert!(!is_invalid_grant(
+            400,
+            &json!({ "error": "invalid_client" })
+        ));
+        assert!(!is_invalid_grant(400, &json!("invalid_grant")));
+    }
+
+    #[test]
+    fn refresh_error_converts_to_core_error_with_its_message() {
+        let err: Error = RefreshError::Revoked("oauth refresh : http 400".into()).into();
+        assert!(matches!(err, Error::Invalid(ref m) if m == "oauth refresh : http 400"));
+        assert_eq!(
+            RefreshError::Failed("down".into()).to_string(),
+            "down",
+            "Display = message"
+        );
     }
 }
