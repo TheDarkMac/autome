@@ -1,6 +1,6 @@
 //! Test d'intégration de [`RabbitMqQueue`] contre un vrai RabbitMQ.
 //!
-//! **Gaté** par `TEST_AMQP_URL` (skip-pass sinon — la CI n'a pas de broker).
+//! **Gaté** par `TEST_AMQP_URL` (skip-pass sinon ; la CI le fournit, job `backend`).
 //! En local :
 //!
 //! ```bash

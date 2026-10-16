@@ -1,7 +1,7 @@
 //! Test d'intégration de [`PgRevocationStore`] contre un **vrai** PostgreSQL.
 //!
 //! **Gaté par environnement** : ne s'exécute que si `TEST_DATABASE_URL` est
-//! défini (sinon il *skip* en passant — la CI, sans service Postgres, le saute).
+//! défini (sinon il *skip* en passant ; la CI le fournit, job `backend`).
 //! En local :
 //!
 //! ```bash
