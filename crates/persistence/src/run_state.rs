@@ -3,8 +3,13 @@
 //! Un `RunCheckpoint` se projette sur une ligne `runs` (scalaires, `next_node`,
 //! `error`) et N lignes `run_steps` (la map `outputs`). IDs logiques en TEXT
 //! (migration `0009`).
+//!
+//! Nombre d'instructions **indépendant du nombre de nodes et de runs** (#198,
+//! AUDIT §10) : un checkpoint écrit toutes ses sorties en un seul upsert
+//! (`UNNEST`) et retire les sorties disparues en une suppression ; une liste
+//! charge les sorties de tous ses runs en une requête (`run_id = ANY`).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use async_trait::async_trait;
 use autome_core::{Error, Pagination, RunCheckpoint, RunListPage, RunStateStore, RunStatus};
@@ -48,23 +53,45 @@ impl PgRunStateStore {
         Self { pool }
     }
 
-    /// Reconstruit un `RunCheckpoint` depuis une ligne `runs` + ses `run_steps`.
-    async fn row_to_checkpoint(
+    /// Reconstruit les `RunCheckpoint` de lignes `runs`, avec les sorties de
+    /// **tous** ces runs lues en une seule requête (pas de N+1).
+    async fn rows_to_checkpoints(
         client: &deadpool_postgres::Client,
-        run: &Row,
-    ) -> autome_core::Result<RunCheckpoint> {
-        let run_id: String = run.get("id");
+        runs: &[Row],
+    ) -> autome_core::Result<Vec<RunCheckpoint>> {
+        if runs.is_empty() {
+            return Ok(Vec::new());
+        }
+        let ids: Vec<String> = runs.iter().map(|r| r.get("id")).collect();
         let steps = client
             .query(
-                "SELECT node_id, output FROM run_steps WHERE run_id = $1",
-                &[&run_id],
+                "SELECT run_id, node_id, output FROM run_steps WHERE run_id = ANY($1)",
+                &[&ids],
             )
             .await
             .map_err(|e| storage_err("load steps", e))?;
-        let outputs: BTreeMap<String, Value> = steps
-            .iter()
-            .map(|s| (s.get::<_, String>("node_id"), s.get::<_, Value>("output")))
-            .collect();
+        let mut outputs: HashMap<String, BTreeMap<String, Value>> = HashMap::new();
+        for step in &steps {
+            outputs
+                .entry(step.get("run_id"))
+                .or_default()
+                .insert(step.get("node_id"), step.get("output"));
+        }
+        runs.iter()
+            .map(|run| {
+                let id: String = run.get("id");
+                let run_outputs = outputs.remove(&id).unwrap_or_default();
+                Self::row_to_checkpoint(run, run_outputs)
+            })
+            .collect()
+    }
+
+    /// Un `RunCheckpoint` depuis une ligne `runs` et ses sorties déjà lues.
+    fn row_to_checkpoint(
+        run: &Row,
+        outputs: BTreeMap<String, Value>,
+    ) -> autome_core::Result<RunCheckpoint> {
+        let run_id: String = run.get("id");
         Ok(RunCheckpoint {
             run_id,
             workflow_id: run.get("workflow_id"),
@@ -126,21 +153,28 @@ impl RunStateStore for PgRunStateStore {
         .await
         .map_err(|e| storage_err("checkpoint", e))?;
 
-        // Remplace les sorties (la map fait foi).
-        tx.execute(
-            "DELETE FROM run_steps WHERE run_id = $1",
-            &[&snapshot.run_id],
-        )
-        .await
-        .map_err(|e| storage_err("clear steps", e))?;
-        for (node_id, output) in &snapshot.outputs {
+        // La map fait foi : toutes les sorties en un upsert, puis suppression
+        // des seules sorties disparues — deux instructions quel que soit le
+        // nombre de nodes (#198 ; avant : un DELETE puis un INSERT par node).
+        let node_ids: Vec<&str> = snapshot.outputs.keys().map(String::as_str).collect();
+        let outputs: Vec<&Value> = snapshot.outputs.values().collect();
+        if !node_ids.is_empty() {
             tx.execute(
-                "INSERT INTO run_steps (run_id, node_id, output) VALUES ($1, $2, $3)",
-                &[&snapshot.run_id, node_id, output],
+                "INSERT INTO run_steps (run_id, node_id, output) \
+                 SELECT $1, node_id, output FROM UNNEST($2::text[], $3::jsonb[]) \
+                   AS s(node_id, output) \
+                 ON CONFLICT (run_id, node_id) DO UPDATE SET output = EXCLUDED.output",
+                &[&snapshot.run_id, &node_ids, &outputs],
             )
             .await
-            .map_err(|e| storage_err("insert step", e))?;
+            .map_err(|e| storage_err("upsert steps", e))?;
         }
+        tx.execute(
+            "DELETE FROM run_steps WHERE run_id = $1 AND node_id <> ALL($2::text[])",
+            &[&snapshot.run_id, &node_ids],
+        )
+        .await
+        .map_err(|e| storage_err("prune steps", e))?;
         tx.commit().await.map_err(|e| storage_err("commit", e))?;
         Ok(())
     }
@@ -156,7 +190,7 @@ impl RunStateStore for PgRunStateStore {
             .map_err(|e| storage_err("load", e))?;
         match row {
             None => Ok(None),
-            Some(r) => Ok(Some(Self::row_to_checkpoint(&client, &r).await?)),
+            Some(r) => Ok(Self::rows_to_checkpoints(&client, &[r]).await?.pop()),
         }
     }
 
@@ -173,11 +207,7 @@ impl RunStateStore for PgRunStateStore {
             )
             .await
             .map_err(|e| storage_err("list_orphans", e))?;
-        let mut out = Vec::with_capacity(rows.len());
-        for r in &rows {
-            out.push(Self::row_to_checkpoint(&client, r).await?);
-        }
-        Ok(out)
+        Self::rows_to_checkpoints(&client, &rows).await
     }
 
     async fn mark_failed(
@@ -222,7 +252,7 @@ impl RunStateStore for PgRunStateStore {
             .map_err(|e| storage_err("try_claim", e))?;
         match row {
             None => Ok(None),
-            Some(r) => Ok(Some(Self::row_to_checkpoint(&client, &r).await?)),
+            Some(r) => Ok(Self::rows_to_checkpoints(&client, &[r]).await?.pop()),
         }
     }
 
@@ -274,10 +304,7 @@ impl RunStateStore for PgRunStateStore {
             )
             .await
             .map_err(|e| storage_err("list_by_workflow", e))?;
-        let mut items = Vec::with_capacity(rows.len());
-        for r in &rows {
-            items.push(Self::row_to_checkpoint(&client, r).await?);
-        }
+        let items = Self::rows_to_checkpoints(&client, &rows).await?;
         Ok(RunListPage {
             items,
             total: total as usize,
