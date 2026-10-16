@@ -204,7 +204,9 @@ scripts/compose-smoke.sh
 
 Compte super-admin de dev (optionnel) : appliquer le seed **après** le premier
 démarrage de l'API (migrations appliquées), puis se connecter avec
-`dev@autome.local` / `autome-dev-password` :
+`dev@autome.local` / `autome-dev-password` — ou promouvoir son propre compte
+(`docker compose exec api autome-api promote-admin <email>`, cf.
+« Administration des utilisateurs ») :
 
 ```bash
 docker compose exec -T db psql -U postgres -d autome < migrations/seeds/dev_seed.sql
@@ -473,13 +475,14 @@ comptes sont publics ; tout le reste exige `Authorization: Bearer <access_token>
 | Méthode | Path | Body | Réponse |
 |---|---|---|---|
 | POST | `/auth/signup` | `{"email","password"}` | 201 + paire de jetons · 400 saisie invalide · 409 email déjà pris |
-| POST | `/auth/login` | `{"email","password"}` | 200 + paire de jetons · 401 identifiants invalides · 429 trop d'échecs (`Retry-After`) |
+| POST | `/auth/login` | `{"email","password"}` | 200 + paire de jetons · 401 identifiants invalides · 403 compte suspendu · 429 trop d'échecs (`Retry-After`) |
 | POST | `/auth/refresh` | `{"refresh_token"}` | 200 + nouvelle paire · 401 refresh invalide, expiré ou déjà utilisé |
 | POST | `/auth/logout` | `{"refresh_token"}` (+ `Authorization: Bearer <access_token>` facultatif) | 204 session fermée (aussi si déjà fermée) · 401 refresh invalide ou expiré |
 | POST | `/auth/logout-all` | — (`Authorization: Bearer <access_token>` requis) | 204 toutes les sessions fermées · 401 access absent, invalide ou déjà révoqué |
 | POST | `/auth/password` | `{"current_password","new_password"}` (Bearer requis) | 200 + nouvelle paire · 400 nouveau mot de passe invalide ou identique · 403 mot de passe actuel incorrect · 409 changé entre-temps · 429 trop d'essais |
 | POST | `/auth/password/forgot` | `{"email"}` | 202 demande prise en compte (que le compte existe ou non) · 400 email invalide · 429 trop de demandes · 503 aucun envoi d'email configuré |
 | POST | `/auth/password/reset` | `{"token","new_password"}` | 204 mot de passe remplacé, sessions fermées · 400 lien invalide, expiré ou déjà utilisé, ou mot de passe invalide · 503 non configuré |
+| GET | `/auth/me` | — (Bearer requis) | 200 `{"id","email","role","permissions"}` · 401 session invalide ou compte suspendu |
 
 - Paire de jetons : `{"access_token","refresh_token","token_type":"Bearer","expires_in":900}`.
   Access valable 15 min, refresh 7 jours et **à usage unique** (rotation) : de
@@ -540,7 +543,7 @@ comptes sont publics ; tout le reste exige `Authorization: Bearer <access_token>
 - Mot de passe : 8 à 1024 caractères, haché en **Argon2id**. L'email est
   normalisé (trim + minuscules).
 - Un compte créé par `signup` reçoit le rôle **editor** (CRUD workflows, runs,
-  credentials) — pas d'administration.
+  credentials) — pas d'administration (voir « Administration des utilisateurs »).
 - Anti-bruteforce : 5 tentatives sans succès par email et par fenêtre de 15 min,
   puis 429 (`Retry-After`) jusqu'à la fin de la fenêtre — même avec le bon mot
   de passe. En `AUTOME_PERSISTENCE=postgres`, le compteur est **partagé par
@@ -601,6 +604,66 @@ curl -s -H 'content-type: application/json' \
 
 Base de dev seedée (`migrations/seeds/dev_seed.sql`) : compte super-admin
 `dev@autome.local` / `autome-dev-password` (à ne jamais appliquer en prod).
+
+### Administration des utilisateurs
+
+Onglet « Administration » du frontend, visible des seuls comptes qui détiennent
+`users.admin` (ou `*`) ; API `/admin/users` (Bearer + `users.admin`, #208) :
+
+| Méthode | Path | Body | Réponse |
+|---|---|---|---|
+| GET | `/admin/users?q=&offset=&limit=` | — | 200 `{"items","total","offset","limit"}` — comptes du plus ancien au plus récent, `q` = partie de l'email, `limit` ≤ 200 (défaut 50) |
+| GET | `/admin/users/{id}` | — | 200 compte · 404 inconnu |
+| PUT | `/admin/users/{id}/role` | `{"role":"admin"\|"editor"\|"viewer"}` | 200 compte · 400 rôle inconnu · 403 · 404 · 409 son propre rôle |
+| POST | `/admin/users/{id}/disable` | — | 200 compte suspendu, sessions fermées · 403 · 404 · 409 son propre compte |
+| POST | `/admin/users/{id}/enable` | — | 200 compte réactivé · 403 · 404 |
+| POST | `/admin/users/{id}/logout-all` | — | 204 sessions du compte fermées · 403 · 404 |
+
+Un compte vaut `{"id","email","role","permissions","disabled","created_at_ms"}`
+(jamais le hash du mot de passe). Règles :
+
+- Le **rôle** n'est qu'une vue des permissions : `admin` = `*`, `editor` et
+  `viewer` = les jeux standard, `custom` pour tout autre jeu. En changer
+  remplace **toutes** les permissions du compte (une transaction) ; l'effet est
+  immédiat, sans reconnexion.
+- **Pas d'escalade** : attribuer le rôle `admin`, ou modifier, suspendre ou
+  déconnecter un compte qui détient `*`, exige soi-même `*` (403 sinon) — un
+  compte qui n'a que `users.admin` gère les autres comptes mais ne crée pas de
+  super-admin.
+- **Pas de verrouillage** : un administrateur ne change pas son propre rôle et
+  ne se suspend pas lui-même (409).
+- **Suspension** : réversible ; le compte garde ses workflows, runs et
+  permissions. Toutes ses sessions sont fermées (version de session), sa
+  connexion répond 403 « account disabled » — seulement avec le bon mot de
+  passe, sinon 401 comme d'habitude — et aucun lien de réinitialisation ne lui
+  est envoyé. Une connexion simultanée à la suspension ne peut pas en
+  réchapper : le drapeau est écrit avant la fermeture des sessions et relu par
+  la connexion après lecture de la version. Réactiver ne rouvre pas les
+  anciennes sessions.
+- Chaque action est auditée sous l'administrateur, ressource = compte visé :
+  `admin.users_list`, `admin.user_get`, `admin.user_role` (avec `from`/`to`),
+  `admin.user_disable`, `admin.user_enable`, `admin.user_logout_all` ; les refus
+  (403/409) sont audités `Denied`.
+- Pas de suppression de compte ni de création par un administrateur : un
+  compte s'inscrit lui-même (`/auth/signup`), puis un administrateur ajuste
+  son rôle.
+
+**Premier administrateur** : l'API n'en crée jamais (aucune promotion par
+HTTP). Inscrire le compte, puis le promouvoir depuis l'infrastructure — la
+commande lit `DATABASE_URL` et exige `AUTOME_PERSISTENCE=postgres` :
+
+```bash
+docker compose exec api autome-api promote-admin admin@example.com
+```
+
+```bash
+kubectl -n autome exec deploy/api -- autome-api promote-admin admin@example.com
+```
+
+Elle donne le rôle `admin` (`*`) et réactive le compte s'il était suspendu —
+c'est aussi le recours si plus aucun administrateur n'a accès. Audit
+`admin.user_promote` sous l'acteur `cli`. Email inconnu : code de sortie non
+nul et message `aucun compte pour …`.
 
 ### Données personnelles (adresses IP)
 
