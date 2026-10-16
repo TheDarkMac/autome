@@ -1,14 +1,18 @@
 # Intégration continue Autome (F10.4).
 #
 # Reproduit la « definition of done » appliquée à chaque feature :
-#   - backend  : fmt + clippy (zéro warning) + tests workspace + build
+#   - backend  : fmt + clippy (zéro warning) + schéma (migrations + seed)
+#                + tests workspace, y compris contre un vrai PostgreSQL et un
+#                vrai RabbitMQ (services du job) + build
 #   - frontend : typecheck + lint + tests Vitest
 #   - smoke    : images réelles api + worker sur PostgreSQL et RabbitMQ
 #                (Docker Compose), un run de bout en bout (#216)
 #
-# Les tests backend sont in-process / in-memory (api : reqwest sur serveur
-# local ; worker : queue/stores in-memory) et le frontend tourne sous jsdom.
-# Seul le smoke démarre des services : il couvre le câblage que ces tests ne
+# Les tests backend sont surtout in-process / in-memory (api : reqwest sur
+# serveur local ; worker : queue/stores in-memory) ; ceux qui ciblent les
+# `Pg*Store` et `RabbitMqQueue` lisent `TEST_DATABASE_URL` / `TEST_AMQP_URL`,
+# fournies par le job backend (services PostgreSQL et RabbitMQ, #218). Le
+# frontend tourne sous jsdom. Le smoke couvre le câblage que ces tests ne
 # voient pas (variables d'environnement, migrations au démarrage, Dockerfiles,
 # healthchecks, sélecteurs de backend).
 name: CI
@@ -31,6 +35,39 @@ jobs:
   backend:
     name: Backend (Rust)
     runs-on: ubuntu-latest
+    # Mêmes versions que docker-compose.yml et k8s/. Le job ne démarre ses
+    # étapes qu'une fois les healthchecks verts.
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_PASSWORD: pg
+        ports:
+          - 5432:5432
+        # En TCP : le serveur temporaire de l'entrypoint (initdb) n'écoute
+        # que sur le socket Unix, `pg_isready` ne peut donc pas le confondre
+        # avec le serveur définitif.
+        options: >-
+          --health-cmd "pg_isready -h 127.0.0.1 -U postgres"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 30
+      rabbitmq:
+        image: rabbitmq:3-management-alpine
+        ports:
+          - 5672:5672
+        # Listeners AMQP eux-mêmes (`ping` répond avant que le port accepte
+        # les connexions), comme dans docker-compose.yml.
+        options: >-
+          --health-cmd "rabbitmq-diagnostics -q check_port_connectivity"
+          --health-interval 5s
+          --health-timeout 10s
+          --health-retries 30
+    env:
+      # Lues par les tests réels (persistence, worker, api). Fournies mais
+      # service injoignable ⇒ ces tests échouent (pas de saut).
+      TEST_DATABASE_URL: postgres://postgres:pg@localhost:5432/postgres
+      TEST_AMQP_URL: amqp://guest:guest@localhost:5672/%2f
     steps:
       - uses: actions/checkout@v4
 
@@ -49,8 +86,28 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
+      # Toutes les migrations + seed de dev sur un PostgreSQL jetable
+      # (conteneur dédié, indépendant du service) et invariants du schéma.
+      - name: Schema (migrations + seed)
+        run: scripts/check-migrations.sh
+
+      # `--nocapture` : le message de saut des tests réels reste visible, ce
+      # qui permet à l'étape suivante de vérifier qu'aucun n'a été sauté.
       - name: Tests
-        run: cargo test --workspace --locked
+        run: |
+          set -o pipefail
+          cargo test --workspace --locked -- --nocapture 2>&1 | tee "$RUNNER_TEMP/cargo-test.log"
+
+      # Garde-fou : un test réel qui passe sans avoir rien exécuté (variable
+      # renommée, retirée de `env:`…) ferait passer la CI au vert à tort.
+      - name: Real-service tests were not skipped
+        run: |
+          if grep -E 'absent → test (PostgreSQL|RabbitMQ) sauté' "$RUNNER_TEMP/cargo-test.log"; then
+            echo "::error::Tests PostgreSQL/RabbitMQ sautés malgré les services du job"
+            exit 1
+          fi
+          echo "Binaires de tests réels exécutés :"
+          grep -E 'Running .*(pg_[a-z_]+|rabbitmq)\.rs' "$RUNNER_TEMP/cargo-test.log"
 
       - name: Build (release)
         run: cargo build --workspace --release --locked
