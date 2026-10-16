@@ -11,8 +11,10 @@ use std::sync::Arc;
 use autome_api::accounts::{accounts_router, AccountsState, IpThrottle};
 use autome_api::auth::protected_router;
 use autome_api::credentials::{credentials_router, CredentialsState};
+use autome_api::mail::MailSettings;
 use autome_api::metrics::{metrics_router, with_metrics, Metrics};
 use autome_api::observability::with_request_tracing;
+use autome_api::password_reset::{PasswordReset, ResetTokens};
 use autome_api::probes::{probes_router, ProbesState};
 use autome_api::runs::{runs_router, RunsState};
 use autome_api::runtime::{
@@ -105,18 +107,40 @@ fn webhooks_state(backends: &Backends, config: &Config, max_per_window: u32) -> 
 }
 
 /// État des endpoints de comptes : Argon2id sur les stores de `backends`,
-/// anti-bruteforce par email et par adresse IP (#190).
+/// anti-bruteforce par email et par adresse IP (#190), mot de passe oublié
+/// si un envoi d'email est configuré (#204).
 fn accounts_state(
     backends: &Backends,
     ip_throttle: IpThrottle,
+    password_reset: Option<PasswordReset>,
 ) -> autome_core::Result<AccountsState> {
-    Ok(AccountsState::new(
+    let accounts = AccountsState::new(
         backends.auth.clone(),
         backends.users.clone(),
         Arc::new(Argon2PasswordHasher::new()),
     )?
     .with_throttle(backends.login_throttle.clone())
-    .with_ip_throttle(ip_throttle))
+    .with_ip_throttle(ip_throttle);
+    Ok(match password_reset {
+        Some(reset) => accounts.with_password_reset(reset),
+        None => accounts,
+    })
+}
+
+/// Mot de passe oublié (#204) : `None` sans envoi d'email possible (`prod`
+/// sans `AUTOME_SMTP_URL`). Configuration invalide ⇒ refus de démarrer.
+fn password_reset(config: &Config) -> Result<Option<PasswordReset>, String> {
+    let Some(mail) = MailSettings::from_env(config.profile)? else {
+        tracing::warn!(
+            "mot de passe oublié désactivé : AUTOME_SMTP_URL absent (503 sur /auth/password/forgot)"
+        );
+        return Ok(None);
+    };
+    tracing::info!(public_url = %mail.public_url, "mot de passe oublié activé");
+    Ok(Some(PasswordReset::new(
+        ResetTokens::from_config(config),
+        mail,
+    )))
 }
 
 #[tokio::main]
@@ -192,9 +216,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!(
         login_max = ip_throttle.login_max,
         signup_max = ip_throttle.signup_max,
+        reset_max = ip_throttle.reset_max,
         "limitation des tentatives par adresse IP"
     );
-    let accounts = accounts_state(&backends, ip_throttle)?;
+    let accounts = accounts_state(&backends, ip_throttle, password_reset(&config)?)?;
     // Webhooks (#202) : quota invalide ⇒ refus de démarrer.
     let webhook_max = max_per_window_from_env()?;
     tracing::info!(
@@ -261,7 +286,9 @@ mod tests {
         let backends =
             build_backends(&config, PersistenceMode::Memory, queue).expect("backends in-memory");
         let ip_throttle = IpThrottle::from_source(&config, |_| None).expect("défauts");
-        let accounts = accounts_state(&backends, ip_throttle).expect("état comptes");
+        let reset = password_reset(&config).expect("journal en dev");
+        assert!(reset.is_some(), "dev sans SMTP : liens journalisés");
+        let accounts = accounts_state(&backends, ip_throttle, reset).expect("état comptes");
         let probes = ProbesState::new(vec![]);
         let webhooks = webhooks_state(&backends, &config, 10);
         let _app: Router = build_router(

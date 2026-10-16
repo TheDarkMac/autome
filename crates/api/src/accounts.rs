@@ -11,10 +11,13 @@
 //! | POST    | `/auth/logout`  | `{ refresh_token }`     | 204                         |
 //! | POST    | `/auth/logout-all` | — (Bearer requis)    | 204                         |
 //! | POST    | `/auth/password` | `{ current_password, new_password }` (Bearer) | 200 + [`TokenResponse`] |
+//! | POST    | `/auth/password/forgot` | `{ email }`      | 202                         |
+//! | POST    | `/auth/password/reset`  | `{ token, new_password }` | 204               |
 //!
 //! Contrat aligné sur le frontend (`frontend/src/auth.ts`) : 400 saisie
 //! invalide, 401 identifiants/jeton refusés, 409 email déjà pris, 429 trop
-//! de tentatives (`Retry-After`).
+//! de tentatives (`Retry-After`), 503 réinitialisation indisponible (aucun
+//! envoi d'email configuré).
 //!
 //! Choix de sécurité :
 //! - **Argon2id** ([`PasswordHasher`]) exécuté dans `spawn_blocking` : ~50 ms
@@ -53,9 +56,20 @@
 //!   **toutes** les sessions (version de session) et renvoie une nouvelle
 //!   paire à l'appareil courant. Mot de passe actuel faux : **403**, pas 401 —
 //!   le client croirait sa session expirée et se déconnecterait.
-//! - Chaque inscription/connexion/déconnexion/changement de mot de passe
-//!   produit un event d'audit `auth.signup` / `auth.login` / `auth.logout` /
-//!   `auth.logout_all` / `auth.password_change`.
+//! - Le mot de passe oublié (#204) répond **toujours 202** à une demande bien
+//!   formée : la recherche du compte et l'envoi de l'email se font **en tâche
+//!   de fond**, si bien que ni le code ni la durée de la réponse ne révèlent
+//!   l'existence du compte. Demandes limitées par email (anti-harcèlement
+//!   d'une boîte) et par IP. Le lien porte un jeton sans état lié au hash
+//!   actuel (cf. [`crate::password_reset`]) : usage unique, 30 min. Sa
+//!   consommation remplace le hash (écriture conditionnelle), ferme **toutes**
+//!   les sessions et lève le blocage de connexion du compte ; jeton invalide,
+//!   expiré ou déjà utilisé : 400 (pas 401, qui signifie « session
+//!   expirée » pour le client).
+//! - Chaque inscription/connexion/déconnexion/changement ou réinitialisation
+//!   de mot de passe produit un event d'audit `auth.signup` / `auth.login` /
+//!   `auth.logout` / `auth.logout_all` / `auth.password_change` /
+//!   `auth.password_reset_request` / `auth.password_reset`.
 
 use std::collections::HashSet;
 use std::net::SocketAddr;
@@ -79,6 +93,7 @@ use utoipa::ToSchema;
 
 use crate::auth::{bearer_token, AuthState, AuthenticatedUser};
 use crate::client_ip::{ClientIpPolicy, IpKeyer};
+use crate::password_reset::{PasswordReset, ResetTokens};
 
 /// Durée de vie d'un access token (15 min).
 pub const ACCESS_TTL_SECONDS: i64 = 15 * 60;
@@ -91,6 +106,9 @@ const DUMMY_PASSWORD: &str = "autome-dummy-password-for-timing";
 pub const DEFAULT_LOGIN_IP_MAX_ATTEMPTS: u32 = 50;
 /// Quota par défaut des tentatives d'inscription par adresse IP et par fenêtre.
 pub const DEFAULT_SIGNUP_IP_MAX_ATTEMPTS: u32 = 10;
+/// Quota par défaut des demandes de réinitialisation par adresse IP et par
+/// fenêtre (#204).
+pub const DEFAULT_RESET_IP_MAX_ATTEMPTS: u32 = 10;
 
 /// Anti-bruteforce par adresse IP cliente (#190). Un quota à 0 désactive le
 /// compteur correspondant.
@@ -104,12 +122,16 @@ pub struct IpThrottle {
     pub login_max: u32,
     /// Tentatives d'inscription tolérées par IP et par fenêtre.
     pub signup_max: u32,
+    /// Demandes de réinitialisation du mot de passe tolérées par IP et par
+    /// fenêtre (#204).
+    pub reset_max: u32,
 }
 
 impl IpThrottle {
     /// Depuis l'environnement : `AUTOME_TRUSTED_PROXIES`,
     /// `AUTOME_LOGIN_IP_MAX_ATTEMPTS` (défaut 50), `AUTOME_SIGNUP_IP_MAX_ATTEMPTS`
-    /// (défaut 10) ; clé HMAC dérivée d'`ENCRYPTION_KEY`.
+    /// (défaut 10), `AUTOME_RESET_IP_MAX_ATTEMPTS` (défaut 10) ; clé HMAC
+    /// dérivée d'`ENCRYPTION_KEY`.
     pub fn from_env(config: &Config) -> Result<Self, String> {
         Self::from_source(config, |name| std::env::var(name).ok())
     }
@@ -138,6 +160,10 @@ impl IpThrottle {
                 "AUTOME_SIGNUP_IP_MAX_ATTEMPTS",
                 DEFAULT_SIGNUP_IP_MAX_ATTEMPTS,
             )?,
+            reset_max: quota(
+                "AUTOME_RESET_IP_MAX_ATTEMPTS",
+                DEFAULT_RESET_IP_MAX_ATTEMPTS,
+            )?,
         })
     }
 }
@@ -158,6 +184,9 @@ pub struct AccountsState {
     pub ip_throttle: Option<IpThrottle>,
     /// Permissions accordées à l'inscription (rôle `editor` par défaut).
     pub signup_permissions: HashSet<String>,
+    /// Mot de passe oublié (#204) ; `None` = indisponible (503), faute
+    /// d'envoi d'email configuré.
+    pub password_reset: Option<PasswordReset>,
     /// Hash leurre vérifié quand l'email est inconnu (égalisation du temps).
     dummy_hash: Arc<str>,
 }
@@ -178,6 +207,7 @@ impl AccountsState {
             throttle: Arc::new(InMemoryLoginThrottle::new()),
             ip_throttle: None,
             signup_permissions: Role::editor().permissions,
+            password_reset: None,
             dummy_hash: dummy_hash.into(),
         })
     }
@@ -192,6 +222,12 @@ impl AccountsState {
     /// Active l'anti-bruteforce par adresse IP (#190).
     pub fn with_ip_throttle(mut self, ip_throttle: IpThrottle) -> Self {
         self.ip_throttle = Some(ip_throttle);
+        self
+    }
+
+    /// Active la réinitialisation du mot de passe par email (#204).
+    pub fn with_password_reset(mut self, password_reset: PasswordReset) -> Self {
+        self.password_reset = Some(password_reset);
         self
     }
 }
@@ -228,6 +264,22 @@ pub struct ChangePasswordBody {
     pub new_password: String,
 }
 
+/// Body de `/auth/password/forgot`.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct ForgotPasswordBody {
+    /// Adresse email du compte (normalisée côté serveur).
+    pub email: String,
+}
+
+/// Body de `/auth/password/reset`.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct ResetPasswordBody {
+    /// Jeton reçu par email (fragment `#reset=` du lien).
+    pub token: String,
+    /// Nouveau mot de passe (8 à 1024 caractères).
+    pub new_password: String,
+}
+
 /// Paire de jetons émise par signup/login/refresh.
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct TokenResponse {
@@ -255,6 +307,8 @@ pub enum AccountError {
     TooManyAttempts(i64),
     /// Authentifié mais refusé (mot de passe actuel incorrect).
     Forbidden(&'static str),
+    /// Fonction non configurée sur ce déploiement (ex. aucun envoi d'email).
+    Unavailable(&'static str),
     /// Erreur interne (store, hash).
     Internal(String),
 }
@@ -268,6 +322,9 @@ impl IntoResponse for AccountError {
             }
             AccountError::Conflict(msg) => (StatusCode::CONFLICT, msg).into_response(),
             AccountError::Forbidden(msg) => (StatusCode::FORBIDDEN, msg).into_response(),
+            AccountError::Unavailable(msg) => {
+                (StatusCode::SERVICE_UNAVAILABLE, msg).into_response()
+            }
             AccountError::TooManyAttempts(secs) => (
                 StatusCode::TOO_MANY_REQUESTS,
                 [(header::RETRY_AFTER, secs.to_string())],
@@ -313,10 +370,10 @@ fn ip_counter(
     headers: &HeaderMap,
 ) -> Option<(String, u32)> {
     let ip = state.ip_throttle.as_ref()?;
-    let max = if scope == LOGIN_IP_SCOPE {
-        ip.login_max
-    } else {
-        ip.signup_max
+    let max = match scope {
+        LOGIN_IP_SCOPE => ip.login_max,
+        RESET_IP_SCOPE => ip.reset_max,
+        _ => ip.signup_max,
     };
     if max == 0 {
         return None;
@@ -363,6 +420,7 @@ async fn check_ip(
 
 const LOGIN_IP_SCOPE: &str = "login-ip";
 const SIGNUP_IP_SCOPE: &str = "signup-ip";
+const RESET_IP_SCOPE: &str = "reset-ip";
 
 fn token_response(access_token: String, refresh_token: String) -> TokenResponse {
     TokenResponse {
@@ -753,9 +811,217 @@ pub async fn change_password(
     Ok(Json(issue_pair(&state, &user_id).await?))
 }
 
-/// Sous-router `/signup`, `/login`, `/refresh`, `/logout` (publics),
-/// `/logout-all` et `/password` (Bearer) — à imbriquer sous
-/// `/auth` avec [`crate::auth::protected_router`].
+/// Message des jetons de réinitialisation refusés (même réponse quelle que
+/// soit la raison : mal formé, expiré, falsifié, déjà utilisé, compte disparu).
+const INVALID_RESET_TOKEN: &str = "invalid or expired reset link";
+
+/// `POST /auth/password/forgot` — envoie un lien de réinitialisation à
+/// l'adresse, **si** un compte lui correspond.
+///
+/// Toujours 202 pour une adresse bien formée : la recherche du compte et
+/// l'envoi ont lieu en tâche de fond, la réponse ne révèle donc ni par son
+/// code ni par sa durée si le compte existe.
+#[utoipa::path(
+    post,
+    path = "/auth/password/forgot",
+    tag = "auth",
+    request_body = ForgotPasswordBody,
+    responses(
+        (status = 202, description = "Demande prise en compte (email envoyé si le compte existe)"),
+        (status = 400, description = "Email invalide"),
+        (status = 429, description = "Trop de demandes (adresse email ou IP) — voir `Retry-After`"),
+        (status = 503, description = "Réinitialisation indisponible : aucun envoi d'email configuré")
+    )
+)]
+pub async fn forgot_password(
+    State(state): State<AccountsState>,
+    peer: Option<ConnectInfo<SocketAddr>>,
+    headers: HeaderMap,
+    Json(body): Json<ForgotPasswordBody>,
+) -> Result<StatusCode, AccountError> {
+    let Some(reset) = state.password_reset.clone() else {
+        return Err(AccountError::Unavailable(
+            "password reset is not configured",
+        ));
+    };
+    let email = normalize_email(&body.email);
+    validate_email(&email).map_err(|e| AccountError::BadRequest(e.to_string()))?;
+    let now = state.auth.clock.now_unix_seconds();
+    // Chaque demande compte : par IP (emails en masse), puis par adresse (une
+    // même boîte inondée). Indépendant de l'existence du compte.
+    let ip = ip_counter(&state, RESET_IP_SCOPE, peer.map(|c| c.0), &headers);
+    check_ip(&state, &ip, "auth.password_reset_request", &email, now).await?;
+    if let LoginAttempt::Blocked { retry_after_secs } = state
+        .throttle
+        .begin_attempt(&format!("reset:{email}"), reset.email_max, now)
+        .await
+        .map_err(internal)?
+    {
+        audit(
+            &state,
+            &email,
+            "auth.password_reset_request",
+            AuditOutcome::Denied,
+        )
+        .await;
+        return Err(AccountError::TooManyAttempts(retry_after_secs));
+    }
+
+    tokio::spawn(async move { send_reset_link(&state, &reset, &email, now).await });
+    Ok(StatusCode::ACCEPTED)
+}
+
+/// Tâche de fond de [`forgot_password`] : lien envoyé seulement si le compte
+/// existe. Les erreurs sont journalisées (jamais le jeton).
+async fn send_reset_link(state: &AccountsState, reset: &PasswordReset, email: &str, now: i64) {
+    let user = match state.users.find_by_email(email).await {
+        Ok(user) => user,
+        Err(e) => {
+            tracing::error!(error = %e, "réinitialisation : recherche du compte impossible");
+            return;
+        }
+    };
+    let Some(user) = user else {
+        audit(
+            state,
+            email,
+            "auth.password_reset_request",
+            AuditOutcome::Failure,
+        )
+        .await;
+        return;
+    };
+    let token = reset.tokens.issue(&user.id, &user.password_hash, now);
+    match reset
+        .mail
+        .mailer
+        .send(&reset.mail_for(&user.email, &token))
+        .await
+    {
+        Ok(()) => {
+            tracing::info!(user_id = %user.id, "lien de réinitialisation envoyé");
+            audit(
+                state,
+                &user.id,
+                "auth.password_reset_request",
+                AuditOutcome::Success,
+            )
+            .await;
+        }
+        Err(e) => {
+            tracing::error!(user_id = %user.id, error = %e, "envoi du lien de réinitialisation impossible");
+            audit(
+                state,
+                &user.id,
+                "auth.password_reset_request",
+                AuditOutcome::Failure,
+            )
+            .await;
+        }
+    }
+}
+
+/// `POST /auth/password/reset` — consomme un lien de réinitialisation : le
+/// mot de passe est remplacé, **toutes** les sessions sont fermées et le
+/// blocage de connexion du compte est levé. Réponse 204 : l'utilisateur se
+/// connecte ensuite avec son nouveau mot de passe.
+#[utoipa::path(
+    post,
+    path = "/auth/password/reset",
+    tag = "auth",
+    request_body = ResetPasswordBody,
+    responses(
+        (status = 204, description = "Mot de passe remplacé ; sessions fermées"),
+        (status = 400, description = "Lien invalide, expiré ou déjà utilisé, ou nouveau mot de passe invalide"),
+        (status = 503, description = "Réinitialisation indisponible : aucun envoi d'email configuré")
+    )
+)]
+pub async fn reset_password(
+    State(state): State<AccountsState>,
+    Json(body): Json<ResetPasswordBody>,
+) -> Result<StatusCode, AccountError> {
+    let Some(reset) = state.password_reset.as_ref() else {
+        return Err(AccountError::Unavailable(
+            "password reset is not configured",
+        ));
+    };
+    let invalid = || AccountError::BadRequest(INVALID_RESET_TOKEN.into());
+    let token = ResetTokens::parse(&body.token).ok_or_else(invalid)?;
+    validate_password(&body.new_password).map_err(|e| AccountError::BadRequest(e.to_string()))?;
+    let now = state.auth.clock.now_unix_seconds();
+    let account = state
+        .users
+        .find_by_id(token.user_id)
+        .await
+        .map_err(internal)?;
+    // Le jeton est vérifié (HMAC, bon marché) avant tout calcul Argon2.
+    let Some(account) = account.filter(|a| reset.tokens.verify(&token, &a.password_hash, now))
+    else {
+        audit(
+            &state,
+            token.user_id,
+            "auth.password_reset",
+            AuditOutcome::Failure,
+        )
+        .await;
+        return Err(invalid());
+    };
+
+    let hasher = Arc::clone(&state.hasher);
+    let new_password = body.new_password;
+    let new_hash = blocking(move || hasher.hash(&new_password)).await?;
+    // Écriture conditionnelle sur le hash lié au jeton : de deux
+    // utilisations concurrentes du même lien, une seule réussit.
+    if !state
+        .users
+        .update_password(&account.id, &account.password_hash, &new_hash)
+        .await
+        .map_err(internal)?
+    {
+        audit(
+            &state,
+            &account.id,
+            "auth.password_reset",
+            AuditOutcome::Failure,
+        )
+        .await;
+        return Err(invalid());
+    }
+
+    let version = state
+        .auth
+        .revocation
+        .bump_session_version(&account.id)
+        .await
+        .map_err(internal)?;
+    // Le compte a pu être bloqué par les échecs qui ont motivé la demande.
+    for key in [
+        email_throttle_key(&account.email),
+        format!("password:{}", account.id),
+    ] {
+        if let Err(e) = state.throttle.reset(&key).await {
+            tracing::warn!(error = %e, "remise à zéro d'un compteur impossible");
+        }
+    }
+    tracing::info!(
+        user_id = %account.id,
+        session_version = version,
+        "mot de passe réinitialisé, sessions fermées"
+    );
+    audit(
+        &state,
+        &account.id,
+        "auth.password_reset",
+        AuditOutcome::Success,
+    )
+    .await;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Sous-router `/signup`, `/login`, `/refresh`, `/logout`,
+/// `/password/forgot`, `/password/reset` (publics), `/logout-all` et
+/// `/password` (Bearer) — à imbriquer sous `/auth` avec
+/// [`crate::auth::protected_router`].
 pub fn accounts_router(state: AccountsState) -> Router {
     Router::new()
         .route("/signup", post(signup))
@@ -764,6 +1030,8 @@ pub fn accounts_router(state: AccountsState) -> Router {
         .route("/logout", post(logout))
         .route("/logout-all", post(logout_all))
         .route("/password", post(change_password))
+        .route("/password/forgot", post(forgot_password))
+        .route("/password/reset", post(reset_password))
         .with_state(state)
 }
 
@@ -771,6 +1039,8 @@ pub fn accounts_router(state: AccountsState) -> Router {
 mod tests {
     use super::*;
     use crate::auth::{protected_router, Clock};
+    use crate::mail::{MailSettings, MemoryMailer, OutgoingMail};
+    use crate::password_reset::RESET_TTL_SECONDS;
     use autome_core::{
         Argon2PasswordHasher, AuditSink, InMemoryAuditSink, InMemoryPermissionStore,
         InMemoryRevocationStore, InMemoryUserStore, PermissionStore, TokenKind, TokenService,
@@ -818,6 +1088,7 @@ mod tests {
         perms: Arc<InMemoryPermissionStore>,
         users: Arc<InMemoryUserStore>,
         audit: Arc<InMemoryAuditSink>,
+        mailer: MemoryMailer,
     }
 
     fn harness_with(hasher: Arc<dyn PasswordHasher + Send + Sync>) -> Harness {
@@ -839,7 +1110,17 @@ mod tests {
             audit.clone(),
         )
         .with_clock(clock.clone());
-        let mut accounts = AccountsState::new(auth.clone(), users.clone(), hasher).unwrap();
+        let mailer = MemoryMailer::new();
+        let reset = PasswordReset::new(
+            ResetTokens::new(b"test-encryption-key"),
+            MailSettings {
+                mailer: Arc::new(mailer.clone()),
+                public_url: "https://app.example.io".into(),
+            },
+        );
+        let mut accounts = AccountsState::new(auth.clone(), users.clone(), hasher)
+            .unwrap()
+            .with_password_reset(reset);
         if let Some(ip) = ip_throttle {
             accounts = accounts.with_ip_throttle(ip);
         }
@@ -850,6 +1131,7 @@ mod tests {
             perms,
             users,
             audit,
+            mailer,
         }
     }
 
@@ -864,6 +1146,7 @@ mod tests {
             keyer: IpKeyer::new(b"test-ip-key"),
             login_max,
             signup_max,
+            reset_max: 0,
         };
         harness_full(Arc::new(PlainHasher), Some(ip))
     }
@@ -1887,23 +2170,29 @@ mod tests {
         let config = Config::load(|_| None).unwrap();
         let defaults = IpThrottle::from_source(&config, |_| None).unwrap();
         assert_eq!(
-            (defaults.login_max, defaults.signup_max),
+            (defaults.login_max, defaults.signup_max, defaults.reset_max),
             (
                 DEFAULT_LOGIN_IP_MAX_ATTEMPTS,
-                DEFAULT_SIGNUP_IP_MAX_ATTEMPTS
+                DEFAULT_SIGNUP_IP_MAX_ATTEMPTS,
+                DEFAULT_RESET_IP_MAX_ATTEMPTS
             )
         );
         let custom = IpThrottle::from_source(&config, |name| match name {
             "AUTOME_LOGIN_IP_MAX_ATTEMPTS" => Some("100".into()),
             "AUTOME_SIGNUP_IP_MAX_ATTEMPTS" => Some(" 0 ".into()),
+            "AUTOME_RESET_IP_MAX_ATTEMPTS" => Some("4".into()),
             "AUTOME_TRUSTED_PROXIES" => Some("10.0.0.0/8".into()),
             _ => None,
         })
         .unwrap();
-        assert_eq!((custom.login_max, custom.signup_max), (100, 0));
+        assert_eq!(
+            (custom.login_max, custom.signup_max, custom.reset_max),
+            (100, 0, 4)
+        );
         for (name, value) in [
             ("AUTOME_LOGIN_IP_MAX_ATTEMPTS", "-1"),
             ("AUTOME_SIGNUP_IP_MAX_ATTEMPTS", "lots"),
+            ("AUTOME_RESET_IP_MAX_ATTEMPTS", "1.5"),
             ("AUTOME_TRUSTED_PROXIES", "10.0.0.0/33"),
         ] {
             let err = IpThrottle::from_source(&config, |n| (n == name).then(|| value.into()))
@@ -1924,6 +2213,354 @@ mod tests {
             .collect();
         assert!(actions.contains(&("auth.signup", AuditOutcome::Success)));
         assert!(actions.contains(&("auth.login", AuditOutcome::Failure)));
+    }
+
+    // ───── Mot de passe oublié (#204) ─────
+
+    fn forgot(email: &str) -> serde_json::Value {
+        json!({ "email": email })
+    }
+
+    fn reset_body(token: &str, new_password: &str) -> serde_json::Value {
+        json!({ "token": token, "new_password": new_password })
+    }
+
+    /// Attend que la tâche de fond ait envoyé `n` emails.
+    async fn wait_mails(h: &Harness, n: usize) -> Vec<OutgoingMail> {
+        for _ in 0..400 {
+            if h.mailer.sent().len() >= n {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        h.mailer.sent()
+    }
+
+    /// Attend l'événement d'audit `action`/`outcome` (fin de la tâche de fond).
+    async fn wait_audit(h: &Harness, action: &str, outcome: AuditOutcome) {
+        for _ in 0..400 {
+            let events = h.audit.list().await.unwrap();
+            if events
+                .iter()
+                .any(|e| e.action == action && e.outcome == outcome)
+            {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        panic!("événement d'audit {action} {outcome:?} attendu");
+    }
+
+    /// Jeton du lien `…/#reset=<jeton>` contenu dans l'email.
+    fn token_in(mail: &OutgoingMail) -> String {
+        let (_, rest) = mail.body.split_once("#reset=").expect("lien attendu");
+        rest.split_whitespace().next().unwrap().to_string()
+    }
+
+    /// Inscrit `email` et renvoie le jeton de réinitialisation reçu.
+    async fn reset_token_for(h: &Harness, email: &str, password: &str) -> String {
+        post(&h.app, "/signup", creds(email, password)).await;
+        let before = h.mailer.sent().len();
+        let r = post(&h.app, "/password/forgot", forgot(email)).await;
+        assert_eq!(r.status(), StatusCode::ACCEPTED);
+        let mails = wait_mails(h, before + 1).await;
+        token_in(mails.last().expect("email envoyé"))
+    }
+
+    #[tokio::test]
+    async fn a_reset_link_replaces_the_password_and_closes_every_session() {
+        let h = harness();
+        let laptop =
+            tokens(post(&h.app, "/signup", creds("ana@example.io", "old-password")).await).await;
+        let phone =
+            tokens(post(&h.app, "/login", creds("ANA@example.io", "old-password")).await).await;
+
+        let r = post(&h.app, "/password/forgot", forgot(" Ana@Example.io ")).await;
+        assert_eq!(r.status(), StatusCode::ACCEPTED);
+        let mails = wait_mails(&h, 1).await;
+        assert_eq!(mails.len(), 1);
+        assert_eq!(mails[0].to, "ana@example.io");
+        assert!(mails[0].body.contains("https://app.example.io/#reset="));
+        let token = token_in(&mails[0]);
+
+        let r = post(
+            &h.app,
+            "/password/reset",
+            reset_body(&token, "new-password"),
+        )
+        .await;
+        assert_eq!(r.status(), StatusCode::NO_CONTENT);
+
+        for pair in [&laptop, &phone] {
+            assert_eq!(
+                whoami_status(&h.app, &pair.access_token).await,
+                StatusCode::UNAUTHORIZED
+            );
+            assert_eq!(
+                refresh_status(&h.app, &pair.refresh_token).await,
+                StatusCode::UNAUTHORIZED
+            );
+        }
+        let old = post(&h.app, "/login", creds("ana@example.io", "old-password")).await;
+        assert_eq!(old.status(), StatusCode::UNAUTHORIZED);
+        let new = post(&h.app, "/login", creds("ana@example.io", "new-password")).await;
+        assert_eq!(new.status(), StatusCode::OK);
+
+        // Usage unique : le hash a changé, le lien ne vaut plus rien.
+        let again = post(
+            &h.app,
+            "/password/reset",
+            reset_body(&token, "third-password"),
+        )
+        .await;
+        assert_eq!(again.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(text(again).await, INVALID_RESET_TOKEN);
+    }
+
+    #[tokio::test]
+    async fn an_unknown_email_gets_the_same_answer_and_no_mail() {
+        let h = harness();
+        post(&h.app, "/signup", creds("bea@example.io", "some-password")).await;
+        let r = post(&h.app, "/password/forgot", forgot("nobody@example.io")).await;
+        assert_eq!(r.status(), StatusCode::ACCEPTED);
+        assert_eq!(text(r).await, "");
+        wait_audit(&h, "auth.password_reset_request", AuditOutcome::Failure).await;
+        assert!(h.mailer.sent().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_malformed_email_is_rejected() {
+        let h = harness();
+        let r = post(&h.app, "/password/forgot", forgot("pas-une-adresse")).await;
+        assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn a_reset_link_expires() {
+        let h = harness();
+        let token = reset_token_for(&h, "cid@example.io", "old-password").await;
+        h.clock.advance(RESET_TTL_SECONDS);
+        let r = post(
+            &h.app,
+            "/password/reset",
+            reset_body(&token, "new-password"),
+        )
+        .await;
+        assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+        let old = post(&h.app, "/login", creds("cid@example.io", "old-password")).await;
+        assert_eq!(old.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn a_password_change_invalidates_pending_links() {
+        let h = harness();
+        let token = reset_token_for(&h, "dan@example.io", "old-password").await;
+        let pair =
+            tokens(post(&h.app, "/login", creds("dan@example.io", "old-password")).await).await;
+        let r = post_bearer(
+            &h.app,
+            "/password",
+            &pair.access_token,
+            pw("old-password", "changed-password"),
+        )
+        .await;
+        assert_eq!(r.status(), StatusCode::OK);
+        let r = post(
+            &h.app,
+            "/password/reset",
+            reset_body(&token, "new-password"),
+        )
+        .await;
+        assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn forged_tokens_and_weak_passwords_are_refused() {
+        let h = harness();
+        let token = reset_token_for(&h, "eve@example.io", "old-password").await;
+        let user = h
+            .users
+            .find_by_email("eve@example.io")
+            .await
+            .unwrap()
+            .unwrap();
+
+        // Jeton signé par une autre clé, ou falsifié, ou absurde.
+        let foreign = ResetTokens::new(b"other-key").issue(&user.id, &user.password_hash, START);
+        let tampered = format!("{}0", &token[..token.len() - 1]);
+        for bad in [foreign.as_str(), tampered.as_str(), "", "x.y.z"] {
+            let r = post(&h.app, "/password/reset", reset_body(bad, "new-password")).await;
+            assert_eq!(r.status(), StatusCode::BAD_REQUEST, "{bad:?}");
+        }
+
+        // Mot de passe trop court : refusé, et le lien reste utilisable.
+        let r = post(&h.app, "/password/reset", reset_body(&token, "short")).await;
+        assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+        let r = post(
+            &h.app,
+            "/password/reset",
+            reset_body(&token, "new-password"),
+        )
+        .await;
+        assert_eq!(r.status(), StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn concurrent_uses_of_one_link_have_a_single_winner() {
+        let h = harness();
+        let token = reset_token_for(&h, "fay@example.io", "old-password").await;
+        let (a, b) = tokio::join!(
+            post(
+                &h.app,
+                "/password/reset",
+                reset_body(&token, "first-password")
+            ),
+            post(
+                &h.app,
+                "/password/reset",
+                reset_body(&token, "second-password")
+            ),
+        );
+        let mut statuses = [a.status(), b.status()];
+        statuses.sort();
+        assert_eq!(statuses, [StatusCode::NO_CONTENT, StatusCode::BAD_REQUEST]);
+    }
+
+    #[tokio::test]
+    async fn requests_are_limited_per_email() {
+        let h = harness();
+        post(&h.app, "/signup", creds("gus@example.io", "some-password")).await;
+        for _ in 0..crate::password_reset::DEFAULT_RESET_EMAIL_MAX_REQUESTS {
+            let r = post(&h.app, "/password/forgot", forgot("gus@example.io")).await;
+            assert_eq!(r.status(), StatusCode::ACCEPTED);
+        }
+        let r = post(&h.app, "/password/forgot", forgot("gus@example.io")).await;
+        assert_eq!(r.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(r.headers().contains_key(header::RETRY_AFTER));
+        // Le quota vaut aussi pour une adresse sans compte (rien n'est révélé).
+        for _ in 0..crate::password_reset::DEFAULT_RESET_EMAIL_MAX_REQUESTS {
+            post(&h.app, "/password/forgot", forgot("ghost@example.io")).await;
+        }
+        let r = post(&h.app, "/password/forgot", forgot("ghost@example.io")).await;
+        assert_eq!(r.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            wait_mails(&h, 3).await.len(),
+            3,
+            "un email par demande acceptée pour le compte existant"
+        );
+    }
+
+    #[tokio::test]
+    async fn requests_are_limited_per_ip() {
+        let ip = IpThrottle {
+            policy: ClientIpPolicy::parse("").unwrap(),
+            keyer: IpKeyer::new(b"test-ip-key"),
+            login_max: 0,
+            signup_max: 0,
+            reset_max: 2,
+        };
+        let h = harness_full(Arc::new(PlainHasher), Some(ip));
+        for email in ["a@example.io", "b@example.io"] {
+            let r = post_from(&h.app, "/password/forgot", IP_A, None, forgot(email)).await;
+            assert_eq!(r.status(), StatusCode::ACCEPTED);
+        }
+        let r = post_from(
+            &h.app,
+            "/password/forgot",
+            IP_A,
+            None,
+            forgot("c@example.io"),
+        )
+        .await;
+        assert_eq!(r.status(), StatusCode::TOO_MANY_REQUESTS);
+        let r = post_from(
+            &h.app,
+            "/password/forgot",
+            IP_B,
+            None,
+            forgot("c@example.io"),
+        )
+        .await;
+        assert_eq!(r.status(), StatusCode::ACCEPTED);
+    }
+
+    #[tokio::test]
+    async fn a_reset_lifts_the_login_lockout() {
+        let h = harness();
+        let token = reset_token_for(&h, "hal@example.io", "old-password").await;
+        for _ in 0..MAX_LOGIN_FAILURES {
+            post(&h.app, "/login", creds("hal@example.io", "wrong-password")).await;
+        }
+        let locked = post(&h.app, "/login", creds("hal@example.io", "old-password")).await;
+        assert_eq!(locked.status(), StatusCode::TOO_MANY_REQUESTS);
+
+        let r = post(
+            &h.app,
+            "/password/reset",
+            reset_body(&token, "new-password"),
+        )
+        .await;
+        assert_eq!(r.status(), StatusCode::NO_CONTENT);
+        let r = post(&h.app, "/login", creds("hal@example.io", "new-password")).await;
+        assert_eq!(r.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn without_a_mailer_the_endpoints_answer_503() {
+        let perms = Arc::new(InMemoryPermissionStore::new());
+        let auth = AuthState::new(
+            TokenService::new(SECRET),
+            Arc::new(InMemoryRevocationStore::new()),
+            perms.clone(),
+            Arc::new(InMemoryAuditSink::new()),
+        );
+        let accounts = AccountsState::new(
+            auth,
+            Arc::new(InMemoryUserStore::new(perms)),
+            Arc::new(PlainHasher),
+        )
+        .unwrap();
+        let app = accounts_router(accounts);
+        let r = post(&app, "/password/forgot", forgot("ivy@example.io")).await;
+        assert_eq!(r.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let r = post(&app, "/password/reset", reset_body("x.1.y", "new-password")).await;
+        assert_eq!(r.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn resets_are_audited_without_secrets() {
+        let h = harness();
+        let token = reset_token_for(&h, "jo@example.io", "old-password").await;
+        wait_audit(&h, "auth.password_reset_request", AuditOutcome::Success).await;
+        let user = h
+            .users
+            .find_by_email("jo@example.io")
+            .await
+            .unwrap()
+            .unwrap();
+        let forged = ResetTokens::new(b"other-key").issue(&user.id, &user.password_hash, START);
+        post(
+            &h.app,
+            "/password/reset",
+            reset_body(&forged, "new-password"),
+        )
+        .await;
+        post(
+            &h.app,
+            "/password/reset",
+            reset_body(&token, "new-password"),
+        )
+        .await;
+        let events = h.audit.list().await.unwrap();
+        assert!(events.iter().any(|e| e.action == "auth.password_reset"
+            && e.actor == user.id
+            && e.outcome == AuditOutcome::Success));
+        assert!(events.iter().any(|e| e.action == "auth.password_reset"
+            && e.actor == user.id
+            && e.outcome == AuditOutcome::Failure));
+        let dump = format!("{events:?}");
+        assert!(!dump.contains(&token[token.len() - 64..]), "MAC du jeton");
+        assert!(!dump.contains("new-password"));
     }
 
     #[tokio::test]

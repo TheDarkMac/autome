@@ -7,6 +7,8 @@
 //! Modules :
 //! - [`accounts`] : inscription, connexion et rotation des jetons
 //!   (`/auth/signup|login|refresh`).
+//! - [`mail`] et [`password_reset`] (#204) : envoi d'emails (SMTP) et jetons
+//!   de réinitialisation du mot de passe.
 //! - [`auth`] (F6.1.c) : extractor axum `AuthenticatedUser` qui consomme
 //!   les primitives `core::auth` (TokenService, RevocationStore).
 //! - [`tls`] (F6.4) : chargement de la config TLS rustls depuis des
@@ -16,9 +18,11 @@ pub mod accounts;
 pub mod auth;
 pub mod client_ip;
 pub mod credentials;
+pub mod mail;
 pub mod metrics;
 pub mod observability;
 pub mod openapi;
+pub mod password_reset;
 pub mod probes;
 pub mod runs;
 pub mod runtime;
