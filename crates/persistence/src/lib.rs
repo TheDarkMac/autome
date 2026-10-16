@@ -24,6 +24,7 @@ pub mod revocation;
 pub mod run_state;
 pub mod selectors;
 pub mod users;
+pub mod webhook_endpoints;
 pub mod workflow_repo;
 
 pub use audit::PgAuditSink;
@@ -42,4 +43,5 @@ pub use selectors::{
     QueueMode,
 };
 pub use users::PgUserStore;
+pub use webhook_endpoints::PgWebhookEndpointStore;
 pub use workflow_repo::PgWorkflowRepository;
