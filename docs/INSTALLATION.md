@@ -179,7 +179,7 @@ démarrage (`AUTOME_MIGRATE=true`). Les données survivent à un
 
 | Service | URL | Identifiants |
 |---|---|---|
-| API | http://localhost:8080 | — (`/livez`, `/readyz`, `/metrics`) |
+| API | http://localhost:8080 | — (`/livez`, `/readyz`, `/metrics`, `/openapi.json`) |
 | Frontend | http://localhost:8081 | — |
 | Grafana | http://localhost:3000 | `admin` / `admin` |
 | Prometheus | http://localhost:9090 | — |
@@ -191,6 +191,7 @@ Vérification rapide :
 ```bash
 curl http://localhost:8080/readyz     # -> {"status":"ready","checks":{"postgres":"ok","rabbitmq":"ok"}}
 curl http://localhost:8080/metrics    # -> métriques Prometheus
+curl http://localhost:8080/openapi.json  # -> spec OpenAPI 3 de l'API (publique)
 docker compose ps                     # api et worker « healthy »
 ```
 
