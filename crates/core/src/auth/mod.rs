@@ -28,6 +28,6 @@ pub use throttle::{
     LOGIN_WINDOW_SECONDS, MAX_LOGIN_FAILURES,
 };
 pub use users::{
-    normalize_email, validate_email, validate_password, CreateUser, InMemoryUserStore, UserRecord,
-    UserStore,
+    normalize_email, validate_email, validate_password, CreateUser, InMemoryUserStore, UserPage,
+    UserRecord, UserStore, UserSummary,
 };
