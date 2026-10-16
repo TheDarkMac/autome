@@ -28,9 +28,15 @@
 //!   `GET /readyz` (base et broker joignables) — défaut `127.0.0.1:9091`,
 //!   `0.0.0.0:9091` dans l'image ; vide = désactivées (#192).
 //!
-//! Arrêt **gracieux** : sur `SIGINT`/`SIGTERM`, le pool stoppe et `await` la
-//! fin des tâches en cours (pas de message perdu en vol).
+//! - `AUTOME_WORKER_SHUTDOWN_TIMEOUT_SECS` : délai laissé aux runs en cours à
+//!   l'arrêt (défaut 25 s, #200).
+//!
+//! Arrêt **borné** : sur `SIGINT`/`SIGTERM`, le pool cesse de consommer,
+//! `/readyz` passe à 503 et les runs en cours ont le délai d'arrêt pour se
+//! terminer ; au-delà, ils sont clos en `failed` (« worker arrêté pendant
+//! l'exécution ») au lieu de rester `running` jusqu'au balayage des orphelins.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -42,9 +48,10 @@ use autome_persistence::selectors::{
     build_workflow_repository, ensure_durable_backends, PersistenceMode, QueueMode,
 };
 use autome_worker::probe::{self, ProbeState};
+use autome_worker::shutdown::shutdown_timeout_from_env;
 use autome_worker::{
-    reap_orphans, ConnectorCredentialsMode, Handler, IdempotencyStore, InMemoryIdempotencyStore,
-    RunExecutor, WorkerPool,
+    drain, reap_orphans, ConnectorCredentialsMode, DrainOutcome, Handler, IdempotencyStore,
+    InMemoryIdempotencyStore, RunExecutor, WorkerPool,
 };
 
 /// Queue des runs (alignée sur `QueueRunDispatcher::queue_name` par défaut).
@@ -143,7 +150,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    let handler: Arc<dyn Handler + Send + Sync> = Arc::new(RunExecutor::new(repo, store, resolver));
+    let executor = RunExecutor::new(repo, Arc::clone(&store), resolver);
+    // Runs en cours, pour clore ceux qu'un arrêt interromprait (#200).
+    let in_flight = executor.in_flight();
+    let handler: Arc<dyn Handler + Send + Sync> = Arc::new(executor);
     let idempotency: Arc<dyn IdempotencyStore + Send + Sync> =
         Arc::new(InMemoryIdempotencyStore::new());
 
@@ -161,6 +171,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let pool = WorkerPool::new(queue, handler, idempotency, RUNS_QUEUE, concurrency);
 
+    // Arrêt borné (#200) : délai laissé aux runs en cours ; `/readyz` à 503
+    // dès le signal.
+    let shutdown_timeout = shutdown_timeout_from_env()?;
+    let draining = Arc::new(AtomicBool::new(false));
+
     // Sondes (#192) : adresse invalide ou déjà prise ⇒ refus de démarrer
     // (l'orchestrateur tuerait sinon un worker sain faute de réponse).
     let probes = match probe_addr_from_env() {
@@ -169,7 +184,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .await
                 .map_err(|e| format!("AUTOME_WORKER_PROBE_ADDR `{addr}` : {e}"))?;
             tracing::info!(%addr, "sondes /livez et /readyz en écoute");
-            let state = ProbeState::new(pool.liveness(), health_checks, run_timeout_ms);
+            let state = ProbeState::new(pool.liveness(), health_checks, run_timeout_ms)
+                .with_draining(Arc::clone(&draining));
             Some(tokio::spawn(probe::serve(listener, Arc::new(state))))
         }
         None => {
@@ -182,14 +198,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Arrêt gracieux : SIGINT (Ctrl-C) ou SIGTERM (orchestrateur).
     shutdown_signal().await;
-    tracing::info!("signal d'arrêt reçu : drain des tâches en cours");
-    running.stop().await;
+    draining.store(true, Ordering::Release);
+    tracing::info!(
+        timeout_s = shutdown_timeout.as_secs(),
+        runs_en_cours = in_flight.snapshot().len(),
+        "signal d'arrêt reçu : plus de nouveaux runs, drain des runs en cours"
+    );
+    let outcome = drain(running, &in_flight, store.as_ref(), shutdown_timeout).await;
     reaper.abort();
     if let Some(probes) = probes {
         probes.abort();
     }
-    tracing::info!("autome-worker arrêté proprement");
-    Ok(())
+    match outcome {
+        DrainOutcome::Completed => {
+            tracing::info!("autome-worker arrêté proprement");
+            Ok(())
+        }
+        DrainOutcome::Interrupted { failed } => {
+            tracing::warn!(
+                runs = failed.len(),
+                run_ids = ?failed,
+                "délai d'arrêt dépassé : runs interrompus clos en échec"
+            );
+            // Le runtime attendrait sinon, à sa destruction, la fin des
+            // threads bloquants du moteur — c'est-à-dire des runs qu'on vient
+            // de clore.
+            std::process::exit(0)
+        }
+    }
 }
 
 /// Attend `SIGINT` (Ctrl-C) ou, sous Unix, `SIGTERM`.

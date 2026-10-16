@@ -8,8 +8,10 @@
 //!   l'orchestrateur redémarre le conteneur ;
 //! - `/readyz` : PostgreSQL et broker joignables
 //!   ([`autome_persistence::run_checks`]) — échec ⇒ « pas prêt » (déploiement
-//!   progressif suspendu), sans redémarrage.
+//!   progressif suspendu), sans redémarrage. Pendant l'arrêt (#200) : 503
+//!   `draining`, et `/livez` reste 200 (les consommateurs ne bouclent plus).
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -36,6 +38,7 @@ pub struct ProbeState {
     stall_ms: i64,
     busy_limit_ms: i64,
     check_timeout: Duration,
+    draining: Arc<AtomicBool>,
 }
 
 impl ProbeState {
@@ -52,10 +55,29 @@ impl ProbeState {
             stall_ms: STALL_MS,
             busy_limit_ms: run_timeout_ms.saturating_add(STALL_MS),
             check_timeout: CHECK_TIMEOUT,
+            draining: Arc::new(AtomicBool::new(false)),
         }
     }
 
+    /// Arrêt en cours dès que `draining` passe à `true` (#200).
+    pub fn with_draining(mut self, draining: Arc<AtomicBool>) -> Self {
+        self.draining = draining;
+        self
+    }
+
     async fn respond(&self, path: &str) -> (u16, &'static str, String) {
+        if self.draining.load(Ordering::Acquire) {
+            // Les consommateurs ne bouclent plus : ne pas les déclarer figés.
+            return match path {
+                "/livez" => (200, "text/plain", "ok".into()),
+                "/readyz" => (
+                    503,
+                    "application/json",
+                    r#"{"checks":{},"status":"draining"}"#.into(),
+                ),
+                _ => (404, "text/plain", "not found".into()),
+            };
+        }
         match path {
             "/livez" => match self
                 .liveness
@@ -251,6 +273,20 @@ mod tests {
             .starts_with("HTTP/1.1 400 "));
         let huge = format!("GET /{} HTTP/1.1\r\n", "a".repeat(10_000));
         assert!(request(addr, &huge).await.starts_with("HTTP/1.1 400 "));
+    }
+
+    #[tokio::test]
+    async fn while_draining_readiness_is_503_and_liveness_stays_up() {
+        // Consommateurs arrêtés depuis longtemps : figés sans le drain.
+        let liveness = Arc::new(PoolLiveness::new(1, now_ms() - 120_000));
+        let draining = Arc::new(AtomicBool::new(true));
+        let addr =
+            start(ProbeState::new(liveness, vec![], 3_600_000).with_draining(draining)).await;
+        let ready = request(addr, "GET /readyz HTTP/1.1\r\n\r\n").await;
+        assert!(ready.starts_with("HTTP/1.1 503 "), "{ready}");
+        assert!(ready.ends_with(r#"{"checks":{},"status":"draining"}"#));
+        let live = request(addr, "GET /livez HTTP/1.1\r\n\r\n").await;
+        assert!(live.starts_with("HTTP/1.1 200 "), "{live}");
     }
 
     #[test]
