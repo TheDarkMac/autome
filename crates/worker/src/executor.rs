@@ -12,7 +12,8 @@
 //! ```
 //!
 //! Le **runner de nodes** traduit chaque node en effet concret :
-//! - `Trigger` : pass-through (le déclencheur a déjà eu lieu côté API) ;
+//! - `Trigger` : renvoie le `payload` du message de run (corps d'un webhook,
+//!   payload d'un run manuel — #202), référençable par `{{ <trigger>.… }}` ;
 //! - `Action { action_type: "http_request" }` : [`HttpAction`] via un
 //!   [`ReqwestHttpClient`] **partagé** (un seul client bloquant réutilisé),
 //!   filtré anti-SSRF : destinations publiques seulement, sauf hôtes de
@@ -190,7 +191,8 @@ fn now_ms() -> i64 {
 /// Runner de nodes de production. `http`/`resolver` sont clonés/partagés dans
 /// le thread bloquant.
 ///
-/// - `Trigger` : pass-through (`Null`) — le déclenchement a eu lieu côté API.
+/// - `Trigger` : renvoie `payload`, celui du message de run (#202) — le
+///   déclenchement a eu lieu côté API ; `Null` en l'absence de payload.
 /// - `Action { http_request }` : délègue à [`HttpAction`] (les `params` du
 ///   node portent `url`/`method`/`headers`/`body`).
 /// - `Action { slack.* | gmail.* | notion.* | github.* }` : délègue à
@@ -210,9 +212,10 @@ fn run_node<C: HttpClient + Clone>(
     http: &C,
     resolver: &dyn CredentialResolver,
     owner: Option<&str>,
+    payload: &serde_json::Value,
 ) -> Result<serde_json::Value, String> {
     match &node.kind {
-        NodeKind::Trigger { .. } => Ok(serde_json::Value::Null),
+        NodeKind::Trigger { .. } => Ok(payload.clone()),
         NodeKind::Action { action_type } => match action_type.as_str() {
             "http_request" => HttpAction::new(http.clone())
                 .execute(&node.params)
@@ -247,7 +250,10 @@ where
         // Tous les logs du run (y compris ceux du moteur et des connecteurs)
         // portent `run_id` / `workflow_id`.
         let span = tracing::info_span!("run", run_id, workflow_id);
-        self.execute(run_id, workflow_id).instrument(span).await
+        let payload = body["payload"].clone();
+        self.execute(run_id, workflow_id, payload)
+            .instrument(span)
+            .await
     }
 }
 
@@ -255,8 +261,14 @@ impl<C> RunExecutor<C>
 where
     C: HttpClient + Clone + Send + Sync + 'static,
 {
-    /// Exécute le run `run_id` de `workflow_id` (dans le span du run).
-    async fn execute(&self, run_id: &str, workflow_id: &str) -> HandlerVerdict {
+    /// Exécute le run `run_id` de `workflow_id` (dans le span du run) ; le
+    /// `payload` du message est la sortie des nœuds trigger.
+    async fn execute(
+        &self,
+        run_id: &str,
+        workflow_id: &str,
+        payload: serde_json::Value,
+    ) -> HandlerVerdict {
         // Le workflow vit dans l'espace d'ids de son propriétaire (#188), qui
         // est aussi celui du run (fixé au dispatch, immuable) : on lit d'abord
         // le run, sans le réclamer, pour savoir où chercher.
@@ -323,7 +335,14 @@ where
         let report = match tokio::task::spawn_blocking(move || {
             let _entered = span.enter();
             let runner = move |node: &Node, ctx: &RunContext| {
-                run_node(node, ctx, &http, resolver.as_ref(), owner.as_deref())
+                run_node(
+                    node,
+                    ctx,
+                    &http,
+                    resolver.as_ref(),
+                    owner.as_deref(),
+                    &payload,
+                )
             };
             Engine::new().run(&dag, &runner)
         })
@@ -674,6 +693,31 @@ mod tests {
         assert!(http.sent.lock().unwrap().is_empty());
         let error = store.load("run-n").await.unwrap().unwrap().error.unwrap();
         assert!(error.contains("sans propriétaire"), "{error}");
+    }
+
+    // ───── Payload du run (#202) ─────
+
+    #[tokio::test]
+    async fn trigger_outputs_the_run_payload_for_downstream_templates() {
+        let repo = Arc::new(InMemoryWorkflowRepository::new());
+        let store = Arc::new(InMemoryRunStateStore::new());
+        let mut wf = slack_workflow("wf-p");
+        wf.nodes[1].params = json!({ "channel": "C1", "text": "{{ entry.body.issue.title }}" });
+        seed_owned(&repo, &store, wf, "run-p", Some("alice")).await;
+        let http = RecordingHttp::default();
+        let exec =
+            RunExecutor::with_http(repo, Arc::clone(&store) as Arc<_>, resolver(), http.clone());
+
+        let mut msg = delivery("run-p", "wf-p");
+        msg.message.body["payload"] = json!({ "body": { "issue": { "title": "Bug 42" } } });
+        assert_eq!(exec.handle(&msg).await, HandlerVerdict::Ok);
+
+        let sent = http.sent.lock().unwrap();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].body.as_ref().unwrap()["text"], "Bug 42");
+        let cp = store.load("run-p").await.unwrap().unwrap();
+        assert_eq!(cp.status, RunStatus::Succeeded);
+        assert_eq!(cp.outputs["entry"]["body"]["issue"]["title"], "Bug 42");
     }
 
     // ───── Livraison au plus une fois (#174) ─────
