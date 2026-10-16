@@ -67,6 +67,7 @@ flowchart TB
     DB[("PostgreSQL<br/>workflows · runs · credentials · users")]
     SEC[("Chiffrement enveloppe<br/>KeyProvider versionné · AES-256-GCM<br/>(KMS = cible production)")]
     OBS["Prometheus + Grafana"]
+    SMTP["Relais SMTP<br/>(emails de réinitialisation)"]
   end
 
   UI --> GW --> API
@@ -82,6 +83,7 @@ flowchart TB
   ENG --- DB
   CONN --- SEC
   API --- SEC
+  API -->|mot de passe oublié| SMTP
   API & WK -.metrics.-> OBS
   ENG -.-> CORE
   CONN -.-> CORE
@@ -95,6 +97,9 @@ flowchart TB
   (`/hooks/{token}`, #202) résout l'URL secrète vers `(propriétaire, workflow,
   nœud)` puis dispatche un run `trigger_type: "webhook"` dont le payload
   devient la sortie du nœud trigger dans le worker.
+- **Emails** : seule l'API en envoie (mot de passe oublié, #204), via un relais
+  SMTP (`api::mail`, `lettre` + rustls) en tâche de fond. Les liens portent un
+  jeton HMAC sans état (`api::password_reset`) : aucune table dédiée.
 - **engine** est agnostique : il dépend de **traits** de `core` (queue, stores,
   connecteurs) et ne connaît ni RabbitMQ ni PostgreSQL ni Slack directement.
 
