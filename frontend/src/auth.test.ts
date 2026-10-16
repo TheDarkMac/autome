@@ -8,10 +8,14 @@ import {
   login,
   logout,
   logoutAll,
+  readResetToken,
   refresh,
+  requestPasswordReset,
+  resetPassword,
   signup,
   tokenExpiresAtMs,
   validateCredentials,
+  validatePasswordReset,
   whoami,
   type TokenPair,
 } from "./auth";
@@ -298,6 +302,88 @@ describe("changePassword", () => {
     await expect(
       call(new Response("", { status: 429, headers: { "Retry-After": "120" } })),
     ).rejects.toMatchObject({ status: 429, message: /2 min/ });
+  });
+});
+
+describe("requestPasswordReset", () => {
+  it("POST /auth/password/forgot avec l'email nettoyé ; 202 suffit", async () => {
+    const fetchImpl = vi.fn().mockResolvedValue(new Response(null, { status: 202 }));
+    await requestPasswordReset("  ana@example.io ", fetchImpl);
+    const [url, init] = fetchImpl.mock.calls[0]!;
+    expect(url).toMatch(/\/auth\/password\/forgot$/);
+    expect(JSON.parse(init.body)).toEqual({ email: "ana@example.io" });
+  });
+
+  it("refuse un email invalide sans appel réseau", async () => {
+    const fetchImpl = vi.fn();
+    await expect(requestPasswordReset("pas-un-email", fetchImpl)).rejects.toMatchObject({
+      status: 400,
+    });
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
+  it("traduit 429 et 503", async () => {
+    const call = (res: Response) =>
+      requestPasswordReset("ana@example.io", vi.fn().mockResolvedValue(res));
+    await expect(
+      call(new Response("", { status: 429, headers: { "Retry-After": "900" } })),
+    ).rejects.toMatchObject({ status: 429, message: /15 min/ });
+    await expect(call(new Response("", { status: 503 }))).rejects.toMatchObject({
+      status: 503,
+      message: /pas disponible/,
+    });
+  });
+});
+
+describe("resetPassword", () => {
+  it("POST /auth/password/reset avec le jeton ; 204 attendu", async () => {
+    const fetchImpl = vi.fn().mockResolvedValue(new Response(null, { status: 204 }));
+    await resetPassword("uid.123.mac", "new-password", fetchImpl);
+    const [url, init] = fetchImpl.mock.calls[0]!;
+    expect(url).toMatch(/\/auth\/password\/reset$/);
+    expect(JSON.parse(init.body)).toEqual({
+      token: "uid.123.mac",
+      new_password: "new-password",
+    });
+  });
+
+  it("refuse un mot de passe trop court sans appel réseau", async () => {
+    const fetchImpl = vi.fn();
+    await expect(resetPassword("t", "short", fetchImpl)).rejects.toMatchObject({
+      status: 400,
+    });
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
+  it("explique un lien refusé et relaie les autres 400", async () => {
+    const call = (body: string) =>
+      resetPassword(
+        "t",
+        "new-password",
+        vi.fn().mockResolvedValue(new Response(body, { status: 400 })),
+      );
+    await expect(call("invalid or expired reset link")).rejects.toMatchObject({
+      status: 400,
+      message: /invalide, expiré ou déjà utilisé/,
+    });
+    await expect(call("mot de passe trop long")).rejects.toMatchObject({
+      message: "mot de passe trop long",
+    });
+  });
+});
+
+describe("readResetToken / validatePasswordReset", () => {
+  it("extrait le jeton du fragment #reset=", () => {
+    expect(readResetToken("#reset=uid.1.mac")).toBe("uid.1.mac");
+    expect(readResetToken("#reset=")).toBeNull();
+    expect(readResetToken("#autre=x")).toBeNull();
+    expect(readResetToken("")).toBeNull();
+  });
+
+  it("valide longueur et confirmation", () => {
+    expect(validatePasswordReset("short", "short")).toMatch(/au moins/);
+    expect(validatePasswordReset("new-password", "other-password")).toMatch(/confirmation/);
+    expect(validatePasswordReset("new-password", "new-password")).toBeNull();
   });
 });
 

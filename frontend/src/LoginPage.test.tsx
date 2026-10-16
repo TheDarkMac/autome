@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 
 import { ApiError } from "./api";
-import { LoginPage } from "./LoginPage";
+import { LoginPage, RESET_REQUESTED_MESSAGE } from "./LoginPage";
 
 function fill(email: string, password: string): void {
   fireEvent.change(screen.getByLabelText("Email"), { target: { value: email } });
@@ -98,5 +98,63 @@ describe("<LoginPage />", () => {
       resolve();
     });
     expect(screen.getByRole("button", { name: "Se connecter" })).toBeEnabled();
+  });
+
+  describe("mot de passe oublié (#204)", () => {
+    it("n'affiche pas le lien sans requestPasswordReset", () => {
+      render(<LoginPage login={vi.fn()} signup={vi.fn()} />);
+      expect(
+        screen.queryByRole("button", { name: "Mot de passe oublié ?" }),
+      ).not.toBeInTheDocument();
+    });
+
+    it("envoie la demande puis affiche une confirmation neutre", async () => {
+      const requestPasswordReset = vi.fn().mockResolvedValue(undefined);
+      render(
+        <LoginPage
+          login={vi.fn()}
+          signup={vi.fn()}
+          requestPasswordReset={requestPasswordReset}
+        />,
+      );
+      fireEvent.change(screen.getByLabelText("Email"), { target: { value: "ana@b.io" } });
+      fireEvent.click(screen.getByRole("button", { name: "Mot de passe oublié ?" }));
+      const form = screen.getByRole("form", { name: "Mot de passe oublié" });
+      expect(form).toBeInTheDocument();
+      // L'email déjà saisi est repris.
+      expect(screen.getByLabelText("Email")).toHaveValue("ana@b.io");
+
+      fireEvent.click(screen.getByRole("button", { name: "Envoyer le lien" }));
+      expect(await screen.findByRole("status")).toHaveTextContent(RESET_REQUESTED_MESSAGE);
+      expect(requestPasswordReset).toHaveBeenCalledWith("ana@b.io");
+
+      fireEvent.click(screen.getByRole("button", { name: "Retour à la connexion" }));
+      expect(screen.getByRole("form", { name: "Connexion" })).toBeInTheDocument();
+    });
+
+    it("affiche l'erreur de la demande (429, 503…)", async () => {
+      const requestPasswordReset = vi
+        .fn()
+        .mockRejectedValue(new ApiError("trop de tentatives : réessayez dans 15 min", 429));
+      render(
+        <LoginPage
+          login={vi.fn()}
+          signup={vi.fn()}
+          requestPasswordReset={requestPasswordReset}
+          initialMode="forgot"
+        />,
+      );
+      fireEvent.change(screen.getByLabelText("Email"), { target: { value: "ana@b.io" } });
+      fireEvent.click(screen.getByRole("button", { name: "Envoyer le lien" }));
+      expect(await screen.findByRole("alert")).toHaveTextContent("15 min");
+      expect(screen.queryByRole("status")).not.toBeInTheDocument();
+    });
+
+    it("affiche une information au-dessus du formulaire de connexion", () => {
+      render(
+        <LoginPage login={vi.fn()} signup={vi.fn()} notice="Mot de passe réinitialisé" />,
+      );
+      expect(screen.getByRole("status")).toHaveTextContent("Mot de passe réinitialisé");
+    });
   });
 });

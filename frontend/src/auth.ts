@@ -14,6 +14,8 @@
 //   - POST /auth/logout   { refresh_token } (+ Bearer access) → 204
 //   - POST /auth/logout-all (Bearer access)        → 204
 //   - POST /auth/password { current_password, new_password } (Bearer) → TokenPair
+//   - POST /auth/password/forgot { email }          → 202 (compte existant ou non)
+//   - POST /auth/password/reset  { token, new_password } → 204
 //   - GET  /auth/whoami   (Bearer access)          → "hello <sub>"
 //
 // `fetchImpl` est injectable partout pour les tests.
@@ -169,6 +171,94 @@ export async function changePassword(
   return parseTokenPair(await res.json());
 }
 
+/**
+ * Demande un lien de réinitialisation du mot de passe (#204). Le serveur
+ * répond 202 que le compte existe ou non : la réussite ne dit pas qu'un
+ * email est parti, seulement que la demande est prise en compte.
+ */
+export async function requestPasswordReset(
+  email: string,
+  fetchImpl: typeof fetch = fetch,
+): Promise<void> {
+  const trimmed = email.trim();
+  if (!EMAIL_RE.test(trimmed)) throw new ApiError("Email invalide.", 400);
+  const res = await postJson("/auth/password/forgot", { email: trimmed }, fetchImpl);
+  if (res.status === 400) throw new ApiError("Email invalide.", 400);
+  if (res.status === 429) throw new ApiError(tooManyAttemptsMessage(res), 429);
+  if (res.status === 503) {
+    throw new ApiError(
+      "la réinitialisation par email n'est pas disponible sur ce serveur : contactez un administrateur",
+      503,
+    );
+  }
+  if (!res.ok) {
+    throw new ApiError(
+      `POST /auth/password/forgot a échoué (${res.status})`,
+      res.status,
+    );
+  }
+}
+
+/**
+ * Choisit un nouveau mot de passe avec le jeton reçu par email (#204). Toutes
+ * les sessions du compte sont fermées : il faut ensuite se connecter.
+ */
+export async function resetPassword(
+  token: string,
+  newPassword: string,
+  fetchImpl: typeof fetch = fetch,
+): Promise<void> {
+  if (newPassword.length < MIN_PASSWORD_LENGTH) {
+    throw new ApiError(
+      `le nouveau mot de passe doit faire au moins ${MIN_PASSWORD_LENGTH} caractères`,
+      400,
+    );
+  }
+  const res = await postJson(
+    "/auth/password/reset",
+    { token, new_password: newPassword },
+    fetchImpl,
+  );
+  if (res.status === 400) {
+    const reason = await res.text();
+    throw new ApiError(
+      reason === INVALID_RESET_LINK
+        ? "ce lien de réinitialisation est invalide, expiré ou déjà utilisé : demandez-en un nouveau"
+        : reason || "nouveau mot de passe refusé",
+      400,
+    );
+  }
+  if (res.status === 503) {
+    throw new ApiError(
+      "la réinitialisation par email n'est pas disponible sur ce serveur",
+      503,
+    );
+  }
+  if (!res.ok) {
+    throw new ApiError(
+      `POST /auth/password/reset a échoué (${res.status})`,
+      res.status,
+    );
+  }
+}
+
+/** Corps de la réponse 400 du serveur pour un jeton refusé. */
+const INVALID_RESET_LINK = "invalid or expired reset link";
+
+/** Préfixe du fragment des liens envoyés par email (`…/#reset=<jeton>`). */
+export const RESET_HASH_PREFIX = "#reset=";
+
+/**
+ * Jeton de réinitialisation porté par le fragment de l'URL, ou `null`. Le
+ * jeton voyage dans le fragment pour ne jamais atteindre les journaux du
+ * serveur qui sert le frontend.
+ */
+export function readResetToken(hash: string): string | null {
+  if (!hash.startsWith(RESET_HASH_PREFIX)) return null;
+  const token = hash.slice(RESET_HASH_PREFIX.length).trim();
+  return token.length > 0 ? token : null;
+}
+
 /** Récupère le `sub` de l'utilisateur courant via `/auth/whoami`. */
 export async function whoami(
   accessToken: string,
@@ -287,6 +377,15 @@ export function validatePasswordChange(
     return `le nouveau mot de passe doit faire au moins ${MIN_PASSWORD_LENGTH} caractères`;
   }
   if (next === current) return "le nouveau mot de passe doit différer de l'actuel";
+  if (next !== confirm) return "la confirmation ne correspond pas";
+  return null;
+}
+
+/** Erreurs de saisie d'une réinitialisation, sans aller-retour réseau. */
+export function validatePasswordReset(next: string, confirm: string): string | null {
+  if (next.length < MIN_PASSWORD_LENGTH) {
+    return `le nouveau mot de passe doit faire au moins ${MIN_PASSWORD_LENGTH} caractères`;
+  }
   if (next !== confirm) return "la confirmation ne correspond pas";
   return null;
 }
