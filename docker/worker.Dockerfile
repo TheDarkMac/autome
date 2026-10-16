@@ -9,15 +9,31 @@
 # Build (contexte = racine du dépôt) :
 #   docker build -f docker/worker.Dockerfile -t autome-worker .
 
-# ───────────────────────── Builder ─────────────────────────
+# ───────────────────────── Chef ─────────────────────────
 # Image de base pinnée par digest (reproductibilité supply-chain, #162).
 # Tag lisible : rust:1.90-bookworm. Pour rafraîchir le digest :
 #   docker buildx imagetools inspect rust:1.90-bookworm
-FROM rust:1.90-bookworm@sha256:3914072ca0c3b8aad871db9169a651ccfce30cf58303e5d6f2db16d1d8a7e58f AS builder
+FROM rust:1.90-bookworm@sha256:3914072ca0c3b8aad871db9169a651ccfce30cf58303e5d6f2db16d1d8a7e58f AS chef
+
+# cargo-chef (#219), version pinnée : cf. api.Dockerfile.
+RUN cargo install cargo-chef --locked --version 0.1.78
 
 WORKDIR /app
-COPY . .
 
+# ───────────────────────── Planner ─────────────────────────
+FROM chef AS planner
+COPY . .
+RUN cargo chef prepare --recipe-path recipe.json
+
+# ───────────────────────── Builder ─────────────────────────
+FROM chef AS builder
+
+# Dépendances seules : couche en cache tant que Cargo.toml / Cargo.lock ne
+# changent pas. Un changement de source ne recompile que le workspace.
+COPY --from=planner /app/recipe.json recipe.json
+RUN cargo chef cook --release --locked -p autome-worker --recipe-path recipe.json
+
+COPY . .
 RUN cargo build --release --locked -p autome-worker \
     && strip target/release/autome-worker
 
