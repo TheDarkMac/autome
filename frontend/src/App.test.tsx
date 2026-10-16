@@ -61,6 +61,49 @@ describe("<App />", () => {
     await act(async () => undefined);
   });
 
+  it("ouvre la réinitialisation depuis le lien #reset= puis revient à la connexion (#204)", async () => {
+    globalThis.fetch = vi.fn().mockResolvedValue(jsonResponse(sampleSpec)) as typeof fetch;
+    window.history.replaceState(null, "", "/#reset=uid.1.mac");
+    const resetPasswordImpl = vi.fn().mockResolvedValue(undefined);
+    render(
+      <App
+        sessionOptions={{ store: memorySessionStore() }}
+        resetPasswordImpl={resetPasswordImpl}
+      />,
+    );
+    expect(screen.getByRole("form", { name: "Réinitialisation du mot de passe" })).toBeInTheDocument();
+    // Le jeton quitte aussitôt la barre d'adresse.
+    await waitFor(() => expect(window.location.hash).toBe(""));
+
+    fireEvent.change(screen.getByLabelText("Nouveau mot de passe"), {
+      target: { value: "new-password" },
+    });
+    fireEvent.change(screen.getByLabelText("Confirmation"), {
+      target: { value: "new-password" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Enregistrer le mot de passe" }));
+
+    expect(await screen.findByRole("form", { name: "Connexion" })).toBeInTheDocument();
+    expect(screen.getByRole("status")).toHaveTextContent(/réinitialisé/);
+    expect(resetPasswordImpl).toHaveBeenCalledWith("uid.1.mac", "new-password");
+  });
+
+  it("demande un lien depuis la page de connexion (#204)", async () => {
+    globalThis.fetch = vi.fn().mockResolvedValue(jsonResponse(sampleSpec)) as typeof fetch;
+    const requestPasswordResetImpl = vi.fn().mockResolvedValue(undefined);
+    render(
+      <App
+        sessionOptions={{ store: memorySessionStore() }}
+        requestPasswordResetImpl={requestPasswordResetImpl}
+      />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Mot de passe oublié ?" }));
+    fireEvent.change(screen.getByLabelText("Email"), { target: { value: "ana@b.io" } });
+    fireEvent.click(screen.getByRole("button", { name: "Envoyer le lien" }));
+    expect(await screen.findByRole("status")).toHaveTextContent(/lien de réinitialisation/);
+    expect(requestPasswordResetImpl).toHaveBeenCalledWith("ana@b.io");
+  });
+
   it("connecte l'utilisateur puis affiche l'éditeur", async () => {
     globalThis.fetch = vi.fn().mockResolvedValue(jsonResponse(sampleSpec)) as typeof fetch;
     const loginImpl = vi.fn().mockResolvedValue({

@@ -166,6 +166,70 @@
         ]
       }
     },
+    "/auth/password/forgot": {
+      "post": {
+        "tags": [
+          "auth"
+        ],
+        "summary": "`POST /auth/password/forgot` — envoie un lien de réinitialisation à\nl'adresse, **si** un compte lui correspond.",
+        "description": "Toujours 202 pour une adresse bien formée : la recherche du compte et\nl'envoi ont lieu en tâche de fond, la réponse ne révèle donc ni par son\ncode ni par sa durée si le compte existe.",
+        "operationId": "forgot_password",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ForgotPasswordBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "description": "Demande prise en compte (email envoyé si le compte existe)"
+          },
+          "400": {
+            "description": "Email invalide"
+          },
+          "429": {
+            "description": "Trop de demandes (adresse email ou IP) — voir `Retry-After`"
+          },
+          "503": {
+            "description": "Réinitialisation indisponible : aucun envoi d'email configuré"
+          }
+        }
+      }
+    },
+    "/auth/password/reset": {
+      "post": {
+        "tags": [
+          "auth"
+        ],
+        "summary": "`POST /auth/password/reset` — consomme un lien de réinitialisation : le\nmot de passe est remplacé, **toutes** les sessions sont fermées et le\nblocage de connexion du compte est levé. Réponse 204 : l'utilisateur se\nconnecte ensuite avec son nouveau mot de passe.",
+        "operationId": "reset_password",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ResetPasswordBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Mot de passe remplacé ; sessions fermées"
+          },
+          "400": {
+            "description": "Lien invalide, expiré ou déjà utilisé, ou nouveau mot de passe invalide"
+          },
+          "503": {
+            "description": "Réinitialisation indisponible : aucun envoi d'email configuré"
+          }
+        }
+      }
+    },
     "/auth/refresh": {
       "post": {
         "tags": [
@@ -1322,6 +1386,19 @@
           }
         }
       },
+      "ForgotPasswordBody": {
+        "type": "object",
+        "description": "Body de `/auth/password/forgot`.",
+        "required": [
+          "email"
+        ],
+        "properties": {
+          "email": {
+            "type": "string",
+            "description": "Adresse email du compte (normalisée côté serveur)."
+          }
+        }
+      },
       "ListCredentialsResponse": {
         "type": "object",
         "description": "Réponse de `GET /credentials`.",
@@ -1477,6 +1554,24 @@
           "refresh_token": {
             "type": "string",
             "description": "Refresh token obtenu au login/signup ou au refresh précédent."
+          }
+        }
+      },
+      "ResetPasswordBody": {
+        "type": "object",
+        "description": "Body de `/auth/password/reset`.",
+        "required": [
+          "token",
+          "new_password"
+        ],
+        "properties": {
+          "new_password": {
+            "type": "string",
+            "description": "Nouveau mot de passe (8 à 1024 caractères)."
+          },
+          "token": {
+            "type": "string",
+            "description": "Jeton reçu par email (fragment `#reset=` du lien)."
           }
         }
       },

@@ -3,12 +3,18 @@ import { apiBaseUrl, fetchOpenApi, type OpenApiSpec } from "./api";
 import { createApiClient } from "./apiClient";
 import { fetchCatalog, STATIC_CATALOG, type CatalogItem } from "./catalog";
 import { AccountPanel } from "./AccountPanel";
+import {
+  readResetToken,
+  requestPasswordReset as apiRequestPasswordReset,
+  resetPassword as apiResetPassword,
+} from "./auth";
 import { ConnectorsPanel } from "./ConnectorsPanel";
 import type { CanvasNode, WireGraph } from "./graph";
 import { LoginPage } from "./LoginPage";
 import { NodeCanvas, type NodeCanvasController } from "./NodeCanvas";
 import { NodePanel, type WebhookActions } from "./NodePanel";
 import { Palette } from "./Palette";
+import { ResetPasswordPage } from "./ResetPasswordPage";
 import type { ParamValues } from "./paramSchema";
 import { RunsList } from "./RunsList";
 import { RunExecutionPanel } from "./RunExecutionPanel";
@@ -31,6 +37,10 @@ type View = "edit" | "runs" | "connectors" | "account";
 export interface AppProps {
   /** Options de session (store/impls injectables pour les tests). */
   sessionOptions?: UseSessionOptions;
+  /** Demande de lien de réinitialisation (#204), injectable pour les tests. */
+  requestPasswordResetImpl?: typeof apiRequestPasswordReset;
+  /** Réinitialisation par jeton (#204), injectable pour les tests. */
+  resetPasswordImpl?: typeof apiResetPassword;
 }
 
 // Workflow courant : tant que F8.7 (persistence backend) n'est pas en place,
@@ -38,7 +48,11 @@ export interface AppProps {
 // `workflowId` côté backend.
 const DRAFT_WORKFLOW_ID = "wf-draft";
 
-export function App({ sessionOptions }: AppProps = {}): JSX.Element {
+export function App({
+  sessionOptions,
+  requestPasswordResetImpl = apiRequestPasswordReset,
+  resetPasswordImpl = apiResetPassword,
+}: AppProps = {}): JSX.Element {
   const {
     session,
     loading: sessionLoading,
@@ -50,6 +64,30 @@ export function App({ sessionOptions }: AppProps = {}): JSX.Element {
     authFetch,
   } = useSession(sessionOptions);
   const [logoutAllError, setLogoutAllError] = useState<string | null>(null);
+
+  // Lien de réinitialisation (#204) : jeton lu une fois dans le fragment,
+  // puis retiré de la barre d'adresse (et de l'historique).
+  const [resetToken, setResetToken] = useState<string | null>(() =>
+    readResetToken(window.location.hash),
+  );
+  const [loginNotice, setLoginNotice] = useState<string | null>(null);
+  useEffect(() => {
+    if (resetToken) {
+      window.history.replaceState(
+        null,
+        "",
+        window.location.pathname + window.location.search,
+      );
+    }
+  }, [resetToken]);
+  const onResetDone = useCallback(() => {
+    setResetToken(null);
+    setLoginNotice(
+      "Mot de passe réinitialisé : connectez-vous avec le nouveau mot de passe.",
+    );
+    // Le serveur a fermé toutes les sessions, celle de cet appareil comprise.
+    if (session) logout();
+  }, [session, logout]);
 
   // Ferme la session sur tous les appareils (#186) — action destructrice,
   // confirmée ; en cas d'échec, la session locale reste ouverte et l'erreur
@@ -151,8 +189,25 @@ export function App({ sessionOptions }: AppProps = {}): JSX.Element {
       </main>
     );
   }
+  if (resetToken) {
+    return (
+      <ResetPasswordPage
+        token={resetToken}
+        resetPassword={(token, next) => resetPasswordImpl(token, next)}
+        onDone={onResetDone}
+        onCancel={() => setResetToken(null)}
+      />
+    );
+  }
   if (!session) {
-    return <LoginPage login={login} signup={signup} />;
+    return (
+      <LoginPage
+        login={login}
+        signup={signup}
+        requestPasswordReset={(email) => requestPasswordResetImpl(email)}
+        notice={loginNotice}
+      />
+    );
   }
 
   return (

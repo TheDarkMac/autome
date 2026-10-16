@@ -89,6 +89,51 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/auth/password/forgot": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * `POST /auth/password/forgot` — envoie un lien de réinitialisation à
+         *     l'adresse, **si** un compte lui correspond.
+         * @description Toujours 202 pour une adresse bien formée : la recherche du compte et
+         *     l'envoi ont lieu en tâche de fond, la réponse ne révèle donc ni par son
+         *     code ni par sa durée si le compte existe.
+         */
+        post: operations["forgot_password"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/auth/password/reset": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * `POST /auth/password/reset` — consomme un lien de réinitialisation : le
+         *     mot de passe est remplacé, **toutes** les sessions sont fermées et le
+         *     blocage de connexion du compte est levé. Réponse 204 : l'utilisateur se
+         *     connecte ensuite avec son nouveau mot de passe.
+         */
+        post: operations["reset_password"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/auth/refresh": {
         parameters: {
             query?: never;
@@ -454,6 +499,11 @@ export interface components {
             /** @description Mot de passe en clair (8 à 1024 caractères). */
             password: string;
         };
+        /** @description Body de `/auth/password/forgot`. */
+        ForgotPasswordBody: {
+            /** @description Adresse email du compte (normalisée côté serveur). */
+            email: string;
+        };
         /** @description Réponse de `GET /credentials`. */
         ListCredentialsResponse: {
             /** @description Credentials du user courant, tri lexical par `provider_id`. */
@@ -506,6 +556,13 @@ export interface components {
         RefreshBody: {
             /** @description Refresh token obtenu au login/signup ou au refresh précédent. */
             refresh_token: string;
+        };
+        /** @description Body de `/auth/password/reset`. */
+        ResetPasswordBody: {
+            /** @description Nouveau mot de passe (8 à 1024 caractères). */
+            new_password: string;
+            /** @description Jeton reçu par email (fragment `#reset=` du lien). */
+            token: string;
         };
         /** @description Paire de jetons émise par signup/login/refresh. */
         TokenResponse: {
@@ -707,6 +764,85 @@ export interface operations {
             };
             /** @description Trop d'essais — voir `Retry-After` */
             429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    forgot_password: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ForgotPasswordBody"];
+            };
+        };
+        responses: {
+            /** @description Demande prise en compte (email envoyé si le compte existe) */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Email invalide */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Trop de demandes (adresse email ou IP) — voir `Retry-After` */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Réinitialisation indisponible : aucun envoi d'email configuré */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    reset_password: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ResetPasswordBody"];
+            };
+        };
+        responses: {
+            /** @description Mot de passe remplacé ; sessions fermées */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Lien invalide, expiré ou déjà utilisé, ou nouveau mot de passe invalide */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Réinitialisation indisponible : aucun envoi d'email configuré */
+            503: {
                 headers: {
                     [name: string]: unknown;
                 };
