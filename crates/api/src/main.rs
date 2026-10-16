@@ -15,6 +15,7 @@ use autome_api::credentials::{credentials_router, CredentialsState};
 use autome_api::mail::MailSettings;
 use autome_api::metrics::{metrics_router, with_metrics, Metrics};
 use autome_api::observability::with_request_tracing;
+use autome_api::openapi::openapi_router;
 use autome_api::password_reset::{PasswordReset, ResetTokens};
 use autome_api::probes::{probes_router, ProbesState};
 use autome_api::runs::{runs_router, RunsState};
@@ -37,8 +38,8 @@ use axum::{routing::get, Router};
 /// Période de la purge des entrées d'authentification expirées.
 const MAINTENANCE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(600);
 
-/// Construit le routeur racine : sondes (`/livez`, `/readyz`, `/health`) et
-/// `/metrics` publics,
+/// Construit le routeur racine : sondes (`/livez`, `/readyz`, `/health`),
+/// `/metrics` et la spec `/openapi.json` publics,
 /// `/auth/signup|login|refresh` publics (émission des jetons), `/auth/whoami|admin`
 /// protégés par JWT, l'administration des utilisateurs (`/admin/users`, #208),
 /// le CRUD `workflows` + `runs` (domaine 7) et les webhooks
@@ -81,6 +82,7 @@ fn build_router(
 
     let router = Router::new()
         .merge(probes_router(probes))
+        .merge(openapi_router())
         .nest(
             "/auth",
             protected_router(backends.auth.clone()).merge(accounts_router(accounts)),
@@ -335,11 +337,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn router_builds() {
-        // Le routeur racine complet (health + auth + workflows + runs +
-        // metrics) se construit sans panique ni conflit de routes, avec des
-        // backends in-memory dérivés d'une config de dev.
+    /// Routeur racine complet avec des backends in-memory dérivés d'une
+    /// config de dev.
+    fn dev_router() -> Router {
         let config = Config::load(|_| None).expect("config dev par défaut");
         let queue = std::sync::Arc::new(autome_core::InMemoryQueue::new());
         let backends =
@@ -350,12 +350,45 @@ mod tests {
         let accounts = accounts_state(&backends, ip_throttle, reset).expect("état comptes");
         let probes = ProbesState::new(vec![]);
         let webhooks = webhooks_state(&backends, &config, 10);
-        let _app: Router = build_router(
+        build_router(
             &backends,
             accounts,
             webhooks,
             probes,
             Arc::new(Metrics::new()),
-        );
+        )
+    }
+
+    #[test]
+    fn router_builds() {
+        // Le routeur racine complet (health + auth + workflows + runs +
+        // metrics + openapi) se construit sans panique ni conflit de routes.
+        let _app: Router = dev_router();
+    }
+
+    #[tokio::test]
+    async fn openapi_json_is_served_publicly_by_the_full_router() {
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode};
+        use http_body_util::BodyExt;
+        use tower::ServiceExt;
+
+        // #206 : `openapi_router` n'était pas monté ⇒ 404 sur un serveur lancé.
+        // Sans Bearer : la spec est publique, comme les sondes.
+        let response = dev_router()
+            .oneshot(
+                Request::builder()
+                    .uri("/openapi.json")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let spec: serde_json::Value =
+            serde_json::from_slice(&bytes).expect("spec OpenAPI = JSON valide");
+        assert!(spec["openapi"].as_str().unwrap_or("").starts_with("3."));
+        assert!(spec["paths"]["/workflows"].is_object());
     }
 }
