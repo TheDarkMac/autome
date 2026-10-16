@@ -18,6 +18,7 @@ use serde_json::{json, Value};
 
 fn trig(id: &str) -> Node {
     Node {
+        position: None,
         id: NodeId::new(id),
         name: id.into(),
         kind: NodeKind::Trigger {
@@ -29,6 +30,7 @@ fn trig(id: &str) -> Node {
 
 fn action(id: &str, params: Value) -> Node {
     Node {
+        position: None,
         id: NodeId::new(id),
         name: id.into(),
         kind: NodeKind::Action {
@@ -40,6 +42,7 @@ fn action(id: &str, params: Value) -> Node {
 
 fn ctrl(id: &str, kind: NodeKind, params: Value) -> Node {
     Node {
+        position: None,
         id: NodeId::new(id),
         name: id.into(),
         kind,

@@ -76,6 +76,19 @@ pub struct Node {
     /// validé côté formulaire (F8.4) ; on reste générique ici.
     #[serde(default)]
     pub params: serde_json::Value,
+    /// Position dans l'éditeur visuel (#225). Pure disposition : le moteur
+    /// l'ignore ; absente des graphes écrits à la main ou via l'API.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub position: Option<NodePosition>,
+}
+
+/// Coordonnées d'un node sur le canvas de l'éditeur (repère React Flow).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct NodePosition {
+    /// Abscisse.
+    pub x: f64,
+    /// Ordonnée.
+    pub y: f64,
 }
 
 /// Une arête orientée reliant deux nodes.
@@ -141,6 +154,7 @@ mod tests {
             name: "demo".into(),
             nodes: vec![
                 Node {
+                    position: None,
                     id: NodeId::new("trigger"),
                     name: "Webhook".into(),
                     kind: NodeKind::Trigger {
@@ -149,6 +163,7 @@ mod tests {
                     params: serde_json::json!({ "path": "/hook" }),
                 },
                 Node {
+                    position: None,
                     id: NodeId::new("act"),
                     name: "HTTP".into(),
                     kind: NodeKind::Action {
@@ -202,6 +217,23 @@ mod tests {
             g.node(&NodeId::new("i")).unwrap().params,
             serde_json::Value::Null
         );
+    }
+
+    #[test]
+    fn position_roundtrips_and_stays_absent_when_unset() {
+        let mut g = sample();
+        // Sans position (graphe écrit à la main / via l'API) : pas de clé.
+        let v = serde_json::to_value(&g).expect("to_value");
+        assert!(v["nodes"][0].get("position").is_none());
+
+        g.nodes[0].position = Some(NodePosition { x: 120.5, y: -40.0 });
+        let v = serde_json::to_value(&g).expect("to_value");
+        assert_eq!(
+            v["nodes"][0]["position"],
+            serde_json::json!({ "x": 120.5, "y": -40.0 })
+        );
+        let back: WorkflowGraph = serde_json::from_value(v).expect("from_value");
+        assert_eq!(back, g);
     }
 
     #[test]

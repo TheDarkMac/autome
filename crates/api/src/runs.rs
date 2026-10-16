@@ -455,6 +455,7 @@ mod tests {
             id: WorkflowId::new(id),
             name: format!("workflow {id}"),
             nodes: vec![autome_core::Node {
+                position: None,
                 id: NodeId::new("entry"),
                 name: "entry".into(),
                 kind: NodeKind::Trigger {

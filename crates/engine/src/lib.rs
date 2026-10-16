@@ -59,6 +59,7 @@ mod tests {
             id: WorkflowId::new("wf"),
             name: "t".into(),
             nodes: vec![Node {
+                position: None,
                 id: NodeId::new("t"),
                 name: "trigger".into(),
                 kind: NodeKind::Trigger {

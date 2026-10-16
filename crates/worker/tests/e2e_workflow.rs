@@ -49,6 +49,7 @@ fn pipeline_workflow(id: &str) -> WorkflowGraph {
         name: format!("pipeline {id}"),
         nodes: vec![
             Node {
+                position: None,
                 id: NodeId::new("entry"),
                 name: "entry".into(),
                 kind: NodeKind::Trigger {
@@ -57,6 +58,7 @@ fn pipeline_workflow(id: &str) -> WorkflowGraph {
                 params: Value::Null,
             },
             Node {
+                position: None,
                 id: NodeId::new("fetch"),
                 name: "fetch".into(),
                 kind: NodeKind::Action {
@@ -65,6 +67,7 @@ fn pipeline_workflow(id: &str) -> WorkflowGraph {
                 params: Value::Null,
             },
             Node {
+                position: None,
                 id: NodeId::new("double"),
                 name: "double".into(),
                 kind: NodeKind::Action {

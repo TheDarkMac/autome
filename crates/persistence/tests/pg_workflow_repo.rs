@@ -15,6 +15,7 @@ fn wf(id: &str, name: &str) -> WorkflowGraph {
         id: WorkflowId::new(id),
         name: name.into(),
         nodes: vec![Node {
+            position: None,
             id: NodeId::new("entry"),
             name: "entry".into(),
             kind: NodeKind::Trigger {

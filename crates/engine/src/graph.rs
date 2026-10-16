@@ -279,6 +279,7 @@ mod tests {
 
     fn node(id: &str, kind: NodeKind) -> Node {
         Node {
+            position: None,
             id: NodeId::new(id),
             name: id.to_string(),
             kind,
