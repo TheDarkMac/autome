@@ -105,6 +105,12 @@ flowchart TB
 - **Emails** : seule l'API en envoie (mot de passe oublié, #204), via un relais
   SMTP (`api::mail`, `lettre` + rustls) en tâche de fond. Les liens portent un
   jeton HMAC sans état (`api::password_reset`) : aucune table dédiée.
+- **Tokens de connecteurs** : l'API les écrit au callback OAuth, le worker les
+  lit pour le propriétaire du run (`connector_tokens`, chiffrés) et rafraîchit
+  les access tokens expirés sous le verrou de ligne PostgreSQL
+  (`ConnectorTokenStore::update_locked`, #211) : un seul appel au provider par
+  credential, quel que soit le nombre de répliques. Un `invalid_grant` marque la
+  credential invalide (migration `0018`) jusqu'à la reconnexion.
 - **engine** est agnostique : il dépend de **traits** de `core` (queue, stores,
   connecteurs) et ne connaît ni RabbitMQ ni PostgreSQL ni Slack directement.
 

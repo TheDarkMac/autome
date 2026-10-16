@@ -329,10 +329,15 @@ Le worker ne construit jamais l'`*Auth` à partir d'un secret global : le
   requête HTTP (message explicite indiquant `/credentials/<provider>/authorize`) ;
 - token expiré (`expires_at_ms` à moins de `REFRESH_SKEW_MS`) ⇒ rafraîchi par
   le worker via `oauth::TokenRefresher` (`OAuthClient::refresh`) puis
-  re-stocké (`merge_refreshed` garde refresh token et scope non renvoyés). Un
-  token sans `expires_at_ms` n'est jamais rafraîchi. Un connecteur n'a donc
-  pas à gérer l'expiration lui-même (un token révoqué côté provider reste,
-  lui, une erreur HTTP remontée par l'interpreter) ;
+  re-stocké (`merge_refreshed` garde refresh token et scope non renvoyés), sous
+  le verrou exclusif du store (`ConnectorTokenStore::update_locked` : verrou de
+  ligne PostgreSQL partagé par les répliques). Un `invalid_grant`
+  (`RefreshError::Revoked`) marque la credential invalide jusqu'à la
+  reconnexion ; les autres échecs (`RefreshError::Failed`) sont retentés au run
+  suivant. Un token sans `expires_at_ms` n'est jamais rafraîchi. Un connecteur
+  n'a donc pas à gérer l'expiration lui-même (un access token révoqué côté
+  provider avant son expiration reste, lui, une erreur HTTP remontée par
+  l'interpreter) ;
 - le token global `AUTOME_CONNECTOR_TOKEN_<PROVIDER>` n'est lu qu'en repli
   du mode mono-tenant `AUTOME_CONNECTOR_CREDENTIALS=single_tenant`
   (cf. [INSTALLATION.md](INSTALLATION.md#tokens-des-connecteurs-par-utilisateur)).
