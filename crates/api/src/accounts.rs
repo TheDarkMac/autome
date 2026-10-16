@@ -1545,13 +1545,33 @@ mod tests {
             1,
             "{statuses:?}"
         );
-        // Le perdant : vérifié après coup (403) ou devancé à l'écriture (409).
-        assert!(statuses.iter().all(|s| [
-            StatusCode::OK,
-            StatusCode::FORBIDDEN,
-            StatusCode::CONFLICT
-        ]
-        .contains(s)));
+        // Le perdant, selon l'entrelacement : son jeton vérifié après que le
+        // gagnant a fermé toutes les sessions (401), son mot de passe vérifié
+        // après le changement (403), ou son écriture devancée (409).
+        assert!(
+            statuses.iter().all(|s| [
+                StatusCode::OK,
+                StatusCode::UNAUTHORIZED,
+                StatusCode::FORBIDDEN,
+                StatusCode::CONFLICT
+            ]
+            .contains(s)),
+            "{statuses:?}"
+        );
+        // Un seul nouveau mot de passe est en place.
+        let logins = [
+            post(&h.app, "/login", creds("vic@example.io", "first-password"))
+                .await
+                .status(),
+            post(&h.app, "/login", creds("vic@example.io", "second-password"))
+                .await
+                .status(),
+        ];
+        assert_eq!(
+            logins.iter().filter(|s| **s == StatusCode::OK).count(),
+            1,
+            "{logins:?}"
+        );
     }
 
     #[tokio::test]
