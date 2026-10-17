@@ -1870,6 +1870,13 @@ export interface operations {
                     "application/json": unknown;
                 };
             };
+            /** @description Paramètres d'un nœud `schedule` / `polling` invalides */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
             /** @description Token absent ou invalide */
             401: {
                 headers: {
@@ -1969,7 +1976,7 @@ export interface operations {
                     "application/json": unknown;
                 };
             };
-            /** @description id path ≠ id body */
+            /** @description id path ≠ id body, ou paramètres d'un nœud `schedule` / `polling` invalides */
             400: {
                 headers: {
                     [name: string]: unknown;
