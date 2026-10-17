@@ -95,6 +95,10 @@ pub const MIGRATIONS: &[(&str, &str)] = &[
         "0018_connector_token_invalidation.sql",
         include_str!("../../../migrations/0018_connector_token_invalidation.sql"),
     ),
+    (
+        "0019_trigger_schedules.sql",
+        include_str!("../../../migrations/0019_trigger_schedules.sql"),
+    ),
 ];
 
 fn storage_err(context: &str, e: impl std::fmt::Display) -> Error {
