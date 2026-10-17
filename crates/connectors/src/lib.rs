@@ -19,6 +19,7 @@ pub mod schedule;
 pub mod sdk;
 pub mod slack;
 pub mod template;
+pub mod triggers;
 pub mod webhook;
 
 pub use credentials::{CredentialService, CredentialSummary, OAuthCredentialService, ProviderInfo};
@@ -46,4 +47,5 @@ pub use sdk::{
 };
 pub use slack::{SlackAuth, SlackConnector, SlackReadChannel, SlackSendMessage};
 pub use template::{EchoAction, EchoAuth, EchoConnector};
+pub use triggers::{planned_triggers, PollingSpec, TriggerSpec, PLANNED_TRIGGER_TYPES};
 pub use webhook::WebhookTrigger;
