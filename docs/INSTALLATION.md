@@ -55,6 +55,7 @@ cp .env.example .env
 | `RUST_LOG` | Niveau des logs, syntaxe `EnvFilter` (ex. `info,autome_worker=debug`) | `info` | `info` |
 | `AUTOME_WORKER_CONCURRENCY` | Worker : tâches consommatrices par process | `4` | selon charge |
 | `AUTOME_RUN_TIMEOUT_SECS` | Worker : au-delà, un run encore `running` est clos en `failed` (min. 60) | `3600` | > durée du plus long run |
+| `AUTOME_SCHEDULER_TICK_SECS` | Worker : période de la boucle des déclencheurs `schedule` / `polling` (s, `0` = désactivée) | `10` | `10` |
 | `AUTOME_SMTP_URL` | Relais SMTP des emails (mot de passe oublié) : `smtps://user:pass@hôte` (TLS, 465) ou `smtp://hôte:587?tls=required` (STARTTLS). Contient un mot de passe : à mettre dans un secret | *(non défini : liens journalisés en `dev`)* | **requis pour le mot de passe oublié** (sinon 503) |
 | `AUTOME_MAIL_FROM` | Expéditeur des emails, ex. `Autome <no-reply@exemple.fr>` | *(non défini)* | obligatoire avec `AUTOME_SMTP_URL` |
 | `AUTOME_CORS_ORIGINS` | Origines du **frontend** autorisées à appeler l'API depuis le navigateur (`scheme://hôte[:port]`, séparées par des virgules ; ni joker, ni chemin — refus de démarrer sinon). Vide = aucune | `http://localhost:5173,http://localhost:8081` | **obligatoire** si le frontend est servi sur une autre origine que l'API |
@@ -498,6 +499,42 @@ token ; token et secret de signature sont dérivés d'`ENCRYPTION_KEY` (table
 `webhook_endpoints`, migration `0016`). Changer `ENCRYPTION_KEY` change donc
 toutes les URL (à redistribuer aux émetteurs). Les journaux affichent
 `/hooks/{token}`, jamais le token.
+
+## Déclencheurs planifiés : cron, intervalle, polling (#227)
+
+Les nœuds `trigger_type: "schedule"` et `"polling"` d'un workflow enregistré
+démarrent des runs sans intervention : c'est le **worker** qui les déclenche
+(boucle toutes les `AUTOME_SCHEDULER_TICK_SECS`, défaut 10 s). Toutes les
+répliques font tourner la boucle ; les échéances sont partagées en base
+(`trigger_schedules`, migration `0019`) et chacune n'est déclenchée **qu'une
+fois** (compare-and-set sur une révision). PostgreSQL est requis : en
+`AUTOME_PERSISTENCE=memory`, l'API et le worker ne partagent rien.
+
+- **`schedule`** : `cron` (5 champs, **UTC** : `*/15 * * * *`, `0 9 * * 1-5`,
+  `0 0 1 * *` ; plages, pas, listes ; jour de semaine 0–7, 0 et 7 = dimanche ;
+  si jour du mois et jour de semaine sont tous deux restreints, l'un **ou**
+  l'autre suffit) **ou** `interval_seconds` (5 à 2 678 400). `timezone` :
+  seul `UTC` est accepté. Payload du nœud :
+  `{ node_id, scheduled_at, scheduled_at_ms }`.
+- **`polling`** : `GET url` toutes les `interval_seconds` (défaut 60, min. 5)
+  par le client HTTP filtré anti-SSRF (`AUTOME_EGRESS_ALLOWLIST` pour une cible
+  interne). Les éléments du tableau JSON (la réponse, ou le chemin pointé
+  `items_path`, ex. `data.items`, 1000 premiers) sont identifiés par `key`
+  (défaut `id`) ; **un run par nouvel élément** (au plus 100 par poll, la suite
+  au poll suivant), payload `{ node_id, item }`. Le **premier poll sert de
+  référence** : les éléments déjà présents ne déclenchent rien. Réponse non
+  2xx, non JSON ou sans tableau : journalisée, nouvel essai à l'échéance
+  suivante. Pas d'authentification de la requête pour l'instant.
+- **Validation** à l'enregistrement : `POST` / `PUT /workflows` répondent 400
+  en nommant le nœud (cron invalide ou impossible comme `0 0 30 2 *`, `cron` et
+  `interval_seconds` ensemble, fuseau non UTC, URL non http(s)…). Modifier les
+  paramètres d'un nœud recalcule son échéance (et remet à zéro la référence
+  d'un polling) ; retirer le nœud ou supprimer le workflow arrête les runs.
+- **Garanties** : déclenchement **au plus une fois** — un worker tué entre
+  l'avancée de l'échéance et l'envoi du run perd ce déclenchement. Une
+  échéance `schedule` en retard de plus de 5 min (workers arrêtés) est
+  **sautée** (journal `échéance manquée`), sans rafale de rattrapage. La
+  précision est celle de la période de la boucle.
 
 ## Authentification (comptes & jetons)
 
