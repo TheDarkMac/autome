@@ -26,7 +26,7 @@ documentation et les exemples de workflows. Détail dans la
 
 - **Moteur de workflows DAG** : exécution séquentielle, branches
   conditionnelles, boucles, parallélisme, mapping de données, gestion d'erreurs.
-- **Triggers** : webhook (HTTP entrant), scheduler (cron/intervalle), polling.
+- **Triggers** : webhook (HTTP entrant), scheduler (cron UTC / intervalle), polling — planifiés par le worker, une seule réplique déclenche chaque échéance.
 - **Actions & connecteurs** : Slack, Gmail, Notion, GitHub, HTTP générique —
   plus un SDK de connecteur pour en ajouter sans toucher au cœur.
 - **Orchestrateur scalable** : file de messages, pool de workers stateless,
