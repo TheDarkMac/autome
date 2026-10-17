@@ -54,12 +54,14 @@ pub mod executor;
 pub mod liveness;
 pub mod probe;
 pub mod shutdown;
+pub mod triggers;
 pub use dispatch::{
     ConnectorCredentialsMode, CredentialResolver, EnvCredentialResolver, OwnerCredentialResolver,
 };
 pub use executor::{reap_orphans, RunExecutor};
 pub use liveness::PoolLiveness;
 pub use shutdown::{drain, DrainOutcome, InFlightRuns};
+pub use triggers::TriggerLoop;
 
 /// Verdict que retourne un [`Handler`] après traitement.
 #[derive(Debug, Clone, PartialEq, Eq)]

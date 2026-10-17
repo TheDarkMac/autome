@@ -183,6 +183,20 @@ impl CronTime {
     }
 }
 
+/// Horodatage Unix (ms) au format RFC 3339 UTC, à la seconde
+/// (`2026-10-17T09:00:00Z`).
+pub fn rfc3339_utc(ms: i64) -> String {
+    let secs = ms.div_euclid(1_000);
+    let (year, month, day) = civil_from_days(secs.div_euclid(86_400));
+    let in_day = secs.rem_euclid(86_400);
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
+        in_day / 3_600,
+        (in_day % 3_600) / 60,
+        in_day % 60
+    )
+}
+
 /// Horizon de recherche de la prochaine échéance : au-delà, l'expression est
 /// considérée comme ne se déclenchant jamais (ex. `0 0 30 2 *`). Couvre le
 /// 29 février (cycle de 4 ans, 8 ans autour d'un siècle non bissextile).
@@ -444,6 +458,13 @@ mod tests {
         );
         assert_eq!(at(2024, 2, 29, 0, 0), 1_709_164_800_000);
         assert_eq!(at(1969, 12, 31, 0, 0), -DAY_MS);
+    }
+
+    #[test]
+    fn rfc3339_formats_utc_seconds() {
+        assert_eq!(rfc3339_utc(0), "1970-01-01T00:00:00Z");
+        assert_eq!(rfc3339_utc(at(2024, 2, 29, 9, 5) + 7_999), "2024-02-29T09:05:07Z");
+        assert_eq!(rfc3339_utc(-1), "1969-12-31T23:59:59Z");
     }
 
     #[test]
