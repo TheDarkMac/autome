@@ -91,6 +91,23 @@ describe("validateParams", () => {
     expect(errs["interval_seconds"]).toMatch(/≥ 5/);
   });
 
+  it("schedule : cron ou intervalle, fuseau UTC seulement", () => {
+    const schedule = findNodeSchema("trigger", "schedule")!;
+    expect(defaultParams(schedule)).toEqual({ timezone: "UTC" });
+    expect(validateParams(schedule, { cron: "0 9 * * 1-5", timezone: "UTC" })).toEqual({});
+    expect(validateParams(schedule, { interval_seconds: 30 })).toEqual({});
+    expect(validateParams(schedule, { interval_seconds: 3_000_000 })["interval_seconds"]).toMatch(
+      /≤ 2678400/,
+    );
+    expect(validateParams(schedule, { timezone: "Europe/Paris" })["timezone"]).toMatch(
+      /Valeur non autoris/,
+    );
+  });
+
+  it("polling : champ identifiant par défaut", () => {
+    expect(defaultParams(polling)).toEqual({ interval_seconds: 60, key: "id" });
+  });
+
   it("rejette un number non numérique", () => {
     const errs = validateParams(polling, { url: "https://x", interval_seconds: "abc" as unknown as number });
     expect(errs["interval_seconds"]).toMatch(/Doit être un nombre/);

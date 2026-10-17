@@ -1120,6 +1120,9 @@
               }
             }
           },
+          "400": {
+            "description": "Paramètres d'un nœud `schedule` / `polling` invalides"
+          },
           "401": {
             "description": "Token absent ou invalide"
           },
@@ -1240,7 +1243,7 @@
             }
           },
           "400": {
-            "description": "id path ≠ id body"
+            "description": "id path ≠ id body, ou paramètres d'un nœud `schedule` / `polling` invalides"
           },
           "401": {
             "description": "Token absent ou invalide"
