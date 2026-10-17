@@ -463,7 +463,10 @@ mod tests {
     #[test]
     fn rfc3339_formats_utc_seconds() {
         assert_eq!(rfc3339_utc(0), "1970-01-01T00:00:00Z");
-        assert_eq!(rfc3339_utc(at(2024, 2, 29, 9, 5) + 7_999), "2024-02-29T09:05:07Z");
+        assert_eq!(
+            rfc3339_utc(at(2024, 2, 29, 9, 5) + 7_999),
+            "2024-02-29T09:05:07Z"
+        );
         assert_eq!(rfc3339_utc(-1), "1969-12-31T23:59:59Z");
     }
 
