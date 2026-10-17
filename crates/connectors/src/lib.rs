@@ -40,7 +40,7 @@ pub use notion::{
 };
 pub use polling::PollingTrigger;
 pub use reqwest_client::ReqwestHttpClient;
-pub use schedule::{CronSchedule, CronTime, ScheduleTrigger};
+pub use schedule::{rfc3339_utc, CronSchedule, CronTime, ScheduleTrigger};
 pub use sdk::{
     ActionSchema, Connector, Credentials, ParamKind, ParamSpec, RecordingClient, RetryPolicy,
     RetryingClient,
