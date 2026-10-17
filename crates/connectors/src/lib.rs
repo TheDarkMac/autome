@@ -19,6 +19,7 @@ pub mod schedule;
 pub mod sdk;
 pub mod slack;
 pub mod template;
+pub mod triggers;
 pub mod webhook;
 
 pub use credentials::{CredentialService, CredentialSummary, OAuthCredentialService, ProviderInfo};
@@ -39,11 +40,12 @@ pub use notion::{
 };
 pub use polling::PollingTrigger;
 pub use reqwest_client::ReqwestHttpClient;
-pub use schedule::{CronSchedule, CronTime, ScheduleTrigger};
+pub use schedule::{rfc3339_utc, CronSchedule, CronTime, ScheduleTrigger};
 pub use sdk::{
     ActionSchema, Connector, Credentials, ParamKind, ParamSpec, RecordingClient, RetryPolicy,
     RetryingClient,
 };
 pub use slack::{SlackAuth, SlackConnector, SlackReadChannel, SlackSendMessage};
 pub use template::{EchoAction, EchoAuth, EchoConnector};
+pub use triggers::{planned_triggers, PollingSpec, TriggerSpec, PLANNED_TRIGGER_TYPES};
 pub use webhook::WebhookTrigger;

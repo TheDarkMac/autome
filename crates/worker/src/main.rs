@@ -31,6 +31,13 @@
 //! - `AUTOME_WORKER_SHUTDOWN_TIMEOUT_SECS` : délai laissé aux runs en cours à
 //!   l'arrêt (défaut 25 s, #200).
 //!
+//! - `AUTOME_SCHEDULER_TICK_SECS` : période de la boucle des déclencheurs
+//!   `schedule` (cron / intervalle) et `polling` (défaut 10 s, `0` =
+//!   désactivée, #227). Chaque réplique la fait tourner ; les échéances sont
+//!   partagées en base (`trigger_schedules`) et une seule réplique déclenche
+//!   chacune. Les polls passent par le client HTTP filtré anti-SSRF
+//!   (`AUTOME_EGRESS_ALLOWLIST`). Sans PostgreSQL, rien n'est planifié.
+//!
 //! Arrêt **borné** : sur `SIGINT`/`SIGTERM`, le pool cesse de consommer,
 //! `/readyz` passe à 503 et les runs en cours ont le délai d'arrêt pour se
 //! terminer ; au-delà, ils sont clos en `failed` (« worker arrêté pendant
@@ -42,16 +49,18 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use autome_connectors::oauth::{OAuthClient, OAuthRegistry};
 use autome_connectors::{EgressPolicy, ReqwestHttpClient};
-use autome_core::{telemetry, Config};
+use autome_core::{telemetry, Config, QueueRunDispatcher};
 use autome_persistence::selectors::{
     build_connector_token_store, build_health_checks, build_queue, build_run_state_store,
-    build_workflow_repository, ensure_durable_backends, PersistenceMode, QueueMode,
+    build_trigger_schedule_store, build_workflow_repository, ensure_durable_backends,
+    PersistenceMode, QueueMode,
 };
 use autome_worker::probe::{self, ProbeState};
 use autome_worker::shutdown::shutdown_timeout_from_env;
+use autome_worker::triggers::tick_period_from_env;
 use autome_worker::{
     drain, reap_orphans, ConnectorCredentialsMode, DrainOutcome, Handler, IdempotencyStore,
-    InMemoryIdempotencyStore, RunExecutor, WorkerPool,
+    InMemoryIdempotencyStore, RunExecutor, TriggerLoop, WorkerPool,
 };
 
 /// Queue des runs (alignée sur `QueueRunDispatcher::queue_name` par défaut).
@@ -150,6 +159,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
+    // Déclencheurs planifiés (#227) : runs publiés sur la même file, comme
+    // ceux de l'API.
+    let scheduler_period = tick_period_from_env()?;
+    let scheduler = match scheduler_period {
+        Some(period) => {
+            let dispatcher = QueueRunDispatcher::new(queue.clone(), Arc::clone(&store))
+                .with_queue_name(RUNS_QUEUE);
+            let triggers = TriggerLoop::new(
+                build_trigger_schedule_store(&config, persistence)?,
+                Arc::new(dispatcher),
+                Arc::new(ReqwestHttpClient::with_policy(EgressPolicy::from_env())),
+            );
+            Some(triggers.spawn(period, now_ms))
+        }
+        None => {
+            tracing::warn!("AUTOME_SCHEDULER_TICK_SECS=0 : déclencheurs planifiés désactivés");
+            None
+        }
+    };
+
     let executor = RunExecutor::new(repo, Arc::clone(&store), resolver);
     // Runs en cours, pour clore ceux qu'un arrêt interromprait (#200).
     let in_flight = executor.in_flight();
@@ -164,6 +193,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         credentials = ?credentials_mode,
         concurrency,
         run_timeout_s = run_timeout_ms / 1_000,
+        scheduler_tick_s = scheduler_period.map(|p| p.as_secs()),
         runs_queue = RUNS_QUEUE,
         log_format = ?log_format,
         "autome-worker démarré"
@@ -199,6 +229,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Arrêt gracieux : SIGINT (Ctrl-C) ou SIGTERM (orchestrateur).
     shutdown_signal().await;
     draining.store(true, Ordering::Release);
+    // Plus aucun déclenchement planifié pendant le drain.
+    if let Some(scheduler) = scheduler {
+        scheduler.abort();
+    }
     tracing::info!(
         timeout_s = shutdown_timeout.as_secs(),
         runs_en_cours = in_flight.snapshot().len(),

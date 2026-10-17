@@ -23,6 +23,7 @@ pub mod retry;
 pub mod revocation;
 pub mod run_state;
 pub mod selectors;
+pub mod trigger_schedules;
 pub mod users;
 pub mod webhook_endpoints;
 pub mod workflow_repo;
@@ -39,9 +40,10 @@ pub use revocation::PgRevocationStore;
 pub use run_state::PgRunStateStore;
 pub use selectors::{
     build_connector_token_store, build_health_checks, build_queue, build_run_state_store,
-    build_workflow_repository, connector_cipher, ensure_durable_backends, PersistenceMode,
-    QueueMode,
+    build_trigger_schedule_store, build_workflow_repository, connector_cipher,
+    ensure_durable_backends, PersistenceMode, QueueMode,
 };
+pub use trigger_schedules::PgTriggerScheduleStore;
 pub use users::PgUserStore;
 pub use webhook_endpoints::PgWebhookEndpointStore;
 pub use workflow_repo::PgWorkflowRepository;

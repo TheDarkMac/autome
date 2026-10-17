@@ -9,14 +9,14 @@ use std::time::Duration;
 use autome_connectors::oauth::{ConnectorTokenStore, InMemoryConnectorTokenStore};
 use autome_core::{
     Config, EnvelopeCipher, Error, HealthCheck, InMemoryKeyProvider, InMemoryQueue,
-    InMemoryRunStateStore, InMemoryWorkflowRepository, Profile, Queue, Result, RunStateStore,
-    WorkflowRepository,
+    InMemoryRunStateStore, InMemoryTriggerScheduleStore, InMemoryWorkflowRepository, Profile,
+    Queue, Result, RunStateStore, TriggerScheduleStore, WorkflowRepository,
 };
 use sha2::{Digest, Sha256};
 
 use crate::{
-    connect, PgConnectorTokenStore, PgRunStateStore, PgWorkflowRepository, PostgresCheck,
-    QueueCheck, RabbitMqQueue,
+    connect, PgConnectorTokenStore, PgRunStateStore, PgTriggerScheduleStore, PgWorkflowRepository,
+    PostgresCheck, QueueCheck, RabbitMqQueue,
 };
 
 /// Backend de persistance des stores (`AUTOME_PERSISTENCE`).
@@ -171,6 +171,21 @@ pub fn build_workflow_repository(
         PersistenceMode::Memory => Arc::new(InMemoryWorkflowRepository::new()),
         PersistenceMode::Postgres => {
             Arc::new(PgWorkflowRepository::new(connect(&config.database_url)?))
+        }
+    })
+}
+
+/// Construit le store des échéances des déclencheurs planifiés (#227) selon
+/// le `mode`. En `Memory`, il est propre au process : l'API et le worker ne le
+/// partagent pas (aucun déclenchement planifié hors PostgreSQL).
+pub fn build_trigger_schedule_store(
+    config: &Config,
+    mode: PersistenceMode,
+) -> Result<Arc<dyn TriggerScheduleStore>> {
+    Ok(match mode {
+        PersistenceMode::Memory => Arc::new(InMemoryTriggerScheduleStore::new()),
+        PersistenceMode::Postgres => {
+            Arc::new(PgTriggerScheduleStore::new(connect(&config.database_url)?))
         }
     })
 }

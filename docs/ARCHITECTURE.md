@@ -54,7 +54,7 @@ flowchart TB
 
   subgraph Backend["Backend Rust (workspace Cargo)"]
     API["binaire api<br/>REST + auth, CRUD workflows, /metrics"]
-    SCHED["module core::scheduler<br/>(cron / intervalle)"]
+    SCHED["boucle worker::triggers<br/>(cron / intervalle / polling)"]
     WHK["Webhook trigger<br/>(HTTP entrant)"]
     WK["binaire worker<br/>pool d'exécuteurs de runs"]
     ENG["crate engine<br/>moteur DAG (séquence, conditions, boucles, //)"]
@@ -91,12 +91,19 @@ flowchart TB
   WK -.-> CORE
 ```
 
-- **Deux binaires** seulement : `api` et `worker`. Le **scheduler** (F5.3) et
-  l'**ingress webhook** ne sont pas des services séparés : ce sont des modules
-  (`core::scheduler`, `api::webhooks`) hébergés par ces binaires. L'ingress
+- **Deux binaires** seulement : `api` et `worker`. Le **planificateur** des
+  déclencheurs `schedule` / `polling` et l'**ingress webhook** ne sont pas des
+  services séparés : ce sont des modules (`worker::triggers`, `api::webhooks`)
+  hébergés par ces binaires. L'ingress
   (`/hooks/{token}`, #202) résout l'URL secrète vers `(propriétaire, workflow,
   nœud)` puis dispatche un run `trigger_type: "webhook"` dont le payload
   devient la sortie du nœud trigger dans le worker.
+- **Déclencheurs planifiés** (#227) : l'API valide les nœuds `schedule` (cron
+  UTC ou intervalle) et `polling` à l'enregistrement et tient une ligne par nœud
+  dans `trigger_schedules` (échéance, état, révision). Chaque worker fait
+  tourner la boucle `worker::triggers` : il lit les échéances atteintes, les
+  avance par compare-and-set sur la révision — une seule réplique gagne, donc
+  déclenche — puis dispatche le run comme l'API. Pas d'élection de leader.
 - **Administration des utilisateurs** (#208) : `api::admin` (`/admin/users`,
   permission `users.admin`) liste les comptes, remplace leurs permissions par un
   rôle (transaction), les suspend (`users.disabled_at`, migration `0017`, plus
@@ -191,9 +198,10 @@ flowchart TB
 - **api / worker / frontend** : sans état → scalables. `api` (2 réplicas) et
   `frontend` (2 réplicas) sont fixés dans les manifests ; l'**HPA** du worker
   (piloté par la profondeur de file) reste une *cible*.
-- **scheduler** : pas de Deployment dédié — c'est un module (`core::scheduler`).
-  En production multi-réplicas, une **élection de leader** sera nécessaire pour
-  éviter les doubles déclenchements (*cible*).
+- **scheduler** : pas de Deployment dédié — c'est une boucle du worker
+  (`worker::triggers`). Les répliques se coordonnent par compare-and-set sur
+  `trigger_schedules` (#227) : une échéance n'est déclenchée qu'une fois, sans
+  élection de leader.
 - **postgres** : `StatefulSet` (PVC) ; **rabbitmq** : `Deployment` (stockage
   éphémère en dev). Réplica de lecture / sauvegardes = *cible production*.
 - **prometheus + grafana** : déployés dans le cluster (datasource + dashboard
@@ -362,8 +370,8 @@ terminés). Quelques points d'exploitation restent à brancher :
   → **dette suivie : [issue #107](https://github.com/TheDarkMac/autome/issues/107)**.
 - **Secret JWT** : `api` utilise un secret de dev codé en dur plutôt que
   `config.jwt_secret` (même dette #107).
-- **Cibles production** signalées dans ce document : HPA du worker, élection de
-  leader du scheduler, réplica/sauvegardes PostgreSQL, TLS d'ingress
+- **Cibles production** signalées dans ce document : HPA du worker,
+  réplica/sauvegardes PostgreSQL, TLS d'ingress
   (cert-manager), KMS managé pour les clés de chiffrement.
 
 > Le découpage par **traits** dans `core` est précisément ce qui permettra de
