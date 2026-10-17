@@ -63,7 +63,8 @@ fn build_router(
     cors: Vec<HeaderValue>,
 ) -> Router {
     let wf_state = WorkflowsState::new(backends.auth.clone(), backends.workflows.clone())
-        .with_webhooks(backends.webhooks.clone());
+        .with_webhooks(backends.webhooks.clone())
+        .with_schedules(backends.schedules.clone());
     let runs_state = RunsState::new(
         backends.auth.clone(),
         backends.workflows.clone(),

@@ -24,12 +24,22 @@
 //! workflows antérieurs à la migration `0010`, sans propriétaire) ; un
 //! utilisateur ordinaire qui le tente reçoit 403, quelle que soit l'existence
 //! de la ressource.
+//!
+//! **Déclencheurs planifiés** (#227) : à la création et à la mise à jour, les
+//! paramètres des nœuds `schedule` / `polling` sont validés (400 qui nomme le
+//! nœud : cron invalide, fuseau autre qu'UTC, intervalle hors bornes, URL non
+//! http(s)…) puis leurs échéances alignées sur le workflow enregistré
+//! ([`autome_core::TriggerScheduleStore::sync`]). Si cet alignement échoue, la
+//! requête répond 500 : une création est annulée (workflow supprimé, un nouvel
+//! essai réussit), une mise à jour peut être renvoyée telle quelle.
 
 use std::sync::Arc;
 
+use autome_connectors::planned_triggers;
 use autome_core::{
-    AuditEvent, AuditOutcome, Pagination, WebhookEndpointStore, WorkflowGraph, WorkflowId,
-    WorkflowPage, WorkflowRepository, PERM_WORKFLOWS_READ, PERM_WORKFLOWS_WRITE,
+    AuditEvent, AuditOutcome, Pagination, ScheduledTrigger, TriggerScheduleStore,
+    WebhookEndpointStore, WorkflowGraph, WorkflowId, WorkflowPage, WorkflowRepository,
+    PERM_WORKFLOWS_READ, PERM_WORKFLOWS_WRITE,
 };
 use axum::{
     extract::{FromRef, Path, Query, State},
@@ -53,6 +63,9 @@ pub struct WorkflowsState {
     /// Endpoints de webhook (#202), purgés quand un nœud webhook ou le
     /// workflow disparaît ; `None` = pas de purge (tests).
     pub webhooks: Option<Arc<dyn WebhookEndpointStore>>,
+    /// Échéances des déclencheurs planifiés (#227) ; `None` = non tenues
+    /// (tests). Les paramètres sont validés dans tous les cas.
+    pub schedules: Option<Arc<dyn TriggerScheduleStore>>,
 }
 
 impl WorkflowsState {
@@ -62,7 +75,30 @@ impl WorkflowsState {
             auth,
             repo,
             webhooks: None,
+            schedules: None,
         }
+    }
+
+    /// Builder : échéances des déclencheurs planifiés (#227).
+    pub fn with_schedules(mut self, schedules: Arc<dyn TriggerScheduleStore>) -> Self {
+        self.schedules = Some(schedules);
+        self
+    }
+
+    /// Aligne les échéances du workflow sur ses nœuds planifiés.
+    async fn sync_schedules(
+        &self,
+        ns: &str,
+        id: &str,
+        triggers: &[ScheduledTrigger],
+    ) -> Result<(), String> {
+        let Some(schedules) = &self.schedules else {
+            return Ok(());
+        };
+        schedules
+            .sync(ns, id, triggers)
+            .await
+            .map_err(|e| e.to_string())
     }
 
     /// Builder : purge des endpoints de webhook (#202).
@@ -166,6 +202,11 @@ impl IntoResponse for WorkflowError {
     }
 }
 
+/// Nœuds planifiés de `workflow`, paramètres validés (400 sinon).
+fn validated_triggers(workflow: &WorkflowGraph) -> Result<Vec<ScheduledTrigger>, WorkflowError> {
+    planned_triggers(workflow).map_err(WorkflowError::BadRequest)
+}
+
 /// Ressource d'audit : l'id, préfixé du propriétaire quand l'espace visé
 /// n'est pas celui de l'appelant (super-admin).
 fn resource(user: &AuthenticatedUser, ns: &str, id: &str) -> String {
@@ -248,6 +289,7 @@ pub async fn list_workflows(
     request_body(content = serde_json::Value, description = "Workflow graph complet"),
     responses(
         (status = 201, description = "Créé", body = serde_json::Value),
+        (status = 400, description = "Paramètres d'un nœud `schedule` / `polling` invalides"),
         (status = 401, description = "Token absent ou invalide"),
         (status = 403, description = "Manque `workflows.write`, ou `owner` d'autrui sans `*`"),
         (status = 409, description = "Id déjà utilisé dans cet espace")
@@ -265,9 +307,28 @@ pub async fn create_workflow(
         .require_permission(&user, PERM_WORKFLOWS_WRITE)
         .await?;
     let ns = state.auth.namespace(&user, q.owner.as_deref()).await?;
+    let triggers = validated_triggers(&workflow)?;
     let res = resource(&user, &ns, &workflow.id.0);
     match state.repo.create(&ns, workflow.clone()).await {
         Ok(()) => {
+            if let Err(e) = state.sync_schedules(&ns, &workflow.id.0, &triggers).await {
+                // Annulée : un nouvel essai ne doit pas répondre 409.
+                if let Err(rollback) = state.repo.delete(&ns, &workflow.id).await {
+                    tracing::error!(workflow_id = %workflow.id.0, error = %rollback,
+                        "création : annulation impossible après l'échec des échéances");
+                }
+                audit_event(
+                    &state,
+                    user.user_id(),
+                    "workflows.create",
+                    &res,
+                    AuditOutcome::Failure,
+                )
+                .await;
+                return Err(WorkflowError::Internal(format!(
+                    "échéances des déclencheurs non enregistrées : {e}"
+                )));
+            }
             audit_event(
                 &state,
                 user.user_id(),
@@ -356,7 +417,7 @@ pub async fn get_workflow(
     request_body(content = serde_json::Value, description = "Workflow graph complet"),
     responses(
         (status = 200, description = "Remplacé", body = serde_json::Value),
-        (status = 400, description = "id path ≠ id body"),
+        (status = 400, description = "id path ≠ id body, ou paramètres d'un nœud `schedule` / `polling` invalides"),
         (status = 401, description = "Token absent ou invalide"),
         (status = 403, description = "Manque `workflows.write`, ou `owner` d'autrui sans `*`"),
         (status = 404, description = "Workflow inconnu dans cet espace")
@@ -381,12 +442,27 @@ pub async fn update_workflow(
         )));
     }
     let ns = state.auth.namespace(&user, q.owner.as_deref()).await?;
+    let triggers = validated_triggers(&workflow)?;
     let res = resource(&user, &ns, &id);
     match state.repo.update(&ns, workflow.clone()).await {
         Ok(()) => {
             state
                 .prune_webhooks(&ns, &id, &crate::webhooks::webhook_node_ids(&workflow))
                 .await;
+            if let Err(e) = state.sync_schedules(&ns, &id, &triggers).await {
+                audit_event(
+                    &state,
+                    user.user_id(),
+                    "workflows.update",
+                    &res,
+                    AuditOutcome::Failure,
+                )
+                .await;
+                return Err(WorkflowError::Internal(format!(
+                    "workflow enregistré mais échéances des déclencheurs non alignées \
+                     (renvoyer la requête) : {e}"
+                )));
+            }
             audit_event(
                 &state,
                 user.user_id(),
@@ -446,6 +522,11 @@ pub async fn delete_workflow(
         .await
         .map_err(internal)?;
     state.prune_webhooks(&ns, &id, &[]).await;
+    // En PostgreSQL la suppression du workflow emporte ses échéances
+    // (cascade) ; ici pour les autres stores.
+    if let Err(e) = state.sync_schedules(&ns, &id, &[]).await {
+        tracing::warn!(workflow_id = %id, error = %e, "suppression des échéances impossible");
+    }
     let outcome = if existed {
         AuditOutcome::Success
     } else {
@@ -1110,5 +1191,215 @@ mod tests {
             .unwrap();
         assert_eq!(r.status(), StatusCode::NO_CONTENT);
         assert!(webhooks.resolve(&[1; 32]).await.unwrap().is_none());
+    }
+
+    // ───── #227 — déclencheurs planifiés ─────
+
+    /// Store d'échéances qui échoue sur commande (base indisponible).
+    #[derive(Default)]
+    struct FlakySchedules {
+        inner: autome_core::InMemoryTriggerScheduleStore,
+        fail: std::sync::atomic::AtomicBool,
+    }
+
+    #[async_trait::async_trait]
+    impl TriggerScheduleStore for FlakySchedules {
+        async fn sync(
+            &self,
+            owner: &str,
+            workflow_id: &str,
+            triggers: &[ScheduledTrigger],
+        ) -> autome_core::Result<()> {
+            if self.fail.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(autome_core::Error::Invalid("base indisponible".into()));
+            }
+            self.inner.sync(owner, workflow_id, triggers).await
+        }
+        async fn due(
+            &self,
+            now_ms: i64,
+            limit: usize,
+        ) -> autome_core::Result<Vec<autome_core::ScheduleSlot>> {
+            self.inner.due(now_ms, limit).await
+        }
+        async fn advance(
+            &self,
+            slot: &autome_core::ScheduleSlot,
+            update: autome_core::SlotUpdate,
+        ) -> autome_core::Result<bool> {
+            self.inner.advance(slot, update).await
+        }
+    }
+
+    fn with_trigger(id: &str, trigger_type: &str, params: serde_json::Value) -> serde_json::Value {
+        let mut wf = sample_workflow_json(id);
+        wf["nodes"] = serde_json::json!([{
+            "id": "entry", "name": "entry", "kind": "trigger",
+            "trigger_type": trigger_type, "params": params
+        }]);
+        wf
+    }
+
+    async fn scheduled(store: &FlakySchedules) -> Vec<(String, String, serde_json::Value)> {
+        store
+            .due(i64::MAX, 100)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|s| (s.workflow_id, s.node_id, s.params))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn invalid_trigger_parameters_are_rejected_with_400() {
+        let (state, svc, perms, _, repo) = make_test_state();
+        let app = workflows_router(state);
+        perms.assign_role("alice", &Role::editor()).unwrap();
+        let token = svc.issue_access("alice", 900, FIXED_NOW).unwrap();
+
+        let bad = with_trigger(
+            "wf-1",
+            "schedule",
+            serde_json::json!({ "cron": "99 * * * *" }),
+        );
+        let r = app
+            .clone()
+            .oneshot(auth_req("POST", "/", &token, Some(&bad.to_string())))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+        let msg = body_string(r).await;
+        assert!(
+            msg.contains("nœud `entry` (schedule)") && msg.contains("hors bornes"),
+            "{msg}"
+        );
+        assert!(repo
+            .get("alice", &WorkflowId::new("wf-1"))
+            .await
+            .unwrap()
+            .is_none());
+
+        // Mise à jour : même contrôle, workflow inchangé.
+        repo.create("alice", sample_workflow("wf-2")).await.unwrap();
+        let bad = with_trigger("wf-2", "polling", serde_json::json!({ "url": "ftp://x" }));
+        let r = app
+            .oneshot(auth_req("PUT", "/wf-2", &token, Some(&bad.to_string())))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            repo.get("alice", &WorkflowId::new("wf-2")).await.unwrap(),
+            Some(sample_workflow("wf-2"))
+        );
+    }
+
+    #[tokio::test]
+    async fn schedules_follow_create_update_and_delete() {
+        let (state, svc, perms, _, _) = make_test_state();
+        let store = Arc::new(FlakySchedules::default());
+        let app = workflows_router(state.with_schedules(store.clone()));
+        perms.assign_role("alice", &Role::editor()).unwrap();
+        let token = svc.issue_access("alice", 900, FIXED_NOW).unwrap();
+
+        let cron = serde_json::json!({ "cron": "0 9 * * 1-5" });
+        let wf = with_trigger("wf-1", "schedule", cron.clone());
+        let r = app
+            .clone()
+            .oneshot(auth_req("POST", "/", &token, Some(&wf.to_string())))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::CREATED);
+        assert_eq!(
+            scheduled(&store).await,
+            vec![("wf-1".into(), "entry".into(), cron)]
+        );
+        assert_eq!(store.due(i64::MAX, 1).await.unwrap()[0].owner_id, "alice");
+
+        // Devient un webhook : plus d'échéance.
+        let hook = with_trigger("wf-1", "webhook", serde_json::json!({}));
+        let r = app
+            .clone()
+            .oneshot(auth_req("PUT", "/wf-1", &token, Some(&hook.to_string())))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+        assert!(scheduled(&store).await.is_empty());
+
+        // Polling, puis suppression du workflow.
+        let poll = serde_json::json!({ "url": "https://api.example/items" });
+        let wf = with_trigger("wf-1", "polling", poll.clone());
+        app.clone()
+            .oneshot(auth_req("PUT", "/wf-1", &token, Some(&wf.to_string())))
+            .await
+            .unwrap();
+        assert_eq!(
+            scheduled(&store).await,
+            vec![("wf-1".into(), "entry".into(), poll)]
+        );
+        let r = app
+            .oneshot(auth_req("DELETE", "/wf-1", &token, None))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::NO_CONTENT);
+        assert!(scheduled(&store).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn failed_schedule_sync_undoes_a_create_so_it_can_be_retried() {
+        let (state, svc, perms, _, repo) = make_test_state();
+        let store = Arc::new(FlakySchedules::default());
+        let app = workflows_router(state.with_schedules(store.clone()));
+        perms.assign_role("alice", &Role::editor()).unwrap();
+        let token = svc.issue_access("alice", 900, FIXED_NOW).unwrap();
+        let wf = with_trigger(
+            "wf-1",
+            "schedule",
+            serde_json::json!({ "interval_seconds": 60 }),
+        );
+
+        store.fail.store(true, std::sync::atomic::Ordering::SeqCst);
+        let r = app
+            .clone()
+            .oneshot(auth_req("POST", "/", &token, Some(&wf.to_string())))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(repo
+            .get("alice", &WorkflowId::new("wf-1"))
+            .await
+            .unwrap()
+            .is_none());
+
+        // Nouvel essai : pas de 409.
+        store.fail.store(false, std::sync::atomic::Ordering::SeqCst);
+        let r = app
+            .clone()
+            .oneshot(auth_req("POST", "/", &token, Some(&wf.to_string())))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::CREATED);
+        let changed = with_trigger(
+            "wf-1",
+            "schedule",
+            serde_json::json!({ "interval_seconds": 120 }),
+        );
+        // Mise à jour qui échoue : 500, à renvoyer telle quelle.
+        store.fail.store(true, std::sync::atomic::Ordering::SeqCst);
+        let r = app
+            .clone()
+            .oneshot(auth_req("PUT", "/wf-1", &token, Some(&changed.to_string())))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        store.fail.store(false, std::sync::atomic::Ordering::SeqCst);
+        let r = app
+            .oneshot(auth_req("PUT", "/wf-1", &token, Some(&changed.to_string())))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+        assert_eq!(
+            scheduled(&store).await[0].2,
+            serde_json::json!({ "interval_seconds": 120 })
+        );
     }
 }
