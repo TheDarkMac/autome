@@ -73,7 +73,7 @@ async fn count(pool: &PgPool, sql: &str, owner: &str) -> i64 {
 async fn seed(pool: &PgPool, email: &str) -> String {
     let users = PgUserStore::new(pool.clone());
     let perms: HashSet<String> = ["workflows.read".to_string()].into();
-    let CreateUser::Created(user) = users.create(email, "hash", &perms).await.unwrap() else {
+    let CreateUser::Created(user) = users.create(email, "hash", &perms, true).await.unwrap() else {
         panic!("compte");
     };
     let id = user.id;
@@ -243,7 +243,7 @@ async fn erase_removes_everything_of_the_account_and_nothing_else() {
     // L'email redevient libre.
     assert!(matches!(
         PgUserStore::new(pool.clone())
-            .create("alice@example.io", "h", &HashSet::new())
+            .create("alice@example.io", "h", &HashSet::new(), true)
             .await
             .unwrap(),
         CreateUser::Created(_)

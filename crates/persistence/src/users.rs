@@ -1,7 +1,8 @@
 //! [`UserStore`] adossé à PostgreSQL (tables `users` + `user_permissions`), **async**.
 //!
 //! Schéma : migrations `0001_users.sql`, `0007_rbac_permissions.sql` et
-//! `0017_user_admin.sql` (suspension, index de pagination). Le compte et ses
+//! `0017_user_admin.sql` (suspension, index de pagination) et
+//! `0020_email_verification.sql` (#231). Le compte et ses
 //! permissions sont écrits dans **une seule transaction** : un crash entre les
 //! deux ne laisse ni compte sans droits ni droits orphelins. Il en va de même
 //! du remplacement des permissions par l'administration (#208).
@@ -19,7 +20,8 @@ fn storage_err(context: &str, e: impl std::fmt::Display) -> Error {
 }
 
 /// Colonnes d'un [`UserRecord`], dans l'ordre lu par [`record`].
-const RECORD_COLUMNS: &str = "id::text, email, password_hash, disabled_at IS NOT NULL";
+const RECORD_COLUMNS: &str =
+    "id::text, email, password_hash, disabled_at IS NOT NULL, email_verified_at IS NOT NULL";
 
 fn record(r: &Row) -> UserRecord {
     UserRecord {
@@ -27,6 +29,7 @@ fn record(r: &Row) -> UserRecord {
         email: r.get(1),
         password_hash: r.get(2),
         disabled: r.get(3),
+        email_verified: r.get(4),
     }
 }
 
@@ -35,7 +38,8 @@ fn record(r: &Row) -> UserRecord {
 /// `user_permissions`), évaluée pour les seules lignes de la page.
 const SUMMARY_COLUMNS: &str = "u.id::text, u.email, u.disabled_at IS NOT NULL, \
      (extract(epoch FROM u.created_at) * 1000)::bigint, \
-     ARRAY(SELECT p.permission FROM user_permissions p WHERE p.user_id = u.id::text)";
+     ARRAY(SELECT p.permission FROM user_permissions p WHERE p.user_id = u.id::text), \
+     u.email_verified_at IS NOT NULL";
 
 fn summary(r: &Row) -> UserSummary {
     UserSummary {
@@ -44,6 +48,7 @@ fn summary(r: &Row) -> UserSummary {
         disabled: r.get(2),
         created_at_ms: r.get(3),
         permissions: r.get::<_, Vec<String>>(4).into_iter().collect(),
+        email_verified: r.get(5),
     }
 }
 
@@ -81,6 +86,7 @@ impl UserStore for PgUserStore {
         email: &str,
         password_hash: &str,
         permissions: &HashSet<String>,
+        email_verified: bool,
     ) -> autome_core::Result<CreateUser> {
         let mut client = self.pool.get().await.map_err(|e| storage_err("pool", e))?;
         let tx = client
@@ -92,9 +98,10 @@ impl UserStore for PgUserStore {
         // détecté sans dépendre du code d'erreur 23505.
         let row = tx
             .query_opt(
-                "INSERT INTO users (email, password_hash) VALUES ($1, $2) \
+                "INSERT INTO users (email, password_hash, email_verified_at) \
+                 VALUES ($1, $2, CASE WHEN $3 THEN now() END) \
                  ON CONFLICT (email) DO NOTHING RETURNING id::text",
-                &[&email, &password_hash],
+                &[&email, &password_hash, &email_verified],
             )
             .await
             .map_err(|e| storage_err("create user", e))?;
@@ -119,6 +126,7 @@ impl UserStore for PgUserStore {
             email: email.to_string(),
             password_hash: password_hash.to_string(),
             disabled: false,
+            email_verified,
         }))
     }
 
@@ -284,6 +292,26 @@ impl UserStore for PgUserStore {
             )
             .await
             .map_err(|e| storage_err("set_disabled", e))?;
+        Ok(n == 1)
+    }
+
+    async fn mark_email_verified(&self, id: &str, email: &str) -> autome_core::Result<bool> {
+        if !is_uuid(id) {
+            return Ok(false);
+        }
+        let client = self.pool.get().await.map_err(|e| storage_err("pool", e))?;
+        // Conditionnée à l'email : un lien émis pour une autre adresse ne
+        // vérifie rien. Une nouvelle vérification garde la date de la première.
+        let n = client
+            .execute(
+                "UPDATE users SET \
+                   email_verified_at = COALESCE(email_verified_at, now()), \
+                   updated_at = now() \
+                 WHERE id = $1::text::uuid AND email = $2",
+                &[&id, &email],
+            )
+            .await
+            .map_err(|e| storage_err("mark_email_verified", e))?;
         Ok(n == 1)
     }
 }

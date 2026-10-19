@@ -17,6 +17,11 @@
 //! ([`UserStore::set_permissions`], atomique) et suspension
 //! ([`UserStore::set_disabled`]). Un compte suspendu garde ses données et ses
 //! permissions ; c'est l'API qui refuse sa connexion et ferme ses sessions.
+//!
+//! La vérification de l'email (#231) n'est qu'un drapeau : le compte est créé
+//! vérifié ou non (selon que le déploiement exige la preuve de possession de
+//! l'adresse), puis [`UserStore::mark_email_verified`] le passe à vérifié.
+//! C'est l'API qui refuse la connexion d'un compte non vérifié.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -46,6 +51,8 @@ pub struct UserRecord {
     pub password_hash: String,
     /// Compte suspendu par un administrateur (#208) : connexion refusée.
     pub disabled: bool,
+    /// Adresse email vérifiée (#231) : possession prouvée par un lien reçu.
+    pub email_verified: bool,
 }
 
 /// Vue d'administration d'un compte (#208) — jamais le hash du mot de passe.
@@ -57,6 +64,8 @@ pub struct UserSummary {
     pub email: String,
     /// Compte suspendu.
     pub disabled: bool,
+    /// Adresse email vérifiée (#231).
+    pub email_verified: bool,
     /// Création du compte, en millisecondes Unix.
     pub created_at_ms: i64,
     /// Permissions accordées.
@@ -85,12 +94,14 @@ pub enum CreateUser {
 #[async_trait]
 pub trait UserStore: Send + Sync {
     /// Crée le compte et lui accorde `permissions`, atomiquement.
-    /// `email` doit déjà être normalisé.
+    /// `email` doit déjà être normalisé ; `email_verified` : adresse tenue
+    /// pour vérifiée dès la création (#231).
     async fn create(
         &self,
         email: &str,
         password_hash: &str,
         permissions: &HashSet<String>,
+        email_verified: bool,
     ) -> Result<CreateUser>;
 
     /// Recherche un compte par email normalisé.
@@ -121,6 +132,11 @@ pub trait UserStore: Send + Sync {
     /// Suspend (`true`) ou réactive (`false`) le compte. Idempotent ; `false`
     /// si le compte est inconnu.
     async fn set_disabled(&self, id: &str, disabled: bool) -> Result<bool>;
+
+    /// Marque l'adresse de `id` vérifiée (#231) **seulement** si elle vaut
+    /// encore `email` : un lien émis pour une autre adresse ne vérifie rien.
+    /// Idempotent ; `false` si le compte est inconnu ou son email différent.
+    async fn mark_email_verified(&self, id: &str, email: &str) -> Result<bool>;
 }
 
 /// Normalise un email : espaces de bord retirés, minuscules.
@@ -237,6 +253,7 @@ impl InMemoryUserStore {
                 id: record.id,
                 email: record.email,
                 disabled: record.disabled,
+                email_verified: record.email_verified,
                 created_at_ms,
             });
         }
@@ -258,6 +275,7 @@ impl UserStore for InMemoryUserStore {
         email: &str,
         password_hash: &str,
         permissions: &HashSet<String>,
+        email_verified: bool,
     ) -> Result<CreateUser> {
         let mut users = self.lock()?;
         if users.contains_key(email) {
@@ -268,6 +286,7 @@ impl UserStore for InMemoryUserStore {
             email: email.to_string(),
             password_hash: password_hash.to_string(),
             disabled: false,
+            email_verified,
         };
         for p in permissions {
             self.permissions.grant(&record.id, p.clone())?;
@@ -363,6 +382,17 @@ impl UserStore for InMemoryUserStore {
             None => Ok(false),
         }
     }
+
+    async fn mark_email_verified(&self, id: &str, email: &str) -> Result<bool> {
+        let mut users = self.lock()?;
+        match users.get_mut(email) {
+            Some(user) if user.record.id == id => {
+                user.record.email_verified = true;
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -430,7 +460,12 @@ mod tests {
         let (users, perms) = store();
         let role = Role::editor();
         let created = users
-            .create("alice@example.io", "$argon2id$hash", &role.permissions)
+            .create(
+                "alice@example.io",
+                "$argon2id$hash",
+                &role.permissions,
+                true,
+            )
             .await
             .unwrap();
         let CreateUser::Created(record) = created else {
@@ -450,8 +485,14 @@ mod tests {
     async fn duplicate_email_is_reported_without_overwrite() {
         let (users, _) = store();
         let none = HashSet::new();
-        users.create("bob@example.io", "h1", &none).await.unwrap();
-        let again = users.create("bob@example.io", "h2", &none).await.unwrap();
+        users
+            .create("bob@example.io", "h1", &none, true)
+            .await
+            .unwrap();
+        let again = users
+            .create("bob@example.io", "h2", &none, true)
+            .await
+            .unwrap();
         assert_eq!(again, CreateUser::EmailTaken);
         let kept = users
             .find_by_email("bob@example.io")
@@ -469,7 +510,7 @@ mod tests {
 
     async fn created(users: &InMemoryUserStore, email: &str) -> UserRecord {
         match users
-            .create(email, "hash", &Role::editor().permissions)
+            .create(email, "hash", &Role::editor().permissions, true)
             .await
             .unwrap()
         {
@@ -563,7 +604,7 @@ mod tests {
     async fn find_by_id_and_conditional_password_update() {
         let (users, _) = store();
         let CreateUser::Created(alice) = users
-            .create("alice@example.io", "hash-v1", &HashSet::new())
+            .create("alice@example.io", "hash-v1", &HashSet::new(), true)
             .await
             .unwrap()
         else {
@@ -602,6 +643,83 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn email_verification_is_set_at_creation_or_marked_later() {
+        let (users, _) = store();
+        let none = HashSet::new();
+        let CreateUser::Created(alice) = users
+            .create("alice@example.io", "h", &none, false)
+            .await
+            .unwrap()
+        else {
+            panic!("création");
+        };
+        assert!(!alice.email_verified);
+        assert!(
+            !users
+                .summary(&alice.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .email_verified
+        );
+
+        // Lien émis pour une autre adresse, ou compte inconnu : rien n'est écrit.
+        assert!(!users
+            .mark_email_verified(&alice.id, "old@example.io")
+            .await
+            .unwrap());
+        assert!(!users
+            .mark_email_verified("inconnu", "alice@example.io")
+            .await
+            .unwrap());
+        assert!(
+            !users
+                .find_by_id(&alice.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .email_verified
+        );
+
+        assert!(users
+            .mark_email_verified(&alice.id, "alice@example.io")
+            .await
+            .unwrap());
+        assert!(
+            users
+                .mark_email_verified(&alice.id, "alice@example.io")
+                .await
+                .unwrap(),
+            "idempotent"
+        );
+        assert!(
+            users
+                .find_by_email("alice@example.io")
+                .await
+                .unwrap()
+                .unwrap()
+                .email_verified
+        );
+        assert!(
+            users
+                .summary(&alice.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .email_verified
+        );
+
+        let CreateUser::Created(bob) = users
+            .create("bob@example.io", "h", &none, true)
+            .await
+            .unwrap()
+        else {
+            panic!("création");
+        };
+        assert!(bob.email_verified, "créé vérifié");
+    }
+
+    #[tokio::test]
     async fn remove_deletes_the_account_and_its_permissions() {
         let (users, perms) = store();
         let alice = created(&users, "alice@example.io").await;
@@ -615,7 +733,7 @@ mod tests {
         // L'email redevient libre.
         assert!(matches!(
             users
-                .create("alice@example.io", "h", &HashSet::new())
+                .create("alice@example.io", "h", &HashSet::new(), true)
                 .await
                 .unwrap(),
             CreateUser::Created(_)
