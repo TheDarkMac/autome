@@ -5,6 +5,8 @@
 //! | Méthode | Path                             | Body         | Succès               |
 //! |---------|----------------------------------|--------------|----------------------|
 //! | GET     | `/admin/users?q=&offset=&limit=` | —            | 200 + [`UserListResponse`] |
+//! | POST    | `/admin/users`                   | `{ email, role }` | 201 + [`InvitedUser`] |
+//! | POST    | `/admin/users/{id}/invitation`   | —            | 204                  |
 //! | GET     | `/admin/users/{id}`              | —            | 200 + [`AdminUser`]  |
 //! | PUT     | `/admin/users/{id}/role`         | `{ role }`   | 200 + [`AdminUser`]  |
 //! | POST    | `/admin/users/{id}/disable`      | —            | 200 + [`AdminUser`]  |
@@ -40,18 +42,27 @@
 //! - la **vérification de l'email** (#231) peut être faite à la place du
 //!   titulaire (lien perdu, envoi d'emails en panne) : l'adresse actuelle du
 //!   compte est marquée vérifiée et sa connexion devient possible ;
+//! - l'**invitation** (#241, cf. [`crate::invitation`]) crée le compte au
+//!   rôle choisi (défaut `editor` ; `admin` exige `*`, comme ci-dessus), sans
+//!   mot de passe utilisable, et lui envoie un lien pour le choisir. L'envoi
+//!   est **synchrone** : l'administrateur sait s'il est parti
+//!   (`invitation_sent`) et peut renvoyer l'invitation tant que le compte n'a
+//!   pas choisi son mot de passe (409 ensuite) ; le renvoi invalide les liens
+//!   précédents. Annuler une invitation, c'est supprimer le compte ;
 //! - compte inconnu : 404 ; chaque appel produit un event d'audit
 //!   `admin.users_list` / `admin.user_get` / `admin.user_role` /
 //!   `admin.user_disable` / `admin.user_enable` / `admin.user_logout_all` /
-//!   `admin.user_verify_email` / `admin.user_delete` (ressource = compte visé, ou son pseudonyme une fois
+//!   `admin.user_verify_email` / `admin.user_delete` / `admin.user_invite` /
+//!   `admin.user_invite_resend` (ressource = compte visé, ou son pseudonyme une fois
 //!   effacé).
 
 use std::collections::HashSet;
 use std::sync::Arc;
 
 use autome_core::{
-    normalize_email, role_of, AuditEvent, AuditOutcome, AuditSink, Role, UserStore, UserSummary,
-    PERM_USERS_ADMIN, PERM_WILDCARD, ROLE_ADMIN,
+    has_usable_password, normalize_email, role_of, unusable_password_hash, validate_email,
+    AuditEvent, AuditOutcome, AuditSink, Role, UserStore, UserSummary, PERM_USERS_ADMIN,
+    PERM_WILDCARD, ROLE_ADMIN, ROLE_EDITOR,
 };
 use axum::{
     extract::{FromRef, Path, Query, State},
@@ -66,6 +77,7 @@ use utoipa::{IntoParams, ToSchema};
 
 use crate::auth::{AuthError, AuthState, AuthenticatedUser, OwnerScope};
 use crate::erasure::{erase_account, Erasure};
+use crate::invitation::{invite_account, Invitation, Invited};
 
 /// Taille de page par défaut de la liste.
 pub const DEFAULT_PAGE_SIZE: usize = 50;
@@ -81,6 +93,9 @@ pub struct AdminState {
     pub users: Arc<dyn UserStore + Send + Sync>,
     /// Suppression de compte (#229) ; `None` = indisponible (503).
     pub erasure: Option<Erasure>,
+    /// Invitations (#241) ; `None` = indisponibles (503), faute d'envoi
+    /// d'email configuré.
+    pub invitation: Option<Invitation>,
 }
 
 impl AdminState {
@@ -90,7 +105,14 @@ impl AdminState {
             auth,
             users,
             erasure: None,
+            invitation: None,
         }
+    }
+
+    /// Active les invitations de comptes (#241).
+    pub fn with_invitation(mut self, invitation: Invitation) -> Self {
+        self.invitation = Some(invitation);
+        self
     }
 
     /// Active la suppression de comptes (#229).
@@ -135,6 +157,9 @@ pub struct AdminUser {
     pub disabled: bool,
     /// Adresse email vérifiée (#231).
     pub email_verified: bool,
+    /// Invitation en attente (#241) : le compte n'a pas encore choisi son mot
+    /// de passe et ne peut pas se connecter.
+    pub invitation_pending: bool,
     /// Création du compte (millisecondes Unix).
     pub created_at_ms: i64,
 }
@@ -150,6 +175,7 @@ impl From<UserSummary> for AdminUser {
             permissions,
             disabled: user.disabled,
             email_verified: user.email_verified,
+            invitation_pending: !user.password_set,
             created_at_ms: user.created_at_ms,
         }
     }
@@ -166,6 +192,26 @@ pub struct UserListResponse {
     pub offset: usize,
     /// Limite appliquée.
     pub limit: usize,
+}
+
+/// Corps de [`invite_user`].
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct InviteBody {
+    /// Adresse de la personne invitée (normalisée côté serveur).
+    pub email: String,
+    /// `admin`, `editor` ou `viewer` ; défaut `editor`.
+    #[serde(default)]
+    pub role: Option<String>,
+}
+
+/// Réponse de [`invite_user`].
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct InvitedUser {
+    /// Compte créé (invitation en attente).
+    pub user: AdminUser,
+    /// L'email d'invitation est parti ; sinon, le renvoyer
+    /// (`POST /admin/users/{id}/invitation`).
+    pub invitation_sent: bool,
 }
 
 /// Corps de [`set_role`].
@@ -188,6 +234,8 @@ pub enum AdminError {
     Conflict(&'static str),
     /// Fonction non configurée sur ce déploiement.
     Unavailable(&'static str),
+    /// Service externe en échec (envoi d'email).
+    BadGateway(&'static str),
     /// Erreur interne (store).
     Internal(String),
 }
@@ -206,6 +254,7 @@ impl IntoResponse for AdminError {
             AdminError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg).into_response(),
             AdminError::Conflict(msg) => (StatusCode::CONFLICT, msg).into_response(),
             AdminError::Unavailable(msg) => (StatusCode::SERVICE_UNAVAILABLE, msg).into_response(),
+            AdminError::BadGateway(msg) => (StatusCode::BAD_GATEWAY, msg).into_response(),
             AdminError::Internal(msg) => {
                 tracing::error!(error = %msg, "erreur interne de l'administration");
                 (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response()
@@ -350,6 +399,172 @@ pub async fn list_users(
         offset,
         limit,
     }))
+}
+
+/// `POST /admin/users` — invite une personne : compte créé au rôle choisi,
+/// sans mot de passe utilisable, et email d'invitation envoyé.
+#[utoipa::path(
+    post,
+    path = "/admin/users",
+    tag = "admin",
+    request_body = InviteBody,
+    responses(
+        (status = 201, description = "Compte créé, invitation en attente (`invitation_sent` : email parti)", body = InvitedUser),
+        (status = 400, description = "Email invalide ou rôle inconnu"),
+        (status = 401, description = "Token absent ou invalide"),
+        (status = 403, description = "Manque `users.admin`, ou `*` pour le rôle `admin`"),
+        (status = 409, description = "Email déjà enregistré"),
+        (status = 503, description = "Invitations indisponibles : aucun envoi d'email configuré")
+    ),
+    security(("bearer" = []))
+)]
+pub async fn invite_user(
+    user: AuthenticatedUser,
+    State(state): State<AdminState>,
+    Json(body): Json<InviteBody>,
+) -> Result<(StatusCode, Json<InvitedUser>), AdminError> {
+    const ACTION: &str = "admin.user_invite";
+    state
+        .auth
+        .require_permission(&user, PERM_USERS_ADMIN)
+        .await?;
+    let Some(invitation) = state.invitation.as_ref() else {
+        return Err(AdminError::Unavailable("invitations are not configured"));
+    };
+    let email = normalize_email(&body.email);
+    validate_email(&email).map_err(|e| AdminError::BadRequest(e.to_string()))?;
+    let Some(role) = Role::standard(body.role.as_deref().unwrap_or(ROLE_EDITOR)) else {
+        return Err(AdminError::BadRequest(
+            "unknown role (expected admin, editor or viewer)".into(),
+        ));
+    };
+    if role.name == ROLE_ADMIN {
+        require_wildcard(&state, &user, &email, ACTION).await?;
+    }
+    let now = state.auth.clock.now_unix_seconds();
+    let (invited, sent) = match invite_account(
+        state.users.as_ref(),
+        invitation,
+        &email,
+        &role.permissions,
+        now,
+    )
+    .await
+    .map_err(internal)?
+    {
+        Invited::Created { user, sent } => (user, sent),
+        Invited::EmailTaken => {
+            audit(
+                &state,
+                user.user_id(),
+                ACTION,
+                &email,
+                AuditOutcome::Denied,
+                json!({ "reason": "email taken" }),
+            )
+            .await;
+            return Err(AdminError::Conflict("email already registered"));
+        }
+    };
+    audit(
+        &state,
+        user.user_id(),
+        ACTION,
+        &invited.id,
+        AuditOutcome::Success,
+        json!({ "role": role.name, "sent": sent }),
+    )
+    .await;
+    Ok((
+        StatusCode::CREATED,
+        Json(InvitedUser {
+            user: reload(&state, &invited.id).await?,
+            invitation_sent: sent,
+        }),
+    ))
+}
+
+/// `POST /admin/users/{id}/invitation` — renvoie l'invitation d'un compte qui
+/// n'a pas encore choisi son mot de passe ; les liens précédents ne valent
+/// plus rien.
+#[utoipa::path(
+    post,
+    path = "/admin/users/{id}/invitation",
+    tag = "admin",
+    params(("id" = String, Path, description = "Identifiant du compte")),
+    responses(
+        (status = 204, description = "Nouvelle invitation envoyée"),
+        (status = 401, description = "Token absent ou invalide"),
+        (status = 403, description = "Manque `users.admin`, ou `*` pour un compte super-admin"),
+        (status = 404, description = "Compte inconnu"),
+        (status = 409, description = "Compte déjà activé (mot de passe choisi) ou suspendu"),
+        (status = 502, description = "Envoi de l'email impossible ; les liens précédents sont invalidés"),
+        (status = 503, description = "Invitations indisponibles : aucun envoi d'email configuré")
+    ),
+    security(("bearer" = []))
+)]
+pub async fn resend_invitation(
+    user: AuthenticatedUser,
+    State(state): State<AdminState>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, AdminError> {
+    const ACTION: &str = "admin.user_invite_resend";
+    state
+        .auth
+        .require_permission(&user, PERM_USERS_ADMIN)
+        .await?;
+    let Some(invitation) = state.invitation.as_ref() else {
+        return Err(AdminError::Unavailable("invitations are not configured"));
+    };
+    target_for_change(&state, &user, &id, ACTION).await?;
+    let Some(account) = state.users.find_by_id(&id).await.map_err(internal)? else {
+        return Err(AdminError::NotFound);
+    };
+    if has_usable_password(&account.password_hash) {
+        return Err(AdminError::Conflict("account already activated"));
+    }
+    if account.disabled {
+        return Err(AdminError::Conflict("account disabled"));
+    }
+    // Nouveau hash inutilisable : les liens liés à l'ancien meurent. Écriture
+    // conditionnelle : une acceptation concurrente gagne.
+    let rotated = autome_core::UserRecord {
+        password_hash: unusable_password_hash(),
+        ..account.clone()
+    };
+    if !state
+        .users
+        .update_password(&id, &account.password_hash, &rotated.password_hash)
+        .await
+        .map_err(internal)?
+    {
+        return Err(AdminError::Conflict("account already activated"));
+    }
+    let now = state.auth.clock.now_unix_seconds();
+    if let Err(e) = invitation.send(&rotated, now).await {
+        tracing::error!(target_id = %id, error = %e, "renvoi de l'invitation impossible");
+        audit(
+            &state,
+            user.user_id(),
+            ACTION,
+            &id,
+            AuditOutcome::Failure,
+            json!({ "reason": "mail not sent" }),
+        )
+        .await;
+        return Err(AdminError::BadGateway("invitation email not sent"));
+    }
+    tracing::info!(target_id = %id, "invitation renvoyée");
+    audit(
+        &state,
+        user.user_id(),
+        ACTION,
+        &id,
+        AuditOutcome::Success,
+        Value::Null,
+    )
+    .await;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// `GET /admin/users/{id}` — un compte et ses permissions.
@@ -776,13 +991,14 @@ pub async fn promote_admin(
 /// Routes `/admin/users…` (à fusionner à plat dans le router racine).
 pub fn admin_router(state: AdminState) -> Router {
     Router::new()
-        .route("/admin/users", get(list_users))
+        .route("/admin/users", get(list_users).post(invite_user))
         .route("/admin/users/:id", get(get_user).delete(delete_user))
         .route("/admin/users/:id/role", put(set_role))
         .route("/admin/users/:id/disable", post(disable_user))
         .route("/admin/users/:id/enable", post(enable_user))
         .route("/admin/users/:id/logout-all", post(logout_user))
         .route("/admin/users/:id/verify-email", post(verify_user_email))
+        .route("/admin/users/:id/invitation", post(resend_invitation))
         .with_state(state)
 }
 
@@ -790,6 +1006,8 @@ pub fn admin_router(state: AdminState) -> Router {
 mod tests {
     use super::*;
     use crate::erasure::InMemoryAccountEraser;
+    use crate::invitation::InviteTokens;
+    use crate::mail::{MailSettings, Mailer, MemoryMailer, OutgoingMail};
     use autome_connectors::oauth::InMemoryConnectorTokenStore;
     use autome_core::{
         AuditSink, CreateUser, EnvelopeCipher, InMemoryAuditSink, InMemoryKeyProvider,
@@ -802,6 +1020,7 @@ mod tests {
     use axum::body::Body;
     use axum::http::Request;
     use http_body_util::BodyExt;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use tower::ServiceExt;
 
     const SECRET: &[u8] = b"test-secret-must-be-long-enough-32+";
@@ -814,8 +1033,29 @@ mod tests {
         }
     }
 
+    /// Transport d'emails qu'un test peut mettre en panne.
+    #[derive(Default)]
+    struct ToggleMailer {
+        sent: MemoryMailer,
+        down: AtomicBool,
+    }
+
+    #[axum::async_trait]
+    impl Mailer for ToggleMailer {
+        async fn send(&self, mail: &OutgoingMail) -> Result<(), String> {
+            if self.down.load(Ordering::SeqCst) {
+                return Err("smtp en panne".into());
+            }
+            self.sent.send(mail).await
+        }
+    }
+
+    const INVITE_KEY: &[u8] = b"test-encryption-key";
+
     struct Fixture {
         app: Router,
+        auth: AuthState,
+        mailer: Arc<ToggleMailer>,
         users: Arc<InMemoryUserStore>,
         perms: Arc<InMemoryPermissionStore>,
         revocation: Arc<InMemoryRevocationStore>,
@@ -849,12 +1089,26 @@ mod tests {
                 Some(Arc::clone(&audit)),
             );
             let erasure = Erasure::new(Arc::new(eraser), Arc::new(InMemoryLoginThrottle::new()));
+            let mailer = Arc::new(ToggleMailer::default());
+            let invitation = Invitation::new(
+                InviteTokens::new(INVITE_KEY),
+                MailSettings {
+                    mailer: mailer.clone(),
+                    public_url: "https://app.example.io".into(),
+                },
+            );
             let app = admin_router(
-                AdminState::new(auth, Arc::clone(&users) as Arc<dyn UserStore + Send + Sync>)
-                    .with_erasure(erasure),
+                AdminState::new(
+                    auth.clone(),
+                    Arc::clone(&users) as Arc<dyn UserStore + Send + Sync>,
+                )
+                .with_erasure(erasure)
+                .with_invitation(invitation),
             );
             Self {
                 app,
+                auth,
+                mailer,
                 users,
                 perms,
                 revocation,
@@ -952,6 +1206,12 @@ mod tests {
             ("POST", format!("/admin/users/{other}/enable"), None),
             ("POST", format!("/admin/users/{other}/logout-all"), None),
             ("DELETE", format!("/admin/users/{other}"), None),
+            (
+                "POST",
+                "/admin/users".to_string(),
+                Some(json!({ "email": "new@example.io" })),
+            ),
+            ("POST", format!("/admin/users/{other}/invitation"), None),
         ] {
             let res = fx.call(method, &uri, &editor, body).await;
             assert_eq!(res.status(), StatusCode::FORBIDDEN, "{method} {uri}");
@@ -1493,5 +1753,292 @@ mod tests {
         assert_eq!(res.status(), StatusCode::NO_CONTENT);
         let unknown = fx.call("DELETE", "/admin/users/inconnu", &root, None).await;
         assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
+    }
+
+    // --- Invitations (#241) -------------------------------------------------
+
+    /// Jeton du dernier email d'invitation envoyé.
+    fn last_invite_token(fx: &Fixture) -> String {
+        let mail = fx.mailer.sent.sent().pop().expect("invitation envoyée");
+        let (_, rest) = mail.body.split_once("#invite=").expect("lien attendu");
+        rest.split_whitespace().next().unwrap().to_string()
+    }
+
+    #[tokio::test]
+    async fn an_admin_invites_with_a_role_and_the_link_targets_the_account() {
+        let fx = Fixture::new();
+        let admin = fx.account("root@example.io", users_admin_only()).await;
+        let res = fx
+            .call(
+                "POST",
+                "/admin/users",
+                &admin,
+                Some(json!({ "email": " Ivy@Example.io ", "role": "viewer" })),
+            )
+            .await;
+        assert_eq!(res.status(), StatusCode::CREATED);
+        let body = json_body(res).await;
+        assert_eq!(body["invitation_sent"], true);
+        let user = &body["user"];
+        assert_eq!(user["email"], "ivy@example.io");
+        assert_eq!(user["role"], ROLE_VIEWER);
+        assert_eq!(user["invitation_pending"], true);
+        assert_eq!(user["email_verified"], false);
+        assert!(user.get("password_hash").is_none());
+        let id = user["id"].as_str().unwrap().to_string();
+
+        let mail = fx.mailer.sent.sent().pop().unwrap();
+        assert_eq!(mail.to, "ivy@example.io");
+        assert!(mail.body.contains("https://app.example.io/#invite="));
+        let token = last_invite_token(&fx);
+        let parsed = InviteTokens::parse(&token).unwrap();
+        assert_eq!(parsed.user_id, id);
+        let account = fx.users.find_by_id(&id).await.unwrap().unwrap();
+        assert!(!has_usable_password(&account.password_hash));
+        assert!(InviteTokens::new(INVITE_KEY).verify(&parsed, &account.password_hash, NOW));
+
+        // Rôle par défaut : editor ; email déjà pris : 409.
+        let res = fx
+            .call(
+                "POST",
+                "/admin/users",
+                &admin,
+                Some(json!({ "email": "joe@example.io" })),
+            )
+            .await;
+        assert_eq!(json_body(res).await["user"]["role"], ROLE_EDITOR);
+        let res = fx
+            .call(
+                "POST",
+                "/admin/users",
+                &admin,
+                Some(json!({ "email": "ivy@example.io" })),
+            )
+            .await;
+        assert_eq!(res.status(), StatusCode::CONFLICT);
+        assert_eq!(fx.mailer.sent.sent().len(), 2, "pas d'email sur un conflit");
+
+        let invites: Vec<_> = fx
+            .actions()
+            .await
+            .into_iter()
+            .filter(|(a, _, _)| a == "admin.user_invite")
+            .collect();
+        assert_eq!(invites.len(), 3);
+        assert_eq!(
+            invites[0],
+            ("admin.user_invite".into(), id, AuditOutcome::Success)
+        );
+        assert_eq!(invites[2].2, AuditOutcome::Denied);
+    }
+
+    #[tokio::test]
+    async fn invitations_validate_input_and_never_escalate() {
+        let fx = Fixture::new();
+        let admin = fx.account("root@example.io", users_admin_only()).await;
+        for (body, status) in [
+            (json!({ "email": "pas-un-email" }), StatusCode::BAD_REQUEST),
+            (
+                json!({ "email": "a@example.io", "role": "owner" }),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                json!({ "email": "a@example.io", "role": "admin" }),
+                StatusCode::FORBIDDEN,
+            ),
+        ] {
+            let res = fx
+                .call("POST", "/admin/users", &admin, Some(body.clone()))
+                .await;
+            assert_eq!(res.status(), status, "{body}");
+        }
+        assert!(fx
+            .users
+            .find_by_email("a@example.io")
+            .await
+            .unwrap()
+            .is_none());
+        assert!(fx.mailer.sent.sent().is_empty());
+
+        // Avec `*`, le rôle admin est attribuable dès l'invitation.
+        let root = fx.account("super@example.io", Role::super_admin()).await;
+        let res = fx
+            .call(
+                "POST",
+                "/admin/users",
+                &root,
+                Some(json!({ "email": "a@example.io", "role": "admin" })),
+            )
+            .await;
+        assert_eq!(res.status(), StatusCode::CREATED);
+        assert_eq!(json_body(res).await["user"]["role"], ROLE_ADMIN);
+        // Et seul `*` peut renvoyer l'invitation d'un futur super-admin.
+        let id = fx
+            .users
+            .find_by_email("a@example.io")
+            .await
+            .unwrap()
+            .unwrap()
+            .id;
+        let res = fx
+            .call(
+                "POST",
+                &format!("/admin/users/{id}/invitation"),
+                &admin,
+                None,
+            )
+            .await;
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn a_failed_mail_keeps_the_account_and_the_invitation_can_be_resent() {
+        let fx = Fixture::new();
+        let admin = fx.account("root@example.io", users_admin_only()).await;
+        fx.mailer.down.store(true, Ordering::SeqCst);
+        let res = fx
+            .call(
+                "POST",
+                "/admin/users",
+                &admin,
+                Some(json!({ "email": "ivy@example.io" })),
+            )
+            .await;
+        assert_eq!(res.status(), StatusCode::CREATED);
+        let body = json_body(res).await;
+        assert_eq!(body["invitation_sent"], false);
+        let id = body["user"]["id"].as_str().unwrap().to_string();
+        let uri = format!("/admin/users/{id}/invitation");
+
+        // Renvoi toujours en panne : 502.
+        let res = fx.call("POST", &uri, &admin, None).await;
+        assert_eq!(res.status(), StatusCode::BAD_GATEWAY);
+
+        fx.mailer.down.store(false, Ordering::SeqCst);
+        let res = fx.call("POST", &uri, &admin, None).await;
+        assert_eq!(res.status(), StatusCode::NO_CONTENT);
+        let first = last_invite_token(&fx);
+        let res = fx.call("POST", &uri, &admin, None).await;
+        assert_eq!(res.status(), StatusCode::NO_CONTENT);
+        let second = last_invite_token(&fx);
+
+        // Seul le dernier lien vaut.
+        let hash = fx
+            .users
+            .find_by_id(&id)
+            .await
+            .unwrap()
+            .unwrap()
+            .password_hash;
+        let tokens = InviteTokens::new(INVITE_KEY);
+        assert!(!tokens.verify(&InviteTokens::parse(&first).unwrap(), &hash, NOW));
+        assert!(tokens.verify(&InviteTokens::parse(&second).unwrap(), &hash, NOW));
+
+        let outcomes: Vec<_> = fx
+            .actions()
+            .await
+            .into_iter()
+            .filter(|(a, _, _)| a == "admin.user_invite_resend")
+            .map(|(_, _, o)| o)
+            .collect();
+        assert_eq!(
+            outcomes,
+            [
+                AuditOutcome::Failure,
+                AuditOutcome::Success,
+                AuditOutcome::Success
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn only_pending_and_active_invitations_can_be_resent() {
+        let fx = Fixture::new();
+        let admin = fx.account("root@example.io", users_admin_only()).await;
+        let activated = fx.account("bob@example.io", Role::editor()).await;
+        let res = fx
+            .call(
+                "POST",
+                &format!("/admin/users/{activated}/invitation"),
+                &admin,
+                None,
+            )
+            .await;
+        assert_eq!(res.status(), StatusCode::CONFLICT);
+        assert_eq!(text_body(res).await, "account already activated");
+
+        let res = fx
+            .call(
+                "POST",
+                "/admin/users",
+                &admin,
+                Some(json!({ "email": "ivy@example.io" })),
+            )
+            .await;
+        let id = json_body(res).await["user"]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        fx.call("POST", &format!("/admin/users/{id}/disable"), &admin, None)
+            .await;
+        let res = fx
+            .call(
+                "POST",
+                &format!("/admin/users/{id}/invitation"),
+                &admin,
+                None,
+            )
+            .await;
+        assert_eq!(res.status(), StatusCode::CONFLICT);
+        assert_eq!(text_body(res).await, "account disabled");
+
+        let res = fx
+            .call("POST", "/admin/users/inconnu/invitation", &admin, None)
+            .await;
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            fx.mailer.sent.sent().len(),
+            1,
+            "seule l'invitation initiale"
+        );
+
+        // Annuler une invitation : supprimer le compte.
+        let res = fx
+            .call("DELETE", &format!("/admin/users/{id}"), &admin, None)
+            .await;
+        assert_eq!(res.status(), StatusCode::NO_CONTENT);
+        assert!(fx.users.find_by_id(&id).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn without_mail_invitations_are_503() {
+        let fx = Fixture::new();
+        let admin = fx.account("root@example.io", users_admin_only()).await;
+        let other = fx.account("bob@example.io", Role::editor()).await;
+        let state = AdminState::new(fx.auth.clone(), fx.users.clone());
+        let app = admin_router(state);
+        for (uri, body) in [
+            (
+                "/admin/users".to_string(),
+                json!({ "email": "a@example.io" }),
+            ),
+            (format!("/admin/users/{other}/invitation"), Value::Null),
+        ] {
+            let res = app
+                .clone()
+                .oneshot(
+                    Request::post(&uri)
+                        .header(
+                            "Authorization",
+                            format!("Bearer {}", fx.token(&admin).await),
+                        )
+                        .header("Content-Type", "application/json")
+                        .body(Body::from(body.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE, "{uri}");
+        }
     }
 }

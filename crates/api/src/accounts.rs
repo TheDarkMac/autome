@@ -15,14 +15,16 @@
 //! | POST    | `/auth/password/reset`  | `{ token, new_password }` | 204               |
 //! | POST    | `/auth/email/verify`    | `{ token }`      | 204                         |
 //! | POST    | `/auth/email/resend`    | `{ email }`      | 202                         |
+//! | POST    | `/auth/invitation/accept` | `{ token, password }` | 200 + [`TokenResponse`] |
 //! | GET     | `/auth/me`      | — (Bearer requis)       | 200 + [`MeResponse`]        |
 //! | DELETE  | `/auth/me`      | `{ current_password }` (Bearer) | 204                 |
 //!
 //! Contrat aligné sur le frontend (`frontend/src/auth.ts`) : 400 saisie
 //! invalide, 401 identifiants/jeton refusés, 403 compte suspendu ou email non
-//! vérifié (connexion avec le bon mot de passe), 409 email déjà pris, 429 trop
-//! de tentatives (`Retry-After`), 503 réinitialisation ou vérification
-//! indisponible (aucun envoi d'email configuré).
+//! vérifié (connexion avec le bon mot de passe) ou inscriptions fermées, 409
+//! email déjà pris, 429 trop de tentatives (`Retry-After`), 503
+//! réinitialisation, vérification ou invitation indisponible (aucun envoi
+//! d'email configuré).
 //!
 //! Choix de sécurité :
 //! - **Argon2id** ([`PasswordHasher`]) exécuté dans `spawn_blocking` : ~50 ms
@@ -94,11 +96,23 @@
 //!   IP). Une réinitialisation du mot de passe réussie vérifie aussi
 //!   l'adresse : elle prouve la même possession de la boîte, et rend son
 //!   compte à qui se serait vu « réserver » son adresse par un tiers.
+//! - Un compte **invité** par l'administration (#241, cf.
+//!   [`crate::invitation`]) n'a pas de mot de passe utilisable : à la
+//!   connexion, il est vérifié contre le hash leurre (même durée, même 401
+//!   qu'un mauvais mot de passe : rien ne révèle une invitation en attente).
+//!   L'acceptation de l'invitation vérifie le lien (HMAC, avant Argon2),
+//!   écrit le mot de passe choisi à la place du hash inutilisable (écriture
+//!   conditionnelle : usage unique), marque l'adresse vérifiée (le lien a été
+//!   reçu) et connecte. Un mot de passe oublié sur un compte invité suit le
+//!   même chemin que la réinitialisation : le lien reçu prouve la boîte.
+//!   Les inscriptions publiques peuvent être fermées (`AUTOME_SIGNUP=
+//!   invite_only`) : 403 `signup closed`.
 //! - Chaque inscription/connexion/déconnexion/changement ou réinitialisation
 //!   de mot de passe produit un event d'audit `auth.signup` / `auth.login` /
 //!   `auth.logout` / `auth.logout_all` / `auth.password_change` /
 //!   `auth.password_reset_request` / `auth.password_reset` /
-//!   `auth.email_verify_request` / `auth.email_verify` ; la suppression,
+//!   `auth.email_verify_request` / `auth.email_verify` /
+//!   `auth.invitation_accept` ; la suppression,
 //!   `auth.account_delete` sous le pseudonyme du compte effacé.
 
 use std::collections::HashSet;
@@ -106,9 +120,9 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use autome_core::{
-    email_throttle_key, normalize_email, role_of, validate_email, validate_password, AuditEvent,
-    AuditOutcome, Config, CreateUser, InMemoryLoginThrottle, LoginAttempt, LoginThrottleStore,
-    PasswordHasher, Role, TokenKind, UserStore, PERM_WILDCARD,
+    email_throttle_key, has_usable_password, normalize_email, role_of, validate_email,
+    validate_password, AuditEvent, AuditOutcome, Config, CreateUser, InMemoryLoginThrottle,
+    LoginAttempt, LoginThrottleStore, PasswordHasher, Role, TokenKind, UserStore, PERM_WILDCARD,
 };
 pub use autome_core::{LOGIN_WINDOW_SECONDS, MAX_LOGIN_FAILURES};
 use axum::{
@@ -125,6 +139,7 @@ use crate::auth::{bearer_token, AuthState, AuthenticatedUser};
 use crate::client_ip::{ClientIpPolicy, IpKeyer};
 use crate::email_verification::{EmailVerification, VerifyTokens};
 use crate::erasure::{erase_account, Erasure};
+use crate::invitation::InviteTokens;
 use crate::password_reset::{PasswordReset, ResetTokens};
 
 /// Durée de vie d'un access token (15 min).
@@ -234,6 +249,11 @@ pub struct AccountsState {
     /// Vérification de l'email (#231) ; `None` = désactivée : les comptes
     /// sont créés vérifiés, la connexion n'est pas conditionnée.
     pub email_verification: Option<EmailVerification>,
+    /// Acceptation des invitations (#241) ; `None` = indisponible (503).
+    pub invitations: Option<InviteTokens>,
+    /// Inscriptions publiques ouvertes (`AUTOME_SIGNUP`, #241) ; fermées, les
+    /// comptes ne naissent que par invitation.
+    pub signup_open: bool,
     /// Hash leurre vérifié quand l'email est inconnu (égalisation du temps).
     dummy_hash: Arc<str>,
 }
@@ -257,6 +277,8 @@ impl AccountsState {
             password_reset: None,
             erasure: None,
             email_verification: None,
+            invitations: None,
+            signup_open: true,
             dummy_hash: dummy_hash.into(),
         })
     }
@@ -289,6 +311,18 @@ impl AccountsState {
     /// Exige la vérification de l'email à l'inscription (#231).
     pub fn with_email_verification(mut self, verification: EmailVerification) -> Self {
         self.email_verification = Some(verification);
+        self
+    }
+
+    /// Accepte les liens d'invitation émis par l'administration (#241).
+    pub fn with_invitations(mut self, tokens: InviteTokens) -> Self {
+        self.invitations = Some(tokens);
+        self
+    }
+
+    /// Ouvre (`true`, défaut) ou ferme les inscriptions publiques (#241).
+    pub fn with_signup_open(mut self, open: bool) -> Self {
+        self.signup_open = open;
         self
     }
 }
@@ -353,6 +387,15 @@ pub struct ResetPasswordBody {
 pub struct VerifyEmailBody {
     /// Jeton reçu par email (fragment `#verify=` du lien).
     pub token: String,
+}
+
+/// Body de `/auth/invitation/accept`.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct AcceptInvitationBody {
+    /// Jeton reçu par email (fragment `#invite=` du lien).
+    pub token: String,
+    /// Mot de passe choisi (8 à 1024 caractères).
+    pub password: String,
 }
 
 /// Body de `/auth/email/resend`.
@@ -543,6 +586,8 @@ const ACCOUNT_DISABLED: &str = "account disabled";
 /// Message du refus de connexion d'un compte dont l'email n'est pas vérifié
 /// (#231).
 const EMAIL_NOT_VERIFIED: &str = "email not verified";
+/// Message du refus d'inscription quand elles sont fermées (#241).
+const SIGNUP_CLOSED: &str = "signup closed";
 
 /// Émet une paire à la version de session courante de l'utilisateur (#186).
 async fn issue_pair(state: &AccountsState, user_id: &str) -> Result<TokenResponse, AccountError> {
@@ -593,6 +638,7 @@ async fn is_enabled(state: &AccountsState, user_id: &str) -> Result<bool, Accoun
         (status = 201, description = "Compte créé et connecté (vérification de l'email désactivée)", body = TokenResponse),
         (status = 202, description = "Compte créé, email de vérification envoyé : connexion possible après vérification", body = SignupPending),
         (status = 400, description = "Email ou mot de passe invalide"),
+        (status = 403, description = "Inscriptions fermées (`signup closed`) : comptes créés par invitation seulement"),
         (status = 409, description = "Email déjà enregistré"),
         (status = 429, description = "Trop d'inscriptions depuis cette adresse — voir `Retry-After`")
     )
@@ -604,6 +650,10 @@ pub async fn signup(
     Json(body): Json<CredentialsBody>,
 ) -> Result<Response, AccountError> {
     let email = normalize_email(&body.email);
+    if !state.signup_open {
+        audit(&state, &email, "auth.signup", AuditOutcome::Denied).await;
+        return Err(AccountError::Forbidden(SIGNUP_CLOSED));
+    }
     validate_email(&email).map_err(|e| AccountError::BadRequest(e.to_string()))?;
     validate_password(&body.password).map_err(|e| AccountError::BadRequest(e.to_string()))?;
     // Toute inscription compte (réussie ou non) : création de comptes en masse
@@ -686,7 +736,13 @@ pub async fn login(
         return Err(AccountError::TooManyAttempts(retry_after_secs));
     }
 
-    let user = state.users.find_by_email(&email).await.map_err(internal)?;
+    // Compte invité sans mot de passe (#241) : traité comme inconnu.
+    let user = state
+        .users
+        .find_by_email(&email)
+        .await
+        .map_err(internal)?
+        .filter(|u| has_usable_password(&u.password_hash));
     // Email inconnu : on vérifie quand même contre le hash leurre pour que la
     // durée de réponse ne révèle pas l'existence du compte.
     let phc = match &user {
@@ -1308,9 +1364,13 @@ pub async fn resend_verification(
         };
         match user {
             None => audit(&state, &email, ACTION, AuditOutcome::Failure).await,
-            // Déjà vérifié (rien à faire) ou suspendu (le lien ne lui rendrait
-            // pas l'accès).
-            Some(user) if user.email_verified || user.disabled => {
+            // Déjà vérifié (rien à faire), suspendu ou invité sans mot de passe
+            // (#241) : le lien ne lui rendrait pas l'accès.
+            Some(user)
+                if user.email_verified
+                    || user.disabled
+                    || !has_usable_password(&user.password_hash) =>
+            {
                 audit(&state, &user.id, ACTION, AuditOutcome::Denied).await
             }
             Some(user) => send_verification_link(&state, &verification, &user, now).await,
@@ -1369,6 +1429,96 @@ pub async fn verify_email(
     tracing::info!(user_id = %token.user_id, "adresse email vérifiée");
     audit(&state, token.user_id, ACTION, AuditOutcome::Success).await;
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// Message des liens d'invitation refusés (même réponse quelle que soit la
+/// raison : mal formé, expiré, falsifié, déjà utilisé ou renvoyé depuis,
+/// compte disparu).
+const INVALID_INVITE_TOKEN: &str = "invalid or expired invitation link";
+
+/// `POST /auth/invitation/accept` — consomme un lien d'invitation (#241) : le
+/// mot de passe choisi remplace le hash inutilisable, l'adresse est marquée
+/// vérifiée et une paire de jetons est émise (connexion directe).
+#[utoipa::path(
+    post,
+    path = "/auth/invitation/accept",
+    tag = "auth",
+    request_body = AcceptInvitationBody,
+    responses(
+        (status = 200, description = "Invitation acceptée, connecté", body = TokenResponse),
+        (status = 400, description = "Lien invalide, expiré, déjà utilisé ou remplacé par un renvoi, ou mot de passe invalide"),
+        (status = 403, description = "Compte suspendu par un administrateur (`account disabled`)"),
+        (status = 503, description = "Invitations indisponibles : aucun envoi d'email configuré")
+    )
+)]
+pub async fn accept_invitation(
+    State(state): State<AccountsState>,
+    Json(body): Json<AcceptInvitationBody>,
+) -> Result<Json<TokenResponse>, AccountError> {
+    const ACTION: &str = "auth.invitation_accept";
+    let Some(tokens) = state.invitations.as_ref() else {
+        return Err(AccountError::Unavailable("invitations are not configured"));
+    };
+    let invalid = || AccountError::BadRequest(INVALID_INVITE_TOKEN.into());
+    let token = InviteTokens::parse(&body.token).ok_or_else(invalid)?;
+    validate_password(&body.password).map_err(|e| AccountError::BadRequest(e.to_string()))?;
+    let now = state.auth.clock.now_unix_seconds();
+    // Le jeton est vérifié (HMAC, bon marché) avant tout calcul Argon2 ; il
+    // n'est lié qu'à un hash inutilisable (compte encore invité).
+    let Some(account) = state
+        .users
+        .find_by_id(token.user_id)
+        .await
+        .map_err(internal)?
+        .filter(|a| {
+            !has_usable_password(&a.password_hash) && tokens.verify(&token, &a.password_hash, now)
+        })
+    else {
+        audit(&state, token.user_id, ACTION, AuditOutcome::Failure).await;
+        return Err(invalid());
+    };
+    // Suspendu avant d'avoir accepté : le lien reste valable s'il est réactivé.
+    if account.disabled {
+        audit(&state, &account.id, ACTION, AuditOutcome::Denied).await;
+        return Err(AccountError::Forbidden(ACCOUNT_DISABLED));
+    }
+
+    let hasher = Arc::clone(&state.hasher);
+    let password = body.password;
+    let hash = blocking(move || hasher.hash(&password)).await?;
+    // Écriture conditionnelle sur le hash lié au jeton : de deux acceptations
+    // concurrentes (ou d'une acceptation et d'un renvoi), une seule gagne.
+    if !state
+        .users
+        .update_password(&account.id, &account.password_hash, &hash)
+        .await
+        .map_err(internal)?
+    {
+        audit(&state, &account.id, ACTION, AuditOutcome::Failure).await;
+        return Err(invalid());
+    }
+    // Le lien a été reçu dans la boîte du compte : l'adresse est prouvée.
+    if let Err(e) = state
+        .users
+        .mark_email_verified(&account.id, &account.email)
+        .await
+    {
+        tracing::warn!(error = %e, "vérification de l'email après invitation impossible");
+    }
+    // Version lue avant le drapeau de suspension (cf. doc du module).
+    let sv = state
+        .auth
+        .revocation
+        .session_version(&account.id)
+        .await
+        .map_err(internal)?;
+    if !is_enabled(&state, &account.id).await? {
+        audit(&state, &account.id, ACTION, AuditOutcome::Denied).await;
+        return Err(AccountError::Forbidden(ACCOUNT_DISABLED));
+    }
+    tracing::info!(user_id = %account.id, "invitation acceptée");
+    audit(&state, &account.id, ACTION, AuditOutcome::Success).await;
+    Ok(Json(issue_pair_at(&state, &account.id, sv)?))
 }
 
 /// `GET /auth/me` — l'utilisateur authentifié, son rôle et ses permissions
@@ -1539,6 +1689,7 @@ pub fn accounts_router(state: AccountsState) -> Router {
         .route("/password/reset", post(reset_password))
         .route("/email/verify", post(verify_email))
         .route("/email/resend", post(resend_verification))
+        .route("/invitation/accept", post(accept_invitation))
         .route("/me", get(me).delete(delete_account))
         .with_state(state)
 }
@@ -1614,18 +1765,19 @@ mod tests {
         hasher: Arc<dyn PasswordHasher + Send + Sync>,
         ip_throttle: Option<IpThrottle>,
     ) -> Harness {
-        harness_build(hasher, ip_throttle, false)
+        harness_build(hasher, ip_throttle, false, true)
     }
 
     /// Harness où la vérification de l'email est exigée (#231).
     fn harness_verify(ip_throttle: Option<IpThrottle>) -> Harness {
-        harness_build(Arc::new(PlainHasher), ip_throttle, true)
+        harness_build(Arc::new(PlainHasher), ip_throttle, true, true)
     }
 
     fn harness_build(
         hasher: Arc<dyn PasswordHasher + Send + Sync>,
         ip_throttle: Option<IpThrottle>,
         email_verification: bool,
+        signup_open: bool,
     ) -> Harness {
         let clock = Arc::new(MovableClock(Mutex::new(START)));
         let perms = Arc::new(InMemoryPermissionStore::new());
@@ -1646,7 +1798,9 @@ mod tests {
         let reset = PasswordReset::new(ResetTokens::new(b"test-encryption-key"), mail.clone());
         let mut accounts = AccountsState::new(auth.clone(), users.clone(), hasher)
             .unwrap()
-            .with_password_reset(reset);
+            .with_password_reset(reset)
+            .with_invitations(invite_tokens())
+            .with_signup_open(signup_open);
         if email_verification {
             accounts = accounts.with_email_verification(EmailVerification::new(
                 VerifyTokens::new(b"test-encryption-key"),
@@ -3700,6 +3854,302 @@ mod tests {
         let r = post(&h.app, "/email/verify", verify_body("x")).await;
         assert_eq!(r.status(), StatusCode::SERVICE_UNAVAILABLE);
         let r = post(&h.app, "/email/resend", forgot("ivy@example.io")).await;
+        assert_eq!(r.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    // --- Invitations (#241) -------------------------------------------------
+
+    fn invite_tokens() -> InviteTokens {
+        InviteTokens::new(b"test-encryption-key")
+    }
+
+    /// Compte invité (comme `POST /admin/users`) : `(id, hash inutilisable)`.
+    async fn invited(h: &Harness, email: &str) -> (String, String) {
+        let hash = autome_core::unusable_password_hash();
+        let CreateUser::Created(user) = h
+            .users
+            .create(email, &hash, &Role::viewer().permissions, false)
+            .await
+            .unwrap()
+        else {
+            panic!("création");
+        };
+        (user.id, hash)
+    }
+
+    fn accept_body(token: &str, password: &str) -> serde_json::Value {
+        json!({ "token": token, "password": password })
+    }
+
+    #[tokio::test]
+    async fn an_invitation_is_accepted_once_and_logs_in() {
+        let h = harness_verify(None);
+        let (id, hash) = invited(&h, "ivy@example.io").await;
+        let token = invite_tokens().issue(&id, &hash, START);
+
+        let r = post(
+            &h.app,
+            "/invitation/accept",
+            accept_body(&token, "chosen-pw"),
+        )
+        .await;
+        assert_eq!(r.status(), StatusCode::OK);
+        let pair = tokens(r).await;
+        assert_eq!(verify(&pair.access_token).sub, id);
+        assert_eq!(
+            whoami_status(&h.app, &pair.access_token).await,
+            StatusCode::OK
+        );
+        let account = h.users.find_by_id(&id).await.unwrap().unwrap();
+        assert_eq!(account.password_hash, "plain:chosen-pw");
+        assert!(account.email_verified, "le lien prouve la boîte");
+        // Rôle choisi par l'administration conservé.
+        assert_eq!(
+            h.perms.permissions_for(&id).await.unwrap(),
+            Role::viewer().permissions
+        );
+        // Connexion ordinaire ensuite (vérification exigée : déjà faite).
+        let r = post(&h.app, "/login", creds("ivy@example.io", "chosen-pw")).await;
+        assert_eq!(r.status(), StatusCode::OK);
+
+        // Usage unique.
+        let r = post(
+            &h.app,
+            "/invitation/accept",
+            accept_body(&token, "other-pw!"),
+        )
+        .await;
+        assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(text(r).await, INVALID_INVITE_TOKEN);
+        let actions: Vec<_> = h
+            .audit
+            .list()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.action == "auth.invitation_accept")
+            .map(|e| (e.actor, e.outcome))
+            .collect();
+        assert_eq!(
+            actions,
+            [
+                (id.clone(), AuditOutcome::Success),
+                (id, AuditOutcome::Failure)
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_resent_invitation_kills_the_previous_link() {
+        let h = harness();
+        let (id, first) = invited(&h, "ivy@example.io").await;
+        let old = invite_tokens().issue(&id, &first, START);
+        // Renvoi (`POST /admin/users/{id}/invitation`) : nouveau hash.
+        let second = autome_core::unusable_password_hash();
+        assert!(h.users.update_password(&id, &first, &second).await.unwrap());
+        let r = post(&h.app, "/invitation/accept", accept_body(&old, "chosen-pw")).await;
+        assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+        let new = invite_tokens().issue(&id, &second, START);
+        let r = post(&h.app, "/invitation/accept", accept_body(&new, "chosen-pw")).await;
+        assert_eq!(r.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn expired_forged_or_foreign_links_are_refused() {
+        let h = harness();
+        let (id, hash) = invited(&h, "ivy@example.io").await;
+        let good = invite_tokens().issue(&id, &hash, START);
+
+        // Mot de passe trop court : refusé avant tout, le lien reste valable.
+        let r = post(&h.app, "/invitation/accept", accept_body(&good, "short")).await;
+        assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+        // Autres liens (réinitialisation), clé étrangère, jeton mal formé.
+        let reset = ResetTokens::new(b"test-encryption-key").issue(&id, &hash, START);
+        let foreign = InviteTokens::new(b"other-key").issue(&id, &hash, START);
+        for bad in [reset.as_str(), foreign.as_str(), "nope"] {
+            let r = post(&h.app, "/invitation/accept", accept_body(bad, "chosen-pw")).await;
+            assert_eq!(r.status(), StatusCode::BAD_REQUEST, "{bad}");
+        }
+        // Un compte qui a déjà un mot de passe n'accepte aucune invitation.
+        post(&h.app, "/signup", creds("bob@example.io", "bob-password")).await;
+        let bob = h
+            .users
+            .find_by_email("bob@example.io")
+            .await
+            .unwrap()
+            .unwrap();
+        let t = invite_tokens().issue(&bob.id, &bob.password_hash, START);
+        let r = post(&h.app, "/invitation/accept", accept_body(&t, "chosen-pw")).await;
+        assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            h.users
+                .find_by_id(&bob.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .password_hash,
+            "plain:bob-password"
+        );
+        // Expiré.
+        h.clock.advance(crate::invitation::INVITE_TTL_SECONDS);
+        let r = post(
+            &h.app,
+            "/invitation/accept",
+            accept_body(&good, "chosen-pw"),
+        )
+        .await;
+        assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            h.users
+                .find_by_id(&id)
+                .await
+                .unwrap()
+                .unwrap()
+                .password_hash,
+            hash
+        );
+    }
+
+    #[tokio::test]
+    async fn a_suspended_invitee_cannot_accept_until_reactivated() {
+        let h = harness();
+        let (id, hash) = invited(&h, "ivy@example.io").await;
+        let token = invite_tokens().issue(&id, &hash, START);
+        h.users.set_disabled(&id, true).await.unwrap();
+        let r = post(
+            &h.app,
+            "/invitation/accept",
+            accept_body(&token, "chosen-pw"),
+        )
+        .await;
+        assert_eq!(r.status(), StatusCode::FORBIDDEN);
+        assert_eq!(text(r).await, ACCOUNT_DISABLED);
+        assert_eq!(
+            h.users
+                .find_by_id(&id)
+                .await
+                .unwrap()
+                .unwrap()
+                .password_hash,
+            hash
+        );
+        h.users.set_disabled(&id, false).await.unwrap();
+        let r = post(
+            &h.app,
+            "/invitation/accept",
+            accept_body(&token, "chosen-pw"),
+        )
+        .await;
+        assert_eq!(r.status(), StatusCode::OK);
+    }
+
+    /// Hasher qui compte ses vérifications et refuse les hashs non PHC (comme
+    /// Argon2) : un compte invité doit payer une vérification comme un autre.
+    struct CountingHasher(std::sync::atomic::AtomicUsize);
+    impl PasswordHasher for CountingHasher {
+        fn hash(&self, plain: &str) -> autome_core::Result<String> {
+            PlainHasher.hash(plain)
+        }
+        fn verify(&self, plain: &str, phc: &str) -> autome_core::Result<bool> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            PlainHasher.verify(plain, phc)
+        }
+    }
+
+    #[tokio::test]
+    async fn an_invited_account_cannot_log_in_and_looks_unknown() {
+        let hasher = Arc::new(CountingHasher(Default::default()));
+        let h = harness_with(hasher.clone());
+        let (_, hash) = invited(&h, "ivy@example.io").await;
+        for (email, password) in [
+            ("ivy@example.io", hash.as_str()),
+            ("nobody@example.io", "x"),
+        ] {
+            let before = hasher.0.load(std::sync::atomic::Ordering::SeqCst);
+            let r = post(&h.app, "/login", creds(email, password)).await;
+            assert_eq!(r.status(), StatusCode::UNAUTHORIZED, "{email}");
+            assert_eq!(text(r).await, "invalid credentials");
+            assert_eq!(
+                hasher.0.load(std::sync::atomic::Ordering::SeqCst),
+                before + 1,
+                "une vérification (hash leurre) pour {email}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_forgotten_invitation_is_recovered_by_a_password_reset() {
+        let h = harness_verify(None);
+        let (id, _) = invited(&h, "ivy@example.io").await;
+        let r = post(&h.app, "/password/forgot", forgot("ivy@example.io")).await;
+        assert_eq!(r.status(), StatusCode::ACCEPTED);
+        let token = token_in(wait_mails(&h, 1).await.last().unwrap());
+        let r = post(&h.app, "/password/reset", reset_body(&token, "chosen-pw")).await;
+        assert_eq!(r.status(), StatusCode::NO_CONTENT);
+        assert!(
+            h.users
+                .find_by_id(&id)
+                .await
+                .unwrap()
+                .unwrap()
+                .email_verified
+        );
+        let r = post(&h.app, "/login", creds("ivy@example.io", "chosen-pw")).await;
+        assert_eq!(r.status(), StatusCode::OK);
+        // Le renvoi du lien de vérification, lui, ne lui sert à rien.
+        let before = h.mailer.sent().len();
+        let (_, _) = invited(&h, "joe@example.io").await;
+        let r = post(&h.app, "/email/resend", forgot("joe@example.io")).await;
+        assert_eq!(r.status(), StatusCode::ACCEPTED);
+        wait_audit(&h, "auth.email_verify_request", AuditOutcome::Denied).await;
+        assert_eq!(h.mailer.sent().len(), before);
+    }
+
+    #[tokio::test]
+    async fn closed_signup_is_refused_before_any_work() {
+        let h = harness_build(Arc::new(PlainHasher), None, false, false);
+        let r = post(&h.app, "/signup", creds("eve@example.io", "eve-password")).await;
+        assert_eq!(r.status(), StatusCode::FORBIDDEN);
+        assert_eq!(text(r).await, SIGNUP_CLOSED);
+        assert!(h
+            .users
+            .find_by_email("eve@example.io")
+            .await
+            .unwrap()
+            .is_none());
+        let events = h.audit.list().await.unwrap();
+        assert!(events
+            .iter()
+            .any(|e| e.action == "auth.signup" && e.outcome == AuditOutcome::Denied));
+        // Les invitations, elles, restent acceptées.
+        let (id, hash) = invited(&h, "ivy@example.io").await;
+        let token = invite_tokens().issue(&id, &hash, START);
+        let r = post(
+            &h.app,
+            "/invitation/accept",
+            accept_body(&token, "chosen-pw"),
+        )
+        .await;
+        assert_eq!(r.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn without_invitations_acceptance_is_503() {
+        let perms = Arc::new(InMemoryPermissionStore::new());
+        let auth = AuthState::new(
+            TokenService::new(SECRET),
+            Arc::new(InMemoryRevocationStore::new()),
+            perms.clone(),
+            Arc::new(InMemoryAuditSink::new()),
+        );
+        let users = Arc::new(InMemoryUserStore::new(perms));
+        let state = AccountsState::new(auth, users, Arc::new(PlainHasher)).unwrap();
+        let r = post(
+            &accounts_router(state),
+            "/invitation/accept",
+            accept_body("x.1.y", "chosen-pw"),
+        )
+        .await;
         assert_eq!(r.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 }
