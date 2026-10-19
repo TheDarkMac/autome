@@ -1,6 +1,29 @@
 # Exécuteur de runs `autome-worker` (F10.3) : consommateur long-vivant de la
-# file `runs` (RabbitMQ), état des runs en PostgreSQL. Pas de Service : seules
-# ses sondes écoutent (port 9091, #192).
+# file `runs` (RabbitMQ), état des runs en PostgreSQL. Seul son serveur de
+# sondes écoute (port 9091) : `/livez`, `/readyz` (#192) et `/metrics` (#235).
+#
+# Service **headless** `worker` : pas d'IP virtuelle ni de répartition, le nom
+# DNS résout vers chaque pod prêt ; Prometheus (dns_sd_configs, cf.
+# monitoring.yaml) scrape ainsi chaque réplique. `/metrics` n'a pas
+# d'authentification (aucun identifiant dans les séries) : ne pas exposer ce
+# port hors du cluster.
+apiVersion: v1
+kind: Service
+metadata:
+  name: worker
+  namespace: autome
+  labels:
+    app.kubernetes.io/name: worker
+    app.kubernetes.io/part-of: autome
+spec:
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: worker
+  ports:
+    - name: probes
+      port: 9091
+      targetPort: probes
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
