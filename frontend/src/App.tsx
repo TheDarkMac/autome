@@ -22,6 +22,13 @@ import {
 import { ConnectorsPanel } from "./ConnectorsPanel";
 import type { CanvasNode, WireGraph } from "./graph";
 import { LoginPage } from "./LoginPage";
+import {
+  disableMfa,
+  fetchMfaStatus,
+  regenerateRecoveryCodes,
+  setupMfa,
+} from "./mfa";
+import type { MfaActions } from "./MfaSection";
 import { NodeCanvas, type NodeCanvasController } from "./NodeCanvas";
 import { NodePanel, type WebhookActions } from "./NodePanel";
 import { Palette } from "./Palette";
@@ -85,6 +92,8 @@ export function App({
     changePassword,
     deleteAccount,
     acceptInvitation,
+    verifyMfa,
+    enableMfa,
     authFetch,
   } = useSession(sessionOptions);
   const [logoutAllError, setLogoutAllError] = useState<string | null>(null);
@@ -174,6 +183,17 @@ export function App({
   // Client API typé adossé à l'`authFetch` (F8.7) — identité stable car
   // `authFetch` l'est ; les vues de runs y branchent leurs lectures.
   const api = useMemo(() => createApiClient(authFetch), [authFetch]);
+  // Double authentification (#245) : l'activation renouvelle la session.
+  const mfaActions = useMemo<MfaActions>(
+    () => ({
+      status: () => fetchMfaStatus(authFetch),
+      setup: (password) => setupMfa(password, authFetch),
+      enable: enableMfa,
+      disable: (password, code) => disableMfa(password, code, authFetch),
+      regenerate: (code) => regenerateRecoveryCodes(code, authFetch),
+    }),
+    [authFetch, enableMfa],
+  );
   // Identité et droits de l'utilisateur (#208) : l'onglet Administration
   // n'apparaît qu'avec `users.admin`. Un échec laisse simplement l'onglet
   // masqué (le serveur refuserait de toute façon).
@@ -339,6 +359,7 @@ export function App({
       <LoginPage
         login={login}
         signup={signup}
+        verifyMfa={verifyMfa}
         resendVerification={(email) => resendVerificationImpl(email)}
         requestPasswordReset={(email) => requestPasswordResetImpl(email)}
         notice={loginNotice}
@@ -410,6 +431,7 @@ export function App({
             {...(me ? { email: me.email } : {})}
             changePassword={changePassword}
             deleteAccount={onDeleteAccount}
+            mfa={mfaActions}
           />
         </div>
       ) : view === "connectors" ? (

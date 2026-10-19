@@ -2,7 +2,8 @@ import { describe, expect, it, vi } from "vitest";
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 
 import { ApiError } from "./api";
-import { EmailNotVerifiedError } from "./auth";
+import { EmailNotVerifiedError, MfaRequiredError } from "./auth";
+import { MfaChallengeExpiredError } from "./mfa";
 import {
   LoginPage,
   RESET_REQUESTED_MESSAGE,
@@ -217,5 +218,60 @@ describe("<LoginPage /> — vérification de l'email (#231)", () => {
     fireEvent.click(screen.getByRole("button", { name: "Créer le compte" }));
     await waitFor(() => expect(signup).toHaveBeenCalled());
     expect(screen.queryByRole("region", { name: "Vérification de l'email" })).toBeNull();
+  });
+});
+
+describe("<LoginPage /> — double authentification (#245)", () => {
+  async function reachCodeStep(verifyMfa: (token: string, code: string) => Promise<void>) {
+    const login = vi.fn().mockRejectedValue(new MfaRequiredError("u.1.mac"));
+    render(<LoginPage login={login} signup={vi.fn()} verifyMfa={verifyMfa} />);
+    fill("a@b.io", "longenough");
+    fireEvent.click(screen.getByRole("button", { name: "Se connecter" }));
+    await screen.findByRole("form", { name: "Vérification en deux étapes" });
+  }
+
+  it("demande le code puis le vérifie avec le défi", async () => {
+    const verifyMfa = vi.fn().mockResolvedValue(undefined);
+    await reachCodeStep(verifyMfa);
+    fireEvent.change(screen.getByLabelText("Code de vérification"), {
+      target: { value: "123456" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Vérifier" }));
+    await waitFor(() => expect(verifyMfa).toHaveBeenCalledWith("u.1.mac", "123456"));
+  });
+
+  it("accepte un code de secours et affiche un code refusé", async () => {
+    const verifyMfa = vi
+      .fn()
+      .mockRejectedValueOnce(new ApiError("code incorrect ou déjà utilisé", 401))
+      .mockResolvedValue(undefined);
+    await reachCodeStep(verifyMfa);
+    fireEvent.click(screen.getByRole("button", { name: "Utiliser un code de secours" }));
+    fireEvent.change(screen.getByLabelText("Code de secours"), {
+      target: { value: "abcde-fghjk" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Vérifier" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("code incorrect ou déjà utilisé");
+    expect(screen.getByLabelText("Code de secours")).toHaveValue("");
+  });
+
+  it("revient à la connexion quand le défi a expiré", async () => {
+    const verifyMfa = vi.fn().mockRejectedValue(new MfaChallengeExpiredError());
+    await reachCodeStep(verifyMfa);
+    fireEvent.change(screen.getByLabelText("Code de vérification"), {
+      target: { value: "123456" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Vérifier" }));
+    expect(await screen.findByRole("form", { name: "Connexion" })).toBeInTheDocument();
+    expect(screen.getByRole("alert")).toHaveTextContent(/expiré/);
+    expect(screen.getByLabelText("Mot de passe")).toHaveValue("");
+  });
+
+  it("sans verifyMfa, l'erreur s'affiche comme les autres", async () => {
+    const login = vi.fn().mockRejectedValue(new MfaRequiredError("u.1.mac"));
+    render(<LoginPage login={login} signup={vi.fn()} />);
+    fill("a@b.io", "longenough");
+    fireEvent.click(screen.getByRole("button", { name: "Se connecter" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("code de vérification requis");
   });
 });

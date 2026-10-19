@@ -16,6 +16,7 @@ function user(id: string, email: string, extra: Partial<AdminUser> = {}): AdminU
     disabled: false,
     email_verified: true,
     invitation_pending: false,
+    mfa_enabled: false,
     created_at_ms: Date.UTC(2026, 9, 1),
     ...extra,
   };
@@ -41,6 +42,7 @@ function fakeApi(items: AdminUser[] = [ME, ALICE, BOSS], total = items.length): 
       invitation_sent: true,
     })),
     resendInvitation: vi.fn().mockResolvedValue(undefined),
+    resetUserMfa: vi.fn(async (id: string) => ({ ...ALICE, id, mfa_enabled: false })),
     listAllWorkflows: vi.fn().mockResolvedValue({ items: [], total: 0, offset: 0, limit: 50 }),
   };
 }
@@ -480,5 +482,57 @@ describe("<AdminPanel />", () => {
         ),
       ).toBeInTheDocument();
     });
+  });
+});
+
+describe("AdminPanel — double authentification (#245)", () => {
+  it("signale les comptes protégés et réinitialise après confirmation", async () => {
+    const carol = user("u-carol", "carol@example.io", { mfa_enabled: true });
+    const api = fakeApi([ME, ALICE, carol]);
+    api.resetUserMfa = vi.fn(async () => ({ ...carol, mfa_enabled: false }));
+    const confirm = vi.fn().mockReturnValue(true);
+    await renderPanel(api, { confirm });
+
+    expect(within(row("carol@example.io")).getByText("MFA")).toBeInTheDocument();
+    expect(within(row("alice@example.io")).queryByText("MFA")).toBeNull();
+    // Rien à réinitialiser sans second facteur.
+    expect(
+      within(row("alice@example.io")).queryByRole("button", {
+        name: /Réinitialiser la double authentification/,
+      }),
+    ).toBeNull();
+
+    fireEvent.click(
+      within(row("carol@example.io")).getByRole("button", {
+        name: "Réinitialiser la double authentification de carol@example.io",
+      }),
+    );
+    expect(confirm).toHaveBeenCalledWith(expect.stringContaining("vérifié son identité"));
+    await waitFor(() => expect(api.resetUserMfa).toHaveBeenCalledWith("u-carol"));
+    expect(
+      await screen.findByText("Double authentification de carol@example.io réinitialisée."),
+    ).toBeInTheDocument();
+    // La ligne reflète la réponse : plus de badge.
+    await waitFor(() =>
+      expect(within(row("carol@example.io")).queryByText("MFA")).toBeNull(),
+    );
+  });
+
+  it("ne fait rien sans confirmation, et jamais sur son propre compte", async () => {
+    const me = { ...ME, mfa_enabled: true };
+    const carol = user("u-carol", "carol@example.io", { mfa_enabled: true });
+    const api = fakeApi([me, ALICE, carol]);
+    await renderPanel(api, { confirm: () => false });
+    fireEvent.click(
+      within(row("carol@example.io")).getByRole("button", {
+        name: "Réinitialiser la double authentification de carol@example.io",
+      }),
+    );
+    expect(api.resetUserMfa).not.toHaveBeenCalled();
+    expect(
+      within(row("root@example.io")).getByRole("button", {
+        name: "Réinitialiser la double authentification de root@example.io",
+      }),
+    ).toBeDisabled();
   });
 });

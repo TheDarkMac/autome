@@ -405,6 +405,55 @@
         ]
       }
     },
+    "/admin/users/{id}/mfa": {
+      "delete": {
+        "tags": [
+          "admin"
+        ],
+        "summary": "`DELETE /admin/users/{id}/mfa` — réinitialise le second facteur du compte\n(téléphone et codes de secours perdus) : il se connecte de nouveau au seul\nmot de passe et peut se réenrôler. Idempotent.",
+        "operationId": "reset_user_mfa",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Identifiant du compte",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Second facteur réinitialisé",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminUser"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Token absent ou invalide"
+          },
+          "403": {
+            "description": "Manque `users.admin`, ou `*` pour un compte super-admin"
+          },
+          "404": {
+            "description": "Compte inconnu"
+          },
+          "409": {
+            "description": "Son propre compte (passer par `/auth/mfa/disable`)"
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
     "/admin/users/{id}/role": {
       "put": {
         "tags": [
@@ -690,7 +739,7 @@
             }
           },
           "400": {
-            "description": "Lien invalide, expiré, déjà utilisé ou remplacé par un renvoi, ou mot de passe invalide"
+            "description": "Lien invalide, expiré, déjà utilisé ou remplacé par un renvoi, ou mot de passe invalide, courant ou divulgué"
           },
           "403": {
             "description": "Compte suspendu par un administrateur (`account disabled`)"
@@ -706,7 +755,7 @@
         "tags": [
           "auth"
         ],
-        "summary": "`POST /auth/login` — échange email + mot de passe contre une paire de jetons.",
+        "summary": "`POST /auth/login` — échange email + mot de passe contre une paire de\njetons ; si le second facteur est actif (#245), contre un défi (202) à\nprésenter avec un code à `/auth/mfa/verify`.",
         "operationId": "login",
         "requestBody": {
           "content": {
@@ -725,6 +774,16 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/TokenResponse"
+                }
+              }
+            }
+          },
+          "202": {
+            "description": "Mot de passe correct, second facteur exigé : défi à présenter avec un code à `/auth/mfa/verify`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MfaChallenge"
                 }
               }
             }
@@ -877,6 +936,263 @@
         ]
       }
     },
+    "/auth/mfa": {
+      "get": {
+        "tags": [
+          "auth"
+        ],
+        "summary": "`GET /auth/mfa` — état du second facteur du compte courant.",
+        "operationId": "mfa_status",
+        "responses": {
+          "200": {
+            "description": "État du second facteur",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MfaStatus"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Access token absent, invalide, révoqué, ou compte suspendu"
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/auth/mfa/disable": {
+      "post": {
+        "tags": [
+          "auth"
+        ],
+        "summary": "`POST /auth/mfa/disable` — désactive la MFA (mot de passe **et** code\nexigés) ; les codes de secours sont effacés.",
+        "operationId": "mfa_disable",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MfaDisableBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "MFA désactivée"
+          },
+          "401": {
+            "description": "Access token absent, invalide, révoqué, ou compte suspendu"
+          },
+          "403": {
+            "description": "Mot de passe actuel ou code incorrect"
+          },
+          "409": {
+            "description": "MFA inactive (`mfa not enabled`)"
+          },
+          "429": {
+            "description": "Trop d'essais — voir `Retry-After`"
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/auth/mfa/enable": {
+      "post": {
+        "tags": [
+          "auth"
+        ],
+        "summary": "`POST /auth/mfa/enable` — confirme l'enrôlement par un premier code :\nla MFA devient active, toutes les autres sessions sont fermées, les codes\nde secours sont renvoyés (une seule fois) avec une paire neuve.",
+        "operationId": "mfa_enable",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MfaCodeBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "MFA active ; autres sessions fermées",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MfaEnabled"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Access token absent, invalide, révoqué, ou compte suspendu"
+          },
+          "403": {
+            "description": "Code incorrect (`invalid mfa code`)"
+          },
+          "409": {
+            "description": "Aucun enrôlement en attente (`mfa setup required`) ou MFA déjà active"
+          },
+          "429": {
+            "description": "Trop d'essais — voir `Retry-After`"
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/auth/mfa/recovery-codes": {
+      "post": {
+        "tags": [
+          "auth"
+        ],
+        "summary": "`POST /auth/mfa/recovery-codes` — remplace les codes de secours (un code\nvalide exigé) ; les précédents ne valent plus rien.",
+        "operationId": "mfa_recovery_codes",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MfaCodeBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Nouveaux codes de secours",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RecoveryCodes"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Access token absent, invalide, révoqué, ou compte suspendu"
+          },
+          "403": {
+            "description": "Code incorrect (`invalid mfa code`)"
+          },
+          "409": {
+            "description": "MFA inactive (`mfa not enabled`)"
+          },
+          "429": {
+            "description": "Trop d'essais — voir `Retry-After`"
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/auth/mfa/setup": {
+      "post": {
+        "tags": [
+          "auth"
+        ],
+        "summary": "`POST /auth/mfa/setup` — commence l'enrôlement : nouveau secret en\nattente (remplace un enrôlement non confirmé), à scanner puis confirmer\npar `/auth/mfa/enable`.",
+        "operationId": "mfa_setup",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MfaSetupBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Secret en attente de confirmation",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MfaSetup"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Access token absent, invalide, révoqué, ou compte suspendu"
+          },
+          "403": {
+            "description": "Mot de passe actuel incorrect"
+          },
+          "409": {
+            "description": "MFA déjà active (`mfa already enabled`)"
+          },
+          "429": {
+            "description": "Trop d'essais — voir `Retry-After`"
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/auth/mfa/verify": {
+      "post": {
+        "tags": [
+          "auth"
+        ],
+        "summary": "`POST /auth/mfa/verify` — seconde étape de la connexion : échange le défi\nde `/auth/login` et un code (TOTP ou de secours) contre une paire.",
+        "operationId": "mfa_verify",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MfaVerifyBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Connecté",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TokenResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Défi invalide ou expiré (`invalid or expired mfa challenge`) : recommencer la connexion"
+          },
+          "401": {
+            "description": "Code incorrect, déjà utilisé ou rejoué"
+          },
+          "403": {
+            "description": "Compte suspendu (`account disabled`) ou adresse non vérifiée (`email not verified`)"
+          },
+          "429": {
+            "description": "Trop d'essais (compte ou adresse IP) — voir `Retry-After`"
+          }
+        }
+      }
+    },
     "/auth/password": {
       "post": {
         "tags": [
@@ -906,7 +1222,7 @@
             }
           },
           "400": {
-            "description": "Nouveau mot de passe invalide ou identique à l'actuel"
+            "description": "Nouveau mot de passe invalide, identique à l'actuel, courant ou divulgué dans une fuite"
           },
           "401": {
             "description": "Access token absent, invalide ou révoqué"
@@ -984,7 +1300,7 @@
             "description": "Mot de passe remplacé ; sessions fermées"
           },
           "400": {
-            "description": "Lien invalide, expiré ou déjà utilisé, ou nouveau mot de passe invalide"
+            "description": "Lien invalide, expiré ou déjà utilisé, ou nouveau mot de passe invalide, courant ou divulgué"
           },
           "503": {
             "description": "Réinitialisation indisponible : aucun envoi d'email configuré"
@@ -1065,7 +1381,7 @@
             }
           },
           "400": {
-            "description": "Email ou mot de passe invalide"
+            "description": "Email ou mot de passe invalide, ou mot de passe courant ou divulgué dans une fuite"
           },
           "403": {
             "description": "Inscriptions fermées (`signup closed`) : comptes créés par invitation seulement"
@@ -2042,6 +2358,7 @@
           "disabled",
           "email_verified",
           "invitation_pending",
+          "mfa_enabled",
           "created_at_ms"
         ],
         "properties": {
@@ -2069,6 +2386,10 @@
           "invitation_pending": {
             "type": "boolean",
             "description": "Invitation en attente (#241) : le compte n'a pas encore choisi son mot\nde passe et ne peut pas se connecter."
+          },
+          "mfa_enabled": {
+            "type": "boolean",
+            "description": "Second facteur actif (#245)."
           },
           "permissions": {
             "type": "array",
@@ -2488,7 +2809,8 @@
           "id",
           "email",
           "role",
-          "permissions"
+          "permissions",
+          "mfa_enabled"
         ],
         "properties": {
           "email": {
@@ -2498,6 +2820,10 @@
           "id": {
             "type": "string",
             "description": "Identifiant (`claims.sub`)."
+          },
+          "mfa_enabled": {
+            "type": "boolean",
+            "description": "Second facteur actif (#245)."
           },
           "permissions": {
             "type": "array",
@@ -2509,6 +2835,160 @@
           "role": {
             "type": "string",
             "description": "Rôle déduit des permissions : `admin`, `editor`, `viewer` ou `custom`."
+          }
+        }
+      },
+      "MfaChallenge": {
+        "type": "object",
+        "description": "Réponse 202 de `/auth/login` quand la MFA est active : aucun jeton de\nsession, un défi à présenter avec un code à `/auth/mfa/verify`.",
+        "required": [
+          "mfa_required",
+          "mfa_token",
+          "expires_in"
+        ],
+        "properties": {
+          "expires_in": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Durée de validité du défi, en secondes."
+          },
+          "mfa_required": {
+            "type": "boolean",
+            "description": "Toujours `true`."
+          },
+          "mfa_token": {
+            "type": "string",
+            "description": "Jeton de défi (5 min), à renvoyer tel quel."
+          }
+        }
+      },
+      "MfaCodeBody": {
+        "type": "object",
+        "description": "Body de `/auth/mfa/enable` et `/auth/mfa/recovery-codes`.",
+        "required": [
+          "code"
+        ],
+        "properties": {
+          "code": {
+            "type": "string",
+            "description": "Code à 6 chiffres de l'application (ou code de secours, sauf pour\nl'activation)."
+          }
+        }
+      },
+      "MfaDisableBody": {
+        "type": "object",
+        "description": "Body de `/auth/mfa/disable`.",
+        "required": [
+          "current_password",
+          "code"
+        ],
+        "properties": {
+          "code": {
+            "type": "string",
+            "description": "Code à 6 chiffres de l'application, ou code de secours."
+          },
+          "current_password": {
+            "type": "string",
+            "description": "Mot de passe actuel."
+          }
+        }
+      },
+      "MfaEnabled": {
+        "type": "object",
+        "description": "MFA activée : codes de secours (montrés **une seule fois**) et nouvelle\npaire (toutes les autres sessions sont fermées).",
+        "required": [
+          "recovery_codes",
+          "session"
+        ],
+        "properties": {
+          "recovery_codes": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Codes de secours à usage unique."
+          },
+          "session": {
+            "$ref": "#/components/schemas/TokenResponse",
+            "description": "Nouvelle paire de jetons de l'appareil courant."
+          }
+        }
+      },
+      "MfaSetup": {
+        "type": "object",
+        "description": "Enrôlement en attente : à scanner, puis confirmer par un code.",
+        "required": [
+          "secret",
+          "otpauth_uri",
+          "qr_svg"
+        ],
+        "properties": {
+          "otpauth_uri": {
+            "type": "string",
+            "description": "URI `otpauth://totp/…`."
+          },
+          "qr_svg": {
+            "type": "string",
+            "description": "QR code SVG de l'URI."
+          },
+          "secret": {
+            "type": "string",
+            "description": "Secret en base32 (saisie manuelle dans l'application)."
+          }
+        }
+      },
+      "MfaSetupBody": {
+        "type": "object",
+        "description": "Body de `/auth/mfa/setup`.",
+        "required": [
+          "current_password"
+        ],
+        "properties": {
+          "current_password": {
+            "type": "string",
+            "description": "Mot de passe actuel (preuve de possession du compte)."
+          }
+        }
+      },
+      "MfaStatus": {
+        "type": "object",
+        "description": "État du second facteur du compte courant.",
+        "required": [
+          "enabled",
+          "pending",
+          "recovery_codes_left"
+        ],
+        "properties": {
+          "enabled": {
+            "type": "boolean",
+            "description": "MFA active : exigée à la connexion."
+          },
+          "pending": {
+            "type": "boolean",
+            "description": "Enrôlement commencé, pas encore confirmé par un code."
+          },
+          "recovery_codes_left": {
+            "type": "integer",
+            "description": "Codes de secours encore utilisables.",
+            "minimum": 0
+          }
+        }
+      },
+      "MfaVerifyBody": {
+        "type": "object",
+        "description": "Body de `/auth/mfa/verify`.",
+        "required": [
+          "mfa_token",
+          "code"
+        ],
+        "properties": {
+          "code": {
+            "type": "string",
+            "description": "Code à 6 chiffres de l'application, ou code de secours."
+          },
+          "mfa_token": {
+            "type": "string",
+            "description": "Jeton de défi reçu de `/auth/login`."
           }
         }
       },
@@ -2554,6 +3034,22 @@
           "status": {
             "type": "string",
             "description": "`ready`, `unavailable` ou `draining` (arrêt en cours)."
+          }
+        }
+      },
+      "RecoveryCodes": {
+        "type": "object",
+        "description": "Nouveaux codes de secours (les précédents ne valent plus rien).",
+        "required": [
+          "recovery_codes"
+        ],
+        "properties": {
+          "recovery_codes": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Codes de secours à usage unique."
           }
         }
       },
@@ -2799,7 +3295,7 @@
     },
     {
       "name": "auth",
-      "description": "Comptes : inscription, connexion, rotation des jetons."
+      "description": "Comptes : inscription, connexion, rotation des jetons, second facteur (TOTP)."
     },
     {
       "name": "admin",

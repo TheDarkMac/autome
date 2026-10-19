@@ -1,5 +1,5 @@
-// Onglet « Compte » (#196) : changement du mot de passe et suppression du
-// compte (#229, RGPD).
+// Onglet « Compte » (#196) : changement du mot de passe, double
+// authentification (#245) et suppression du compte (#229, RGPD).
 //
 // Changer son mot de passe ferme toutes les sessions côté serveur (autres
 // appareils compris) ; l'appareil courant reçoit une nouvelle paire de jetons
@@ -12,12 +12,15 @@
 import { useState, type FormEvent } from "react";
 
 import { validatePasswordChange } from "./auth";
+import { MfaSection, type MfaActions } from "./MfaSection";
 
 export interface AccountPanelProps {
   email?: string;
   changePassword: (currentPassword: string, newPassword: string) => Promise<void>;
   /** Suppression du compte ; absente ⇒ section masquée. */
   deleteAccount?: (currentPassword: string) => Promise<void>;
+  /** Double authentification (#245) ; absente ⇒ section masquée. */
+  mfa?: MfaActions;
 }
 
 /** Saisie de confirmation quand l'email n'est pas connu. */
@@ -33,6 +36,7 @@ export function AccountPanel({
   email,
   changePassword,
   deleteAccount,
+  mfa,
 }: AccountPanelProps): JSX.Element {
   const [current, setCurrent] = useState("");
   const [next, setNext] = useState("");
@@ -115,6 +119,8 @@ export function AccountPanel({
           {outcome.kind === "busy" ? "Changement…" : "Changer le mot de passe"}
         </button>
       </form>
+
+      {mfa && <MfaSection actions={mfa} />}
 
       {deleteAccount && <DeleteAccountForm email={email} deleteAccount={deleteAccount} />}
     </section>

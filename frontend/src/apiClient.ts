@@ -46,6 +46,7 @@ export const API_PATHS = {
   adminUserLogoutAll: "/admin/users/{id}/logout-all",
   adminUserVerifyEmail: "/admin/users/{id}/verify-email",
   adminUserInvitation: "/admin/users/{id}/invitation",
+  adminUserMfa: "/admin/users/{id}/mfa",
   adminWorkflows: "/admin/workflows",
 } as const;
 
@@ -127,6 +128,11 @@ export interface ApiClient {
   inviteUser(email: string, role: AssignableRole): Promise<Schemas["InvitedUser"]>;
   /** Renvoie l'invitation d'un compte en attente ; l'ancien lien expire. */
   resendInvitation(id: string): Promise<void>;
+  /**
+   * Réinitialise la double authentification d'un compte (#245) : téléphone
+   * et codes de secours perdus ; il se reconnecte au seul mot de passe.
+   */
+  resetUserMfa(id: string): Promise<Schemas["AdminUser"]>;
   /** Workflows de tous les comptes (#243) — réservé au super-admin (`*`). */
   listAllWorkflows(
     params?: ListAllWorkflowsParams,
@@ -328,6 +334,13 @@ export function createApiClient(fetchImpl: typeof fetch = fetch): ApiClient {
         "POST",
         buildPath(API_PATHS.adminUserInvitation, { id }),
         {},
+      );
+    },
+    resetUserMfa(id) {
+      return requestJson<Schemas["AdminUser"]>(
+        fetchImpl,
+        "DELETE",
+        buildPath(API_PATHS.adminUserMfa, { id }),
       );
     },
     listAllWorkflows(params = {}) {

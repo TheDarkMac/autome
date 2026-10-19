@@ -1,11 +1,13 @@
 // Page de connexion / inscription (F8.6.a), demande de lien de
-// réinitialisation du mot de passe (#204) et attente de la vérification de
-// l'adresse (#231).
+// réinitialisation du mot de passe (#204), attente de la vérification de
+// l'adresse (#231) et seconde étape de la connexion par code (#245).
 //
 // Formulaire unique avec bascule login ↔ signup ↔ « mot de passe oublié ».
 // Une inscription qui exige la vérification de l'adresse, ou une connexion
 // refusée faute de vérification, mène à l'écran « vérifiez votre boîte »
-// (renvoi du lien possible).
+// (renvoi du lien possible). Une connexion dont le second facteur est actif
+// (`MfaRequiredError`) mène à la saisie du code de l'application, ou d'un code
+// de secours.
 // La validation client (`validateCredentials`) évite les allers-retours
 // inutiles ; les erreurs serveur (401/409/…) remontent via
 // `ApiError.message`. Découplé du hook : reçoit `login`/`signup` (et
@@ -15,12 +17,14 @@ import { useState, type FormEvent } from "react";
 
 import {
   EmailNotVerifiedError,
+  MfaRequiredError,
   validateCredentials,
   type Credentials,
 } from "./auth";
+import { MfaChallengeExpiredError } from "./mfa";
 import type { PendingVerification } from "./useSession";
 
-type Mode = "login" | "signup" | "forgot" | "verify";
+type Mode = "login" | "signup" | "forgot" | "verify" | "mfa";
 
 /** Pourquoi l'écran de vérification est affiché. */
 type VerifyReason = "signup" | "login";
@@ -29,6 +33,8 @@ export interface LoginPageProps {
   login: (creds: Credentials) => Promise<void>;
   /** Inscription ; une adresse renvoyée ⇒ à vérifier avant connexion (#231). */
   signup: (creds: Credentials) => Promise<PendingVerification | null | void>;
+  /** Seconde étape de la connexion (#245) : défi + code ⇒ session. */
+  verifyMfa?: (mfaToken: string, code: string) => Promise<void>;
   /** Renvoi du lien de vérification (#231) ; absent ⇒ pas de bouton. */
   resendVerification?: (email: string) => Promise<void>;
   /** Demande d'un lien de réinitialisation ; absent ⇒ pas de lien « oublié ». */
@@ -50,6 +56,7 @@ export const VERIFICATION_RESENT_MESSAGE =
 export function LoginPage({
   login,
   signup,
+  verifyMfa,
   resendVerification,
   requestPasswordReset,
   notice = null,
@@ -64,8 +71,29 @@ export function LoginPage({
   const [pending, setPending] = useState<{ email: string; reason: VerifyReason } | null>(
     null,
   );
+  const [mfaToken, setMfaToken] = useState<string | null>(null);
 
   const isSignup = mode === "signup";
+
+  if (mode === "mfa" && mfaToken && verifyMfa) {
+    return (
+      <MfaCodeForm
+        verify={(code) => verifyMfa(mfaToken, code)}
+        onExpired={(message) => {
+          setMode("login");
+          setMfaToken(null);
+          setPassword("");
+          setError(message);
+        }}
+        onBack={() => {
+          setMode("login");
+          setMfaToken(null);
+          setPassword("");
+          setError(null);
+        }}
+      />
+    );
+  }
 
   if (mode === "verify" && pending) {
     return (
@@ -127,6 +155,11 @@ export function LoginPage({
       if (err instanceof EmailNotVerifiedError) {
         setPending({ email: err.email, reason: "login" });
         setMode("verify");
+        return;
+      }
+      if (err instanceof MfaRequiredError && verifyMfa) {
+        setMfaToken(err.mfaToken);
+        setMode("mfa");
         return;
       }
       setError(err instanceof Error ? err.message : "Échec de l'authentification.");
@@ -319,6 +352,122 @@ function VerifyEmailNotice({
           </button>
         </p>
       </section>
+    </main>
+  );
+}
+
+/** Seconde étape de la connexion (#245) : code de l'application ou de secours. */
+function MfaCodeForm({
+  verify,
+  onExpired,
+  onBack,
+}: {
+  verify: (code: string) => Promise<void>;
+  onExpired: (message: string) => void;
+  onBack: () => void;
+}): JSX.Element {
+  const [code, setCode] = useState("");
+  const [recovery, setRecovery] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [submitting, setSubmitting] = useState(false);
+
+  async function handleSubmit(e: FormEvent): Promise<void> {
+    e.preventDefault();
+    setError(null);
+    if (code.trim() === "") {
+      setError("Saisissez un code.");
+      return;
+    }
+    setSubmitting(true);
+    try {
+      await verify(code);
+      // Succès : le parent (App) re-rend hors de la page de login.
+    } catch (err) {
+      if (err instanceof MfaChallengeExpiredError) {
+        onExpired(err.message);
+        return;
+      }
+      setError(err instanceof Error ? err.message : "Échec de la vérification.");
+      setCode("");
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  return (
+    <main className="flex min-h-screen items-center justify-center bg-neutral-50 px-4">
+      <form
+        onSubmit={handleSubmit}
+        noValidate
+        aria-label="Vérification en deux étapes"
+        className="w-full max-w-sm rounded-xl border border-neutral-200 bg-white p-8 shadow-sm"
+      >
+        <h1 className="text-lg font-semibold text-neutral-900">
+          Vérification en deux étapes
+        </h1>
+        <p className="mt-1 text-sm text-neutral-500">
+          {recovery
+            ? "Saisissez l'un de vos codes de secours. Chaque code ne sert qu'une fois."
+            : "Saisissez le code à 6 chiffres affiché par votre application d'authentification."}
+        </p>
+
+        <div className="mt-6">
+          <label htmlFor="mfa-code" className="block text-sm font-medium text-neutral-700">
+            {recovery ? "Code de secours" : "Code de vérification"}
+          </label>
+          <input
+            id="mfa-code"
+            name="mfa-code"
+            type="text"
+            autoComplete="one-time-code"
+            inputMode={recovery ? "text" : "numeric"}
+            autoFocus
+            value={code}
+            onChange={(e) => setCode(e.target.value)}
+            className="mt-1 w-full rounded-md border border-neutral-300 px-3 py-2 font-mono text-sm tracking-widest outline-none focus:border-sky-500 focus:ring-1 focus:ring-sky-500"
+          />
+        </div>
+
+        {error && (
+          <p
+            role="alert"
+            className="mt-4 rounded-md bg-rose-50 px-3 py-2 text-sm text-rose-700"
+          >
+            {error}
+          </p>
+        )}
+
+        <button
+          type="submit"
+          disabled={submitting}
+          className="mt-6 w-full rounded-md bg-neutral-900 px-4 py-2 text-sm font-medium text-white transition hover:bg-neutral-700 disabled:opacity-50"
+        >
+          {submitting ? "Vérification…" : "Vérifier"}
+        </button>
+
+        <p className="mt-4 text-center text-sm text-neutral-500">
+          <button
+            type="button"
+            onClick={() => {
+              setRecovery(!recovery);
+              setCode("");
+              setError(null);
+            }}
+            className="font-medium text-sky-700 hover:underline"
+          >
+            {recovery ? "Utiliser l'application" : "Utiliser un code de secours"}
+          </button>
+        </p>
+        <p className="mt-2 text-center text-sm text-neutral-500">
+          <button
+            type="button"
+            onClick={onBack}
+            className="font-medium text-sky-700 hover:underline"
+          >
+            Retour à la connexion
+          </button>
+        </p>
+      </form>
     </main>
   );
 }
