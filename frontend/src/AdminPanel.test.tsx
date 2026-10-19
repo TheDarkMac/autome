@@ -15,6 +15,7 @@ function user(id: string, email: string, extra: Partial<AdminUser> = {}): AdminU
     permissions: ["workflows.read"],
     disabled: false,
     email_verified: true,
+    invitation_pending: false,
     created_at_ms: Date.UTC(2026, 9, 1),
     ...extra,
   };
@@ -35,6 +36,11 @@ function fakeApi(items: AdminUser[] = [ME, ALICE, BOSS], total = items.length): 
     logoutUser: vi.fn().mockResolvedValue(undefined),
     deleteUser: vi.fn().mockResolvedValue(undefined),
     verifyUserEmail: vi.fn(async (id: string) => ({ ...ALICE, id, email_verified: true })),
+    inviteUser: vi.fn(async (email: string, role: string) => ({
+      user: user("u-new", email, { role, email_verified: false, invitation_pending: true }),
+      invitation_sent: true,
+    })),
+    resendInvitation: vi.fn().mockResolvedValue(undefined),
   };
 }
 
@@ -226,5 +232,95 @@ describe("<AdminPanel />", () => {
     expect(
       within(row("root@example.io")).getByRole("button", { name: /Supprimer/ }),
     ).toBeDisabled();
+  });
+
+  it("invite une personne avec un rôle puis recharge la liste (#241)", async () => {
+    const api = fakeApi();
+    await renderPanel(api, { superAdmin: false });
+    const form = screen.getByRole("form", { name: "Inviter une personne" });
+    const admin = within(form).getByRole("option", { name: "Administrateur" }) as HTMLOptionElement;
+    expect(admin.disabled).toBe(true);
+    expect(within(form).getByRole("combobox")).toHaveValue("editor");
+
+    fireEvent.change(within(form).getByLabelText("Inviter par email"), {
+      target: { value: "ivy@example.io" },
+    });
+    fireEvent.change(within(form).getByRole("combobox"), { target: { value: "viewer" } });
+    await act(async () => {
+      fireEvent.click(within(form).getByRole("button", { name: "Inviter" }));
+    });
+    expect(api.inviteUser).toHaveBeenCalledWith("ivy@example.io", "viewer");
+    expect(screen.getByRole("status")).toHaveTextContent("Invitation envoyée à ivy@example.io.");
+    expect(api.listUsers).toHaveBeenCalledTimes(2);
+    expect(within(form).getByLabelText("Inviter par email")).toHaveValue("");
+  });
+
+  it("signale un email non parti et traduit les refus d'invitation", async () => {
+    const api = fakeApi();
+    api.inviteUser = vi
+      .fn()
+      .mockResolvedValueOnce({
+        user: user("u-new", "ivy@example.io", { invitation_pending: true }),
+        invitation_sent: false,
+      })
+      .mockRejectedValueOnce(new ApiError("POST a échoué (409)", 409))
+      .mockRejectedValueOnce(new ApiError("POST a échoué (503)", 503));
+    await renderPanel(api);
+    const form = screen.getByRole("form", { name: "Inviter une personne" });
+    const invite = async (email: string): Promise<void> => {
+      fireEvent.change(within(form).getByLabelText("Inviter par email"), {
+        target: { value: email },
+      });
+      await act(async () => {
+        fireEvent.click(within(form).getByRole("button", { name: "Inviter" }));
+      });
+    };
+    await invite("ivy@example.io");
+    expect(screen.getByRole("alert")).toHaveTextContent(/l'email n'est pas parti : renvoyez/);
+    await invite("alice@example.io");
+    expect(screen.getByRole("alert")).toHaveTextContent("un compte existe déjà pour cet email");
+    expect(within(form).getByLabelText("Inviter par email")).toHaveValue("alice@example.io");
+    await invite("joe@example.io");
+    expect(screen.getByRole("alert")).toHaveTextContent(/aucun envoi d'email/);
+  });
+
+  it("montre une invitation en attente, la renvoie ou l'annule", async () => {
+    const ivy = user("u-ivy", "ivy@example.io", {
+      email_verified: false,
+      invitation_pending: true,
+    });
+    const api = fakeApi([ME, ALICE, ivy]);
+    const confirm = vi.fn().mockReturnValue(true);
+    await renderPanel(api, { confirm });
+    const line = row("ivy@example.io");
+    expect(within(line).getByText("Invitation en attente")).toBeInTheDocument();
+    expect(within(line).queryByText("Email non vérifié")).toBeNull();
+    expect(within(line).queryByRole("button", { name: /Vérifier/ })).toBeNull();
+    expect(
+      within(row("alice@example.io")).queryByRole("button", { name: /Renvoyer/ }),
+    ).toBeNull();
+
+    await act(async () => {
+      fireEvent.click(
+        within(line).getByRole("button", { name: "Renvoyer l'invitation de ivy@example.io" }),
+      );
+    });
+    expect(api.resendInvitation).toHaveBeenCalledWith("u-ivy");
+    expect(screen.getByRole("status")).toHaveTextContent(/lien précédent ne fonctionne plus/);
+
+    api.resendInvitation = vi.fn().mockRejectedValue(new ApiError("POST a échoué (502)", 502));
+    await act(async () => {
+      fireEvent.click(within(line).getByRole("button", { name: /Renvoyer/ }));
+    });
+    expect(screen.getByRole("alert")).toHaveTextContent(/n'a pas pu être envoyé/);
+
+    await act(async () => {
+      fireEvent.click(
+        within(line).getByRole("button", { name: "Annuler l'invitation de ivy@example.io" }),
+      );
+    });
+    expect(confirm).toHaveBeenLastCalledWith(expect.stringMatching(/Annuler l'invitation/));
+    expect(api.deleteUser).toHaveBeenCalledWith("u-ivy");
+    expect(screen.getByRole("status")).toHaveTextContent("Invitation de ivy@example.io annulée.");
   });
 });

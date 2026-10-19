@@ -7,9 +7,11 @@ import {
   type Schemas,
 } from "./apiClient";
 import { fetchCatalog, STATIC_CATALOG, type CatalogItem } from "./catalog";
+import { AcceptInvitationPage } from "./AcceptInvitationPage";
 import { AccountPanel } from "./AccountPanel";
 import { AdminPanel } from "./AdminPanel";
 import {
+  readInviteToken,
   readResetToken,
   readVerifyToken,
   requestPasswordReset as apiRequestPasswordReset,
@@ -82,18 +84,22 @@ export function App({
     logoutAll,
     changePassword,
     deleteAccount,
+    acceptInvitation,
     authFetch,
   } = useSession(sessionOptions);
   const [logoutAllError, setLogoutAllError] = useState<string | null>(null);
 
   // Liens reçus par email — réinitialisation (#204), vérification de
-  // l'adresse (#231) : jeton lu une fois dans le fragment, puis retiré de la
-  // barre d'adresse (et de l'historique).
+  // l'adresse (#231), invitation (#241) : jeton lu une fois dans le fragment,
+  // puis retiré de la barre d'adresse (et de l'historique).
   const [resetToken, setResetToken] = useState<string | null>(() =>
     readResetToken(window.location.hash),
   );
   const [verifyToken, setVerifyToken] = useState<string | null>(() =>
     readVerifyToken(window.location.hash),
+  );
+  const [inviteToken, setInviteToken] = useState<string | null>(() =>
+    readInviteToken(window.location.hash),
   );
   const [loginNotice, setLoginNotice] = useState<string | null>(null);
   // Lien collé dans un onglet où l'app est déjà ouverte : seul le fragment
@@ -104,19 +110,21 @@ export function App({
       if (reset) setResetToken(reset);
       const verify = readVerifyToken(window.location.hash);
       if (verify) setVerifyToken(verify);
+      const invite = readInviteToken(window.location.hash);
+      if (invite) setInviteToken(invite);
     };
     window.addEventListener("hashchange", onHashChange);
     return () => window.removeEventListener("hashchange", onHashChange);
   }, []);
   useEffect(() => {
-    if (resetToken || verifyToken) {
+    if (resetToken || verifyToken || inviteToken) {
       window.history.replaceState(
         null,
         "",
         window.location.pathname + window.location.search,
       );
     }
-  }, [resetToken, verifyToken]);
+  }, [resetToken, verifyToken, inviteToken]);
   const onVerifyDone = useCallback(() => {
     setVerifyToken(null);
     setLoginNotice("Adresse email vérifiée : vous pouvez vous connecter.");
@@ -303,6 +311,16 @@ export function App({
         resetPassword={(token, next) => resetPasswordImpl(token, next)}
         onDone={onResetDone}
         onCancel={() => setResetToken(null)}
+      />
+    );
+  }
+  if (inviteToken) {
+    return (
+      <AcceptInvitationPage
+        token={inviteToken}
+        acceptInvitation={acceptInvitation}
+        onDone={() => setInviteToken(null)}
+        onCancel={() => setInviteToken(null)}
       />
     );
   }

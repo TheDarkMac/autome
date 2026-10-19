@@ -19,6 +19,7 @@
 //   - POST /auth/password/reset  { token, new_password } → 204
 //   - POST /auth/email/verify    { token }          → 204 (#231)
 //   - POST /auth/email/resend    { email }          → 202 (compte existant ou non)
+//   - POST /auth/invitation/accept { token, password } → TokenPair (#241)
 //   - GET  /auth/whoami   (Bearer access)          → "hello <sub>"
 //   - GET  /auth/me       (Bearer access)          → { id, email, role, permissions } (cf. apiClient)
 //
@@ -375,6 +376,51 @@ export async function verifyEmail(
   }
 }
 
+/**
+ * Accepte l'invitation reçue par email (#241) : le mot de passe choisi active
+ * le compte, et le serveur renvoie directement une paire de jetons.
+ */
+export async function acceptInvitation(
+  token: string,
+  password: string,
+  fetchImpl: typeof fetch = fetch,
+): Promise<TokenPair> {
+  const res = await postJson("/auth/invitation/accept", { token, password }, fetchImpl);
+  if (res.status === 400) {
+    const reason = await res.text();
+    throw new ApiError(
+      reason === INVALID_INVITE_LINK
+        ? "ce lien d'invitation est invalide, expiré ou déjà utilisé : demandez-en un nouveau à un administrateur"
+        : reason || "mot de passe refusé",
+      400,
+    );
+  }
+  if (res.status === 403) {
+    throw new ApiError("ce compte est suspendu : contactez un administrateur", 403);
+  }
+  if (res.status === 503) {
+    throw new ApiError("les invitations ne sont pas disponibles sur ce serveur", 503);
+  }
+  if (!res.ok) {
+    throw new ApiError(
+      `POST /auth/invitation/accept a échoué (${res.status})`,
+      res.status,
+    );
+  }
+  return parseTokenPair(await res.json());
+}
+
+/** Corps de la réponse 400 du serveur pour un lien d'invitation refusé. */
+const INVALID_INVITE_LINK = "invalid or expired invitation link";
+
+/** Préfixe du fragment des liens d'invitation (`…/#invite=<jeton>`, #241). */
+export const INVITE_HASH_PREFIX = "#invite=";
+
+/** Jeton d'invitation porté par le fragment de l'URL, ou `null`. */
+export function readInviteToken(hash: string): string | null {
+  return readHashToken(hash, INVITE_HASH_PREFIX);
+}
+
 /** Préfixe du fragment des liens de vérification (`…/#verify=<jeton>`). */
 export const VERIFY_HASH_PREFIX = "#verify=";
 
@@ -427,6 +473,8 @@ export async function whoami(
 
 /** Corps de la réponse 403 du login pour une adresse non vérifiée (#231). */
 const EMAIL_NOT_VERIFIED = "email not verified";
+/** Corps de la réponse 403 de l'inscription quand elles sont fermées (#241). */
+const SIGNUP_CLOSED = "signup closed";
 
 /** POST login/signup ; renvoie la réponse réussie, lève sinon. */
 async function postCredentials(
@@ -447,8 +495,15 @@ async function postCredentials(
     throw new ApiError("email ou mot de passe incorrect", 401);
   }
   if (res.status === 403) {
-    if ((await res.text().catch(() => "")) === EMAIL_NOT_VERIFIED) {
+    const reason = await res.text().catch(() => "");
+    if (reason === EMAIL_NOT_VERIFIED) {
       throw new EmailNotVerifiedError(creds.email.trim());
+    }
+    if (reason === SIGNUP_CLOSED) {
+      throw new ApiError(
+        "les inscriptions sont fermées : demandez une invitation à un administrateur",
+        403,
+      );
     }
     throw new ApiError("ce compte est suspendu : contactez un administrateur", 403);
   }

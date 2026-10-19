@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 
 import { ApiError } from "./api";
 import {
+  acceptInvitation,
   changePassword,
   decodeJwt,
   deleteAccount,
@@ -10,6 +11,7 @@ import {
   login,
   logout,
   logoutAll,
+  readInviteToken,
   readResetToken,
   readVerifyToken,
   refresh,
@@ -532,5 +534,50 @@ describe("vérification de l'email (#231)", () => {
     expect(readVerifyToken("#verify=")).toBeNull();
     expect(readVerifyToken("#reset=uid.1.mac")).toBeNull();
     expect(readResetToken("#verify=uid.1.mac")).toBeNull();
+  });
+});
+
+describe("invitations (#241)", () => {
+  it("acceptInvitation envoie le jeton et le mot de passe, et renvoie la paire", async () => {
+    const fetchImpl = vi.fn().mockResolvedValue(jsonResponse(TOKENS));
+    const pair = await acceptInvitation("uid.1.mac", "chosen-pw", fetchImpl);
+    expect(pair).toEqual({ accessToken: "a.b.c", refreshToken: "d.e.f" });
+    const [url, init] = fetchImpl.mock.calls[0]!;
+    expect(url).toMatch(/\/auth\/invitation\/accept$/);
+    expect(JSON.parse(init.body)).toEqual({ token: "uid.1.mac", password: "chosen-pw" });
+  });
+
+  it("explique un lien refusé, un compte suspendu et l'absence d'invitations", async () => {
+    const call = (res: Response) =>
+      acceptInvitation("x", "chosen-pw", vi.fn().mockResolvedValue(res));
+    await expect(
+      call(new Response("invalid or expired invitation link", { status: 400 })),
+    ).rejects.toMatchObject({ status: 400, message: /lien d'invitation est invalide/ });
+    await expect(
+      call(new Response("mot de passe trop court", { status: 400 })),
+    ).rejects.toMatchObject({ status: 400, message: "mot de passe trop court" });
+    await expect(call(new Response("account disabled", { status: 403 }))).rejects.toMatchObject({
+      status: 403,
+      message: /suspendu/,
+    });
+    await expect(call(new Response("", { status: 503 }))).rejects.toMatchObject({
+      status: 503,
+    });
+  });
+
+  it("traduit des inscriptions fermées", async () => {
+    await expect(
+      signup(
+        { email: "a@b.io", password: "longenough" },
+        vi.fn().mockResolvedValue(new Response("signup closed", { status: 403 })),
+      ),
+    ).rejects.toMatchObject({ status: 403, message: /inscriptions sont fermées/ });
+  });
+
+  it("lit le jeton du fragment #invite=", () => {
+    expect(readInviteToken("#invite=uid.1.mac")).toBe("uid.1.mac");
+    expect(readInviteToken("#invite=")).toBeNull();
+    expect(readInviteToken("#reset=uid.1.mac")).toBeNull();
+    expect(readResetToken("#invite=uid.1.mac")).toBeNull();
   });
 });

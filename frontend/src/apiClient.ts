@@ -45,6 +45,7 @@ export const API_PATHS = {
   adminUserEnable: "/admin/users/{id}/enable",
   adminUserLogoutAll: "/admin/users/{id}/logout-all",
   adminUserVerifyEmail: "/admin/users/{id}/verify-email",
+  adminUserInvitation: "/admin/users/{id}/invitation",
 } as const;
 
 /** Rôles attribuables par l'administration (#208). */
@@ -109,6 +110,13 @@ export interface ApiClient {
   deleteUser(id: string): Promise<void>;
   /** Marque vérifiée l'adresse email d'un compte (#231). */
   verifyUserEmail(id: string): Promise<Schemas["AdminUser"]>;
+  /**
+   * Invite une personne (#241) : compte créé au rôle choisi, sans mot de
+   * passe, et lien envoyé par email (`invitation_sent`).
+   */
+  inviteUser(email: string, role: AssignableRole): Promise<Schemas["InvitedUser"]>;
+  /** Renvoie l'invitation d'un compte en attente ; l'ancien lien expire. */
+  resendInvitation(id: string): Promise<void>;
 }
 
 /** `true` si les permissions contiennent `permission` (ou le joker `*`). */
@@ -293,6 +301,19 @@ export function createApiClient(fetchImpl: typeof fetch = fetch): ApiClient {
         "POST",
         buildPath(API_PATHS.adminUserVerifyEmail, { id }),
         { body: {} },
+      );
+    },
+    inviteUser(email, role) {
+      return requestJson<Schemas["InvitedUser"]>(fetchImpl, "POST", API_PATHS.adminUsers, {
+        body: { email: email.trim(), role },
+      });
+    },
+    resendInvitation(id) {
+      return requestVoid(
+        fetchImpl,
+        "POST",
+        buildPath(API_PATHS.adminUserInvitation, { id }),
+        {},
       );
     },
   };

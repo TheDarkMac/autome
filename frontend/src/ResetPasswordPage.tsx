@@ -3,7 +3,8 @@
 // Ouverte par le lien reçu par email (`…/#reset=<jeton>`). L'utilisateur
 // choisit un nouveau mot de passe (saisi deux fois) ; le serveur ferme alors
 // toutes ses sessions, d'où le retour à la page de connexion (`onDone`).
-// Découplée du réseau : reçoit `resetPassword` en props.
+// Découplée du réseau : reçoit `resetPassword` en props. Le formulaire
+// (`ChoosePasswordForm`) sert aussi à l'acceptation d'une invitation (#241).
 
 import { useState, type FormEvent } from "react";
 
@@ -25,6 +26,48 @@ export function ResetPasswordPage({
   onDone,
   onCancel,
 }: ResetPasswordPageProps): JSX.Element {
+  return (
+    <ChoosePasswordForm
+      label="Réinitialisation du mot de passe"
+      title="Choisir un nouveau mot de passe"
+      intro={`Au moins ${MIN_PASSWORD_LENGTH} caractères. Toutes vos sessions ouvertes seront fermées.`}
+      submitLabel="Enregistrer le mot de passe"
+      failure="Échec de la réinitialisation."
+      submit={(next) => resetPassword(token, next)}
+      onDone={onDone}
+      onCancel={onCancel}
+    />
+  );
+}
+
+export interface ChoosePasswordFormProps {
+  /** Nom accessible du formulaire. */
+  label: string;
+  title: string;
+  intro: string;
+  submitLabel: string;
+  /** Message d'un échec sans détail. */
+  failure: string;
+  /** Envoie le mot de passe choisi (rejette avec un message lisible). */
+  submit: (password: string) => Promise<void>;
+  onDone: () => void;
+  onCancel: () => void;
+}
+
+/**
+ * Choix d'un mot de passe saisi deux fois, partagé par la réinitialisation
+ * (#204) et l'acceptation d'une invitation (#241).
+ */
+export function ChoosePasswordForm({
+  label,
+  title,
+  intro,
+  submitLabel,
+  failure,
+  submit,
+  onDone,
+  onCancel,
+}: ChoosePasswordFormProps): JSX.Element {
   const [next, setNext] = useState("");
   const [confirm, setConfirm] = useState("");
   const [error, setError] = useState<string | null>(null);
@@ -40,10 +83,10 @@ export function ResetPasswordPage({
     setError(null);
     setSubmitting(true);
     try {
-      await resetPassword(token, next);
+      await submit(next);
       onDone();
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Échec de la réinitialisation.");
+      setError(err instanceof Error ? err.message : failure);
       setSubmitting(false);
     }
   }
@@ -53,16 +96,11 @@ export function ResetPasswordPage({
       <form
         onSubmit={handleSubmit}
         noValidate
-        aria-label="Réinitialisation du mot de passe"
+        aria-label={label}
         className="w-full max-w-sm rounded-xl border border-neutral-200 bg-white p-8 shadow-sm"
       >
-        <h1 className="text-lg font-semibold text-neutral-900">
-          Choisir un nouveau mot de passe
-        </h1>
-        <p className="mt-1 text-sm text-neutral-500">
-          Au moins {MIN_PASSWORD_LENGTH} caractères. Toutes vos sessions
-          ouvertes seront fermées.
-        </p>
+        <h1 className="text-lg font-semibold text-neutral-900">{title}</h1>
+        <p className="mt-1 text-sm text-neutral-500">{intro}</p>
 
         <div className="mt-6 space-y-4">
           <PasswordField
@@ -93,7 +131,7 @@ export function ResetPasswordPage({
           disabled={submitting}
           className="mt-6 w-full rounded-md bg-neutral-900 px-4 py-2 text-sm font-medium text-white transition hover:bg-neutral-700 disabled:opacity-50"
         >
-          {submitting ? "Veuillez patienter…" : "Enregistrer le mot de passe"}
+          {submitting ? "Veuillez patienter…" : submitLabel}
         </button>
 
         <p className="mt-4 text-center text-sm text-neutral-500">
