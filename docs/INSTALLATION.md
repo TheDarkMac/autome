@@ -57,8 +57,9 @@ cp .env.example .env
 | `AUTOME_RUN_TIMEOUT_SECS` | Worker : au-delà, une tentative encore `running` est close en `failed` (min. 60) | `3600` | > durée du plus long run |
 | `AUTOME_RUN_LEASE_SECS` | Worker : bail d'un run en cours (min. 10) ; sans battement depuis ce délai (worker tué), le run est remis en file et repris par un autre worker | `60` | `60` |
 | `AUTOME_SCHEDULER_TICK_SECS` | Worker : période de la boucle des déclencheurs `schedule` / `polling` (s, `0` = désactivée) | `10` | `10` |
-| `AUTOME_SMTP_URL` | Relais SMTP des emails (mot de passe oublié, vérification de l'adresse) : `smtps://user:pass@hôte` (TLS, 465) ou `smtp://hôte:587?tls=required` (STARTTLS). Contient un mot de passe : à mettre dans un secret | *(non défini : liens journalisés en `dev`)* | **requis pour le mot de passe oublié** (sinon 503) et la vérification de l'email (sinon comptes créés vérifiés) |
+| `AUTOME_SMTP_URL` | Relais SMTP des emails (mot de passe oublié, vérification de l'adresse, invitations) : `smtps://user:pass@hôte` (TLS, 465) ou `smtp://hôte:587?tls=required` (STARTTLS). Contient un mot de passe : à mettre dans un secret | *(non défini : liens journalisés en `dev`)* | **requis pour le mot de passe oublié et les invitations** (sinon 503) et la vérification de l'email (sinon comptes créés vérifiés) |
 | `AUTOME_EMAIL_VERIFICATION` | `required` : un compte inscrit ne se connecte qu'après avoir ouvert le lien reçu par email (dès qu'un envoi d'email est possible) ; `off` : comptes créés vérifiés (#231) | `required` | `required` |
+| `AUTOME_SIGNUP` | `open` : inscriptions publiques (`/auth/signup`) ; `invite_only` : comptes créés par invitation d'un administrateur seulement, `/auth/signup` répond 403 `signup closed` (#241). Autre valeur : refus de démarrer | `open` | selon l'instance (`invite_only` pour une équipe fermée) |
 | `AUTOME_MAIL_FROM` | Expéditeur des emails, ex. `Autome <no-reply@exemple.fr>` | *(non défini)* | obligatoire avec `AUTOME_SMTP_URL` |
 | `AUTOME_CORS_ORIGINS` | Origines du **frontend** autorisées à appeler l'API depuis le navigateur (`scheme://hôte[:port]`, séparées par des virgules ; ni joker, ni chemin — refus de démarrer sinon). Vide = aucune | `http://localhost:5173,http://localhost:8081` | **obligatoire** si le frontend est servi sur une autre origine que l'API |
 | `AUTOME_PUBLIC_URL` | URL publique du **frontend**, base des liens envoyés par email (jamais déduite de l'en-tête `Host`) | `http://localhost:5173` | obligatoire avec `AUTOME_SMTP_URL` |
@@ -630,7 +631,7 @@ comptes sont publics ; tout le reste exige `Authorization: Bearer <access_token>
 
 | Méthode | Path | Body | Réponse |
 |---|---|---|---|
-| POST | `/auth/signup` | `{"email","password"}` | 201 + paire de jetons (vérification désactivée) · 202 `{"email","verification_required":true}` sans jetons, lien de vérification envoyé · 400 saisie invalide · 409 email déjà pris |
+| POST | `/auth/signup` | `{"email","password"}` | 201 + paire de jetons (vérification désactivée) · 202 `{"email","verification_required":true}` sans jetons, lien de vérification envoyé · 400 saisie invalide · 403 `signup closed` (`AUTOME_SIGNUP=invite_only`) · 409 email déjà pris |
 | POST | `/auth/login` | `{"email","password"}` | 200 + paire de jetons · 401 identifiants invalides · 403 `account disabled` (compte suspendu) ou `email not verified` · 429 trop d'échecs (`Retry-After`) |
 | POST | `/auth/refresh` | `{"refresh_token"}` | 200 + nouvelle paire · 401 refresh invalide, expiré ou déjà utilisé |
 | POST | `/auth/logout` | `{"refresh_token"}` (+ `Authorization: Bearer <access_token>` facultatif) | 204 session fermée (aussi si déjà fermée) · 401 refresh invalide ou expiré |
@@ -640,6 +641,7 @@ comptes sont publics ; tout le reste exige `Authorization: Bearer <access_token>
 | POST | `/auth/password/reset` | `{"token","new_password"}` | 204 mot de passe remplacé, sessions fermées · 400 lien invalide, expiré ou déjà utilisé, ou mot de passe invalide · 503 non configuré |
 | POST | `/auth/email/verify` | `{"token"}` | 204 adresse vérifiée · 400 lien invalide ou expiré · 503 vérification désactivée |
 | POST | `/auth/email/resend` | `{"email"}` | 202 demande prise en compte (que le compte existe ou non) · 400 email invalide · 429 trop de demandes · 503 vérification désactivée |
+| POST | `/auth/invitation/accept` | `{"token","password"}` | 200 + paire de jetons, compte activé et adresse vérifiée · 400 lien invalide, expiré, déjà utilisé ou remplacé par un renvoi, ou mot de passe invalide · 403 `account disabled` · 503 aucun envoi d'email configuré |
 | GET | `/auth/me` | — (Bearer requis) | 200 `{"id","email","role","permissions"}` · 401 session invalide ou compte suspendu |
 | DELETE | `/auth/me` | `{"current_password"}` (Bearer requis) | 204 compte et données effacés, sessions fermées · 401 session invalide ou compte suspendu · 403 mot de passe actuel incorrect · 409 compte administrateur (`*`) · 429 trop d'essais |
 
@@ -735,6 +737,21 @@ comptes sont publics ; tout le reste exige `Authorization: Bearer <access_token>
   normalisé (trim + minuscules).
 - Un compte créé par `signup` reçoit le rôle **editor** (CRUD workflows, runs,
   credentials) — pas d'administration (voir « Administration des utilisateurs »).
+  Avec `AUTOME_SIGNUP=invite_only`, `signup` répond 403 `signup closed` (audit
+  `auth.signup` `Denied`) et les comptes ne naissent que par invitation ; le
+  frontend affiche « les inscriptions sont fermées : demandez une invitation à
+  un administrateur ».
+- **Acceptation d'une invitation** (#241) : le lien
+  `AUTOME_PUBLIC_URL/#invite=<jeton>` ouvre la page « Bienvenue sur Autome » ;
+  le mot de passe choisi (saisi deux fois) active le compte, l'adresse est
+  marquée vérifiée (le lien a été reçu) et la session s'ouvre aussitôt — une
+  session déjà ouverte dans ce navigateur est d'abord fermée. Le jeton est sans
+  état, sous sa propre clé, lié au hash inutilisable du compte invité : il
+  vaut **7 jours**, une seule fois, et meurt quand l'invitation est renvoyée.
+  Tant qu'elle n'est pas acceptée, une connexion au compte répond 401 comme un
+  mauvais mot de passe (vérifiée contre le hash leurre : même durée), et
+  « Mot de passe oublié » fonctionne aussi pour l'activer. Audit
+  `auth.invitation_accept`.
 - Anti-bruteforce : 5 tentatives sans succès par email et par fenêtre de 15 min,
   puis 429 (`Retry-After`) jusqu'à la fin de la fenêtre — même avec le bon mot
   de passe. En `AUTOME_PERSISTENCE=postgres`, le compteur est **partagé par
@@ -811,9 +828,11 @@ Onglet « Administration » du frontend, visible des seuls comptes qui détienne
 | POST | `/admin/users/{id}/enable` | — | 200 compte réactivé · 403 · 404 |
 | POST | `/admin/users/{id}/logout-all` | — | 204 sessions du compte fermées · 403 · 404 |
 | POST | `/admin/users/{id}/verify-email` | — | 200 compte, adresse vérifiée · 403 · 404 |
+| POST | `/admin/users` | `{"email","role"?}` (`role` : `admin`\|`editor`\|`viewer`, défaut `editor`) | 201 `{"user","invitation_sent"}` compte invité · 400 email ou rôle invalide · 403 (`admin` sans `*`) · 409 email déjà pris · 503 aucun envoi d'email |
+| POST | `/admin/users/{id}/invitation` | — | 204 invitation renvoyée, anciens liens invalidés · 403 · 404 · 409 compte déjà activé ou suspendu · 502 email non envoyé · 503 aucun envoi d'email |
 | DELETE | `/admin/users/{id}` | — | 204 compte et données effacés · 403 · 404 · 409 son propre compte |
 
-Un compte vaut `{"id","email","role","permissions","disabled","email_verified","created_at_ms"}`
+Un compte vaut `{"id","email","role","permissions","disabled","email_verified","invitation_pending","created_at_ms"}`
 (jamais le hash du mot de passe). Règles :
 
 - Le **rôle** n'est qu'une vue des permissions : `admin` = `*`, `editor` et
@@ -847,14 +866,27 @@ Un compte vaut `{"id","email","role","permissions","disabled","email_verified","
   `admin.users_list`, `admin.user_get`, `admin.user_role` (avec `from`/`to`),
   `admin.user_disable`, `admin.user_enable`, `admin.user_logout_all`,
   `admin.user_verify_email`, `admin.user_delete` (ressource = pseudonyme du compte effacé, avec le nombre
-  de workflows, runs et tokens supprimés) ; les refus (403/409) sont audités
+  de workflows, runs et tokens supprimés), `admin.user_invite` (avec `role`
+  et `sent`), `admin.user_invite_resend` ; les refus (403/409) sont audités
   `Denied`.
-- Pas de création de compte par un administrateur : un compte s'inscrit
-  lui-même (`/auth/signup`), puis un administrateur ajuste son rôle.
+- **Invitation** (#241) : formulaire « Inviter par email » de l'onglet (email
+  et rôle ; `admin` réservé à `*`, comme ci-dessus). Le compte est créé au rôle
+  choisi **sans mot de passe utilisable** et non vérifié, puis un email part
+  avec le lien d'activation (7 jours). L'envoi est **synchrone** :
+  `invitation_sent: false` (relais SMTP en panne) laisse le compte créé, à qui
+  l'on renvoie l'invitation (« Renvoyer l'invitation » ; 502 si l'email ne part
+  toujours pas). Chaque renvoi invalide les liens précédents. Badge
+  « Invitation en attente » tant que le mot de passe n'est pas choisi ;
+  « Annuler l'invitation » supprime le compte (même route que la
+  suppression). Un compte qui a déjà choisi son mot de passe ou qui est
+  suspendu ne reçoit pas de renvoi (409). Sans envoi d'email possible
+  (`prod` sans SMTP), les deux routes répondent 503.
 
 **Premier administrateur** : l'API n'en crée jamais (aucune promotion par
 HTTP). Inscrire le compte, puis le promouvoir depuis l'infrastructure — la
-commande lit `DATABASE_URL` et exige `AUTOME_PERSISTENCE=postgres` :
+commande lit `DATABASE_URL` et exige `AUTOME_PERSISTENCE=postgres`. Sur une
+instance aux inscriptions fermées (`AUTOME_SIGNUP=invite_only`), l'inviter
+directement avec le rôle `admin` (voir plus bas) :
 
 ```bash
 docker compose exec api autome-api promote-admin admin@example.com
@@ -868,6 +900,19 @@ Elle donne le rôle `admin` (`*`), réactive le compte s'il était suspendu et
 vérifie son adresse email — c'est aussi le recours si plus aucun
 administrateur n'a accès. Audit `admin.user_promote` sous l'acteur `cli`. Email
 inconnu : code de sortie non nul et message `aucun compte pour …`.
+
+`autome-api invite <email> [admin|editor|viewer]` (mêmes prérequis, plus un
+envoi d'email : SMTP, ou journal de la commande en `dev`) crée un compte invité
+au rôle donné (défaut `editor`) et lui envoie le lien d'activation — c'est
+l'amorçage d'une instance fermée :
+
+```bash
+docker compose exec api autome-api invite admin@example.com admin
+```
+
+Audit `admin.user_invite` sous l'acteur `cli`. Email déjà pris ou rôle
+inconnu : code de sortie non nul. Compte créé mais email non parti : code de
+sortie non nul, renvoyer l'invitation depuis l'onglet Administration.
 
 `autome-api verify-email <email>` (mêmes prérequis) vérifie seulement
 l'adresse d'un compte, sans toucher à ses droits — envoi d'emails en panne,
@@ -974,6 +1019,8 @@ npm run test       # Vitest
 | `TLS partiellement configuré` au démarrage | Une seule des deux variables TLS positionnée | Définir `AUTOME_TLS_CERT` **et** `AUTOME_TLS_KEY`, ou aucune |
 | « Mot de passe oublié » répond 503 / « pas disponible sur ce serveur » | Profil `prod` sans `AUTOME_SMTP_URL` | Définir `AUTOME_SMTP_URL`, `AUTOME_MAIL_FROM` et `AUTOME_PUBLIC_URL` |
 | Aucun email de réinitialisation reçu | Relais SMTP refusé/injoignable (log `envoi du lien de réinitialisation impossible`), quota atteint, ou adresse sans compte | Vérifier `AUTOME_SMTP_URL` et les journaux de l'API ; en `dev` sans SMTP, le lien est dans les journaux |
+| Inscription refusée « les inscriptions sont fermées » (403 `signup closed`) | `AUTOME_SIGNUP=invite_only` (#241) | Se faire inviter par un administrateur (onglet Administration) ou, pour le premier compte, `autome-api invite <email> admin` |
+| « Ce lien d'invitation est invalide, expiré ou déjà utilisé » | Lien de plus de 7 jours, déjà utilisé, ou remplacé par un renvoi (#241) | Demander un renvoi à un administrateur (« Renvoyer l'invitation »), ou utiliser « Mot de passe oublié » avec l'adresse invitée |
 | Connexion refusée « adresse email pas encore vérifiée » (403 `email not verified`) | Lien de vérification pas encore ouvert (#231) | Ouvrir le lien reçu ou cliquer « Renvoyer le lien » ; en `dev` sans SMTP, le lien est dans les journaux de l'API ; sinon `autome-api verify-email <email>` ou l'onglet Administration |
 | Console du navigateur : `blocked by CORS policy` / préflight `OPTIONS` en 405 ; l'interface ne charge rien | Origine du frontend absente de `AUTOME_CORS_ORIGINS` (aucune par défaut en `prod`) | Ajouter l'origine exacte du frontend (schéma + hôte + port) à `AUTOME_CORS_ORIGINS` et redémarrer l'API |
 | Port déjà utilisé (`address already in use`) | 8080/8081/3000/9090/5432/15672 occupé | Libérer le port ou ajuster `APP_HTTP_ADDR` / les mappings du compose |
