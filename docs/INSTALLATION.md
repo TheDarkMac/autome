@@ -75,9 +75,15 @@ connexion part vers l'adresse vérifiée : pas de DNS rebinding) et sur chaque
 redirection (5 au plus). Délai 30 s (connexion 10 s), réponse ≤ 10 Mio.
 
 Pour joindre un service interne légitime (IdP on-prem, API intranet), ajoutez
-son nom ou son IP à `AUTOME_EGRESS_ALLOWLIST`. Avec un **proxy sortant**
-(`HTTPS_PROXY`), ajoutez le proxy à l'allowlist : le filtrage des noms d'hôte
-revient alors au proxy, qui fait la résolution DNS.
+son nom ou son IP à `AUTOME_EGRESS_ALLOWLIST`.
+
+**Proxy sortant** : `HTTP_PROXY`, `HTTPS_PROXY` et `ALL_PROXY` (et leurs formes
+en minuscules) sont **ignorés** par ces requêtes ; l'API et le worker
+l'indiquent au démarrage. Derrière un proxy, c'est lui qui résoudrait l'hôte
+cible, hors de portée du filtre : `http://localhost/` ou un nom interne
+redeviendraient joignables (#233). Si le réseau impose de sortir par un proxy,
+utilisez une passerelle transparente (NAT, egress gateway du maillage) : la
+connexion part alors vers l'adresse déjà vérifiée.
 
 ### Perte du broker (RabbitMQ)
 
