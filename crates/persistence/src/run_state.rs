@@ -41,6 +41,36 @@ fn status_from_str(s: &str) -> autome_core::Result<RunStatus> {
     }
 }
 
+/// Sorties d'un checkpoint, dans la transaction `tx`. La map fait foi :
+/// toutes les sorties en un upsert, puis suppression des seules sorties
+/// disparues — deux instructions quel que soit le nombre de nodes (#198 ;
+/// avant : un DELETE puis un INSERT par node).
+async fn write_steps(
+    tx: &tokio_postgres::Transaction<'_>,
+    snapshot: &RunCheckpoint,
+) -> autome_core::Result<()> {
+    let node_ids: Vec<&str> = snapshot.outputs.keys().map(String::as_str).collect();
+    let outputs: Vec<&Value> = snapshot.outputs.values().collect();
+    if !node_ids.is_empty() {
+        tx.execute(
+            "INSERT INTO run_steps (run_id, node_id, output) \
+             SELECT $1, node_id, output FROM UNNEST($2::text[], $3::jsonb[]) \
+               AS s(node_id, output) \
+             ON CONFLICT (run_id, node_id) DO UPDATE SET output = EXCLUDED.output",
+            &[&snapshot.run_id, &node_ids, &outputs],
+        )
+        .await
+        .map_err(|e| storage_err("upsert steps", e))?;
+    }
+    tx.execute(
+        "DELETE FROM run_steps WHERE run_id = $1 AND node_id <> ALL($2::text[])",
+        &[&snapshot.run_id, &node_ids],
+    )
+    .await
+    .map_err(|e| storage_err("prune steps", e))?;
+    Ok(())
+}
+
 /// Store d'état de runs persisté dans PostgreSQL.
 #[derive(Clone)]
 pub struct PgRunStateStore {
@@ -153,30 +183,47 @@ impl RunStateStore for PgRunStateStore {
         .await
         .map_err(|e| storage_err("checkpoint", e))?;
 
-        // La map fait foi : toutes les sorties en un upsert, puis suppression
-        // des seules sorties disparues — deux instructions quel que soit le
-        // nombre de nodes (#198 ; avant : un DELETE puis un INSERT par node).
-        let node_ids: Vec<&str> = snapshot.outputs.keys().map(String::as_str).collect();
-        let outputs: Vec<&Value> = snapshot.outputs.values().collect();
-        if !node_ids.is_empty() {
-            tx.execute(
-                "INSERT INTO run_steps (run_id, node_id, output) \
-                 SELECT $1, node_id, output FROM UNNEST($2::text[], $3::jsonb[]) \
-                   AS s(node_id, output) \
-                 ON CONFLICT (run_id, node_id) DO UPDATE SET output = EXCLUDED.output",
-                &[&snapshot.run_id, &node_ids, &outputs],
-            )
-            .await
-            .map_err(|e| storage_err("upsert steps", e))?;
-        }
-        tx.execute(
-            "DELETE FROM run_steps WHERE run_id = $1 AND node_id <> ALL($2::text[])",
-            &[&snapshot.run_id, &node_ids],
-        )
-        .await
-        .map_err(|e| storage_err("prune steps", e))?;
+        write_steps(&tx, snapshot).await?;
         tx.commit().await.map_err(|e| storage_err("commit", e))?;
         Ok(())
+    }
+
+    async fn finish(&self, snapshot: &RunCheckpoint) -> autome_core::Result<bool> {
+        let mut client = self.pool.get().await.map_err(|e| storage_err("pool", e))?;
+        let tx = client
+            .transaction()
+            .await
+            .map_err(|e| storage_err("begin", e))?;
+        // `UPDATE` seul, jamais d'insertion : un run effacé entre-temps
+        // (#229) n'est pas recréé. Le verrou de ligne sérialise l'écriture
+        // avec un effacement concurrent ; `owner_id` reste celui en place.
+        let n = tx
+            .execute(
+                "UPDATE runs SET workflow_id = $2, version = $3, status = $4, \
+                   trigger_type = $5, started_at_ms = $6, finished_at_ms = $7, \
+                   created_at_ms = $8, next_node = $9, error = $10 \
+                 WHERE id = $1",
+                &[
+                    &snapshot.run_id,
+                    &snapshot.workflow_id,
+                    &snapshot.version,
+                    &status_to_str(snapshot.status),
+                    &snapshot.trigger_type,
+                    &snapshot.started_at_ms,
+                    &snapshot.finished_at_ms,
+                    &snapshot.created_at_ms,
+                    &snapshot.next_node,
+                    &snapshot.error,
+                ],
+            )
+            .await
+            .map_err(|e| storage_err("finish", e))?;
+        if n == 0 {
+            return Ok(false);
+        }
+        write_steps(&tx, snapshot).await?;
+        tx.commit().await.map_err(|e| storage_err("commit", e))?;
+        Ok(true)
     }
 
     async fn load(&self, run_id: &str) -> autome_core::Result<Option<RunCheckpoint>> {

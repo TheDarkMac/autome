@@ -291,3 +291,32 @@ async fn batched_outputs_keep_the_map_authoritative() {
     let claimed = store.try_claim("q", 50).await.unwrap().unwrap();
     assert_eq!(claimed.outputs["seed"], json!("payload"));
 }
+
+#[tokio::test]
+async fn finish_updates_an_existing_run_and_never_recreates_an_erased_one() {
+    let Some((store, _serial)) = setup().await else {
+        eprintln!("TEST_DATABASE_URL absent → test PostgreSQL sauté");
+        return;
+    };
+    let queued =
+        RunCheckpoint::queued("r1", "wf", 1, "manual", 1_000).with_owner(Some("alice".into()));
+    store.checkpoint(&queued).await.unwrap();
+
+    let mut done = RunCheckpoint::queued("r1", "wf", 1, "manual", 1_000);
+    done.status = RunStatus::Succeeded;
+    done.started_at_ms = Some(1_100);
+    done.finished_at_ms = Some(1_200);
+    done.outputs.insert("call".into(), json!({ "ok": true }));
+    assert!(store.finish(&done).await.unwrap());
+    let got = store.load("r1").await.unwrap().unwrap();
+    assert_eq!(got.status, RunStatus::Succeeded);
+    assert_eq!(got.finished_at_ms, Some(1_200));
+    assert_eq!(got.outputs["call"], json!({ "ok": true }));
+    assert_eq!(got.owner_id.as_deref(), Some("alice"), "propriétaire gardé");
+
+    // Run inconnu (effacé pendant l'exécution, #229) : ni ligne ni sorties.
+    let mut ghost = done.clone();
+    ghost.run_id = "ghost".into();
+    assert!(!store.finish(&ghost).await.unwrap());
+    assert!(store.load("ghost").await.unwrap().is_none());
+}
