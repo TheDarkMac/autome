@@ -15,8 +15,8 @@ Déclenchée sur **push** et **pull request** vers `main`. Reproduit la
 
 | Job | Étapes |
 |---|---|
-| **Backend (Rust)** | services `postgres:16-alpine` + `rabbitmq:3-management-alpine` (healthchecks) · toolchain pinnée + cache · `cargo fmt --all --check` · `cargo clippy --workspace --all-targets -- -D warnings` · `scripts/check-migrations.sh` (migrations + seed + invariants) · `cargo test --workspace --locked -- --nocapture` avec `TEST_DATABASE_URL` / `TEST_AMQP_URL` · garde-fou « aucun test réel sauté » · `cargo build --workspace --release --locked` |
-| **Frontend (Node)** | Corepack/pnpm · `pnpm install --frozen-lockfile` · `pnpm run typecheck` · `pnpm run lint` · `pnpm run test` (Vitest) |
+| **Backend (Rust)** | services `postgres:16-alpine` + `rabbitmq:3-management-alpine` (healthchecks) · toolchain pinnée + cache · `cargo fmt --all --check` · `cargo clippy --workspace --all-targets -- -D warnings` · `scripts/check-migrations.sh` (migrations + seed + invariants) · `cargo llvm-cov --no-report --workspace --locked -- --nocapture` (tests instrumentés) avec `TEST_DATABASE_URL` / `TEST_AMQP_URL` · garde-fou « aucun test réel sauté » · rapport de couverture (résumé du job + artefact `coverage-backend`) · plancher `--fail-under-lines` / `--fail-under-functions` · `cargo build --workspace --release --locked` |
+| **Frontend (Node)** | Corepack/pnpm · `pnpm install --frozen-lockfile` · `pnpm run typecheck` · `pnpm run lint` · `pnpm run test:coverage` (Vitest, couverture v8 et planchers de `vite.config.ts`) · rapport de couverture (résumé du job + artefact `coverage-frontend`) |
 | **Smoke e2e (Docker Compose)** | `docker/bake-action` construit les images `api` / `worker` depuis le compose (surcharge `docker/compose.ci.yml`, cache `gha` partagé avec la CD) · `docker compose up --no-build --wait api worker` (PostgreSQL + RabbitMQ, healthchecks) · `scripts/compose-smoke.sh` · journaux des conteneurs si échec · `down --volumes` toujours — #216 |
 
 - `concurrency` avec `cancel-in-progress` (annule les runs obsolètes).
@@ -31,6 +31,22 @@ Déclenchée sur **push** et **pull request** vers `main`. Reproduit la
 - Garde-fou : l'étape *Real-service tests were not skipped* échoue si la
   sortie des tests contient un message de saut PostgreSQL/RabbitMQ, et liste
   les binaires de tests réels exécutés (preuve dans les logs).
+- **Couverture chiffrée** (#247), sans service tiers :
+  - backend : `cargo llvm-cov` remplace `cargo test` (tests exécutés une seule
+    fois, instrumentés, toujours contre les services réels du job). Total puis
+    une ligne par crate (lignes, fonctions, régions) dans le résumé du job,
+    rendu par `scripts/coverage-summary.sh rust` ; `lcov.info` +
+    `coverage.json` en artefact (14 jours).
+  - frontend : `vitest run --coverage` (fournisseur v8) sur tout `src/`
+    (fichiers non testés compris ; exclus : tests, `apiSchema.ts` généré,
+    `main.tsx`), lignes / instructions / fonctions / branches dans le résumé,
+    `lcov.info` + rapport HTML en artefact.
+  - **Planchers bloquants** juste sous la mesure courante : options
+    `--fail-under-*` de l'étape *Coverage threshold* (`ci.yml`) et
+    `test.coverage.thresholds` (`frontend/vite.config.ts`). On les remonte
+    quand la couverture monte ; on ne les baisse pas pour faire passer une PR.
+  - En local : `cargo llvm-cov --workspace` (`cargo install cargo-llvm-cov` +
+    `rustup component add llvm-tools-preview`), `pnpm run test:coverage`.
 - `scripts/check-migrations.sh` démarre son propre PostgreSQL jetable
   (`postgres:16-alpine`, surchargeable par `PGIMAGE`) : schéma vierge, toutes
   les migrations dans l'ordre + seed de dev, puis invariants (tables, contraintes).
@@ -62,7 +78,7 @@ protégé + secret optionnel.
 | Aspect | État | Référence |
 |---|---|---|
 | Lockfile Rust | `Cargo.lock` **versionné** | racine du dépôt |
-| Builds Rust verrouillés | `--locked` en CI (`clippy`, `test`, `build`) **et** dans les Dockerfiles | `ci.yml`, `docker/*.Dockerfile` |
+| Builds Rust verrouillés | `--locked` en CI (`clippy`, `llvm-cov`, `build`) **et** dans les Dockerfiles | `ci.yml`, `docker/*.Dockerfile` |
 | Lockfile frontend | `pnpm-lock.yaml` **versionné** + `pnpm install --frozen-lockfile` (CI + Docker) | `frontend/`, `ci.yml`, `frontend/Dockerfile` |
 | Toolchain Rust | **pinnée 1.90** (CI `dtolnay/rust-toolchain@1.90` + images `rust:1.90-bookworm`) | `ci.yml`, `docker/*` |
 | MSRV | `rust-version = "1.85"` (plancher edition2024) | `Cargo.toml` |
@@ -116,9 +132,10 @@ protégé + secret optionnel.
 **Intégration (CI)**
 - [x] `cargo fmt --all --check` vert.
 - [x] `cargo clippy --workspace --all-targets -- -D warnings` vert.
-- [x] `cargo test --workspace --locked` vert.
+- [x] `cargo test --workspace --locked` vert (via `cargo llvm-cov`).
 - [x] `cargo build --workspace --release --locked` vert.
 - [x] Frontend : `typecheck` + `lint` + `test` verts.
+- [x] Couverture chiffrée backend et frontend dans le résumé du job, avec plancher bloquant — #247.
 - [x] CI déclenchée sur push **et** PR vers `main`.
 - [x] Smoke de bout en bout sur la stack Compose (images réelles, PostgreSQL, RabbitMQ) — #216.
 - [x] Tests PostgreSQL/RabbitMQ réels (`TEST_DATABASE_URL` / `TEST_AMQP_URL`) exécutés en CI, avec garde-fou contre le saut silencieux — #218.

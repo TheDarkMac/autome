@@ -105,11 +105,15 @@ cd frontend && npm install && npm run dev
 cargo test --workspace                 # backend (unitaires + intégration + e2e)
 cd frontend && npm run test            # frontend (Vitest)
 scripts/check-migrations.sh            # applique les migrations sur un PG jetable (Docker)
+cargo llvm-cov --workspace             # couverture backend (cargo-llvm-cov)
+cd frontend && npm run test:coverage   # couverture frontend (Vitest, v8)
 ```
 
 La CI rejoue exactement cette « definition of done » :
 `cargo fmt --check`, `cargo clippy -D warnings`, `cargo test --workspace`,
-puis `typecheck` / `lint` / `test` côté frontend.
+puis `typecheck` / `lint` / `test` côté frontend. Les tests y tournent avec la
+couverture chiffrée (résumé du job, plancher bloquant — cf.
+[CICD](docs/CICD.md)).
 
 ---
 
