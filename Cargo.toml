@@ -63,6 +63,8 @@ deadpool-postgres = "0.14"
 lapin = "2"
 tokio-executor-trait = "2"
 tokio-reactor-trait = "1"
+# `StreamExt::next` sur le consommateur `basic_consume` de lapin (#237).
+futures-lite = "2"
 # TLS (F6.4) — server HTTPS rustls (provider explicite : ring)
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 rustls-pemfile = "2"
