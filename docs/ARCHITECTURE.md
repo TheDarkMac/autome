@@ -181,7 +181,7 @@ flowchart TB
       A1["api pod<br/>/livez · /readyz · /metrics"]
     end
     subgraph wkD["Deployment: worker (HPA = cible)"]
-      W1["worker pod<br/>:9091 /livez · /readyz"]
+      W1["worker pod<br/>:9091 /livez · /readyz · /metrics"]
     end
     subgraph feD["Deployment: frontend (nginx, 2 réplicas)"]
       F1["frontend pod"]
@@ -203,6 +203,7 @@ flowchart TB
   CM -.envFrom.-> A1
   CM -.envFrom.-> W1
   PROM -.scrape /metrics.-> A1
+  PROM -.scrape :9091/metrics.-> W1
   PROM --> GRAF
 ```
 
@@ -330,6 +331,12 @@ erDiagram
 - Métriques **Prometheus** exposées par l'API sur `/metrics` (requêtes,
   latence, in-flight ; label `path` = template de route → cardinalité bornée),
   scrapées par Prometheus, visualisées dans Grafana (dashboard provisionné) — F10.6.
+  Le **worker** expose les siennes sur le port des sondes (`:9091/metrics`,
+  #235) : livraisons par issue, erreurs de file, runs et histogram de durée par
+  statut, runs en cours, orphelins clos, déclencheurs planifiés. Labels fixes
+  (aucun id), registre partagé par `Arc` sans état global ; primitives du format
+  communes dans `autome_core::prometheus`. Prometheus découvre chaque réplique
+  par DNS (Service headless `worker` en k8s).
 - **Logs structurés** `tracing` (#176) : une ligne JSON par événement en `prod`
   (`AUTOME_LOG_FORMAT`, niveau `RUST_LOG`). API : span `http_request`
   (`request_id`, méthode, chemin sans query string) + ligne d'accès, en-tête

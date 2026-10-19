@@ -215,7 +215,9 @@ Vérification rapide :
 
 ```bash
 curl http://localhost:8080/readyz     # -> {"status":"ready","checks":{"postgres":"ok","rabbitmq":"ok"}}
-curl http://localhost:8080/metrics    # -> métriques Prometheus
+curl http://localhost:8080/metrics    # -> métriques Prometheus de l'API
+docker compose exec worker bash -c 'exec 3<>/dev/tcp/127.0.0.1/9091; printf "GET /metrics HTTP/1.0\r\n\r\n" >&3; cat <&3'
+                                      # -> métriques du worker (port non publié)
 curl http://localhost:8080/openapi.json  # -> spec OpenAPI 3 de l'API (publique)
 docker compose ps                     # api et worker « healthy »
 ```
@@ -399,7 +401,8 @@ opposées :
 - Une **startup probe** (~90 s) couvre les migrations et l'attente du broker
   au démarrage avant que la liveness ne s'applique.
 - Worker : `AUTOME_WORKER_PROBE_ADDR` (défaut `127.0.0.1:9091`, `0.0.0.0:9091`
-  dans l'image ; vide = sondes désactivées).
+  dans l'image ; vide = sondes désactivées). Le même port sert `GET /metrics`
+  (cf. C.6).
 - `/health` reste un alias de `/livez` (compatibilité).
 - **Compose** : healthchecks sur `/readyz` (API) et `/livez` (worker) ; le
   worker attend que l'API soit *prête* (migrations appliquées) pour démarrer.
@@ -440,13 +443,40 @@ un autre worker puis acquitté sans exécution. Périodes de grâce :
 
 ### C.6 Monitoring
 
-Le namespace inclut **Prometheus** (scrape de l'API) et **Grafana** (datasource
-+ dashboard *Autome — Overview* provisionnés) :
+Le namespace inclut **Prometheus** (scrape de l'API et de chaque worker) et
+**Grafana** (datasource + dashboard *Autome — Overview* provisionnés) :
 
 ```bash
 kubectl -n autome port-forward svc/grafana 3000:3000     # http://localhost:3000 (admin/admin)
 kubectl -n autome port-forward svc/prometheus 9090:9090  # http://localhost:9090
 ```
+
+**Métriques du worker (#235)** : `GET /metrics` sur le port des sondes (`9091`),
+servi aussi pendant l'arrêt. Prometheus découvre **chaque réplique** par DNS
+(job `autome-worker`, `dns_sd_configs` sur le nom `worker` : DNS de Docker en
+compose, Service headless `worker` en k8s) ; un label `instance` par pod.
+
+| Série | Type | Lecture |
+|---|---|---|
+| `autome_worker_deliveries_total{outcome}` | counter | messages de la file traités : `ack`, `retry`, `dead_letter`, `deduplicated` |
+| `autome_worker_queue_errors_total` | counter | poll / ack / nack en échec (broker qui décroche) |
+| `autome_worker_runs_total{status}` | counter | runs exécutés jusqu'au bout par ce worker : `succeeded`, `failed` (une redélivrance acquittée sans exécution n'en est pas un) |
+| `autome_worker_run_duration_seconds{status}` | histogram | durée entre le claim et l'état final (buckets 0,1 s → 1 h) |
+| `autome_worker_runs_in_flight` | gauge | runs en cours sur ce worker |
+| `autome_worker_orphan_runs_reaped_total` | counter | runs interrompus clos par le balayage des orphelins |
+| `autome_worker_trigger_runs_total{kind,result}` | counter | runs des déclencheurs `schedule` / `polling` : `dispatched`, ou `failed` (déclenchement perdu) |
+| `autome_worker_trigger_missed_total` | counter | échéances `schedule` sautées (plus de 5 min de retard) |
+| `autome_worker_trigger_poll_errors_total` | counter | polls en échec (réseau, statut HTTP, réponse illisible) |
+| `autome_worker_trigger_tick_errors_total` | counter | passes de planification sans accès aux échéances |
+| `autome_worker_draining` | gauge | `1` pendant l'arrêt |
+
+Toutes les séries existent dès le démarrage (à zéro) et leurs labels sont des
+valeurs fixes : **aucun id de run, de workflow ni d'utilisateur**. Comme
+`/metrics` de l'API, l'endpoint n'est pas authentifié ; le port `9091` ne doit
+pas sortir du réseau interne (non publié en compose, Service headless sans
+Ingress en k8s). Exemples d'alertes : `rate(autome_worker_queue_errors_total[5m]) > 0`,
+`sum(rate(autome_worker_runs_total{status="failed"}[15m])) / sum(rate(autome_worker_runs_total[15m])) > 0.2`,
+`increase(autome_worker_trigger_runs_total{result="failed"}[15m]) > 0`.
 
 **Logs** : en `prod`, l'API et le worker écrivent **une ligne JSON par
 événement** sur la sortie standard, prête pour un collecteur (Loki, Fluent Bit,
