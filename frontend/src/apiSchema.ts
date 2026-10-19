@@ -127,6 +127,27 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/admin/users/{id}/mfa": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /**
+         * `DELETE /admin/users/{id}/mfa` — réinitialise le second facteur du compte
+         *     (téléphone et codes de secours perdus) : il se connecte de nouveau au seul
+         *     mot de passe et peut se réenrôler. Idempotent.
+         */
+        delete: operations["reset_user_mfa"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/admin/users/{id}/role": {
         parameters: {
             query?: never;
@@ -258,7 +279,11 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** `POST /auth/login` — échange email + mot de passe contre une paire de jetons. */
+        /**
+         * `POST /auth/login` — échange email + mot de passe contre une paire de
+         *     jetons ; si le second facteur est actif (#245), contre un défi (202) à
+         *     présenter avec un code à `/auth/mfa/verify`.
+         */
         post: operations["login"];
         delete?: never;
         options?: never;
@@ -333,6 +358,125 @@ export interface paths {
          *     du mot de passe actuel. Toutes ses sessions sont fermées.
          */
         delete: operations["delete_account"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/auth/mfa": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** `GET /auth/mfa` — état du second facteur du compte courant. */
+        get: operations["mfa_status"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/auth/mfa/disable": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * `POST /auth/mfa/disable` — désactive la MFA (mot de passe **et** code
+         *     exigés) ; les codes de secours sont effacés.
+         */
+        post: operations["mfa_disable"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/auth/mfa/enable": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * `POST /auth/mfa/enable` — confirme l'enrôlement par un premier code :
+         *     la MFA devient active, toutes les autres sessions sont fermées, les codes
+         *     de secours sont renvoyés (une seule fois) avec une paire neuve.
+         */
+        post: operations["mfa_enable"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/auth/mfa/recovery-codes": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * `POST /auth/mfa/recovery-codes` — remplace les codes de secours (un code
+         *     valide exigé) ; les précédents ne valent plus rien.
+         */
+        post: operations["mfa_recovery_codes"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/auth/mfa/setup": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * `POST /auth/mfa/setup` — commence l'enrôlement : nouveau secret en
+         *     attente (remplace un enrôlement non confirmé), à scanner puis confirmer
+         *     par `/auth/mfa/enable`.
+         */
+        post: operations["mfa_setup"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/auth/mfa/verify": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * `POST /auth/mfa/verify` — seconde étape de la connexion : échange le défi
+         *     de `/auth/login` et un code (TOTP ou de secours) contre une paire.
+         */
+        post: operations["mfa_verify"];
+        delete?: never;
         options?: never;
         head?: never;
         patch?: never;
@@ -730,6 +874,8 @@ export interface components {
              *     de passe et ne peut pas se connecter.
              */
             invitation_pending: boolean;
+            /** @description Second facteur actif (#245). */
+            mfa_enabled: boolean;
             /** @description Permissions accordées, triées. */
             permissions: string[];
             /** @description Rôle déduit des permissions : `admin`, `editor`, `viewer` ou `custom`. */
@@ -905,10 +1051,82 @@ export interface components {
             email: string;
             /** @description Identifiant (`claims.sub`). */
             id: string;
+            /** @description Second facteur actif (#245). */
+            mfa_enabled: boolean;
             /** @description Permissions accordées, triées (`*` = toutes). */
             permissions: string[];
             /** @description Rôle déduit des permissions : `admin`, `editor`, `viewer` ou `custom`. */
             role: string;
+        };
+        /**
+         * @description Réponse 202 de `/auth/login` quand la MFA est active : aucun jeton de
+         *     session, un défi à présenter avec un code à `/auth/mfa/verify`.
+         */
+        MfaChallenge: {
+            /**
+             * Format: int64
+             * @description Durée de validité du défi, en secondes.
+             */
+            expires_in: number;
+            /** @description Toujours `true`. */
+            mfa_required: boolean;
+            /** @description Jeton de défi (5 min), à renvoyer tel quel. */
+            mfa_token: string;
+        };
+        /** @description Body de `/auth/mfa/enable` et `/auth/mfa/recovery-codes`. */
+        MfaCodeBody: {
+            /**
+             * @description Code à 6 chiffres de l'application (ou code de secours, sauf pour
+             *     l'activation).
+             */
+            code: string;
+        };
+        /** @description Body de `/auth/mfa/disable`. */
+        MfaDisableBody: {
+            /** @description Code à 6 chiffres de l'application, ou code de secours. */
+            code: string;
+            /** @description Mot de passe actuel. */
+            current_password: string;
+        };
+        /**
+         * @description MFA activée : codes de secours (montrés **une seule fois**) et nouvelle
+         *     paire (toutes les autres sessions sont fermées).
+         */
+        MfaEnabled: {
+            /** @description Codes de secours à usage unique. */
+            recovery_codes: string[];
+            /** @description Nouvelle paire de jetons de l'appareil courant. */
+            session: components["schemas"]["TokenResponse"];
+        };
+        /** @description Enrôlement en attente : à scanner, puis confirmer par un code. */
+        MfaSetup: {
+            /** @description URI `otpauth://totp/…`. */
+            otpauth_uri: string;
+            /** @description QR code SVG de l'URI. */
+            qr_svg: string;
+            /** @description Secret en base32 (saisie manuelle dans l'application). */
+            secret: string;
+        };
+        /** @description Body de `/auth/mfa/setup`. */
+        MfaSetupBody: {
+            /** @description Mot de passe actuel (preuve de possession du compte). */
+            current_password: string;
+        };
+        /** @description État du second facteur du compte courant. */
+        MfaStatus: {
+            /** @description MFA active : exigée à la connexion. */
+            enabled: boolean;
+            /** @description Enrôlement commencé, pas encore confirmé par un code. */
+            pending: boolean;
+            /** @description Codes de secours encore utilisables. */
+            recovery_codes_left: number;
+        };
+        /** @description Body de `/auth/mfa/verify`. */
+        MfaVerifyBody: {
+            /** @description Code à 6 chiffres de l'application, ou code de secours. */
+            code: string;
+            /** @description Jeton de défi reçu de `/auth/login`. */
+            mfa_token: string;
         };
         /** @description Description publique d'un provider — pas de `client_secret`. */
         ProviderDto: {
@@ -925,6 +1143,11 @@ export interface components {
             };
             /** @description `ready`, `unavailable` ou `draining` (arrêt en cours). */
             status: string;
+        };
+        /** @description Nouveaux codes de secours (les précédents ne valent plus rien). */
+        RecoveryCodes: {
+            /** @description Codes de secours à usage unique. */
+            recovery_codes: string[];
         };
         /** @description Body de `/auth/refresh` et `/auth/logout`. */
         RefreshBody: {
@@ -1427,6 +1650,57 @@ export interface operations {
             };
         };
     };
+    reset_user_mfa: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Identifiant du compte */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Second facteur réinitialisé */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AdminUser"];
+                };
+            };
+            /** @description Token absent ou invalide */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Manque `users.admin`, ou `*` pour un compte super-admin */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Compte inconnu */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Son propre compte (passer par `/auth/mfa/disable`) */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
     set_role: {
         parameters: {
             query?: never;
@@ -1680,7 +1954,7 @@ export interface operations {
                     "application/json": components["schemas"]["TokenResponse"];
                 };
             };
-            /** @description Lien invalide, expiré, déjà utilisé ou remplacé par un renvoi, ou mot de passe invalide */
+            /** @description Lien invalide, expiré, déjà utilisé ou remplacé par un renvoi, ou mot de passe invalide, courant ou divulgué */
             400: {
                 headers: {
                     [name: string]: unknown;
@@ -1723,6 +1997,15 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["TokenResponse"];
+                };
+            };
+            /** @description Mot de passe correct, second facteur exigé : défi à présenter avec un code à `/auth/mfa/verify` */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MfaChallenge"];
                 };
             };
             /** @description Identifiants invalides */
@@ -1889,6 +2172,291 @@ export interface operations {
             };
         };
     };
+    mfa_status: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description État du second facteur */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MfaStatus"];
+                };
+            };
+            /** @description Access token absent, invalide, révoqué, ou compte suspendu */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    mfa_disable: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["MfaDisableBody"];
+            };
+        };
+        responses: {
+            /** @description MFA désactivée */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Access token absent, invalide, révoqué, ou compte suspendu */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Mot de passe actuel ou code incorrect */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description MFA inactive (`mfa not enabled`) */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Trop d'essais — voir `Retry-After` */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    mfa_enable: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["MfaCodeBody"];
+            };
+        };
+        responses: {
+            /** @description MFA active ; autres sessions fermées */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MfaEnabled"];
+                };
+            };
+            /** @description Access token absent, invalide, révoqué, ou compte suspendu */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Code incorrect (`invalid mfa code`) */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Aucun enrôlement en attente (`mfa setup required`) ou MFA déjà active */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Trop d'essais — voir `Retry-After` */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    mfa_recovery_codes: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["MfaCodeBody"];
+            };
+        };
+        responses: {
+            /** @description Nouveaux codes de secours */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RecoveryCodes"];
+                };
+            };
+            /** @description Access token absent, invalide, révoqué, ou compte suspendu */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Code incorrect (`invalid mfa code`) */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description MFA inactive (`mfa not enabled`) */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Trop d'essais — voir `Retry-After` */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    mfa_setup: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["MfaSetupBody"];
+            };
+        };
+        responses: {
+            /** @description Secret en attente de confirmation */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MfaSetup"];
+                };
+            };
+            /** @description Access token absent, invalide, révoqué, ou compte suspendu */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Mot de passe actuel incorrect */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description MFA déjà active (`mfa already enabled`) */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Trop d'essais — voir `Retry-After` */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    mfa_verify: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["MfaVerifyBody"];
+            };
+        };
+        responses: {
+            /** @description Connecté */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TokenResponse"];
+                };
+            };
+            /** @description Défi invalide ou expiré (`invalid or expired mfa challenge`) : recommencer la connexion */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Code incorrect, déjà utilisé ou rejoué */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Compte suspendu (`account disabled`) ou adresse non vérifiée (`email not verified`) */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Trop d'essais (compte ou adresse IP) — voir `Retry-After` */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
     change_password: {
         parameters: {
             query?: never;
@@ -1911,7 +2479,7 @@ export interface operations {
                     "application/json": components["schemas"]["TokenResponse"];
                 };
             };
-            /** @description Nouveau mot de passe invalide ou identique à l'actuel */
+            /** @description Nouveau mot de passe invalide, identique à l'actuel, courant ou divulgué dans une fuite */
             400: {
                 headers: {
                     [name: string]: unknown;
@@ -2011,7 +2579,7 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description Lien invalide, expiré ou déjà utilisé, ou nouveau mot de passe invalide */
+            /** @description Lien invalide, expiré ou déjà utilisé, ou nouveau mot de passe invalide, courant ou divulgué */
             400: {
                 headers: {
                     [name: string]: unknown;
@@ -2089,7 +2657,7 @@ export interface operations {
                     "application/json": components["schemas"]["SignupPending"];
                 };
             };
-            /** @description Email ou mot de passe invalide */
+            /** @description Email ou mot de passe invalide, ou mot de passe courant ou divulgué dans une fuite */
             400: {
                 headers: {
                     [name: string]: unknown;

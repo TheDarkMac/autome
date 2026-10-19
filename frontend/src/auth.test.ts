@@ -183,6 +183,16 @@ describe("login / signup", () => {
     expect(fetchImpl.mock.calls[0]![0]).toMatch(/\/auth\/signup$/);
   });
 
+  it("affiche le refus d'un mot de passe compromis à l'inscription (#245)", async () => {
+    const refused = new Response(
+      "mot de passe trop courant ou divulgué dans une fuite de données : choisissez-en un autre",
+      { status: 400 },
+    );
+    await expect(
+      signup({ email: "a@b.io", password: "Password2024!" }, vi.fn().mockResolvedValue(refused)),
+    ).rejects.toMatchObject({ status: 400, message: /trop courant ou divulgué/ });
+  });
+
   it("traduit un 429 en délai d'attente lisible", async () => {
     const limited = new Response("too many attempts", {
       status: 429,

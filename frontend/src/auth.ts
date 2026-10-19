@@ -8,7 +8,9 @@
 // refresh ; la confiance reste côté backend qui re-vérifie la signature.
 //
 // Contrat HTTP attendu (frontend-first, comme `runs.ts`/`credentials.ts`) :
-//   - POST /auth/login    { email, password }      → TokenPair
+//   - POST /auth/login    { email, password }      → TokenPair, ou 202
+//     { mfa_required, mfa_token } quand le second facteur est actif (#245,
+//     cf. `mfa.ts`)
 //   - POST /auth/signup   { email, password }      → 201 TokenPair, ou 202
 //     { email, verification_required } quand l'adresse doit être vérifiée (#231)
 //   - POST /auth/refresh  { refresh_token }        → TokenPair
@@ -61,6 +63,17 @@ export class EmailNotVerifiedError extends ApiError {
   }
 }
 
+/**
+ * Mot de passe correct, second facteur exigé (#245) : le serveur a répondu
+ * 202 avec un défi, à présenter avec un code (`verifyMfa` de `mfa.ts`).
+ */
+export class MfaRequiredError extends ApiError {
+  constructor(public readonly mfaToken: string) {
+    super("code de vérification requis", 202);
+    this.name = "MfaRequiredError";
+  }
+}
+
 /** Identifiants saisis dans le formulaire login/signup. */
 export interface Credentials {
   readonly email: string;
@@ -69,12 +82,24 @@ export interface Credentials {
 
 // ─────────────────────────── appels réseau ───────────────────────────
 
+/**
+ * Connexion. Si le second facteur est actif (#245), lève
+ * [`MfaRequiredError`] avec le défi à présenter avec un code.
+ */
 export async function login(
   creds: Credentials,
   fetchImpl: typeof fetch = fetch,
 ): Promise<TokenPair> {
   const res = await postCredentials("/auth/login", creds, fetchImpl);
-  return parseTokenPair(await res.json());
+  const body: unknown = await res.json();
+  if (res.status === 202) {
+    const token = ((body ?? {}) as Record<string, unknown>)["mfa_token"];
+    if (typeof token !== "string" || token === "") {
+      throw new ApiError("réponse de connexion mal formée : défi manquant", 202);
+    }
+    throw new MfaRequiredError(token);
+  }
+  return parseTokenPair(body);
 }
 
 /**
@@ -491,6 +516,12 @@ async function postCredentials(
     { email: creds.email.trim(), password: creds.password },
     fetchImpl,
   );
+  // Saisie refusée par le serveur, dont un mot de passe courant ou divulgué
+  // à l'inscription (#245) : son message est déjà rédigé pour l'utilisateur.
+  if (res.status === 400) {
+    const reason = await res.text().catch(() => "");
+    throw new ApiError(reason || "saisie refusée par le serveur", 400);
+  }
   if (res.status === 401) {
     throw new ApiError("email ou mot de passe incorrect", 401);
   }
@@ -523,7 +554,7 @@ async function postCredentials(
  * Message d'un 429 (anti-bruteforce par compte ou par adresse IP) : délai
  * tiré de `Retry-After`, arrondi à la minute supérieure.
  */
-function tooManyAttemptsMessage(res: Response): string {
+export function tooManyAttemptsMessage(res: Response): string {
   const seconds = Number(res.headers.get("Retry-After"));
   if (!Number.isFinite(seconds) || seconds <= 0) {
     return "trop de tentatives : réessayez plus tard";
@@ -532,7 +563,7 @@ function tooManyAttemptsMessage(res: Response): string {
   return `trop de tentatives : réessayez dans ${minutes} min`;
 }
 
-async function postJson(
+export async function postJson(
   path: string,
   body: unknown,
   fetchImpl: typeof fetch,
@@ -553,7 +584,7 @@ async function postJson(
   }
 }
 
-function parseTokenPair(raw: unknown): TokenPair {
+export function parseTokenPair(raw: unknown): TokenPair {
   const v = (raw ?? {}) as Record<string, unknown>;
   const accessToken =
     typeof v["access_token"] === "string" ? v["access_token"] : null;

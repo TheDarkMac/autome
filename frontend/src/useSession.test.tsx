@@ -365,4 +365,46 @@ describe("useSession", () => {
     expect(result.current.session).toBeNull();
     expect(store.read()).toBeNull();
   });
+
+  it("verifyMfa ouvre la session renvoyée ; un refus ne change rien (#245)", async () => {
+    const store = memorySessionStore();
+    const verifyMfaImpl = vi
+      .fn()
+      .mockRejectedValueOnce(new Error("code incorrect"))
+      .mockResolvedValue(mkPair("carol", 10_000));
+    const { result } = renderHook(() => useSession({ store, verifyMfaImpl }));
+
+    await act(async () => {
+      await expect(result.current.verifyMfa("u.1.mac", "000000")).rejects.toThrow(
+        "code incorrect",
+      );
+    });
+    expect(result.current.session).toBeNull();
+
+    await act(async () => {
+      await result.current.verifyMfa("u.1.mac", "123456");
+    });
+    expect(verifyMfaImpl).toHaveBeenLastCalledWith("u.1.mac", "123456");
+    expect(result.current.session?.userId).toBe("carol");
+    expect(store.read()?.refreshToken).toBe("refresh-carol");
+  });
+
+  it("enableMfa remplace la session et renvoie les codes de secours (#245)", async () => {
+    const store = memorySessionStore(mkPair("dan", 10_000));
+    const enableMfaImpl = vi.fn().mockResolvedValue({
+      recoveryCodes: ["abcde-fghjk"],
+      tokens: { ...mkPair("dan", 20_000), refreshToken: "refresh-dan-2" },
+    });
+    const { result } = renderHook(() => useSession({ store, enableMfaImpl }));
+
+    let codes: string[] = [];
+    await act(async () => {
+      codes = await result.current.enableMfa("123456");
+    });
+    expect(codes).toEqual(["abcde-fghjk"]);
+    // Appel authentifié : l'`authFetch` de la session est transmis.
+    expect(enableMfaImpl).toHaveBeenCalledWith("123456", result.current.authFetch);
+    expect(store.read()?.refreshToken).toBe("refresh-dan-2");
+  });
 });
+

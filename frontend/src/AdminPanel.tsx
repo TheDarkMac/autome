@@ -33,6 +33,7 @@ export type AdminApi = Pick<
   | "verifyUserEmail"
   | "inviteUser"
   | "resendInvitation"
+  | "resetUserMfa"
   | "listAllWorkflows"
 >;
 
@@ -261,6 +262,16 @@ export function AdminPanel({
     );
   }
 
+  function onResetMfa(user: AdminUser): void {
+    const message = `Réinitialiser la double authentification de ${user.email} ? Il se connectera de nouveau avec son seul mot de passe : faites-le seulement après avoir vérifié son identité (téléphone et codes de secours perdus).`;
+    if (!confirm(message)) return;
+    void runAction(
+      user,
+      () => api.resetUserMfa(user.id),
+      `Double authentification de ${user.email} réinitialisée.`,
+    );
+  }
+
   function onLogout(user: AdminUser): void {
     if (!confirm(`Fermer toutes les sessions de ${user.email} ?`)) return;
     void runAction(
@@ -367,6 +378,7 @@ export function AdminPanel({
                     onDelete={() => onDelete(user)}
                     onVerifyEmail={() => onVerifyEmail(user)}
                     onResend={() => onResend(user)}
+                    onResetMfa={() => onResetMfa(user)}
                     {...(superAdmin ? { onWorkflows: () => showWorkflowsOf(user) } : {})}
                   />
                 ))}
@@ -481,6 +493,7 @@ function UserRow({
   onDelete,
   onVerifyEmail,
   onResend,
+  onResetMfa,
   onWorkflows,
 }: {
   user: AdminUser;
@@ -493,6 +506,7 @@ function UserRow({
   onDelete: () => void;
   onVerifyEmail: () => void;
   onResend: () => void;
+  onResetMfa: () => void;
   /** Super-admin seulement : filtre la liste des workflows sur ce compte. */
   onWorkflows?: () => void;
 }): JSX.Element {
@@ -551,6 +565,14 @@ function UserRow({
             </span>
           )
         )}
+        {user.mfa_enabled && (
+          <span
+            title="Double authentification active"
+            className="ml-1 rounded bg-indigo-50 px-2 py-0.5 text-xs font-medium text-indigo-800"
+          >
+            MFA
+          </span>
+        )}
       </td>
       <td className="px-3 py-2 text-neutral-500">{created}</td>
       <td className="px-3 py-2">
@@ -585,6 +607,17 @@ function UserRow({
               className="rounded-md border border-neutral-200 px-2 py-1 text-xs text-neutral-700 hover:bg-neutral-50 disabled:opacity-60"
             >
               Vérifier l'email
+            </button>
+          )}
+          {user.mfa_enabled && (
+            <button
+              type="button"
+              onClick={onResetMfa}
+              disabled={locked || self}
+              aria-label={`Réinitialiser la double authentification de ${user.email}`}
+              className="rounded-md border border-neutral-200 px-2 py-1 text-xs text-neutral-700 hover:bg-neutral-50 disabled:opacity-60"
+            >
+              Réinitialiser la MFA
             </button>
           )}
           <button

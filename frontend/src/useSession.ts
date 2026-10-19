@@ -6,7 +6,8 @@
 //     être vérifiée — #231) / `logout` (qui ferme aussi la session
 //     côté serveur, au mieux — #184), `logoutAll` (toutes les sessions,
 //     tous appareils — #186), `changePassword` (#196), `deleteAccount`
-//     (#229) et `acceptInvitation` (#241, connexion directe) ;
+//     (#229), `acceptInvitation` (#241, connexion directe), `verifyMfa`
+//     (seconde étape de la connexion) et `enableMfa` (#245) ;
 //   - rafraîchit l'access token de manière proactive (timer réarmé à
 //     `skewMs` avant l'expiration) et sur échec, déconnecte proprement.
 //
@@ -28,6 +29,7 @@ import {
   type TokenPair,
 } from "./auth";
 import { createAuthFetch, type AuthFetch } from "./authFetch";
+import { enableMfa as apiEnableMfa, verifyMfa as apiVerifyMfa } from "./mfa";
 import {
   msUntilRefresh,
   sessionFromTokens,
@@ -50,6 +52,8 @@ export interface UseSessionOptions {
   changePasswordImpl?: typeof apiChangePassword;
   deleteAccountImpl?: typeof apiDeleteAccount;
   acceptInvitationImpl?: typeof apiAcceptInvitation;
+  verifyMfaImpl?: typeof apiVerifyMfa;
+  enableMfaImpl?: typeof apiEnableMfa;
 }
 
 /** Inscription en attente de la vérification de l'adresse (#231). */
@@ -94,6 +98,18 @@ export interface UseSessionResult {
    */
   acceptInvitation: (token: string, password: string) => Promise<void>;
   /**
+   * Seconde étape de la connexion (#245) : échange le défi reçu (cf.
+   * `MfaRequiredError`) et un code contre une session. Rejette sans rien
+   * changer en local si le serveur refuse.
+   */
+  verifyMfa: (mfaToken: string, code: string) => Promise<void>;
+  /**
+   * Active le second facteur par un premier code (#245) : les autres
+   * sessions sont fermées, la courante continue avec la paire renvoyée.
+   * Renvoie les codes de secours, à montrer une seule fois.
+   */
+  enableMfa: (code: string) => Promise<string[]>;
+  /**
    * `fetch` authentifié (F8.7.c) : injecte le Bearer courant et, sur 401,
    * rafraîchit le token puis rejoue la requête. Identité **stable** — sûr à
    * passer à `useMemo`/`useEffect` ou à `createApiClient`.
@@ -116,6 +132,8 @@ export function useSession(options: UseSessionOptions = {}): UseSessionResult {
     changePasswordImpl = apiChangePassword,
     deleteAccountImpl = apiDeleteAccount,
     acceptInvitationImpl = apiAcceptInvitation,
+    verifyMfaImpl = apiVerifyMfa,
+    enableMfaImpl = apiEnableMfa,
   } = options;
 
   // Le store ne doit pas changer entre les rendus : on le fige au montage.
@@ -217,6 +235,22 @@ export function useSession(options: UseSessionOptions = {}): UseSessionResult {
     [apply, acceptInvitationImpl, logoutImpl],
   );
 
+  const verifyMfa = useCallback(
+    async (mfaToken: string, code: string) => {
+      apply(await verifyMfaImpl(mfaToken, code));
+    },
+    [apply, verifyMfaImpl],
+  );
+
+  const enableMfa = useCallback(
+    async (code: string) => {
+      const enabled = await enableMfaImpl(code, authFetch);
+      apply(enabled.tokens);
+      return enabled.recoveryCodes;
+    },
+    [apply, authFetch, enableMfaImpl],
+  );
+
   const login = useCallback(
     async (creds: Credentials) => {
       apply(await loginImpl(creds));
@@ -265,6 +299,8 @@ export function useSession(options: UseSessionOptions = {}): UseSessionResult {
     changePassword,
     deleteAccount,
     acceptInvitation,
+    verifyMfa,
+    enableMfa,
     authFetch,
   };
 }
