@@ -83,7 +83,7 @@ flowchart TB
   ENG --- DB
   CONN --- SEC
   API --- SEC
-  API -->|mot de passe oublié| SMTP
+  API -->|mot de passe oublié, vérification de l'email| SMTP
   API & WK -.metrics.-> OBS
   ENG -.-> CORE
   CONN -.-> CORE
@@ -116,9 +116,13 @@ flowchart TB
   les sessions, puis efface (`DELETE /auth/me`, `DELETE /admin/users/{id}`).
   Le worker écrit l'état final d'un run par `RunStateStore::finish` (mise à
   jour seulement) : un run effacé pendant son exécution n'est pas recréé.
-- **Emails** : seule l'API en envoie (mot de passe oublié, #204), via un relais
-  SMTP (`api::mail`, `lettre` + rustls) en tâche de fond. Les liens portent un
-  jeton HMAC sans état (`api::password_reset`) : aucune table dédiée.
+- **Emails** : seule l'API en envoie (mot de passe oublié, #204 ; vérification
+  de l'adresse, #231), via un relais SMTP (`api::mail`, `lettre` + rustls) en
+  tâche de fond. Les liens portent un jeton HMAC sans état
+  (`api::signed_link`, une clé par usage) lié à l'état du compte (hash du mot
+  de passe, email) : aucune table dédiée. Seul le drapeau
+  `users.email_verified_at` est stocké ; la connexion d'un compte non vérifié
+  est refusée.
 - **Tokens de connecteurs** : l'API les écrit au callback OAuth, le worker les
   lit pour le propriétaire du run (`connector_tokens`, chiffrés) et rafraîchit
   les access tokens expirés sous le verrou de ligne PostgreSQL
