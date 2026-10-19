@@ -22,9 +22,12 @@
 //!   (`RunStateStore::try_claim`, cf. [`RunExecutor`]).
 //! - [`WorkerPool::process_one`] : unité atomique (poll + handle + ack/nack),
 //!   testable sans pool.
-//! - [`WorkerPool::start`] : spawne `concurrency` tâches tokio qui appellent
-//!   `process_one` en boucle. Renvoie un [`RunningPool`] dont `stop()` signale
-//!   l'arrêt et `await` proprement les tâches.
+//! - [`WorkerPool::start`] : spawne `concurrency` tâches tokio qui attendent
+//!   le message suivant par [`Queue::receive`] (consommateur poussé par le
+//!   broker en RabbitMQ, #237) et le traitent comme `process_one`. Renvoie un
+//!   [`RunningPool`] dont `stop()` signale l'arrêt, rend au broker les
+//!   messages reçus d'avance ([`Queue::stop_receiving`]) et `await`
+//!   proprement les tâches.
 //!
 //! ## Concurrence & backpressure (F5.5)
 //!
@@ -212,7 +215,9 @@ impl WorkerPool {
         Arc::clone(&self.liveness)
     }
 
-    /// Builder : durée de pause entre deux polls quand la file est vide.
+    /// Builder : attente d'un message par tour de boucle quand la file est
+    /// vide (délai de [`Queue::receive`], complété par une pause si la file
+    /// rend la main plus tôt) ; borne aussi la réaction au signal d'arrêt.
     pub fn with_idle_sleep(mut self, dur: Duration) -> Self {
         self.poll_idle_sleep = dur;
         self
@@ -221,13 +226,19 @@ impl WorkerPool {
     /// Traite UN message si disponible. Exposée pour les tests et pour piloter
     /// le worker en mode déterministe.
     pub async fn process_one(&self) -> Result<ProcessOutcome> {
-        self.process_as(None).await
+        let delivery = self.queue.poll(&self.queue_name).await?;
+        self.process(delivery, None).await
     }
 
-    /// [`process_one`](Self::process_one) pour le consommateur `consumer`,
-    /// marqué occupé pendant le traitement du message (liveness, #192).
-    async fn process_as(&self, consumer: Option<usize>) -> Result<ProcessOutcome> {
-        let Some(delivery) = self.queue.poll(&self.queue_name).await? else {
+    /// Traite `delivery` (sinon [`ProcessOutcome::Idle`]) pour le
+    /// consommateur `consumer`, marqué occupé pendant le traitement du
+    /// message (liveness, #192).
+    async fn process(
+        &self,
+        delivery: Option<Delivery>,
+        consumer: Option<usize>,
+    ) -> Result<ProcessOutcome> {
+        let Some(delivery) = delivery else {
             return Ok(ProcessOutcome::Idle);
         };
         // Idempotence (F5.2.c) : si le message porte une clé déjà traitée,
@@ -275,7 +286,12 @@ impl WorkerPool {
                 worker_loop(&pool, &stop, i).await;
             }));
         }
-        RunningPool { handles, shutdown }
+        RunningPool {
+            handles,
+            shutdown,
+            queue: Arc::clone(&pool.queue),
+            queue_name: pool.queue_name.clone(),
+        }
     }
 }
 
@@ -294,14 +310,28 @@ async fn worker_loop(pool: &WorkerPool, shutdown: &AtomicBool, id: usize) {
     let mut failures = 0u32;
     while !shutdown.load(Ordering::Acquire) {
         pool.liveness.tick(id, liveness::now_ms());
-        match pool.process_as(Some(id)).await {
+        let started = tokio::time::Instant::now();
+        let outcome = match pool
+            .queue
+            .receive(&pool.queue_name, pool.poll_idle_sleep)
+            .await
+        {
+            Ok(delivery) => pool.process(delivery, Some(id)).await,
+            Err(e) => Err(e),
+        };
+        match outcome {
             Ok(outcome) => {
                 if failures > 0 {
                     tracing::info!(consumer = id, failures, "file de nouveau disponible");
                     failures = 0;
                 }
+                // File vide : patienter le reste du délai si elle a rendu la
+                // main plus tôt (file en mémoire, sans attente).
                 if outcome == ProcessOutcome::Idle {
-                    tokio::time::sleep(pool.poll_idle_sleep).await;
+                    let left = pool.poll_idle_sleep.saturating_sub(started.elapsed());
+                    if !left.is_zero() {
+                        tokio::time::sleep(left).await;
+                    }
                 }
             }
             Err(e) => {
@@ -328,13 +358,29 @@ async fn worker_loop(pool: &WorkerPool, shutdown: &AtomicBool, id: usize) {
 pub struct RunningPool {
     handles: Vec<JoinHandle<()>>,
     shutdown: Arc<AtomicBool>,
+    queue: Arc<dyn Queue + Send + Sync>,
+    queue_name: String,
 }
 
 impl RunningPool {
+    /// Signale l'arrêt aux tâches puis rend au broker les messages reçus
+    /// d'avance (#237) : les autres répliques les prennent sans attendre la
+    /// fin du drain ni la fermeture de la connexion.
+    async fn halt(&self) {
+        self.shutdown.store(true, Ordering::Release);
+        if let Err(e) = self.queue.stop_receiving(&self.queue_name).await {
+            tracing::warn!(
+                error = %e,
+                "arrêt de la consommation incomplet : les messages reçus d'avance \
+                 reviendront en file à la fermeture de la connexion"
+            );
+        }
+    }
+
     /// Signale l'arrêt et `await` la fin de toutes les tâches. Consommante :
     /// après cet appel le pool n'est plus utilisable. À appeler dans un runtime.
     pub async fn stop(mut self) {
-        self.shutdown.store(true, Ordering::Release);
+        self.halt().await;
         // Vider `handles` AVANT que `Drop` voie un Vec non-vide (sinon abort
         // à tort des tâches déjà attendues).
         let handles = std::mem::take(&mut self.handles);
@@ -347,13 +393,14 @@ impl RunningPool {
     /// `timeout` (#200). `true` si toutes ont terminé ; sinon elles tournent
     /// encore, à interrompre par [`abort`](Self::abort).
     pub async fn stop_within(&mut self, timeout: Duration) -> bool {
-        self.shutdown.store(true, Ordering::Release);
+        let deadline = tokio::time::Instant::now() + timeout;
+        self.halt().await;
         let all = async {
             for handle in self.handles.iter_mut() {
                 let _ = handle.await;
             }
         };
-        let done = tokio::time::timeout(timeout, all).await.is_ok();
+        let done = tokio::time::timeout_at(deadline, all).await.is_ok();
         if done {
             self.handles.clear();
         }
@@ -585,6 +632,88 @@ mod tests {
         assert_eq!(error_backoff(base, 4), Duration::from_millis(400));
         assert_eq!(error_backoff(base, 8), MAX_ERROR_BACKOFF);
         assert_eq!(error_backoff(base, u32::MAX), MAX_ERROR_BACKOFF);
+    }
+
+    // ───── #237 — consommation continue ─────
+
+    use std::sync::atomic::AtomicUsize;
+
+    /// File en mémoire qui compte ses appels ; son `receive` rend la main
+    /// sans attendre, comme le défaut du trait.
+    #[derive(Default)]
+    struct CountingQueue {
+        inner: InMemoryQueue,
+        polls: AtomicUsize,
+        receives: AtomicUsize,
+        stopped: Mutex<Vec<String>>,
+    }
+
+    #[async_trait]
+    impl Queue for CountingQueue {
+        async fn publish(&self, name: &str, msg: Message) -> Result<()> {
+            self.inner.publish(name, msg).await
+        }
+        async fn poll(&self, name: &str) -> Result<Option<Delivery>> {
+            self.polls.fetch_add(1, Ordering::Relaxed);
+            self.inner.poll(name).await
+        }
+        async fn receive(&self, name: &str, _wait: Duration) -> Result<Option<Delivery>> {
+            self.receives.fetch_add(1, Ordering::Relaxed);
+            self.inner.poll(name).await
+        }
+        async fn stop_receiving(&self, name: &str) -> Result<()> {
+            self.stopped.lock().unwrap().push(name.to_string());
+            Ok(())
+        }
+        async fn ack(&self, id: &DeliveryId) -> Result<()> {
+            self.inner.ack(id).await
+        }
+        async fn nack(&self, id: &DeliveryId, verdict: Nack) -> Result<()> {
+            self.inner.nack(id, verdict).await
+        }
+        async fn depth(&self, name: &str) -> Result<usize> {
+            self.inner.depth(name).await
+        }
+    }
+
+    fn counting_pool(q: &Arc<CountingQueue>, handled: &Arc<AtomicUsize>) -> WorkerPool {
+        let handled = Arc::clone(handled);
+        let handler: Arc<dyn Handler + Send + Sync> = Arc::new(move |_d: &Delivery| {
+            handled.fetch_add(1, Ordering::Relaxed);
+            HandlerVerdict::Ok
+        });
+        let idem: Arc<dyn IdempotencyStore + Send + Sync> =
+            Arc::new(InMemoryIdempotencyStore::new());
+        let q_dyn: Arc<dyn Queue + Send + Sync> = Arc::clone(q) as _;
+        WorkerPool::new(q_dyn, handler, idem, "runs", 2).with_idle_sleep(Duration::from_millis(20))
+    }
+
+    #[tokio::test]
+    async fn the_pool_consumes_through_receive_and_stops_receiving_on_stop() {
+        let q = Arc::new(CountingQueue::default());
+        q.publish("runs", Message::new(json!({}))).await.unwrap();
+        let handled = Arc::new(AtomicUsize::new(0));
+        let running = counting_pool(&q, &handled).start();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        running.stop().await;
+
+        assert_eq!(handled.load(Ordering::Relaxed), 1);
+        assert_eq!(q.depth("runs").await.unwrap(), 0);
+        assert_eq!(q.polls.load(Ordering::Relaxed), 0, "plus de polling");
+        // 2 tâches, 200 ms, 20 ms par tour : une file qui rend la main sans
+        // attendre ne fait pas tourner la boucle à vide.
+        let receives = q.receives.load(Ordering::Relaxed);
+        assert!((2..=40).contains(&receives), "{receives} receive");
+        assert_eq!(*q.stopped.lock().unwrap(), vec!["runs".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn a_bounded_stop_also_stops_receiving() {
+        let q = Arc::new(CountingQueue::default());
+        let handled = Arc::new(AtomicUsize::new(0));
+        let mut running = counting_pool(&q, &handled).start();
+        assert!(running.stop_within(Duration::from_secs(5)).await);
+        assert_eq!(*q.stopped.lock().unwrap(), vec!["runs".to_string()]);
     }
 
     // ───── F5.2.c — idempotence ─────
