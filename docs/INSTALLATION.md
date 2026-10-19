@@ -53,7 +53,7 @@ cp .env.example .env
 | `AUTOME_EGRESS_ALLOWLIST` | Hôtes internes autorisés en sortie HTTP (anti-SSRF), séparés par virgule | *(vide : public uniquement)* | selon besoin |
 | `AUTOME_LOG_FORMAT` | Format des logs (API + worker) : `json` ou `text` | `text` | `json` (défaut en `prod`) |
 | `RUST_LOG` | Niveau des logs, syntaxe `EnvFilter` (ex. `info,autome_worker=debug`) | `info` | `info` |
-| `AUTOME_WORKER_CONCURRENCY` | Worker : tâches consommatrices par process | `4` | selon charge |
+| `AUTOME_WORKER_CONCURRENCY` | Worker : tâches consommatrices par process ; aussi le *prefetch* RabbitMQ (messages poussés d'avance au process) | `4` | selon charge |
 | `AUTOME_RUN_TIMEOUT_SECS` | Worker : au-delà, un run encore `running` est clos en `failed` (min. 60) | `3600` | > durée du plus long run |
 | `AUTOME_SCHEDULER_TICK_SECS` | Worker : période de la boucle des déclencheurs `schedule` / `polling` (s, `0` = désactivée) | `10` | `10` |
 | `AUTOME_SMTP_URL` | Relais SMTP des emails (mot de passe oublié, vérification de l'adresse) : `smtps://user:pass@hôte` (TLS, 465) ou `smtp://hôte:587?tls=required` (STARTTLS). Contient un mot de passe : à mettre dans un secret | *(non défini : liens journalisés en `dev`)* | **requis pour le mot de passe oublié** (sinon 503) et la vérification de l'email (sinon comptes créés vérifiés) |
@@ -96,6 +96,17 @@ livraison au moment de la coupure est remis en file par le broker et relivré �
 sans double exécution grâce au claim en base (section suivante). Les
 publications sont **confirmées** par le broker : un message refusé fait échouer
 le déclenchement au lieu d'être perdu silencieusement.
+
+Le worker ne sonde pas la file : il s'y abonne (`basic_consume`) et RabbitMQ
+lui **pousse** les runs, au plus `AUTOME_WORKER_CONCURRENCY` non acquittés par
+process (*prefetch*) ; un run publié démarre sans attendre de tour de boucle, et
+une file vide ne coûte aucun aller-retour réseau. Le reste de la file revient
+aux autres répliques. À l'arrêt, le worker se désabonne d'abord et rend au
+broker les runs reçus d'avance mais pas commencés : les autres répliques les
+prennent aussitôt, sans attendre la fin du drain. Dans l'interface de
+gestion de RabbitMQ, la queue `runs` montre un consommateur par réplique, et
+ses messages *Unacked* (au plus le prefetch par réplique) sont ceux en cours
+ou reçus d'avance.
 
 ### Exécution des runs : au plus une fois
 
