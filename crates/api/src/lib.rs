@@ -10,6 +10,7 @@
 //! - [`admin`] (#208) : administration des utilisateurs (`/admin/users`).
 //! - [`email_verification`] (#231) : vérification de l'adresse email.
 //! - [`erasure`] (#229) : effacement d'un compte et de ses données (RGPD).
+//! - [`invitation`] (#241) : invitation de compte par un administrateur.
 //! - [`mail`] et [`password_reset`] (#204) : envoi d'emails (SMTP) et jetons
 //!   de réinitialisation du mot de passe ; [`signed_link`] : jetons sans état
 //!   des liens envoyés par email.
@@ -26,6 +27,7 @@ pub mod cors;
 pub mod credentials;
 pub mod email_verification;
 pub mod erasure;
+pub mod invitation;
 pub mod mail;
 pub mod metrics;
 pub mod observability;

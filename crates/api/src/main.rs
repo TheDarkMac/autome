@@ -18,6 +18,9 @@ use autome_api::email_verification::{
     OperatorVerification, VerifyTokens,
 };
 use autome_api::erasure::Erasure;
+use autome_api::invitation::{
+    invite_by_operator, signup_open_from_source, Invitation, InviteTokens, Invited,
+};
 use autome_api::mail::MailSettings;
 use autome_api::metrics::{metrics_router, with_metrics, Metrics};
 use autome_api::observability::with_request_tracing;
@@ -62,6 +65,7 @@ const MAINTENANCE_INTERVAL: std::time::Duration = std::time::Duration::from_secs
 fn build_router(
     backends: &Backends,
     accounts: AccountsState,
+    admin: AdminState,
     webhooks: WebhooksState,
     probes: ProbesState,
     metrics: Arc<Metrics>,
@@ -97,10 +101,7 @@ fn build_router(
             "/auth",
             protected_router(backends.auth.clone()).merge(accounts_router(accounts)),
         )
-        .merge(admin_router(
-            AdminState::new(backends.auth.clone(), backends.users.clone())
-                .with_erasure(erasure(backends)),
-        ))
+        .merge(admin_router(admin))
         .merge(workflows_routes)
         .merge(runs_router(runs_state))
         .merge(webhooks_router(webhooks))
@@ -131,21 +132,35 @@ fn erasure(backends: &Backends) -> Erasure {
     Erasure::new(backends.eraser.clone(), backends.login_throttle.clone())
 }
 
-/// Fonctions qui envoient des emails : mot de passe oublié (#204) et
-/// vérification de l'adresse (#231).
+/// Fonctions qui envoient des emails : mot de passe oublié (#204),
+/// vérification de l'adresse (#231) et invitations (#241).
 #[derive(Debug, Default)]
 struct MailFeatures {
     password_reset: Option<PasswordReset>,
     email_verification: Option<EmailVerification>,
+    invitation: Option<Invitation>,
+}
+
+/// État de l'administration (#208) : suppression de comptes (#229) et
+/// invitations si un envoi d'email est configuré (#241).
+fn admin_state(backends: &Backends, invitation: Option<Invitation>) -> AdminState {
+    let admin = AdminState::new(backends.auth.clone(), backends.users.clone())
+        .with_erasure(erasure(backends));
+    match invitation {
+        Some(invitation) => admin.with_invitation(invitation),
+        None => admin,
+    }
 }
 
 /// État des endpoints de comptes : Argon2id sur les stores de `backends`,
-/// anti-bruteforce par email et par adresse IP (#190), mot de passe oublié et
-/// vérification de l'email si un envoi d'email est configuré (#204, #231).
+/// anti-bruteforce par email et par adresse IP (#190), mot de passe oublié,
+/// vérification de l'email et acceptation des invitations si un envoi d'email
+/// est configuré (#204, #231, #241), inscriptions ouvertes ou non (#241).
 fn accounts_state(
     backends: &Backends,
     ip_throttle: IpThrottle,
     mail: MailFeatures,
+    signup_open: bool,
 ) -> autome_core::Result<AccountsState> {
     let accounts = AccountsState::new(
         backends.auth.clone(),
@@ -154,7 +169,12 @@ fn accounts_state(
     )?
     .with_throttle(backends.login_throttle.clone())
     .with_ip_throttle(ip_throttle)
-    .with_erasure(erasure(backends));
+    .with_erasure(erasure(backends))
+    .with_signup_open(signup_open);
+    let accounts = match mail.invitation {
+        Some(invitation) => accounts.with_invitations(invitation.tokens),
+        None => accounts,
+    };
     let accounts = match mail.password_reset {
         Some(reset) => accounts.with_password_reset(reset),
         None => accounts,
@@ -179,13 +199,15 @@ fn mail_features(config: &Config) -> Result<MailFeatures, String> {
 }
 
 /// Sans envoi d'email possible (`prod` sans SMTP), ni mot de passe oublié
-/// (503) ni vérification de l'email (comptes créés vérifiés) ; la
-/// vérification peut aussi être désactivée (`required = false`).
+/// ni invitations (503), ni vérification de l'email (comptes créés
+/// vérifiés) ; la vérification peut aussi être désactivée (`required =
+/// false`).
 fn mail_features_from(config: &Config, mail: Option<MailSettings>, required: bool) -> MailFeatures {
     let Some(mail) = mail else {
         tracing::warn!(
-            "mot de passe oublié et vérification de l'email désactivés : AUTOME_SMTP_URL absent \
-             (503 sur /auth/password/forgot, comptes créés vérifiés)"
+            "mot de passe oublié, invitations et vérification de l'email désactivés : \
+             AUTOME_SMTP_URL absent (503 sur /auth/password/forgot et /admin/users en POST, \
+             comptes créés vérifiés)"
         );
         return MailFeatures::default();
     };
@@ -201,8 +223,67 @@ fn mail_features_from(config: &Config, mail: Option<MailSettings>, required: boo
         None
     };
     MailFeatures {
+        invitation: Some(Invitation::new(
+            InviteTokens::from_config(config),
+            mail.clone(),
+        )),
         password_reset: Some(PasswordReset::new(ResetTokens::from_config(config), mail)),
         email_verification,
+    }
+}
+
+/// `AUTOME_SIGNUP` (#241) : inscriptions publiques ouvertes (`open`, défaut)
+/// ou invitation seulement (`invite_only`). Valeur invalide ⇒ refus de
+/// démarrer.
+fn signup_open() -> Result<bool, String> {
+    let open = signup_open_from_source(std::env::var("AUTOME_SIGNUP").ok().as_deref())?;
+    if !open {
+        tracing::info!("inscriptions publiques fermées : comptes créés par invitation");
+    }
+    Ok(open)
+}
+
+/// `autome-api invite <email> [role]` (#241) : crée un compte invité (rôle
+/// `editor` par défaut) dans la base `DATABASE_URL` et lui envoie
+/// l'invitation, puis s'arrête — amorçage d'une instance aux inscriptions
+/// fermées (`invite <email> admin`). Exige l'accès à l'infrastructure et un
+/// envoi d'email (SMTP, ou journal en `dev`).
+async fn invite_command(
+    config: &Config,
+    email: &str,
+    role: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if PersistenceMode::from_env()? != PersistenceMode::Postgres {
+        return Err("invite requiert AUTOME_PERSISTENCE=postgres (les comptes en mémoire ne survivent pas au processus)".into());
+    }
+    let Some(mail) = MailSettings::from_env(config.profile)? else {
+        return Err("invite requiert un envoi d'email (AUTOME_SMTP_URL)".into());
+    };
+    let invitation = Invitation::new(InviteTokens::from_config(config), mail);
+    let pool = connect(&config.database_url)?;
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_millis() as i64;
+    match invite_by_operator(
+        &PgUserStore::new(pool.clone()),
+        &PgAuditSink::new(pool),
+        &invitation,
+        email,
+        role,
+        now_ms,
+    )
+    .await?
+    {
+        Invited::Created { user, sent: true } => {
+            tracing::info!(user_id = %user.id, "invitation envoyée");
+            Ok(())
+        }
+        Invited::Created { user, sent: false } => Err(format!(
+            "compte {} créé mais invitation non envoyée : la renvoyer depuis l'administration",
+            user.id
+        )
+        .into()),
+        Invited::EmailTaken => Err(format!("un compte existe déjà pour {email}").into()),
     }
 }
 
@@ -295,9 +376,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
             return verify_email_command(&config, email).await;
         }
+        Some("invite") => {
+            return match args.as_slice() {
+                [_, email] => invite_command(&config, email, None).await,
+                [_, email, role] => invite_command(&config, email, Some(role)).await,
+                _ => Err("usage : autome-api invite <email> [admin|editor|viewer]".into()),
+            };
+        }
         Some(other) => {
             return Err(format!(
-                "commande inconnue « {other} » (promote-admin <email>, verify-email <email>)"
+                "commande inconnue « {other} » (promote-admin <email>, verify-email <email>, \
+                 invite <email> [role])"
             )
             .into())
         }
@@ -384,7 +473,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         verify_max = ip_throttle.verify_max,
         "limitation des tentatives par adresse IP"
     );
-    let accounts = accounts_state(&backends, ip_throttle, mail_features(&config)?)?;
+    let mail = mail_features(&config)?;
+    let admin = admin_state(&backends, mail.invitation.clone());
+    let accounts = accounts_state(&backends, ip_throttle, mail, signup_open()?)?;
     // Webhooks (#202) : quota invalide ⇒ refus de démarrer.
     let webhook_max = max_per_window_from_env()?;
     tracing::info!(
@@ -399,7 +490,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         origins = ?cors.iter().filter_map(|o| o.to_str().ok()).collect::<Vec<_>>(),
         "origines CORS autorisées"
     );
-    let app = build_router(&backends, accounts, webhooks, probes, metrics, cors);
+    let app = build_router(&backends, accounts, admin, webhooks, probes, metrics, cors);
 
     // Arrêt gracieux (#194) : SIGTERM/SIGINT ⇒ readiness à 503, délai de
     // retrait, puis drain borné des requêtes en cours.
@@ -458,15 +549,20 @@ mod tests {
         let mail = MailSettings::from_source(config.profile, |_| None).expect("journal en dev");
         let features = mail_features_from(&config, mail, true);
         assert!(
-            features.password_reset.is_some() && features.email_verification.is_some(),
+            features.password_reset.is_some()
+                && features.email_verification.is_some()
+                && features.invitation.is_some(),
             "dev sans SMTP : liens journalisés"
         );
-        let accounts = accounts_state(&backends, ip_throttle, features).expect("état comptes");
+        let admin = admin_state(&backends, features.invitation.clone());
+        let accounts =
+            accounts_state(&backends, ip_throttle, features, true).expect("état comptes");
         let probes = ProbesState::new(vec![]);
         let webhooks = webhooks_state(&backends, &config, 10);
         build_router(
             &backends,
             accounts,
+            admin,
             webhooks,
             probes,
             Arc::new(Metrics::new()),
@@ -481,7 +577,11 @@ mod tests {
 
         // Sans envoi possible : rien (comptes créés vérifiés).
         let none = mail_features_from(&config, None, true);
-        assert!(none.password_reset.is_none() && none.email_verification.is_none());
+        assert!(
+            none.password_reset.is_none()
+                && none.email_verification.is_none()
+                && none.invitation.is_none()
+        );
         // Désactivée explicitement : le mot de passe oublié reste disponible.
         let off = mail_features_from(&config, mail(), false);
         assert!(off.password_reset.is_some() && off.email_verification.is_none());
