@@ -109,6 +109,13 @@ flowchart TB
   rôle (transaction), les suspend (`users.disabled_at`, migration `0017`, plus
   fermeture des sessions par version) et ferme leurs sessions. Le premier
   administrateur naît hors HTTP : `autome-api promote-admin <email>`.
+- **Suppression de compte** (#229, RGPD) : `core::AccountEraser` efface le
+  compte et ce qui lui est rattaché (workflows et leurs cascades, runs,
+  tokens de connecteurs, permissions) et pseudonymise l'audit ; en PostgreSQL,
+  `PgAccountEraser` le fait en une transaction. `api::erasure` ferme d'abord
+  les sessions, puis efface (`DELETE /auth/me`, `DELETE /admin/users/{id}`).
+  Le worker écrit l'état final d'un run par `RunStateStore::finish` (mise à
+  jour seulement) : un run effacé pendant son exécution n'est pas recréé.
 - **Emails** : seule l'API en envoie (mot de passe oublié, #204), via un relais
   SMTP (`api::mail`, `lettre` + rustls) en tâche de fond. Les liens portent un
   jeton HMAC sans état (`api::password_reset`) : aucune table dédiée.
