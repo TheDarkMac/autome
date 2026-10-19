@@ -135,6 +135,34 @@ impl InMemoryAuditSink {
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
+
+    /// Remplace par `pseudonym` l'acteur et la ressource égaux à l'un des
+    /// `identifiers` (id et email d'un compte effacé, #229) ; renvoie le
+    /// nombre d'events modifiés.
+    pub fn pseudonymize(&self, identifiers: &[&str], pseudonym: &str) -> Result<usize> {
+        let mut events = self
+            .events
+            .lock()
+            .map_err(|_| Error::Invalid("audit lock empoisonné".into()))?;
+        let mut changed = 0;
+        for event in events.iter_mut() {
+            let mut touched = false;
+            if identifiers.contains(&event.actor.as_str()) {
+                event.actor = pseudonym.to_string();
+                touched = true;
+            }
+            if event
+                .resource
+                .as_deref()
+                .is_some_and(|r| identifiers.contains(&r))
+            {
+                event.resource = Some(pseudonym.to_string());
+                touched = true;
+            }
+            changed += usize::from(touched);
+        }
+        Ok(changed)
+    }
 }
 
 #[async_trait]
@@ -285,5 +313,29 @@ mod tests {
             .await
             .unwrap();
         assert!(s.list().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn pseudonymize_replaces_actor_and_resource_of_the_given_identifiers() {
+        let sink = InMemoryAuditSink::new();
+        for event in [
+            AuditEvent::new(1, "u-alice", "auth.login", AuditOutcome::Success),
+            AuditEvent::new(2, "alice@example.io", "auth.login", AuditOutcome::Failure),
+            AuditEvent::new(3, "u-admin", "admin.user_disable", AuditOutcome::Success)
+                .with_resource("u-alice"),
+            AuditEvent::new(4, "u-bob", "auth.login", AuditOutcome::Success),
+        ] {
+            sink.record(event).await.unwrap();
+        }
+        let n = sink
+            .pseudonymize(&["u-alice", "alice@example.io"], "erased:00")
+            .unwrap();
+        assert_eq!(n, 3);
+        let events = sink.list().await.unwrap();
+        assert_eq!(events[0].actor, "erased:00");
+        assert_eq!(events[1].actor, "erased:00");
+        assert_eq!(events[2].actor, "u-admin", "acteur tiers conservé");
+        assert_eq!(events[2].resource.as_deref(), Some("erased:00"));
+        assert_eq!(events[3].actor, "u-bob");
     }
 }

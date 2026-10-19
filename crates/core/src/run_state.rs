@@ -135,6 +135,13 @@ pub trait RunStateStore: Send + Sync {
     /// Persiste un snapshot — crée si inconnu, écrase sinon (last-write-wins).
     async fn checkpoint(&self, snapshot: &RunCheckpoint) -> Result<()>;
 
+    /// Écrit l'état final d'un run **seulement s'il existe encore** (même
+    /// écriture que [`checkpoint`](Self::checkpoint), propriétaire compris) ;
+    /// `false` si le run est inconnu. Le worker l'utilise après exécution : un
+    /// run effacé pendant qu'il tournait (suppression de compte, #229) n'est
+    /// pas recréé avec ses sorties.
+    async fn finish(&self, snapshot: &RunCheckpoint) -> Result<bool>;
+
     /// Charge le dernier snapshot d'un run, ou `None`.
     async fn load(&self, run_id: &str) -> Result<Option<RunCheckpoint>>;
 
@@ -198,6 +205,18 @@ impl InMemoryRunStateStore {
     pub fn new() -> Self {
         Self::default()
     }
+
+    /// Supprime tous les runs de `owner` (suppression de compte, #229) et
+    /// renvoie leur nombre. Les runs sans propriétaire ne sont jamais touchés.
+    pub fn remove_owner(&self, owner: &str) -> Result<usize> {
+        let mut map = self
+            .inner
+            .lock()
+            .map_err(|_| Error::Invalid("run_state lock empoisonné".into()))?;
+        let before = map.len();
+        map.retain(|_, c| c.owner_id.as_deref() != Some(owner));
+        Ok(before - map.len())
+    }
 }
 
 #[async_trait]
@@ -217,6 +236,22 @@ impl RunStateStore for InMemoryRunStateStore {
         }
         map.insert(snapshot.run_id.clone(), snap);
         Ok(())
+    }
+
+    async fn finish(&self, snapshot: &RunCheckpoint) -> Result<bool> {
+        let mut map = self
+            .inner
+            .lock()
+            .map_err(|_| Error::Invalid("run_state lock empoisonné".into()))?;
+        let Some(existing) = map.get_mut(&snapshot.run_id) else {
+            return Ok(false);
+        };
+        let owner = existing.owner_id.clone();
+        *existing = snapshot.clone();
+        if owner.is_some() {
+            existing.owner_id = owner;
+        }
+        Ok(true)
     }
 
     async fn load(&self, run_id: &str) -> Result<Option<RunCheckpoint>> {
@@ -753,6 +788,51 @@ mod tests {
         let loaded = store.load("r").await.unwrap().unwrap();
         assert_eq!(loaded.status, RunStatus::Running);
         assert_eq!(loaded.owner_id.as_deref(), Some("alice"));
+    }
+
+    #[tokio::test]
+    async fn finish_writes_only_a_run_that_still_exists() {
+        let store = InMemoryRunStateStore::new();
+        let queued = run_with_created("r", "wf", 1).with_owner(Some("alice".into()));
+        store.checkpoint(&queued).await.unwrap();
+        let mut done = run_with_created("r", "wf", 1);
+        done.status = RunStatus::Succeeded;
+        done.outputs
+            .insert("n".into(), serde_json::json!({ "ok": true }));
+        assert!(store.finish(&done).await.unwrap());
+        let loaded = store.load("r").await.unwrap().unwrap();
+        assert_eq!(loaded.status, RunStatus::Succeeded);
+        assert_eq!(loaded.outputs.len(), 1);
+        assert_eq!(
+            loaded.owner_id.as_deref(),
+            Some("alice"),
+            "propriétaire gardé"
+        );
+
+        // Run effacé pendant l'exécution : rien n'est recréé.
+        assert_eq!(store.remove_owner("alice").unwrap(), 1);
+        assert!(!store.finish(&done).await.unwrap());
+        assert_eq!(store.load("r").await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn remove_owner_spares_other_owners_and_ownerless_runs() {
+        let store = InMemoryRunStateStore::new();
+        for (id, owner) in [
+            ("a1", Some("alice")),
+            ("a2", Some("alice")),
+            ("b", Some("bob")),
+            ("x", None),
+        ] {
+            store
+                .checkpoint(&run_with_created(id, "wf", 1).with_owner(owner.map(String::from)))
+                .await
+                .unwrap();
+        }
+        assert_eq!(store.remove_owner("alice").unwrap(), 2);
+        assert_eq!(store.remove_owner("alice").unwrap(), 0);
+        assert!(store.load("b").await.unwrap().is_some());
+        assert!(store.load("x").await.unwrap().is_some());
     }
 
     #[test]
