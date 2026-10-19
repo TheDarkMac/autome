@@ -45,6 +45,12 @@ lettre = { version = "0.11", default-features = false, features = ["builder", "h
 async-trait = { workspace = true }
 # CORS pour le frontend servi sur une autre origine (#225)
 tower-http = { version = "0.6", features = ["cors"] }
+# Second facteur et mots de passe compromis (#245) : TOTP RFC 6238
+# (HMAC-SHA-1), préfixe SHA-1 du k-anonymat Have I Been Pwned, QR code SVG
+# de l'enrôlement (sans dépendance d'image), client HTTP async du corpus.
+sha1 = "0.10"
+qrcode = { version = "0.14", default-features = false, features = ["svg"] }
+reqwest = { workspace = true }
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
