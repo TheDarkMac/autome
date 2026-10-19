@@ -7,7 +7,8 @@
 //!
 //! - `AUTOME_QUEUE` : `memory` (défaut) | `rabbitmq` (`config.queue_url`) ;
 //! - `AUTOME_PERSISTENCE` : `memory` (défaut) | `postgres` (`config.database_url`) ;
-//! - `AUTOME_WORKER_CONCURRENCY` : nombre de tâches consommatrices (défaut 4).
+//! - `AUTOME_WORKER_CONCURRENCY` : nombre de tâches consommatrices (défaut 4),
+//!   aussi le prefetch du consommateur RabbitMQ (messages poussés d'avance).
 //! - `AUTOME_RUN_TIMEOUT_SECS` : au-delà, un run toujours `running` est
 //!   considéré interrompu et clos en `failed` (défaut 3600, plancher 60). Un
 //!   run n'étant jamais rejoué (#174), c'est ce qui solde les runs d'un worker
@@ -53,7 +54,7 @@ use autome_connectors::oauth::{OAuthClient, OAuthRegistry};
 use autome_connectors::{proxy_vars_set, EgressPolicy, ReqwestHttpClient};
 use autome_core::{telemetry, Config, QueueRunDispatcher};
 use autome_persistence::selectors::{
-    build_connector_token_store, build_health_checks, build_queue, build_run_state_store,
+    build_connector_token_store, build_consuming_queue, build_health_checks, build_run_state_store,
     build_trigger_schedule_store, build_workflow_repository, ensure_durable_backends,
     PersistenceMode, QueueMode,
 };
@@ -133,7 +134,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Backends sélectionnés par l'environnement (partagés avec l'API).
-    let queue = build_queue(&config, queue_mode).await?;
+    // RabbitMQ pousse un message d'avance par tâche consommatrice (#237).
+    let prefetch = u16::try_from(concurrency).unwrap_or(u16::MAX);
+    let queue = build_consuming_queue(&config, queue_mode, prefetch).await?;
     // Sonde `/readyz` (#192) : base et broker effectivement sélectionnés.
     let health_checks = build_health_checks(&config, persistence, queue_mode, queue.clone())?;
     let repo = build_workflow_repository(&config, persistence)?;
