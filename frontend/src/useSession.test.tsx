@@ -60,15 +60,36 @@ describe("useSession", () => {
 
   it("signup persiste la paire", async () => {
     const store = memorySessionStore();
-    const signupImpl = vi.fn().mockResolvedValue(mkPair("bob", 10_000));
+    const signupImpl = vi
+      .fn()
+      .mockResolvedValue({ kind: "signedIn", tokens: mkPair("bob", 10_000) });
     const { result } = renderHook(() => useSession({ store, signupImpl }));
 
+    let pending: unknown = "unset";
     await act(async () => {
-      await result.current.signup({ email: "b@b.io", password: "longenough" });
+      pending = await result.current.signup({ email: "b@b.io", password: "longenough" });
     });
 
+    expect(pending).toBeNull();
     expect(result.current.session?.userId).toBe("bob");
     expect(signupImpl).toHaveBeenCalledOnce();
+  });
+
+  it("signup en attente de vérification n'ouvre aucune session (#231)", async () => {
+    const store = memorySessionStore();
+    const signupImpl = vi
+      .fn()
+      .mockResolvedValue({ kind: "verificationRequired", email: "b@b.io" });
+    const { result } = renderHook(() => useSession({ store, signupImpl }));
+
+    let pending: unknown = null;
+    await act(async () => {
+      pending = await result.current.signup({ email: "B@b.io", password: "longenough" });
+    });
+
+    expect(pending).toEqual({ email: "b@b.io" });
+    expect(result.current.session).toBeNull();
+    expect(store.read()).toBeNull();
   });
 
   it("logout efface la session et le store, et révoque côté serveur", () => {

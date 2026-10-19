@@ -122,6 +122,70 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/admin/users/{id}/verify-email": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * `POST /admin/users/{id}/verify-email` — marque vérifiée l'adresse actuelle
+         *     du compte (#231) : sa connexion devient possible. Idempotent.
+         */
+        post: operations["verify_user_email"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/auth/email/resend": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * `POST /auth/email/resend` — renvoie un lien de vérification à l'adresse,
+         *     **si** un compte non vérifié lui correspond.
+         * @description Toujours 202 pour une adresse bien formée : comme pour le mot de passe
+         *     oublié, la recherche du compte et l'envoi ont lieu en tâche de fond.
+         */
+        post: operations["resend_verification"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/auth/email/verify": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * `POST /auth/email/verify` — consomme un lien de vérification : l'adresse
+         *     du compte est marquée vérifiée et la connexion devient possible. Réponse
+         *     204 : l'utilisateur se connecte ensuite (le lien n'ouvre pas de session).
+         *     Un lien déjà utilisé reste accepté tant qu'il n'a pas expiré (idempotent).
+         */
+        post: operations["verify_email"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/auth/login": {
         parameters: {
             query?: never;
@@ -306,7 +370,11 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** `POST /auth/signup` — crée un compte (rôle `editor`) et le connecte. */
+        /**
+         * `POST /auth/signup` — crée un compte (rôle `editor`) et le connecte ; si
+         *     la vérification de l'email est exigée (#231), il reste non vérifié, un
+         *     lien lui est envoyé et la réponse (202) ne porte aucun jeton.
+         */
         post: operations["signup"];
         delete?: never;
         options?: never;
@@ -583,6 +651,8 @@ export interface components {
             disabled: boolean;
             /** @description Email normalisé. */
             email: string;
+            /** @description Adresse email vérifiée (#231). */
+            email_verified: boolean;
             /** @description Identifiant (`claims.sub`). */
             id: string;
             /** @description Permissions accordées, triées. */
@@ -745,6 +815,11 @@ export interface components {
             /** @description Refresh token obtenu au login/signup ou au refresh précédent. */
             refresh_token: string;
         };
+        /** @description Body de `/auth/email/resend`. */
+        ResendVerificationBody: {
+            /** @description Adresse email du compte (normalisée côté serveur). */
+            email: string;
+        };
         /** @description Body de `/auth/password/reset`. */
         ResetPasswordBody: {
             /** @description Nouveau mot de passe (8 à 1024 caractères). */
@@ -756,6 +831,16 @@ export interface components {
         RoleBody: {
             /** @description `admin`, `editor` ou `viewer`. */
             role: string;
+        };
+        /**
+         * @description Réponse 202 de `/auth/signup` quand l'adresse doit être vérifiée (#231) :
+         *     aucun jeton, un lien de vérification part vers `email`.
+         */
+        SignupPending: {
+            /** @description Adresse normalisée à laquelle le lien est envoyé. */
+            email: string;
+            /** @description Toujours `true` : connexion possible après vérification. */
+            verification_required: boolean;
         };
         /** @description Paire de jetons émise par signup/login/refresh. */
         TokenResponse: {
@@ -781,6 +866,11 @@ export interface components {
             offset: number;
             /** @description Total des comptes correspondant au filtre. */
             total: number;
+        };
+        /** @description Body de `/auth/email/verify`. */
+        VerifyEmailBody: {
+            /** @description Jeton reçu par email (fragment `#verify=` du lien). */
+            token: string;
         };
         /** @description Réponse d'un webhook accepté. */
         WebhookAccepted: {
@@ -1161,6 +1251,129 @@ export interface operations {
             };
         };
     };
+    verify_user_email: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Identifiant du compte */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Adresse vérifiée */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AdminUser"];
+                };
+            };
+            /** @description Token absent ou invalide */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Manque `users.admin`, ou `*` pour un compte super-admin */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Compte inconnu */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    resend_verification: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ResendVerificationBody"];
+            };
+        };
+        responses: {
+            /** @description Demande prise en compte (email envoyé si un compte non vérifié existe) */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Email invalide */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Trop de demandes (adresse email ou IP) — voir `Retry-After` */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Vérification de l'email désactivée sur ce déploiement */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    verify_email: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["VerifyEmailBody"];
+            };
+        };
+        responses: {
+            /** @description Adresse vérifiée */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Lien invalide ou expiré */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Vérification de l'email désactivée sur ce déploiement */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
     login: {
         parameters: {
             query?: never;
@@ -1190,7 +1403,7 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description Compte suspendu par un administrateur */
+            /** @description Compte suspendu par un administrateur (`account disabled`), ou adresse email pas encore vérifiée (`email not verified`) */
             403: {
                 headers: {
                     [name: string]: unknown;
@@ -1529,13 +1742,22 @@ export interface operations {
             };
         };
         responses: {
-            /** @description Compte créé */
+            /** @description Compte créé et connecté (vérification de l'email désactivée) */
             201: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
                     "application/json": components["schemas"]["TokenResponse"];
+                };
+            };
+            /** @description Compte créé, email de vérification envoyé : connexion possible après vérification */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SignupPending"];
                 };
             };
             /** @description Email ou mot de passe invalide */

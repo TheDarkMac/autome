@@ -5,7 +5,8 @@
 // rôle `admin` et les super-admins sans `*`) et traduit ses refus en clair.
 // Suspendre un compte ou fermer ses sessions est confirmé, comme la
 // déconnexion de tous ses appareils ; la suppression définitive d'un compte
-// et de ses données (#229) aussi. Le client API est injecté pour les tests.
+// et de ses données (#229) aussi, ainsi que la vérification d'une adresse à
+// la place de son titulaire (#231). Le client API est injecté pour les tests.
 
 import { useCallback, useEffect, useState, type FormEvent } from "react";
 
@@ -16,7 +17,13 @@ type AdminUser = Schemas["AdminUser"];
 
 export type AdminApi = Pick<
   ApiClient,
-  "listUsers" | "setUserRole" | "disableUser" | "enableUser" | "logoutUser" | "deleteUser"
+  | "listUsers"
+  | "setUserRole"
+  | "disableUser"
+  | "enableUser"
+  | "logoutUser"
+  | "deleteUser"
+  | "verifyUserEmail"
 >;
 
 export interface AdminPanelProps {
@@ -158,6 +165,16 @@ export function AdminPanel({
     );
   }
 
+  function onVerifyEmail(user: AdminUser): void {
+    const message = `Marquer l'adresse ${user.email} comme vérifiée ? Son titulaire pourra se connecter sans ouvrir le lien reçu : faites-le seulement si vous savez que l'adresse lui appartient.`;
+    if (!confirm(message)) return;
+    void runAction(
+      user,
+      () => api.verifyUserEmail(user.id),
+      `Adresse ${user.email} vérifiée.`,
+    );
+  }
+
   function onLogout(user: AdminUser): void {
     if (!confirm(`Fermer toutes les sessions de ${user.email} ?`)) return;
     void runAction(
@@ -260,6 +277,7 @@ export function AdminPanel({
                     onToggle={() => onToggle(user)}
                     onLogout={() => onLogout(user)}
                     onDelete={() => onDelete(user)}
+                    onVerifyEmail={() => onVerifyEmail(user)}
                   />
                 ))}
               </tbody>
@@ -287,6 +305,7 @@ function UserRow({
   onToggle,
   onLogout,
   onDelete,
+  onVerifyEmail,
 }: {
   user: AdminUser;
   self: boolean;
@@ -296,6 +315,7 @@ function UserRow({
   onToggle: () => void;
   onLogout: () => void;
   onDelete: () => void;
+  onVerifyEmail: () => void;
 }): JSX.Element {
   // Un super-admin n'est gérable que par un super-admin (refus 403 sinon).
   const locked = busy || (user.role === "admin" && !superAdmin);
@@ -339,10 +359,26 @@ function UserRow({
             Actif
           </span>
         )}
+        {!user.email_verified && (
+          <span className="ml-1 rounded bg-amber-50 px-2 py-0.5 text-xs font-medium text-amber-800">
+            Email non vérifié
+          </span>
+        )}
       </td>
       <td className="px-3 py-2 text-neutral-500">{created}</td>
       <td className="px-3 py-2">
         <div className="flex gap-2">
+          {!user.email_verified && (
+            <button
+              type="button"
+              onClick={onVerifyEmail}
+              disabled={locked}
+              aria-label={`Vérifier l'adresse de ${user.email}`}
+              className="rounded-md border border-neutral-200 px-2 py-1 text-xs text-neutral-700 hover:bg-neutral-50 disabled:opacity-60"
+            >
+              Vérifier l'email
+            </button>
+          )}
           <button
             type="button"
             onClick={onToggle}

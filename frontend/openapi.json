@@ -370,6 +370,116 @@
         ]
       }
     },
+    "/admin/users/{id}/verify-email": {
+      "post": {
+        "tags": [
+          "admin"
+        ],
+        "summary": "`POST /admin/users/{id}/verify-email` — marque vérifiée l'adresse actuelle\ndu compte (#231) : sa connexion devient possible. Idempotent.",
+        "operationId": "verify_user_email",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Identifiant du compte",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Adresse vérifiée",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminUser"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Token absent ou invalide"
+          },
+          "403": {
+            "description": "Manque `users.admin`, ou `*` pour un compte super-admin"
+          },
+          "404": {
+            "description": "Compte inconnu"
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/auth/email/resend": {
+      "post": {
+        "tags": [
+          "auth"
+        ],
+        "summary": "`POST /auth/email/resend` — renvoie un lien de vérification à l'adresse,\n**si** un compte non vérifié lui correspond.",
+        "description": "Toujours 202 pour une adresse bien formée : comme pour le mot de passe\noublié, la recherche du compte et l'envoi ont lieu en tâche de fond.",
+        "operationId": "resend_verification",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ResendVerificationBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "description": "Demande prise en compte (email envoyé si un compte non vérifié existe)"
+          },
+          "400": {
+            "description": "Email invalide"
+          },
+          "429": {
+            "description": "Trop de demandes (adresse email ou IP) — voir `Retry-After`"
+          },
+          "503": {
+            "description": "Vérification de l'email désactivée sur ce déploiement"
+          }
+        }
+      }
+    },
+    "/auth/email/verify": {
+      "post": {
+        "tags": [
+          "auth"
+        ],
+        "summary": "`POST /auth/email/verify` — consomme un lien de vérification : l'adresse\ndu compte est marquée vérifiée et la connexion devient possible. Réponse\n204 : l'utilisateur se connecte ensuite (le lien n'ouvre pas de session).\nUn lien déjà utilisé reste accepté tant qu'il n'a pas expiré (idempotent).",
+        "operationId": "verify_email",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/VerifyEmailBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Adresse vérifiée"
+          },
+          "400": {
+            "description": "Lien invalide ou expiré"
+          },
+          "503": {
+            "description": "Vérification de l'email désactivée sur ce déploiement"
+          }
+        }
+      }
+    },
     "/auth/login": {
       "post": {
         "tags": [
@@ -402,7 +512,7 @@
             "description": "Identifiants invalides"
           },
           "403": {
-            "description": "Compte suspendu par un administrateur"
+            "description": "Compte suspendu par un administrateur (`account disabled`), ou adresse email pas encore vérifiée (`email not verified`)"
           },
           "429": {
             "description": "Trop d'échecs (compte ou adresse IP) — voir `Retry-After`"
@@ -700,7 +810,7 @@
         "tags": [
           "auth"
         ],
-        "summary": "`POST /auth/signup` — crée un compte (rôle `editor`) et le connecte.",
+        "summary": "`POST /auth/signup` — crée un compte (rôle `editor`) et le connecte ; si\nla vérification de l'email est exigée (#231), il reste non vérifié, un\nlien lui est envoyé et la réponse (202) ne porte aucun jeton.",
         "operationId": "signup",
         "requestBody": {
           "content": {
@@ -714,11 +824,21 @@
         },
         "responses": {
           "201": {
-            "description": "Compte créé",
+            "description": "Compte créé et connecté (vérification de l'email désactivée)",
             "content": {
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/TokenResponse"
+                }
+              }
+            }
+          },
+          "202": {
+            "description": "Compte créé, email de vérification envoyé : connexion possible après vérification",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SignupPending"
                 }
               }
             }
@@ -1678,6 +1798,7 @@
           "role",
           "permissions",
           "disabled",
+          "email_verified",
           "created_at_ms"
         ],
         "properties": {
@@ -1693,6 +1814,10 @@
           "email": {
             "type": "string",
             "description": "Email normalisé."
+          },
+          "email_verified": {
+            "type": "boolean",
+            "description": "Adresse email vérifiée (#231)."
           },
           "id": {
             "type": "string",
@@ -2090,6 +2215,19 @@
           }
         }
       },
+      "ResendVerificationBody": {
+        "type": "object",
+        "description": "Body de `/auth/email/resend`.",
+        "required": [
+          "email"
+        ],
+        "properties": {
+          "email": {
+            "type": "string",
+            "description": "Adresse email du compte (normalisée côté serveur)."
+          }
+        }
+      },
       "ResetPasswordBody": {
         "type": "object",
         "description": "Body de `/auth/password/reset`.",
@@ -2118,6 +2256,24 @@
           "role": {
             "type": "string",
             "description": "`admin`, `editor` ou `viewer`."
+          }
+        }
+      },
+      "SignupPending": {
+        "type": "object",
+        "description": "Réponse 202 de `/auth/signup` quand l'adresse doit être vérifiée (#231) :\naucun jeton, un lien de vérification part vers `email`.",
+        "required": [
+          "email",
+          "verification_required"
+        ],
+        "properties": {
+          "email": {
+            "type": "string",
+            "description": "Adresse normalisée à laquelle le lien est envoyé."
+          },
+          "verification_required": {
+            "type": "boolean",
+            "description": "Toujours `true` : connexion possible après vérification."
           }
         }
       },
@@ -2181,6 +2337,19 @@
             "type": "integer",
             "description": "Total des comptes correspondant au filtre.",
             "minimum": 0
+          }
+        }
+      },
+      "VerifyEmailBody": {
+        "type": "object",
+        "description": "Body de `/auth/email/verify`.",
+        "required": [
+          "token"
+        ],
+        "properties": {
+          "token": {
+            "type": "string",
+            "description": "Jeton reçu par email (fragment `#verify=` du lien)."
           }
         }
       },
