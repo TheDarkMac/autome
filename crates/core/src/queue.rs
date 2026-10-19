@@ -116,6 +116,30 @@ pub trait Queue: Send + Sync {
     /// Le message passe en *in-flight* jusqu'à `ack`/`nack`.
     async fn poll(&self, name: &str) -> Result<Option<Delivery>>;
 
+    /// Attend **au plus** `wait` le prochain message de `name` (consommation
+    /// continue, #237) ; `None` si rien n'est arrivé dans ce délai.
+    ///
+    /// Même contrat d'acquittement que [`poll`](Self::poll). Une impl peut
+    /// rendre la main avant `wait` sans message (l'appelant qui boucle doit
+    /// alors patienter le reste du délai). Par défaut : un seul `poll`, sans
+    /// attente. RabbitMQ la sert par un consommateur `basic_consume` dont le
+    /// broker pousse les messages, au lieu d'un aller-retour par message.
+    async fn receive(&self, name: &str, wait: std::time::Duration) -> Result<Option<Delivery>> {
+        let _ = wait;
+        self.poll(name).await
+    }
+
+    /// Met fin à la consommation continue de `name` par ce process (arrêt du
+    /// worker) : les messages reçus d'avance et pas encore rendus par
+    /// [`receive`](Self::receive) retournent en file pour les autres
+    /// consommateurs. Les livraisons déjà rendues restent à acquitter. Un
+    /// `receive` ultérieur sur `name` peut ne plus rien livrer. Par défaut :
+    /// rien à faire.
+    async fn stop_receiving(&self, name: &str) -> Result<()> {
+        let _ = name;
+        Ok(())
+    }
+
     /// Confirme le succès du traitement — supprime le message in-flight.
     async fn ack(&self, id: &DeliveryId) -> Result<()>;
 
@@ -345,6 +369,14 @@ impl<Q: Queue> Queue for BoundedQueue<Q> {
         self.inner.poll(name).await
     }
 
+    async fn receive(&self, name: &str, wait: std::time::Duration) -> Result<Option<Delivery>> {
+        self.inner.receive(name, wait).await
+    }
+
+    async fn stop_receiving(&self, name: &str) -> Result<()> {
+        self.inner.stop_receiving(name).await
+    }
+
     async fn ack(&self, id: &DeliveryId) -> Result<()> {
         self.inner.ack(id).await
     }
@@ -355,6 +387,10 @@ impl<Q: Queue> Queue for BoundedQueue<Q> {
 
     async fn depth(&self, name: &str) -> Result<usize> {
         self.inner.depth(name).await
+    }
+
+    async fn ping(&self) -> Result<()> {
+        self.inner.ping().await
     }
 }
 
@@ -674,6 +710,20 @@ mod tests {
     async fn bounded_is_send_sync_when_inner_is() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<BoundedQueue<InMemoryQueue>>();
+    }
+
+    #[tokio::test]
+    async fn receive_defaults_to_a_single_poll_through_the_bounded_wrapper() {
+        let q = BoundedQueue::new(InMemoryQueue::new()).with_limit("q", 10);
+        let wait = std::time::Duration::from_secs(3600);
+        // File vide : rend la main sans attendre le délai.
+        assert!(q.receive("q", wait).await.unwrap().is_none());
+        q.publish("q", msg(json!({ "n": 1 }))).await.unwrap();
+        let d = q.receive("q", wait).await.unwrap().expect("un message");
+        assert_eq!(d.message.body, json!({ "n": 1 }));
+        q.ack(&d.id).await.unwrap();
+        q.stop_receiving("q").await.unwrap();
+        q.ping().await.unwrap();
     }
 
     #[tokio::test]
