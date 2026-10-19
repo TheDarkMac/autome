@@ -60,6 +60,10 @@ cp .env.example .env
 | `AUTOME_SMTP_URL` | Relais SMTP des emails (mot de passe oublié, vérification de l'adresse, invitations) : `smtps://user:pass@hôte` (TLS, 465) ou `smtp://hôte:587?tls=required` (STARTTLS). Contient un mot de passe : à mettre dans un secret | *(non défini : liens journalisés en `dev`)* | **requis pour le mot de passe oublié et les invitations** (sinon 503) et la vérification de l'email (sinon comptes créés vérifiés) |
 | `AUTOME_EMAIL_VERIFICATION` | `required` : un compte inscrit ne se connecte qu'après avoir ouvert le lien reçu par email (dès qu'un envoi d'email est possible) ; `off` : comptes créés vérifiés (#231) | `required` | `required` |
 | `AUTOME_SIGNUP` | `open` : inscriptions publiques (`/auth/signup`) ; `invite_only` : comptes créés par invitation d'un administrateur seulement, `/auth/signup` répond 403 `signup closed` (#241). Autre valeur : refus de démarrer | `open` | selon l'instance (`invite_only` pour une équipe fermée) |
+| `AUTOME_PASSWORD_BLOCKLIST_FILE` | Fichier de mots de passe refusés en plus de la liste intégrée (un par ligne, `#` = commentaire, comparaison sans casse) — ex. fuites internes, nom de l'entreprise (#245). Illisible : refus de démarrer | *(non défini)* | facultatif |
+| `AUTOME_PWNED_PASSWORDS` | `hibp` : un mot de passe choisi est aussi comparé au corpus Have I Been Pwned en k-anonymat (seuls 5 caractères hex de son SHA-1 sortent) ; `off` : listes locales seules (#245) | `off` | `hibp` si la sortie vers le corpus est permise |
+| `AUTOME_PWNED_PASSWORDS_URL` | Corpus interrogé avec `AUTOME_PWNED_PASSWORDS=hibp` (même API `GET /range/{préfixe}`, ex. miroir interne) | `https://api.pwnedpasswords.com` | selon le réseau |
+| `AUTOME_MFA_ISSUER` | Nom affiché par les applications d'authentification pour les comptes de cette instance (#245) | `Autome` | ex. `Autome (prod)` |
 | `AUTOME_MAIL_FROM` | Expéditeur des emails, ex. `Autome <no-reply@exemple.fr>` | *(non défini)* | obligatoire avec `AUTOME_SMTP_URL` |
 | `AUTOME_CORS_ORIGINS` | Origines du **frontend** autorisées à appeler l'API depuis le navigateur (`scheme://hôte[:port]`, séparées par des virgules ; ni joker, ni chemin — refus de démarrer sinon). Vide = aucune | `http://localhost:5173,http://localhost:8081` | **obligatoire** si le frontend est servi sur une autre origine que l'API |
 | `AUTOME_PUBLIC_URL` | URL publique du **frontend**, base des liens envoyés par email (jamais déduite de l'en-tête `Host`) | `http://localhost:5173` | obligatoire avec `AUTOME_SMTP_URL` |
@@ -632,7 +636,8 @@ comptes sont publics ; tout le reste exige `Authorization: Bearer <access_token>
 | Méthode | Path | Body | Réponse |
 |---|---|---|---|
 | POST | `/auth/signup` | `{"email","password"}` | 201 + paire de jetons (vérification désactivée) · 202 `{"email","verification_required":true}` sans jetons, lien de vérification envoyé · 400 saisie invalide · 403 `signup closed` (`AUTOME_SIGNUP=invite_only`) · 409 email déjà pris |
-| POST | `/auth/login` | `{"email","password"}` | 200 + paire de jetons · 401 identifiants invalides · 403 `account disabled` (compte suspendu) ou `email not verified` · 429 trop d'échecs (`Retry-After`) |
+| POST | `/auth/login` | `{"email","password"}` | 200 + paire de jetons · 202 `{"mfa_required":true,"mfa_token","expires_in":300}` sans jetons quand la double authentification est active · 401 identifiants invalides · 403 `account disabled` (compte suspendu) ou `email not verified` · 429 trop d'échecs (`Retry-After`) |
+| POST | `/auth/mfa/verify` | `{"mfa_token","code"}` (code de l'application ou de secours) | 200 + paire de jetons · 400 défi invalide ou expiré (recommencer la connexion) · 401 code incorrect, déjà utilisé ou rejoué · 403 compte suspendu · 429 trop d'essais |
 | POST | `/auth/refresh` | `{"refresh_token"}` | 200 + nouvelle paire · 401 refresh invalide, expiré ou déjà utilisé |
 | POST | `/auth/logout` | `{"refresh_token"}` (+ `Authorization: Bearer <access_token>` facultatif) | 204 session fermée (aussi si déjà fermée) · 401 refresh invalide ou expiré |
 | POST | `/auth/logout-all` | — (`Authorization: Bearer <access_token>` requis) | 204 toutes les sessions fermées · 401 access absent, invalide ou déjà révoqué |
@@ -642,7 +647,12 @@ comptes sont publics ; tout le reste exige `Authorization: Bearer <access_token>
 | POST | `/auth/email/verify` | `{"token"}` | 204 adresse vérifiée · 400 lien invalide ou expiré · 503 vérification désactivée |
 | POST | `/auth/email/resend` | `{"email"}` | 202 demande prise en compte (que le compte existe ou non) · 400 email invalide · 429 trop de demandes · 503 vérification désactivée |
 | POST | `/auth/invitation/accept` | `{"token","password"}` | 200 + paire de jetons, compte activé et adresse vérifiée · 400 lien invalide, expiré, déjà utilisé ou remplacé par un renvoi, ou mot de passe invalide · 403 `account disabled` · 503 aucun envoi d'email configuré |
-| GET | `/auth/me` | — (Bearer requis) | 200 `{"id","email","role","permissions"}` · 401 session invalide ou compte suspendu |
+| GET | `/auth/me` | — (Bearer requis) | 200 `{"id","email","role","permissions","mfa_enabled"}` · 401 session invalide ou compte suspendu |
+| GET | `/auth/mfa` | — (Bearer requis) | 200 `{"enabled","pending","recovery_codes_left"}` |
+| POST | `/auth/mfa/setup` | `{"current_password"}` (Bearer requis) | 200 `{"secret","otpauth_uri","qr_svg"}` enrôlement en attente · 403 mot de passe incorrect · 409 `mfa already enabled` · 429 |
+| POST | `/auth/mfa/enable` | `{"code"}` (Bearer requis) | 200 `{"recovery_codes","session"}` MFA active, **autres sessions fermées**, nouvelle paire · 403 `invalid mfa code` · 409 `mfa setup required` / `mfa already enabled` · 429 |
+| POST | `/auth/mfa/disable` | `{"current_password","code"}` (Bearer requis) | 204 · 403 mot de passe ou code incorrect · 409 `mfa not enabled` · 429 |
+| POST | `/auth/mfa/recovery-codes` | `{"code"}` (Bearer requis) | 200 `{"recovery_codes"}` nouveaux codes, anciens invalidés · 403 · 409 `mfa not enabled` · 429 |
 | DELETE | `/auth/me` | `{"current_password"}` (Bearer requis) | 204 compte et données effacés, sessions fermées · 401 session invalide ou compte suspendu · 403 mot de passe actuel incorrect · 409 compte administrateur (`*`) · 429 trop d'essais |
 
 - Paire de jetons : `{"access_token","refresh_token","token_type":"Bearer","expires_in":900}`.
@@ -833,8 +843,9 @@ Onglet « Administration » du frontend, visible des seuls comptes qui détienne
 | POST | `/admin/users` | `{"email","role"?}` (`role` : `admin`\|`editor`\|`viewer`, défaut `editor`) | 201 `{"user","invitation_sent"}` compte invité · 400 email ou rôle invalide · 403 (`admin` sans `*`) · 409 email déjà pris · 503 aucun envoi d'email |
 | POST | `/admin/users/{id}/invitation` | — | 204 invitation renvoyée, anciens liens invalidés · 403 · 404 · 409 compte déjà activé ou suspendu · 502 email non envoyé · 503 aucun envoi d'email |
 | DELETE | `/admin/users/{id}` | — | 204 compte et données effacés · 403 · 404 · 409 son propre compte |
+| DELETE | `/admin/users/{id}/mfa` | — | 200 compte, double authentification réinitialisée (idempotent) · 403 · 404 · 409 son propre compte (passer par `/auth/mfa/disable`) |
 
-Un compte vaut `{"id","email","role","permissions","disabled","email_verified","invitation_pending","created_at_ms"}`
+Un compte vaut `{"id","email","role","permissions","disabled","email_verified","invitation_pending","mfa_enabled","created_at_ms"}`
 (jamais le hash du mot de passe). Règles :
 
 - Le **rôle** n'est qu'une vue des permissions : `admin` = `*`, `editor` et
@@ -869,7 +880,8 @@ Un compte vaut `{"id","email","role","permissions","disabled","email_verified","
   `admin.user_disable`, `admin.user_enable`, `admin.user_logout_all`,
   `admin.user_verify_email`, `admin.user_delete` (ressource = pseudonyme du compte effacé, avec le nombre
   de workflows, runs et tokens supprimés), `admin.user_invite` (avec `role`
-  et `sent`), `admin.user_invite_resend` ; les refus (403/409) sont audités
+  et `sent`), `admin.user_invite_resend`, `admin.user_mfa_reset` (avec
+  `had_mfa`) ; les refus (403/409) sont audités
   `Denied`.
 - **Invitation** (#241) : formulaire « Inviter par email » de l'onglet (email
   et rôle ; `admin` réservé à `*`, comme ci-dessus). Le compte est créé au rôle
@@ -936,6 +948,67 @@ sortie non nul, renvoyer l'invitation depuis l'onglet Administration.
 l'adresse d'un compte, sans toucher à ses droits — envoi d'emails en panne,
 tests de bout en bout (`scripts/compose-smoke.sh`). Audit
 `admin.user_verify_email` sous l'acteur `cli`.
+
+### Mots de passe compromis
+
+Un mot de passe **choisi** — inscription, changement, réinitialisation,
+acceptation d'une invitation — est refusé (400, message unique : « mot de passe
+trop courant ou divulgué… ») s'il figure dans la liste intégrée des mots de
+passe les plus fréquents des fuites publiques, s'il se réduit à un mot courant
+une fois retirés chiffres, symboles et *leet speak* (`P@ssw0rd2024!`), au nom
+du service, à l'email ou à sa partie locale, s'il répète un seul caractère, ou
+s'il figure dans `AUTOME_PASSWORD_BLOCKLIST_FILE` (#245). La connexion, elle,
+ne contrôle jamais rien de tout cela : un compte existant n'est pas verrouillé
+par une liste mise à jour.
+
+Avec `AUTOME_PWNED_PASSWORDS=hibp`, le mot de passe est en plus comparé au
+corpus [Have I Been Pwned](https://haveibeenpwned.com/Passwords) en
+**k-anonymat** : seuls les 5 premiers caractères hexadécimaux de son SHA-1
+quittent l'API (`GET /range/{préfixe}`, réponse complétée de faux suffixes
+par `Add-Padding`), jamais le mot de passe ni son empreinte complète. Le
+corpus est interrogé après le quota d'inscription par IP et après la
+vérification du lien ou du mot de passe actuel. Corpus injoignable ou plus
+lent que 3 s : les listes locales seules s'appliquent (avertissement dans les
+journaux, sans le préfixe) — l'inscription ne dépend pas d'un tiers. Sans
+sortie Internet, pointer `AUTOME_PWNED_PASSWORDS_URL` vers un miroir interne
+(même API), ou laisser `off`.
+
+### Double authentification (TOTP)
+
+Facultative, par compte (#245) : onglet **Compte** → « Activer la double
+authentification ». Mot de passe actuel, puis QR code à scanner (ou clé à
+saisir) dans une application d'authentification (Google Authenticator,
+Microsoft Authenticator, Aegis, 1Password…), puis un premier code : la MFA est
+active, **les autres sessions sont fermées**, et 10 **codes de secours** à
+usage unique s'affichent **une seule fois**. Ensuite, la connexion demande le
+code de l'application (ou un code de secours) après le mot de passe.
+
+- Codes TOTP RFC 6238 (SHA-1, 6 chiffres, 30 s, ±30 s de tolérance
+  d'horloge) ; un code n'est accepté **qu'une fois** (anti-rejeu, aussi entre
+  répliques). Horloge du serveur à garder synchronisée (NTP).
+- Le secret est **chiffré** en base (`user_mfa`, clé dérivée
+  d'`ENCRYPTION_KEY`) ; les codes de secours n'y sont que sous forme
+  d'empreinte HMAC (`mfa_recovery_codes`). **Changer `ENCRYPTION_KEY` rend les
+  secrets illisibles** : il faudra réinitialiser la MFA des comptes concernés.
+- Essais de codes limités par compte (5 par fenêtre de 15 min, comme la
+  connexion) et par IP (quota de connexion) ; le défi de connexion (5 min) est
+  périmé par un changement de mot de passe ou une fermeture des sessions.
+- Désactiver exige le mot de passe **et** un code ; régénérer les codes de
+  secours exige un code. Supprimer le compte efface le second facteur.
+- **Téléphone et codes de secours perdus** : un administrateur réinitialise la
+  MFA du compte (onglet Administration, « Réinitialiser la MFA »), après avoir
+  vérifié l'identité du titulaire ; pour le dernier administrateur :
+
+  ```bash
+  docker compose exec api autome-api reset-mfa admin@example.com
+  ```
+
+  (mêmes prérequis que `promote-admin` ; audit `admin.user_mfa_reset` sous
+  l'acteur `cli`).
+- Audit : `auth.mfa_setup`, `auth.mfa_enable`, `auth.mfa_disable`,
+  `auth.mfa_recovery_codes`, `auth.mfa_challenge` (mot de passe correct, code
+  demandé), `auth.mfa_verify` (échecs) et `auth.login` avec la méthode
+  (`{"mfa":"totp"}` ou `{"mfa":"recovery_code"}`). Jamais un code ni un secret.
 
 ### Données personnelles (adresses IP)
 
@@ -1038,6 +1111,8 @@ npm run test       # Vitest
 | « Mot de passe oublié » répond 503 / « pas disponible sur ce serveur » | Profil `prod` sans `AUTOME_SMTP_URL` | Définir `AUTOME_SMTP_URL`, `AUTOME_MAIL_FROM` et `AUTOME_PUBLIC_URL` |
 | Aucun email de réinitialisation reçu | Relais SMTP refusé/injoignable (log `envoi du lien de réinitialisation impossible`), quota atteint, ou adresse sans compte | Vérifier `AUTOME_SMTP_URL` et les journaux de l'API ; en `dev` sans SMTP, le lien est dans les journaux |
 | Inscription refusée « les inscriptions sont fermées » (403 `signup closed`) | `AUTOME_SIGNUP=invite_only` (#241) | Se faire inviter par un administrateur (onglet Administration) ou, pour le premier compte, `autome-api invite <email> admin` |
+| « mot de passe trop courant ou divulgué » à l'inscription ou au changement | Mot de passe de la liste intégrée, de `AUTOME_PASSWORD_BLOCKLIST_FILE`, dérivé de l'email ou du nom du service, ou présent dans Have I Been Pwned (#245) | En choisir un autre (une phrase de plusieurs mots convient) |
+| Code de double authentification toujours refusé | Horloge du téléphone ou du serveur décalée de plus de 30 s, ou code déjà utilisé | Synchroniser les horloges (NTP), attendre le code suivant, ou utiliser un code de secours ; sinon réinitialisation par un administrateur (`autome-api reset-mfa <email>`) |
 | « Ce lien d'invitation est invalide, expiré ou déjà utilisé » | Lien de plus de 7 jours, déjà utilisé, ou remplacé par un renvoi (#241) | Demander un renvoi à un administrateur (« Renvoyer l'invitation »), ou utiliser « Mot de passe oublié » avec l'adresse invitée |
 | Connexion refusée « adresse email pas encore vérifiée » (403 `email not verified`) | Lien de vérification pas encore ouvert (#231) | Ouvrir le lien reçu ou cliquer « Renvoyer le lien » ; en `dev` sans SMTP, le lien est dans les journaux de l'API ; sinon `autome-api verify-email <email>` ou l'onglet Administration |
 | Console du navigateur : `blocked by CORS policy` / préflight `OPTIONS` en 405 ; l'interface ne charge rien | Origine du frontend absente de `AUTOME_CORS_ORIGINS` (aucune par défaut en `prod`) | Ajouter l'origine exacte du frontend (schéma + hôte + port) à `AUTOME_CORS_ORIGINS` et redémarrer l'API |
