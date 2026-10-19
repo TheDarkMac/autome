@@ -135,6 +135,28 @@ impl Dag {
         Ok(dag)
     }
 
+    /// Empreinte du graphe exécutable (#239) : nodes (type, paramètres) et
+    /// arêtes dans l'ordre du modèle, sans la disposition de l'éditeur. Un
+    /// point de reprise la porte : reprendre un run sur un graphe modifié
+    /// depuis son interruption est refusé.
+    pub fn fingerprint(&self) -> String {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        for id in &self.order {
+            let mut node = self.nodes[id].clone();
+            node.position = None;
+            node.name.clear();
+            hasher.update(serde_json::to_vec(&node).expect("node sérialisable"));
+            hasher.update([0]);
+            for e in self.successors(id) {
+                hasher.update(serde_json::to_vec(e).expect("arête sérialisable"));
+                hasher.update([0]);
+            }
+            hasher.update([1]);
+        }
+        hex::encode(hasher.finalize())
+    }
+
     /// Node racine (point d'entrée unique du workflow).
     pub fn root(&self) -> &Node {
         &self.nodes[&self.root]
