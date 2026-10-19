@@ -32,7 +32,11 @@ export interface paths {
         get: operations["get_user"];
         put?: never;
         post?: never;
-        delete?: never;
+        /**
+         * `DELETE /admin/users/{id}` — efface définitivement le compte et toutes
+         *     ses données (RGPD, droit à l'effacement) ; ses sessions sont fermées.
+         */
+        delete: operations["delete_user"];
         options?: never;
         head?: never;
         patch?: never;
@@ -196,7 +200,12 @@ export interface paths {
         get: operations["me"];
         put?: never;
         post?: never;
-        delete?: never;
+        /**
+         * `DELETE /auth/me` — efface le compte de l'utilisateur authentifié et tout
+         *     ce qui lui est rattaché (RGPD, droit à l'effacement), après vérification
+         *     du mot de passe actuel. Toutes ses sessions sont fermées.
+         */
+        delete: operations["delete_account"];
         options?: never;
         head?: never;
         patch?: never;
@@ -662,6 +671,11 @@ export interface components {
             /** @description Mot de passe en clair (8 à 1024 caractères). */
             password: string;
         };
+        /** @description Body de `DELETE /auth/me`. */
+        DeleteAccountBody: {
+            /** @description Mot de passe actuel (confirmation de la suppression). */
+            current_password: string;
+        };
         /** @description Body de `/auth/password/forgot`. */
         ForgotPasswordBody: {
             /** @description Adresse email du compte (normalisée côté serveur). */
@@ -885,6 +899,62 @@ export interface operations {
             };
             /** @description Compte inconnu */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    delete_user: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Identifiant du compte */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Compte et données effacés */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Token absent ou invalide */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Manque `users.admin`, ou `*` pour un compte super-admin */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Compte inconnu */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Son propre compte (passer par `DELETE /auth/me`) */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Suppression indisponible sur ce déploiement */
+            503: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -1213,6 +1283,63 @@ export interface operations {
             };
             /** @description Access token absent, invalide, révoqué, ou compte suspendu */
             401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    delete_account: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["DeleteAccountBody"];
+            };
+        };
+        responses: {
+            /** @description Compte et données effacés ; sessions fermées */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Access token absent, invalide, révoqué, ou compte suspendu */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Mot de passe actuel incorrect */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Compte administrateur (`*`) : un autre administrateur doit d'abord retirer son rôle */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Trop d'essais — voir `Retry-After` */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Suppression indisponible sur ce déploiement */
+            503: {
                 headers: {
                     [name: string]: unknown;
                 };

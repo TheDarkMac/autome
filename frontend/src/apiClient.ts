@@ -104,6 +104,8 @@ export interface ApiClient {
   enableUser(id: string): Promise<Schemas["AdminUser"]>;
   /** Ferme toutes les sessions d'un autre utilisateur. */
   logoutUser(id: string): Promise<void>;
+  /** Efface définitivement un autre compte et ses données (#229). */
+  deleteUser(id: string): Promise<void>;
 }
 
 /** `true` si les permissions contiennent `permission` (ou le joker `*`). */
@@ -278,6 +280,9 @@ export function createApiClient(fetchImpl: typeof fetch = fetch): ApiClient {
         buildPath(API_PATHS.adminUserLogoutAll, { id }),
         {},
       );
+    },
+    deleteUser(id) {
+      return requestVoid(fetchImpl, "DELETE", buildPath(API_PATHS.adminUser, { id }));
     },
   };
 }

@@ -32,6 +32,7 @@ function fakeApi(items: AdminUser[] = [ME, ALICE, BOSS], total = items.length): 
     disableUser: vi.fn(async (id: string) => ({ ...ALICE, id, disabled: true })),
     enableUser: vi.fn(async (id: string) => ({ ...ALICE, id, disabled: false })),
     logoutUser: vi.fn().mockResolvedValue(undefined),
+    deleteUser: vi.fn().mockResolvedValue(undefined),
   };
 }
 
@@ -173,5 +174,29 @@ describe("<AdminPanel />", () => {
     await waitFor(() =>
       expect(screen.getByRole("alert")).toHaveTextContent(/Liste des comptes indisponible/),
     );
+  });
+  it("supprime un compte après confirmation et le retire de la liste", async () => {
+    const api = fakeApi();
+    const confirm = vi.fn().mockReturnValueOnce(false).mockReturnValue(true);
+    await renderPanel(api, { confirm });
+    const button = within(row("alice@example.io")).getByRole("button", {
+      name: "Supprimer alice@example.io",
+    });
+
+    fireEvent.click(button);
+    expect(api.deleteUser).not.toHaveBeenCalled();
+
+    await act(async () => {
+      fireEvent.click(button);
+    });
+    expect(confirm).toHaveBeenLastCalledWith(expect.stringMatching(/irréversible/));
+    expect(api.deleteUser).toHaveBeenCalledWith("u-alice");
+    expect(screen.queryByText("alice@example.io")).toBeNull();
+    expect(screen.getByRole("status")).toHaveTextContent(/supprimé/);
+    expect(screen.getByText("1–2 sur 2")).toBeInTheDocument();
+    // Son propre compte et, sans `*`, les super-admins ne sont pas supprimables.
+    expect(
+      within(row("root@example.io")).getByRole("button", { name: /Supprimer/ }),
+    ).toBeDisabled();
   });
 });

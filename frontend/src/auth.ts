@@ -173,6 +173,49 @@ export async function changePassword(
 }
 
 /**
+ * Supprime définitivement le compte et ses données (#229, RGPD) après
+ * vérification du mot de passe actuel ; toutes les sessions sont fermées
+ * côté serveur. `fetchImpl` doit porter le Bearer (`authFetch`).
+ */
+export async function deleteAccount(
+  currentPassword: string,
+  fetchImpl: typeof fetch,
+): Promise<void> {
+  let res: Response;
+  try {
+    res = await fetchImpl(`${apiBaseUrl()}/auth/me`, {
+      method: "DELETE",
+      headers: { "Content-Type": "application/json", Accept: "application/json" },
+      body: JSON.stringify({ current_password: currentPassword }),
+    });
+  } catch (e) {
+    throw new ApiError(`backend injoignable : ${(e as Error).message}`);
+  }
+  if (res.status === 401) throw new ApiError("session expirée", 401);
+  if (res.status === 403) {
+    throw new ApiError("mot de passe actuel incorrect", 403);
+  }
+  if (res.status === 409) {
+    throw new ApiError(
+      "un compte administrateur ne peut pas être supprimé : un autre administrateur doit d'abord lui retirer ce rôle",
+      409,
+    );
+  }
+  if (res.status === 429) {
+    throw new ApiError(tooManyAttemptsMessage(res), 429);
+  }
+  if (res.status === 503) {
+    throw new ApiError(
+      "la suppression de compte n'est pas disponible sur ce serveur",
+      503,
+    );
+  }
+  if (!res.ok) {
+    throw new ApiError(`DELETE /auth/me a échoué (${res.status})`, res.status);
+  }
+}
+
+/**
  * Demande un lien de réinitialisation du mot de passe (#204). Le serveur
  * répond 202 que le compte existe ou non : la réussite ne dit pas qu'un
  * email est parti, seulement que la demande est prise en compte.

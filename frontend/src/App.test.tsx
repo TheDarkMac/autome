@@ -262,6 +262,41 @@ describe("<App />", () => {
     expect(screen.getByTestId("current-user")).toHaveTextContent("user-1");
   });
 
+  it("l'onglet Compte supprime le compte puis revient à la connexion (#229)", async () => {
+    globalThis.fetch = vi.fn(async (input) => {
+      const url = typeof input === "string" ? input : (input as Request).url;
+      if (url.endsWith("/auth/me")) {
+        return jsonResponse({
+          id: "user-1",
+          email: "sam@example.io",
+          role: "editor",
+          permissions: ["workflows.read"],
+        });
+      }
+      return jsonResponse(sampleSpec);
+    }) as typeof fetch;
+    window.localStorage.setItem("autome.lastWorkflow.user-1", "wf-1");
+    const deleteAccountImpl = vi.fn().mockResolvedValue(undefined);
+    render(<App sessionOptions={authedSession("user-1", { deleteAccountImpl })} />);
+
+    fireEvent.click(screen.getByRole("tab", { name: "Compte" }));
+    fireEvent.change(screen.getByLabelText("Votre mot de passe"), {
+      target: { value: "the-password" },
+    });
+    const confirmation = await screen.findByLabelText("Saisissez « sam@example.io » pour confirmer");
+    fireEvent.change(confirmation, { target: { value: "sam@example.io" } });
+    await act(async () => {
+      fireEvent.click(
+        screen.getByRole("button", { name: "Supprimer définitivement mon compte" }),
+      );
+    });
+
+    expect(deleteAccountImpl).toHaveBeenCalledWith("the-password", expect.any(Function));
+    expect(await screen.findByText(/compte et vos données ont été supprimés/)).toBeInTheDocument();
+    expect(screen.queryByTestId("current-user")).toBeNull();
+    expect(window.localStorage.getItem("autome.lastWorkflow.user-1")).toBeNull();
+  });
+
   describe("administration des utilisateurs (#208)", () => {
     function backend(permissions: string[]): typeof fetch {
       return vi.fn(async (input) => {

@@ -129,6 +129,49 @@
             "bearer": []
           }
         ]
+      },
+      "delete": {
+        "tags": [
+          "admin"
+        ],
+        "summary": "`DELETE /admin/users/{id}` — efface définitivement le compte et toutes\nses données (RGPD, droit à l'effacement) ; ses sessions sont fermées.",
+        "operationId": "delete_user",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Identifiant du compte",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Compte et données effacés"
+          },
+          "401": {
+            "description": "Token absent ou invalide"
+          },
+          "403": {
+            "description": "Manque `users.admin`, ou `*` pour un compte super-admin"
+          },
+          "404": {
+            "description": "Compte inconnu"
+          },
+          "409": {
+            "description": "Son propre compte (passer par `DELETE /auth/me`)"
+          },
+          "503": {
+            "description": "Suppression indisponible sur ce déploiement"
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
       }
     },
     "/admin/users/{id}/disable": {
@@ -452,6 +495,48 @@
           },
           "401": {
             "description": "Access token absent, invalide, révoqué, ou compte suspendu"
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      },
+      "delete": {
+        "tags": [
+          "auth"
+        ],
+        "summary": "`DELETE /auth/me` — efface le compte de l'utilisateur authentifié et tout\nce qui lui est rattaché (RGPD, droit à l'effacement), après vérification\ndu mot de passe actuel. Toutes ses sessions sont fermées.",
+        "operationId": "delete_account",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DeleteAccountBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Compte et données effacés ; sessions fermées"
+          },
+          "401": {
+            "description": "Access token absent, invalide, révoqué, ou compte suspendu"
+          },
+          "403": {
+            "description": "Mot de passe actuel incorrect"
+          },
+          "409": {
+            "description": "Compte administrateur (`*`) : un autre administrateur doit d'abord retirer son rôle"
+          },
+          "429": {
+            "description": "Trop d'essais — voir `Retry-After`"
+          },
+          "503": {
+            "description": "Suppression indisponible sur ce déploiement"
           }
         },
         "security": [
@@ -1787,6 +1872,19 @@
           "password": {
             "type": "string",
             "description": "Mot de passe en clair (8 à 1024 caractères)."
+          }
+        }
+      },
+      "DeleteAccountBody": {
+        "type": "object",
+        "description": "Body de `DELETE /auth/me`.",
+        "required": [
+          "current_password"
+        ],
+        "properties": {
+          "current_password": {
+            "type": "string",
+            "description": "Mot de passe actuel (confirmation de la suppression)."
           }
         }
       },

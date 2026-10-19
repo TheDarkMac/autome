@@ -4,6 +4,7 @@ import { ApiError } from "./api";
 import {
   changePassword,
   decodeJwt,
+  deleteAccount,
   isTokenExpired,
   login,
   logout,
@@ -309,6 +310,43 @@ describe("changePassword", () => {
     await expect(
       call(new Response("", { status: 429, headers: { "Retry-After": "120" } })),
     ).rejects.toMatchObject({ status: 429, message: /2 min/ });
+  });
+});
+
+describe("deleteAccount", () => {
+  it("DELETE /auth/me avec le mot de passe actuel ; 204 suffit", async () => {
+    const fetchImpl = vi.fn().mockResolvedValue(new Response(null, { status: 204 }));
+    await deleteAccount("the-password", fetchImpl);
+    const [url, init] = fetchImpl.mock.calls[0]!;
+    expect(url).toMatch(/\/auth\/me$/);
+    expect(init.method).toBe("DELETE");
+    expect(JSON.parse(init.body)).toEqual({ current_password: "the-password" });
+  });
+
+  it("traduit 401, 403, 409, 429 et 503", async () => {
+    const call = (res: Response) => deleteAccount("pw", vi.fn().mockResolvedValue(res));
+    await expect(call(jsonResponse({}, 401))).rejects.toMatchObject({ status: 401 });
+    await expect(call(jsonResponse({}, 403))).rejects.toMatchObject({
+      status: 403,
+      message: /actuel incorrect/,
+    });
+    await expect(call(jsonResponse({}, 409))).rejects.toMatchObject({
+      status: 409,
+      message: /administrateur/,
+    });
+    await expect(
+      call(new Response("", { status: 429, headers: { "Retry-After": "60" } })),
+    ).rejects.toMatchObject({ status: 429, message: /1 min/ });
+    await expect(call(jsonResponse({}, 503))).rejects.toMatchObject({
+      status: 503,
+      message: /pas disponible/,
+    });
+  });
+
+  it("signale un backend injoignable", async () => {
+    await expect(
+      deleteAccount("pw", vi.fn().mockRejectedValue(new Error("offline"))),
+    ).rejects.toThrow(/injoignable/);
   });
 });
 

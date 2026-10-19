@@ -1,9 +1,13 @@
-// Onglet « Compte » (#196) : changement du mot de passe.
+// Onglet « Compte » (#196) : changement du mot de passe et suppression du
+// compte (#229, RGPD).
 //
 // Changer son mot de passe ferme toutes les sessions côté serveur (autres
 // appareils compris) ; l'appareil courant reçoit une nouvelle paire de jetons
-// et reste connecté. L'action réseau est injectée (`changePassword` de
-// `useSession`) pour les tests.
+// et reste connecté. Supprimer son compte efface définitivement le compte et
+// ses données, après le mot de passe actuel et l'email retapé en
+// confirmation ; la session locale est ensuite fermée. Les actions réseau
+// sont injectées (`changePassword` / `deleteAccount` de `useSession`) pour
+// les tests.
 
 import { useState, type FormEvent } from "react";
 
@@ -12,7 +16,12 @@ import { validatePasswordChange } from "./auth";
 export interface AccountPanelProps {
   email?: string;
   changePassword: (currentPassword: string, newPassword: string) => Promise<void>;
+  /** Suppression du compte ; absente ⇒ section masquée. */
+  deleteAccount?: (currentPassword: string) => Promise<void>;
 }
+
+/** Saisie de confirmation quand l'email n'est pas connu. */
+export const DELETE_CONFIRMATION_WORD = "SUPPRIMER";
 
 type Outcome =
   | { kind: "idle" }
@@ -20,7 +29,11 @@ type Outcome =
   | { kind: "done" }
   | { kind: "error"; message: string };
 
-export function AccountPanel({ email, changePassword }: AccountPanelProps): JSX.Element {
+export function AccountPanel({
+  email,
+  changePassword,
+  deleteAccount,
+}: AccountPanelProps): JSX.Element {
   const [current, setCurrent] = useState("");
   const [next, setNext] = useState("");
   const [confirm, setConfirm] = useState("");
@@ -102,7 +115,91 @@ export function AccountPanel({ email, changePassword }: AccountPanelProps): JSX.
           {outcome.kind === "busy" ? "Changement…" : "Changer le mot de passe"}
         </button>
       </form>
+
+      {deleteAccount && <DeleteAccountForm email={email} deleteAccount={deleteAccount} />}
     </section>
+  );
+}
+
+function DeleteAccountForm({
+  email,
+  deleteAccount,
+}: {
+  email: string | undefined;
+  deleteAccount: (currentPassword: string) => Promise<void>;
+}): JSX.Element {
+  const [password, setPassword] = useState("");
+  const [typed, setTyped] = useState("");
+  const [outcome, setOutcome] = useState<Outcome>({ kind: "idle" });
+  const expected = email ?? DELETE_CONFIRMATION_WORD;
+  const confirmed = typed.trim().toLowerCase() === expected.toLowerCase();
+
+  async function onSubmit(e: FormEvent<HTMLFormElement>): Promise<void> {
+    e.preventDefault();
+    if (!password || !confirmed) return;
+    setOutcome({ kind: "busy" });
+    try {
+      // En cas de succès, la session est fermée et ce panneau démonté.
+      await deleteAccount(password);
+    } catch (err) {
+      setOutcome({ kind: "error", message: (err as Error).message });
+    }
+  }
+
+  return (
+    <form
+      aria-label="Supprimer mon compte"
+      onSubmit={(e) => void onSubmit(e)}
+      className="mt-6 space-y-4 rounded-lg border border-rose-200 bg-white p-4"
+    >
+      <h3 className="text-sm font-semibold text-rose-800">Supprimer mon compte</h3>
+      <div className="text-sm text-neutral-600">
+        <p>La suppression est définitive. Seront effacés :</p>
+        <ul className="mt-1 list-disc pl-5">
+          <li>votre compte, votre email et votre mot de passe ;</li>
+          <li>vos workflows, leurs URL webhook et leurs planifications ;</li>
+          <li>l'historique de vos exécutions et leurs résultats ;</li>
+          <li>vos connexions aux services (Slack, Gmail, Notion, GitHub…).</li>
+        </ul>
+        <p className="mt-2">
+          Le journal d'audit est conservé, mais ne vous désigne plus que par un identifiant
+          anonyme. Tous vos appareils seront déconnectés.
+        </p>
+      </div>
+      <PasswordField
+        id="delete-password"
+        label="Votre mot de passe"
+        autoComplete="current-password"
+        value={password}
+        onChange={setPassword}
+      />
+      <div>
+        <label htmlFor="delete-confirm" className="block text-sm font-medium text-neutral-700">
+          Saisissez « {expected} » pour confirmer
+        </label>
+        <input
+          id="delete-confirm"
+          name="delete-confirm"
+          type="text"
+          autoComplete="off"
+          value={typed}
+          onChange={(e) => setTyped(e.target.value)}
+          className="mt-1 w-full rounded-md border border-neutral-300 px-3 py-2 text-sm outline-none focus:border-rose-500 focus:ring-1 focus:ring-rose-500"
+        />
+      </div>
+      {outcome.kind === "error" && (
+        <p role="alert" className="text-sm text-rose-700">
+          {outcome.message}
+        </p>
+      )}
+      <button
+        type="submit"
+        disabled={outcome.kind === "busy" || !confirmed || !password}
+        className="rounded-md bg-rose-600 px-4 py-2 text-sm font-medium text-white hover:bg-rose-700 disabled:opacity-60"
+      >
+        {outcome.kind === "busy" ? "Suppression…" : "Supprimer définitivement mon compte"}
+      </button>
+    </form>
   );
 }
 

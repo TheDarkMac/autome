@@ -4,7 +4,8 @@
 //   - charge la session depuis le `SessionStore` au montage ;
 //   - expose `login` / `signup` / `logout` (qui ferme aussi la session
 //     côté serveur, au mieux — #184), `logoutAll` (toutes les sessions,
-//     tous appareils — #186) et `changePassword` (#196) ;
+//     tous appareils — #186), `changePassword` (#196) et `deleteAccount`
+//     (#229) ;
 //   - rafraîchit l'access token de manière proactive (timer réarmé à
 //     `skewMs` avant l'expiration) et sur échec, déconnecte proprement.
 //
@@ -15,6 +16,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 
 import {
   changePassword as apiChangePassword,
+  deleteAccount as apiDeleteAccount,
   login as apiLogin,
   logout as apiLogout,
   logoutAll as apiLogoutAll,
@@ -44,6 +46,7 @@ export interface UseSessionOptions {
   logoutImpl?: typeof apiLogout;
   logoutAllImpl?: typeof apiLogoutAll;
   changePasswordImpl?: typeof apiChangePassword;
+  deleteAccountImpl?: typeof apiDeleteAccount;
 }
 
 export interface UseSessionResult {
@@ -67,6 +70,11 @@ export interface UseSessionResult {
    */
   changePassword: (currentPassword: string, newPassword: string) => Promise<void>;
   /**
+   * Supprime définitivement le compte (#229) puis la session locale. Rejette
+   * sans rien changer en local si le serveur refuse.
+   */
+  deleteAccount: (currentPassword: string) => Promise<void>;
+  /**
    * `fetch` authentifié (F8.7.c) : injecte le Bearer courant et, sur 401,
    * rafraîchit le token puis rejoue la requête. Identité **stable** — sûr à
    * passer à `useMemo`/`useEffect` ou à `createApiClient`.
@@ -87,6 +95,7 @@ export function useSession(options: UseSessionOptions = {}): UseSessionResult {
     logoutImpl = apiLogout,
     logoutAllImpl = apiLogoutAll,
     changePasswordImpl = apiChangePassword,
+    deleteAccountImpl = apiDeleteAccount,
   } = options;
 
   // Le store ne doit pas changer entre les rendus : on le fige au montage.
@@ -165,6 +174,14 @@ export function useSession(options: UseSessionOptions = {}): UseSessionResult {
     [apply, authFetch, changePasswordImpl],
   );
 
+  const deleteAccount = useCallback(
+    async (currentPassword: string) => {
+      await deleteAccountImpl(currentPassword, authFetch);
+      apply(null);
+    },
+    [apply, authFetch, deleteAccountImpl],
+  );
+
   const login = useCallback(
     async (creds: Credentials) => {
       apply(await loginImpl(creds));
@@ -208,6 +225,7 @@ export function useSession(options: UseSessionOptions = {}): UseSessionResult {
     logout,
     logoutAll,
     changePassword,
+    deleteAccount,
     authFetch,
   };
 }

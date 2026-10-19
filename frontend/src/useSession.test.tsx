@@ -160,6 +160,33 @@ describe("useSession", () => {
     expect(store.read()).toEqual(pair);
   });
 
+  it("deleteAccount supprime le compte via authFetch puis vide la session", async () => {
+    const store = memorySessionStore(mkPair("user-1", 10_000));
+    const deleteAccountImpl = vi.fn().mockResolvedValue(undefined);
+    const { result } = renderHook(() => useSession({ store, deleteAccountImpl }));
+
+    await act(async () => {
+      await result.current.deleteAccount("the-password");
+    });
+
+    expect(deleteAccountImpl).toHaveBeenCalledWith("the-password", result.current.authFetch);
+    expect(result.current.session).toBeNull();
+    expect(store.read()).toBeNull();
+  });
+
+  it("deleteAccount refusé garde la session locale", async () => {
+    const pair = mkPair("user-1", 10_000);
+    const store = memorySessionStore(pair);
+    const deleteAccountImpl = vi.fn().mockRejectedValue(new Error("refusé"));
+    const { result } = renderHook(() => useSession({ store, deleteAccountImpl }));
+
+    await act(async () => {
+      await expect(result.current.deleteAccount("bad")).rejects.toThrow("refusé");
+    });
+    expect(store.read()).toEqual(pair);
+    expect(result.current.session?.userId).toBe("user-1");
+  });
+
   it("logout sans session n'appelle pas le serveur", () => {
     const logoutImpl = vi.fn().mockResolvedValue(undefined);
     const { result } = renderHook(() =>
