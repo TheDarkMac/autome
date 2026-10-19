@@ -17,6 +17,11 @@
 //! [`run_parallel`] (F2.5) ordonnance le même graphe de façon concurrente
 //! (fan-out/fan-in, concurrence bornée) avec une sémantique identique.
 //!
+//! Reprise (#239) : [`resume_sequential`] exécute le parcours séquentiel à
+//! partir d'un [`Cursor`] (nœuds traités, contexte, branches actives) et
+//! consulte un [`RunObserver`] avant et après chaque nœud — le worker y
+//! enregistre sa progression et peut interrompre le run entre deux nœuds.
+//!
 //! Mapping (F2.6) : les `params` des nodes runner sont résolus/templatés
 //! contre le contexte avant exécution (cf. [`crate::mapping`]).
 //!
@@ -26,18 +31,19 @@
 //! **non géré** déclenche le fail-fast (downstream `Skipped`). Le statut
 //! final reflète uniquement les échecs non gérés.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{mpsc, Condvar, Mutex};
 use std::thread;
 use std::time::Duration;
 
 use autome_core::{Edge, Node, NodeId, NodeKind};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::{condition, Dag, RunStatus};
 
 /// Statut d'un node exécuté dans un run.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum StepStatus {
     /// Exécuté avec succès.
     Succeeded,
@@ -487,25 +493,201 @@ fn edge_taken(outflow: &Outflow, e: &Edge) -> bool {
 /// activés sont `Skipped`. Fail-fast : au premier échec, le reste est
 /// `Skipped` et le run est `Failed`.
 pub fn run_sequential(dag: &Dag, runner: &(dyn NodeRunner + Sync)) -> RunReport {
-    let order = dag.topological_order();
-    let mut ctx = RunContext::default();
-    let mut steps = Vec::with_capacity(order.len());
-    let mut active: HashSet<NodeId> = HashSet::new();
-    active.insert(dag.root().id.clone());
-    let mut failed = false;
+    match resume_sequential(dag, runner, Cursor::start(dag), &Unobserved) {
+        Ok(Execution::Finished(report)) => report,
+        _ => unreachable!("un parcours sans observateur va à son terme"),
+    }
+}
 
-    for id in &order {
-        let skip = |steps: &mut Vec<StepOutcome>| {
-            steps.push(StepOutcome {
-                node_id: id.clone(),
-                status: StepStatus::Skipped,
-                output: None,
-                error: None,
-            });
-        };
-        if failed || !active.contains(id) {
-            skip(&mut steps);
+/// Point de reprise d'un parcours séquentiel (#239) : état du moteur entre
+/// deux nœuds. Sérialisable : le worker l'enregistre après chaque nœud et
+/// reprend un run interrompu là où il s'était arrêté, sans rien rejouer.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Cursor {
+    /// Empreinte du graphe parcouru ([`Dag::fingerprint`]).
+    graph: String,
+    /// Issues des nœuds déjà traités, préfixe de l'ordre topologique.
+    steps: Vec<StepRecord>,
+    /// Valeurs du contexte par nœud, y compris celles d'un échec géré. Seule
+    /// copie des sorties : une sortie `null` y reste `null` (un
+    /// `Option<Value>` sérialisé la rendrait absente).
+    context: BTreeMap<String, Value>,
+    /// Nœuds atteints par une arête prise (ou racine), pas forcément traités.
+    active: BTreeSet<String>,
+    /// Un échec non géré a eu lieu : le reste sera `Skipped`.
+    failed: bool,
+}
+
+/// Issue d'un nœud traité, sans sa sortie (lue dans le contexte).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct StepRecord {
+    node: String,
+    status: StepStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+impl StepRecord {
+    fn of(step: &StepOutcome) -> Self {
+        Self {
+            node: step.node_id.0.clone(),
+            status: step.status,
+            error: step.error.clone(),
+        }
+    }
+
+    fn outcome(&self, context: &BTreeMap<String, Value>) -> StepOutcome {
+        StepOutcome {
+            node_id: NodeId::new(self.node.clone()),
+            status: self.status,
+            output: (self.status == StepStatus::Succeeded)
+                .then(|| context.get(&self.node).cloned().unwrap_or_default()),
+            error: self.error.clone(),
+        }
+    }
+}
+
+impl Cursor {
+    /// Curseur d'un run qui démarre : rien de traité, racine active.
+    pub fn start(dag: &Dag) -> Self {
+        Self {
+            graph: dag.fingerprint(),
+            steps: Vec::new(),
+            context: BTreeMap::new(),
+            active: BTreeSet::from([dag.root().id.0.clone()]),
+            failed: false,
+        }
+    }
+
+    /// Nombre de nœuds déjà traités (exécutés ou sautés).
+    pub fn done(&self) -> usize {
+        self.steps.len()
+    }
+
+    /// Issues des nœuds déjà traités.
+    pub fn steps(&self) -> Vec<StepOutcome> {
+        self.steps
+            .iter()
+            .map(|r| r.outcome(&self.context))
+            .collect()
+    }
+
+    /// Sorties des nœuds réussis (celles qu'un checkpoint expose).
+    pub fn outputs(&self) -> BTreeMap<String, Value> {
+        self.steps
+            .iter()
+            .filter(|r| r.status == StepStatus::Succeeded)
+            .map(|r| {
+                let value = self.context.get(&r.node).cloned().unwrap_or_default();
+                (r.node.clone(), value)
+            })
+            .collect()
+    }
+
+    /// Le curseur a-t-il été produit par ce graphe ? Faux si le workflow a
+    /// changé depuis (nodes, paramètres ou arêtes).
+    pub fn fits(&self, dag: &Dag) -> bool {
+        self.graph == dag.fingerprint()
+    }
+
+    fn push(&mut self, steps: &mut Vec<StepOutcome>, step: StepOutcome) {
+        self.steps.push(StepRecord::of(&step));
+        steps.push(step);
+    }
+}
+
+/// Décision d'un [`RunObserver`] avant un nœud.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Control {
+    /// Exécuter le nœud.
+    Continue,
+    /// Interrompre le run avant le nœud (rien de lui n'est exécuté).
+    Stop,
+}
+
+/// Observateur d'un parcours séquentiel (#239), appelé autour de chaque
+/// nœud **exécuté** (un nœud `Skipped` ne l'est pas).
+pub trait RunObserver {
+    /// `node` va s'exécuter ; `cursor` ne le compte pas encore.
+    fn before_node(&self, node: &NodeId, cursor: &Cursor) -> Control;
+    /// Un nœud vient d'être traité ; `cursor` le compte.
+    fn after_node(&self, cursor: &Cursor);
+}
+
+/// Observateur neutre de [`run_sequential`].
+struct Unobserved;
+
+impl RunObserver for Unobserved {
+    fn before_node(&self, _: &NodeId, _: &Cursor) -> Control {
+        Control::Continue
+    }
+    fn after_node(&self, _: &Cursor) {}
+}
+
+/// Issue d'un parcours repris ou observé.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Execution {
+    /// Le run est allé à son terme.
+    Finished(RunReport),
+    /// Interrompu par l'observateur avant `next`, qui n'a pas été exécuté.
+    Interrupted {
+        /// Point de reprise (à enregistrer pour continuer plus tard).
+        cursor: Cursor,
+        /// Nœud qui aurait été exécuté.
+        next: NodeId,
+    },
+}
+
+/// Exécute le DAG séquentiellement **à partir de `cursor`** (le
+/// [`Cursor::start`] d'un run neuf, ou celui d'un run interrompu), en
+/// consultant `observer` autour de chaque nœud. Mêmes sémantiques que
+/// [`run_sequential`] : un run repris produit le même rapport qu'un run
+/// d'une traite.
+///
+/// `Err` si le curseur ne correspond pas à ce graphe ([`Cursor::fits`]).
+pub fn resume_sequential(
+    dag: &Dag,
+    runner: &(dyn NodeRunner + Sync),
+    mut cursor: Cursor,
+    observer: &dyn RunObserver,
+) -> Result<Execution, String> {
+    let order = dag.topological_order();
+    let prefix_ok = cursor.steps.len() <= order.len()
+        && cursor
+            .steps
+            .iter()
+            .zip(&order)
+            .all(|(step, id)| step.node == id.0);
+    if !cursor.fits(dag) || !prefix_ok {
+        return Err("point de reprise d'un autre graphe (workflow modifié)".into());
+    }
+    let mut ctx = RunContext {
+        outputs: cursor
+            .context
+            .iter()
+            .map(|(k, v)| (NodeId::new(k.clone()), v.clone()))
+            .collect(),
+    };
+    let mut steps = cursor.steps();
+
+    for id in &order[cursor.steps.len()..] {
+        if cursor.failed || !cursor.active.contains(&id.0) {
+            cursor.push(
+                &mut steps,
+                StepOutcome {
+                    node_id: id.clone(),
+                    status: StepStatus::Skipped,
+                    output: None,
+                    error: None,
+                },
+            );
             continue;
+        }
+        if observer.before_node(id, &cursor) == Control::Stop {
+            return Ok(Execution::Interrupted {
+                cursor,
+                next: id.clone(),
+            });
         }
 
         let node = dag.node(id).expect("node issu du DAG");
@@ -514,31 +696,50 @@ pub fn run_sequential(dag: &Dag, runner: &(dyn NodeRunner + Sync)) -> RunReport 
         // La sortie est enregistrée même en cas d'échec géré (un handler
         // sur le port `error` peut vouloir lire `{ "error": … }`).
         ctx.record(id.clone(), ev.output.clone());
+        cursor.context.insert(id.0.clone(), ev.output.clone());
         let output = (ev.status == StepStatus::Succeeded).then_some(ev.output);
-        steps.push(StepOutcome {
-            node_id: id.clone(),
-            status: ev.status,
-            output,
-            error: ev.error,
-        });
+        cursor.push(
+            &mut steps,
+            StepOutcome {
+                node_id: id.clone(),
+                status: ev.status,
+                output,
+                error: ev.error,
+            },
+        );
 
         if ev.abort {
-            failed = true; // échec non géré → fail-fast (F2.7.d)
+            cursor.failed = true; // échec non géré → fail-fast (F2.7.d)
         } else {
             for e in dag.successors(id) {
                 if edge_taken(&ev.outflow, e) {
-                    active.insert(e.to.clone());
+                    cursor.active.insert(e.to.0.clone());
                 }
             }
         }
+        observer.after_node(&cursor);
     }
 
-    let status = if failed {
+    let status = if cursor.failed {
         RunStatus::Failed
     } else {
         RunStatus::Succeeded
     };
-    RunReport { status, steps }
+    Ok(Execution::Finished(RunReport { status, steps }))
+}
+
+/// Un nœud interrompu **pendant** son exécution peut-il être rejoué à la
+/// reprise (#239) ? Son effet a pu se produire ou non : il ne l'est que s'il
+/// est sans effet de bord (trigger, `if`, `switch`), ou si sa politique
+/// `_error` autorise déjà plusieurs tentatives (`max_attempts > 1`, F2.7) —
+/// l'auteur du workflow a alors accepté qu'il s'exécute plus d'une fois.
+/// `loop` / `while` (corps délégué au runner) ne le sont jamais.
+pub fn rerunnable(node: &Node) -> bool {
+    match node.kind {
+        NodeKind::Trigger { .. } | NodeKind::If | NodeKind::Switch => true,
+        NodeKind::Loop | NodeKind::While => false,
+        NodeKind::Action { .. } => ErrorPolicy::from_params(&node.params).max_attempts > 1,
+    }
 }
 
 /// État partagé de l'ordonnanceur parallèle (F2.5).
@@ -1435,5 +1636,232 @@ mod tests {
         assert_eq!(report.status, RunStatus::Succeeded);
         assert_eq!(status(&report, "h"), StepStatus::Succeeded);
         assert_eq!(status(&report, "ok"), StepStatus::Skipped);
+    }
+
+    // --- #239 : reprise depuis un curseur -------------------------------
+
+    /// Observateur qui interrompt avant le `stop_at`-ième nœud exécuté et
+    /// compte les nœuds vus.
+    struct StopAt {
+        stop_at: usize,
+        before: AtomicUsize,
+        after: AtomicUsize,
+    }
+
+    impl StopAt {
+        fn new(stop_at: usize) -> Self {
+            Self {
+                stop_at,
+                before: AtomicUsize::new(0),
+                after: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl RunObserver for StopAt {
+        fn before_node(&self, _: &NodeId, _: &Cursor) -> Control {
+            if self.before.fetch_add(1, Ordering::SeqCst) == self.stop_at {
+                Control::Stop
+            } else {
+                Control::Continue
+            }
+        }
+        fn after_node(&self, _: &Cursor) {
+            self.after.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    /// Graphe qui exerce branches, échec géré, boucle et templating.
+    fn rich_dag() -> Dag {
+        dag(
+            vec![
+                trig("t"),
+                ctrl(
+                    "i",
+                    NodeKind::If,
+                    serde_json::json!({ "condition": "t.ok == true" }),
+                ),
+                act_p(
+                    "a",
+                    serde_json::json!({ "_error": { "on_error": "fallback" }, "v": "{{ t.n }}" }),
+                ),
+                n("no"),
+                n("h"),
+                ctrl(
+                    "L",
+                    NodeKind::Loop,
+                    serde_json::json!({ "items": "t.list" }),
+                ),
+                n("sink"),
+            ],
+            vec![
+                e("t", "i"),
+                ep("i", "a", "true"),
+                ep("i", "no", "false"),
+                ep("a", "h", "error"),
+                e("h", "L"),
+                e("L", "sink"),
+            ],
+        )
+    }
+
+    fn rich_runner(node: &Node, ctx: &RunContext) -> Result<Value, String> {
+        match node.id.0.as_str() {
+            "t" => Ok(serde_json::json!({ "ok": true, "n": 7, "list": [1, 2] })),
+            "a" => Err(format!("refus de {}", node.params["v"])),
+            "L" => {
+                let item = ctx.output(&NodeId::new("L::item")).expect("item");
+                Ok(Value::from(item.as_i64().unwrap() * 10))
+            }
+            // Lit une sortie amont : prouve que le contexte est restauré.
+            "sink" => Ok(ctx.output(&NodeId::new("L")).cloned().unwrap_or_default()),
+            // Sortie `null` : doit survivre au passage par JSON.
+            "h" => Ok(Value::Null),
+            _ => Ok(serde_json::json!({ "at": node.id.0 })),
+        }
+    }
+
+    #[test]
+    fn resuming_at_any_node_reproduces_the_uninterrupted_report() {
+        let d = rich_dag();
+        let reference = run_sequential(&d, &rich_runner);
+        assert_eq!(reference.status, RunStatus::Succeeded);
+        assert_eq!(output(&reference, "sink"), serde_json::json!([10, 20]));
+        let executed = reference
+            .steps
+            .iter()
+            .filter(|s| s.status != StepStatus::Skipped)
+            .count();
+
+        for stop_at in 0..executed {
+            let first = StopAt::new(stop_at);
+            let interrupted =
+                resume_sequential(&d, &rich_runner, Cursor::start(&d), &first).unwrap();
+            let Execution::Interrupted { cursor, next } = interrupted else {
+                panic!("interruption attendue avant le nœud n°{stop_at}");
+            };
+            assert_eq!(first.after.load(Ordering::SeqCst), stop_at);
+            assert!(cursor.steps().iter().all(|s| s.node_id != next));
+            assert_eq!(cursor.done(), cursor.steps().len());
+
+            // Le curseur passe par la base (JSON) avant la reprise.
+            let json = serde_json::to_value(&cursor).unwrap();
+            let restored: Cursor = serde_json::from_value(json).unwrap();
+            let second = StopAt::new(usize::MAX);
+            let resumed = resume_sequential(&d, &rich_runner, restored, &second).unwrap();
+            assert_eq!(
+                resumed,
+                Execution::Finished(reference.clone()),
+                "reprise avant le nœud n°{stop_at} ({next:?})"
+            );
+            // Rien n'est rejoué : chaque nœud exécuté l'a été une seule fois.
+            assert_eq!(
+                first.after.load(Ordering::SeqCst) + second.after.load(Ordering::SeqCst),
+                executed
+            );
+        }
+    }
+
+    #[test]
+    fn a_resumed_failure_still_skips_the_rest() {
+        let d = dag(
+            vec![trig("t"), n("a"), n("b")],
+            vec![e("t", "a"), e("a", "b")],
+        );
+        let runner = |node: &Node, _: &RunContext| {
+            if node.id.0 == "a" {
+                Err("boom".to_string())
+            } else {
+                Ok(Value::Null)
+            }
+        };
+        // Interrompu juste après l'échec de `a` (avant `b`, jamais exécuté).
+        let obs = StopAt::new(usize::MAX);
+        let Execution::Finished(full) =
+            resume_sequential(&d, &runner, Cursor::start(&d), &obs).unwrap()
+        else {
+            panic!("terme attendu");
+        };
+        assert_eq!(obs.after.load(Ordering::SeqCst), 2, "t et a seulement");
+        assert_eq!(full, run_sequential(&d, &runner));
+        assert_eq!(status(&full, "b"), StepStatus::Skipped);
+    }
+
+    #[test]
+    fn cursor_exposes_successful_outputs_only() {
+        let d = rich_dag();
+        let Execution::Interrupted { cursor, .. } =
+            resume_sequential(&d, &rich_runner, Cursor::start(&d), &StopAt::new(4)).unwrap()
+        else {
+            panic!("interruption attendue");
+        };
+        // t, i, a (échec géré), h traités ; seuls les succès sont exposés.
+        let outputs = cursor.outputs();
+        assert!(outputs.contains_key("t"));
+        assert_eq!(outputs["h"], Value::Null, "sortie `null` gardée");
+        assert!(!outputs.contains_key("a"), "échec géré non exposé");
+        assert!(!outputs.contains_key("no"), "branche non prise");
+    }
+
+    #[test]
+    fn a_cursor_from_another_graph_is_refused() {
+        let d = rich_dag();
+        let Execution::Interrupted { cursor, .. } =
+            resume_sequential(&d, &rich_runner, Cursor::start(&d), &StopAt::new(2)).unwrap()
+        else {
+            panic!("interruption attendue");
+        };
+        assert!(cursor.fits(&d));
+        let changed = dag(vec![trig("t"), n("a")], vec![e("t", "a")]);
+        assert!(!cursor.fits(&changed));
+        let err = resume_sequential(&changed, &rich_runner, cursor, &StopAt::new(usize::MAX))
+            .unwrap_err();
+        assert!(err.contains("workflow modifié"), "{err}");
+    }
+
+    #[test]
+    fn fingerprint_ignores_layout_but_not_parameters() {
+        let base = vec![
+            trig("t"),
+            act_p("a", serde_json::json!({ "url": "https://x" })),
+        ];
+        let fp = dag(base.clone(), vec![e("t", "a")]).fingerprint();
+        // Déplacer ou renommer un node dans l'éditeur ne change rien.
+        let mut moved = base.clone();
+        moved[1].position = Some(autome_core::NodePosition { x: 3.0, y: 4.0 });
+        moved[1].name = "Appel".into();
+        assert_eq!(dag(moved, vec![e("t", "a")]).fingerprint(), fp);
+        // Un paramètre, un type ou une arête, si.
+        let mut param = base.clone();
+        param[1].params = serde_json::json!({ "url": "https://y" });
+        assert_ne!(dag(param, vec![e("t", "a")]).fingerprint(), fp);
+        let mut kind = base.clone();
+        kind[1].kind = NodeKind::Action {
+            action_type: "slack.post_message".into(),
+        };
+        assert_ne!(dag(kind, vec![e("t", "a")]).fingerprint(), fp);
+        let three = vec![base[0].clone(), base[1].clone(), n("b")];
+        assert_ne!(
+            dag(three.clone(), vec![e("t", "a"), e("a", "b")]).fingerprint(),
+            dag(three, vec![e("t", "a"), e("t", "b")]).fingerprint()
+        );
+    }
+
+    #[test]
+    fn only_side_effect_free_or_retryable_nodes_are_rerunnable() {
+        assert!(rerunnable(&trig("t")));
+        assert!(rerunnable(&ctrl("i", NodeKind::If, Value::Null)));
+        assert!(rerunnable(&ctrl("s", NodeKind::Switch, Value::Null)));
+        assert!(!rerunnable(&ctrl("l", NodeKind::Loop, Value::Null)));
+        assert!(!rerunnable(&ctrl("w", NodeKind::While, Value::Null)));
+        assert!(!rerunnable(&n("a")));
+        assert!(!rerunnable(&act_p(
+            "a",
+            serde_json::json!({ "_error": { "max_attempts": 1, "on_error": "continue" } })
+        )));
+        assert!(rerunnable(&act_p(
+            "a",
+            serde_json::json!({ "_error": { "max_attempts": 3 } })
+        )));
     }
 }
