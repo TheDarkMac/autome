@@ -42,6 +42,7 @@ use utoipa::{
         crate::accounts::forgot_password,
         crate::accounts::reset_password,
         crate::accounts::me,
+        crate::accounts::delete_account,
         // administration des utilisateurs (#208)
         crate::admin::list_users,
         crate::admin::get_user,
@@ -49,6 +50,7 @@ use utoipa::{
         crate::admin::disable_user,
         crate::admin::enable_user,
         crate::admin::logout_user,
+        crate::admin::delete_user,
         // workflows (F7.1)
         crate::workflows::list_workflows,
         crate::workflows::create_workflow,
@@ -77,6 +79,7 @@ use utoipa::{
         crate::accounts::ChangePasswordBody,
         crate::accounts::ForgotPasswordBody,
         crate::accounts::ResetPasswordBody,
+        crate::accounts::DeleteAccountBody,
         crate::accounts::TokenResponse,
         crate::accounts::MeResponse,
         crate::admin::AdminUser,

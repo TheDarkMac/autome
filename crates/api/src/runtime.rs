@@ -18,19 +18,20 @@ use autome_connectors::{
     CredentialService, EgressPolicy, OAuthCredentialService, ReqwestHttpClient,
 };
 use autome_core::{
-    Config, InMemoryLoginThrottle, InMemoryPermissionStore, InMemoryRevocationStore,
+    AccountEraser, Config, InMemoryLoginThrottle, InMemoryPermissionStore, InMemoryRevocationStore,
     InMemoryRunStateStore, InMemoryTriggerScheduleStore, InMemoryUserStore,
     InMemoryWebhookEndpointStore, InMemoryWorkflowRepository, LoginThrottleStore, NoopAuditSink,
     Queue, QueueRunDispatcher, Result, RevocationStore, RunDispatcher, RunStateStore,
     TriggerScheduleStore, UserStore, WebhookEndpointStore, WorkflowRepository,
 };
 use autome_persistence::{
-    connect, connector_cipher, run_migrations, PgAuditSink, PgConnectorTokenStore, PgLoginThrottle,
-    PgPermissionStore, PgRevocationStore, PgRunStateStore, PgTriggerScheduleStore, PgUserStore,
-    PgWebhookEndpointStore, PgWorkflowRepository,
+    connect, connector_cipher, run_migrations, PgAccountEraser, PgAuditSink, PgConnectorTokenStore,
+    PgLoginThrottle, PgPermissionStore, PgRevocationStore, PgRunStateStore, PgTriggerScheduleStore,
+    PgUserStore, PgWebhookEndpointStore, PgWorkflowRepository,
 };
 
 use crate::auth::{token_service_from_config, AuthState};
+use crate::erasure::InMemoryAccountEraser;
 
 // Sélecteurs de file/stores partagés avec le worker (dette #107).
 pub use autome_persistence::{
@@ -80,6 +81,9 @@ pub struct Backends {
     pub webhooks: Arc<dyn WebhookEndpointStore>,
     /// Échéances des déclencheurs planifiés (#227), lues par les workers.
     pub schedules: Arc<dyn TriggerScheduleStore>,
+    /// Effacement d'un compte et de ses données (#229) : une transaction en
+    /// `postgres`, étape par étape sur les stores en mémoire sinon.
+    pub eraser: Arc<dyn AccountEraser>,
 }
 
 /// Assemble les backends. En `Postgres`, **un seul pool** est partagé par tous
@@ -92,7 +96,8 @@ pub fn build_backends(
 ) -> Result<Backends> {
     match mode {
         PersistenceMode::Memory => {
-            let runs: Arc<dyn RunStateStore + Send + Sync> = Arc::new(InMemoryRunStateStore::new());
+            let memory_runs = Arc::new(InMemoryRunStateStore::new());
+            let runs: Arc<dyn RunStateStore + Send + Sync> = memory_runs.clone();
             let dispatcher: Arc<dyn RunDispatcher + Send + Sync> =
                 Arc::new(QueueRunDispatcher::new(queue, runs.clone()));
             let permissions = Arc::new(InMemoryPermissionStore::new());
@@ -102,18 +107,36 @@ pub fn build_backends(
                 permissions.clone(),
                 Arc::new(NoopAuditSink),
             );
+            let workflows: Arc<dyn WorkflowRepository + Send + Sync> =
+                Arc::new(InMemoryWorkflowRepository::new());
+            let tokens: Arc<dyn ConnectorTokenStore + Send + Sync> =
+                Arc::new(InMemoryConnectorTokenStore::new(connector_cipher(config)));
+            let users = Arc::new(InMemoryUserStore::new(permissions));
+            let webhooks: Arc<dyn WebhookEndpointStore> =
+                Arc::new(InMemoryWebhookEndpointStore::new());
+            let schedules: Arc<dyn TriggerScheduleStore> =
+                Arc::new(InMemoryTriggerScheduleStore::new());
+            // Audit `Noop` en mémoire : rien à pseudonymiser.
+            let eraser = Arc::new(InMemoryAccountEraser::new(
+                users.clone(),
+                workflows.clone(),
+                memory_runs,
+                tokens.clone(),
+                webhooks.clone(),
+                schedules.clone(),
+                None,
+            ));
             Ok(Backends {
                 auth,
-                workflows: Arc::new(InMemoryWorkflowRepository::new()),
+                workflows,
                 runs,
                 dispatcher,
-                credentials: build_credential_service(Arc::new(InMemoryConnectorTokenStore::new(
-                    connector_cipher(config),
-                )))?,
-                users: Arc::new(InMemoryUserStore::new(permissions)),
+                credentials: build_credential_service(tokens)?,
+                users,
                 login_throttle: Arc::new(InMemoryLoginThrottle::new()),
-                webhooks: Arc::new(InMemoryWebhookEndpointStore::new()),
-                schedules: Arc::new(InMemoryTriggerScheduleStore::new()),
+                webhooks,
+                schedules,
+                eraser,
             })
         }
         PersistenceMode::Postgres => {
@@ -140,6 +163,7 @@ pub fn build_backends(
                 login_throttle: Arc::new(PgLoginThrottle::new(pool.clone())),
                 webhooks: Arc::new(PgWebhookEndpointStore::new(pool.clone())),
                 schedules: Arc::new(PgTriggerScheduleStore::new(pool.clone())),
+                eraser: Arc::new(PgAccountEraser::new(pool.clone())),
                 users: Arc::new(PgUserStore::new(pool)),
             })
         }

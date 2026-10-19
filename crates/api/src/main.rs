@@ -13,6 +13,7 @@ use autome_api::admin::{admin_router, promote_admin, AdminState, Promotion};
 use autome_api::auth::protected_router;
 use autome_api::cors::{allowed_origins_from_env, with_cors};
 use autome_api::credentials::{credentials_router, CredentialsState};
+use autome_api::erasure::Erasure;
 use autome_api::mail::MailSettings;
 use autome_api::metrics::{metrics_router, with_metrics, Metrics};
 use autome_api::observability::with_request_tracing;
@@ -92,10 +93,10 @@ fn build_router(
             "/auth",
             protected_router(backends.auth.clone()).merge(accounts_router(accounts)),
         )
-        .merge(admin_router(AdminState::new(
-            backends.auth.clone(),
-            backends.users.clone(),
-        )))
+        .merge(admin_router(
+            AdminState::new(backends.auth.clone(), backends.users.clone())
+                .with_erasure(erasure(backends)),
+        ))
         .merge(workflows_routes)
         .merge(runs_router(runs_state))
         .merge(webhooks_router(webhooks))
@@ -120,6 +121,12 @@ fn webhooks_state(backends: &Backends, config: &Config, max_per_window: u32) -> 
     .with_max_per_window(max_per_window)
 }
 
+/// Suppression de compte (#229) : effaceur des backends, compteurs
+/// anti-bruteforce partagés.
+fn erasure(backends: &Backends) -> Erasure {
+    Erasure::new(backends.eraser.clone(), backends.login_throttle.clone())
+}
+
 /// État des endpoints de comptes : Argon2id sur les stores de `backends`,
 /// anti-bruteforce par email et par adresse IP (#190), mot de passe oublié
 /// si un envoi d'email est configuré (#204).
@@ -134,7 +141,8 @@ fn accounts_state(
         Arc::new(Argon2PasswordHasher::new()),
     )?
     .with_throttle(backends.login_throttle.clone())
-    .with_ip_throttle(ip_throttle);
+    .with_ip_throttle(ip_throttle)
+    .with_erasure(erasure(backends));
     Ok(match password_reset {
         Some(reset) => accounts.with_password_reset(reset),
         None => accounts,
