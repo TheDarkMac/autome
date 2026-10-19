@@ -803,7 +803,9 @@ comptes sont publics ; tout le reste exige `Authorization: Bearer <access_token>
   `/workflows`, `/workflows/{id}` et `/workflows/{id}/runs` (et lit tout run
   par son id). `?owner=` vide désigne les workflows antérieurs à la migration
   `0010`, sans propriétaire. Un utilisateur ordinaire qui vise l'espace d'autrui
-  reçoit 403, que la ressource existe ou non.
+  reçoit 403, que la ressource existe ou non. La vue d'ensemble de tous les
+  espaces est `GET /admin/workflows` (voir « Administration des
+  utilisateurs »).
 
 ```bash
 curl -s -H 'content-type: application/json' \
@@ -881,6 +883,22 @@ Un compte vaut `{"id","email","role","permissions","disabled","email_verified","
   suppression). Un compte qui a déjà choisi son mot de passe ou qui est
   suspendu ne reçoit pas de renvoi (409). Sans envoi d'email possible
   (`prod` sans SMTP), les deux routes répondent 503.
+- **Workflows de tous les comptes** (#243) : section de l'onglet, visible du
+  seul super-admin (`*`). Elle liste les workflows de **tous** les espaces
+  avec leur propriétaire (email ; « Sans propriétaire » pour les workflows
+  antérieurs à la migration `0010`, « Compte introuvable » si le compte
+  n'existe plus), cherche dans l'id ou le nom et se filtre par propriétaire
+  (clic sur l'email, ou bouton « Workflows » d'une ligne de compte). API :
+
+  | Méthode | Path | Réponse |
+  |---|---|---|
+  | GET | `/admin/workflows?owner=&q=&offset=&limit=` | 200 `{"items","total","offset","limit"}` — tri par propriétaire puis id ; `owner` = id exact du propriétaire (vide : sans propriétaire), `q` = partie de l'id ou du nom (sans casse), `limit` ≤ 200 (défaut 50) · 403 sans `*` (`users.admin` ne suffit pas) |
+
+  Un élément vaut `{"owner_id","owner_email","id","name","node_count"}` :
+  un résumé, jamais le graphe. Le détail se lit par
+  `GET /workflows/{id}?owner=<owner_id>` (voir « Ids de workflow par
+  utilisateur »). Audit `admin.workflows_list` (filtre `owner` en
+  métadonnées).
 
 **Premier administrateur** : l'API n'en crée jamais (aucune promotion par
 HTTP). Inscrire le compte, puis le promouvoir depuis l'infrastructure — la
