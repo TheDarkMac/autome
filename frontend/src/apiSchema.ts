@@ -167,6 +167,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/admin/workflows": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** `GET /admin/workflows` — workflows de tous les espaces, paginés. */
+        get: operations["list_all_workflows"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/auth/email/resend": {
         parameters: {
             query?: never;
@@ -717,6 +734,30 @@ export interface components {
             permissions: string[];
             /** @description Rôle déduit des permissions : `admin`, `editor`, `viewer` ou `custom`. */
             role: string;
+        };
+        /** @description Workflow vu par l'administration. */
+        AdminWorkflow: {
+            /** @description Id dans l'espace du propriétaire. */
+            id: string;
+            /** @description Nom affiché. */
+            name: string;
+            /** @description Nombre de nœuds de la version courante. */
+            node_count: number;
+            /** @description Email du propriétaire ; `null` sans compte correspondant. */
+            owner_email?: string | null;
+            /** @description Propriétaire (espace d'ids) ; vide = sans propriétaire (legacy). */
+            owner_id: string;
+        };
+        /** @description Page de [`list_all_workflows`]. */
+        AdminWorkflowListResponse: {
+            /** @description Workflows de la page, triés par propriétaire puis par id. */
+            items: components["schemas"]["AdminWorkflow"][];
+            /** @description Limite appliquée. */
+            limit: number;
+            /** @description Offset appliqué. */
+            offset: number;
+            /** @description Total des workflows correspondant au filtre. */
+            total: number;
         };
         /**
          * @description Réponse de `POST /credentials/{provider}/authorize` (PKCE côté SPA :
@@ -1485,6 +1526,52 @@ export interface operations {
             };
             /** @description Compte inconnu */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    list_all_workflows: {
+        parameters: {
+            query?: {
+                /**
+                 * @description Espace exact (id du propriétaire ; vide = workflows sans
+                 *     propriétaire). Absent = tous les espaces.
+                 */
+                owner?: string | null;
+                /** @description Sous-chaîne de l'id ou du nom (insensible à la casse). */
+                q?: string | null;
+                /** @description Offset, défaut 0. */
+                offset?: number | null;
+                /** @description Limite, défaut 50, maximum 200. */
+                limit?: number | null;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Page de workflows, tous propriétaires confondus */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AdminWorkflowListResponse"];
+                };
+            };
+            /** @description Token absent ou invalide */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Réservé au super-admin (`*`) */
+            403: {
                 headers: {
                     [name: string]: unknown;
                 };

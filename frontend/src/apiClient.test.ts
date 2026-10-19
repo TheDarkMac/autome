@@ -220,6 +220,27 @@ describe("createApiClient — administration (#208)", () => {
     expect(calls[1]!.url).toMatch(/\/admin\/users$/);
   });
 
+  it("listAllWorkflows : GET /admin/workflows, propriétaire vide transmis", async () => {
+    const page = {
+      items: [
+        { owner_id: "u-1", owner_email: "a@example.io", id: "wf", name: "W", node_count: 2 },
+      ],
+      total: 1,
+      offset: 0,
+      limit: 20,
+    };
+    const { fetchImpl, calls } = mockFetch([json(page), json(page), json(page)]);
+    const client = createApiClient(fetchImpl);
+    const got = await client.listAllWorkflows({ owner: "u/1", q: " fac ", limit: 20 });
+    expect(calls[0]!.init.method ?? "GET").toBe("GET");
+    expect(calls[0]!.url).toContain("/admin/workflows?owner=u%2F1&q=fac&limit=20");
+    expect(got.items[0]!.owner_email).toBe("a@example.io");
+    await client.listAllWorkflows({ owner: "" });
+    expect(calls[1]!.url).toMatch(/\/admin\/workflows\?owner=$/);
+    await client.listAllWorkflows();
+    expect(calls[2]!.url).toMatch(/\/admin\/workflows$/);
+  });
+
   it("setUserRole / disableUser / enableUser / logoutUser", async () => {
     const { fetchImpl, calls } = mockFetch([
       json(ALICE),

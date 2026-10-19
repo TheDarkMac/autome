@@ -58,7 +58,7 @@ use utoipa::{
         crate::admin::verify_user_email,
         crate::admin::delete_user,
         // liste d'administration des workflows (#243)
-        crate::admin_workflows::list_workflows,
+        crate::admin_workflows::list_all_workflows,
         // workflows (F7.1)
         crate::workflows::list_workflows,
         crate::workflows::create_workflow,
