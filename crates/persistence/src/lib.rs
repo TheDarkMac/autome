@@ -8,11 +8,13 @@
 //!
 //! Couvert : [`PgRevocationStore`], [`PgPermissionStore`], [`PgAuditSink`],
 //! [`PgUserStore`] (stores d'authent/RBAC/audit/comptes),
-//! [`PgConnectorTokenStore`] (tokens OAuth des connecteurs, chiffrés) + le
+//! [`PgConnectorTokenStore`] (tokens OAuth des connecteurs, chiffrés),
+//! [`PgAccountEraser`] (effacement d'un compte, #229) + le
 //! [`run_migrations`] runner. Les backends runs/workflows/queue suivent.
 
 pub mod audit;
 pub mod connector_tokens;
+pub mod erasure;
 pub mod health;
 pub mod login_throttle;
 pub mod migrations;
@@ -30,6 +32,7 @@ pub mod workflow_repo;
 
 pub use audit::PgAuditSink;
 pub use connector_tokens::PgConnectorTokenStore;
+pub use erasure::PgAccountEraser;
 pub use health::{run_checks, PostgresCheck, QueueCheck, Readiness, CHECK_TIMEOUT};
 pub use login_throttle::PgLoginThrottle;
 pub use migrations::{run_migrations, MIGRATIONS};

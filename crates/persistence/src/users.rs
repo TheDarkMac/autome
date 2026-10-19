@@ -289,7 +289,7 @@ impl UserStore for PgUserStore {
 }
 
 /// `true` pour un UUID textuel (`8-4-4-4-12` chiffres hexadécimaux).
-fn is_uuid(s: &str) -> bool {
+pub(crate) fn is_uuid(s: &str) -> bool {
     s.len() == 36
         && s.char_indices().all(|(i, c)| match i {
             8 | 13 | 18 | 23 => c == '-',
