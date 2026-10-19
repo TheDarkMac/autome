@@ -12,6 +12,7 @@ pub mod audit;
 pub mod auth;
 pub mod config;
 pub mod health;
+pub mod prometheus;
 pub mod queue;
 pub mod rbac;
 pub mod run_dispatch;
