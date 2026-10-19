@@ -24,8 +24,8 @@ use std::time::{Duration, Instant};
 
 use autome_core::{
     dlq_of, DispatchRequest, InMemoryQueue, InMemoryRunStateStore, InMemoryWorkflowRepository,
-    Node, NodeId, NodeKind, Queue, QueueRunDispatcher, RunDispatcher, RunStateStore, RunStatus,
-    WorkflowGraph, WorkflowId, WorkflowRepository, LEGACY_NAMESPACE,
+    Message, Node, NodeId, NodeKind, Queue, QueueRunDispatcher, RunDispatcher, RunStateStore,
+    RunStatus, WorkflowGraph, WorkflowId, WorkflowRepository, LEGACY_NAMESPACE,
 };
 use autome_engine::{Dag, Engine, NodeRunner, RunStatus as EngineRunStatus, StepStatus};
 use autome_worker::{
@@ -385,8 +385,8 @@ async fn duplicate_delivery_is_deduplicated_and_executes_once() {
         .await
         .unwrap();
 
-    // Deux dispatchs avec le *même* run_id → même `idempotency-key`, deux
-    // messages sur la queue (le store est ré-écrit en Queued à l'identique).
+    // Un dispatch, puis une redélivrance du même message (file *au moins une
+    // fois*) : même `idempotency-key`, deux messages sur la queue.
     let fixed = QueueRunDispatcher::new(
         Arc::clone(&stack.queue) as Arc<dyn Queue + Send + Sync>,
         Arc::clone(&stack.store) as Arc<dyn RunStateStore + Send + Sync>,
@@ -401,7 +401,14 @@ async fn duplicate_delivery_is_deduplicated_and_executes_once() {
         owner_id: None,
     };
     fixed.dispatch(req()).await.unwrap();
-    fixed.dispatch(req()).await.unwrap();
+    // Un second dispatch sous le même id est refusé (le run existe déjà).
+    assert!(fixed.dispatch(req()).await.is_err());
+    let duplicate = Message::new(json!({
+        "run_id": "run-dup", "workflow_id": "wf-pipe", "version": 1,
+        "trigger_type": "manual", "payload": null,
+    }))
+    .with_header("idempotency-key", "run-dup");
+    stack.queue.publish(QUEUE, duplicate).await.unwrap();
     assert_eq!(stack.queue.depth(QUEUE).await.unwrap(), 2);
 
     let pool = stack.pool(1);
