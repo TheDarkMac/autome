@@ -75,7 +75,7 @@ docker compose up --build
 | API | http://localhost:8080 | `GET /livez`, `GET /readyz`, `GET /metrics`, `GET /openapi.json` |
 | Frontend | http://localhost:8081 | SPA (éditeur visuel) |
 | Grafana | http://localhost:3000 | `admin` / `admin` (dashboard *Autome — Overview*) |
-| Prometheus | http://localhost:9090 | scrape de l'API |
+| Prometheus | http://localhost:9090 | scrape de l'API et du worker |
 | RabbitMQ | http://localhost:15672 | UI de management (`guest` / `guest`) |
 
 > Profil `dev` avec des secrets de développement — **ne pas utiliser tel quel
@@ -150,6 +150,7 @@ flowchart LR
   ENG --> CONN["crate connectors<br/>Slack · Gmail · Notion · GitHub"]
   WK --> DB
   API --> PROM["Prometheus → Grafana"]
+  WK --> PROM
 ```
 
 Principes clés : **séparation API / exécution**, **workers stateless** (tout
