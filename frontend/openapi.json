@@ -513,6 +513,90 @@
         ]
       }
     },
+    "/admin/workflows": {
+      "get": {
+        "tags": [
+          "admin"
+        ],
+        "summary": "`GET /admin/workflows` — workflows de tous les espaces, paginés.",
+        "operationId": "list_all_workflows",
+        "parameters": [
+          {
+            "name": "owner",
+            "in": "query",
+            "description": "Espace exact (id du propriétaire ; vide = workflows sans\npropriétaire). Absent = tous les espaces.",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "name": "q",
+            "in": "query",
+            "description": "Sous-chaîne de l'id ou du nom (insensible à la casse).",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "name": "offset",
+            "in": "query",
+            "description": "Offset, défaut 0.",
+            "required": false,
+            "schema": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 0
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Limite, défaut 50, maximum 200.",
+            "required": false,
+            "schema": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 0
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Page de workflows, tous propriétaires confondus",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminWorkflowListResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Token absent ou invalide"
+          },
+          "403": {
+            "description": "Réservé au super-admin (`*`)"
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
     "/auth/email/resend": {
       "post": {
         "tags": [
@@ -1999,6 +2083,76 @@
           }
         }
       },
+      "AdminWorkflow": {
+        "type": "object",
+        "description": "Workflow vu par l'administration.",
+        "required": [
+          "owner_id",
+          "id",
+          "name",
+          "node_count"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "Id dans l'espace du propriétaire."
+          },
+          "name": {
+            "type": "string",
+            "description": "Nom affiché."
+          },
+          "node_count": {
+            "type": "integer",
+            "description": "Nombre de nœuds de la version courante.",
+            "minimum": 0
+          },
+          "owner_email": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Email du propriétaire ; `null` sans compte correspondant."
+          },
+          "owner_id": {
+            "type": "string",
+            "description": "Propriétaire (espace d'ids) ; vide = sans propriétaire (legacy)."
+          }
+        }
+      },
+      "AdminWorkflowListResponse": {
+        "type": "object",
+        "description": "Page de [`list_all_workflows`].",
+        "required": [
+          "items",
+          "total",
+          "offset",
+          "limit"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AdminWorkflow"
+            },
+            "description": "Workflows de la page, triés par propriétaire puis par id."
+          },
+          "limit": {
+            "type": "integer",
+            "description": "Limite appliquée.",
+            "minimum": 0
+          },
+          "offset": {
+            "type": "integer",
+            "description": "Offset appliqué.",
+            "minimum": 0
+          },
+          "total": {
+            "type": "integer",
+            "description": "Total des workflows correspondant au filtre.",
+            "minimum": 0
+          }
+        }
+      },
       "AuthorizeResponse": {
         "type": "object",
         "description": "Réponse de `POST /credentials/{provider}/authorize` (PKCE côté SPA :\nle caller conserve `state` + `code_verifier` jusqu'au callback).",
@@ -2649,7 +2803,7 @@
     },
     {
       "name": "admin",
-      "description": "Administration des utilisateurs : liste, rôles, suspension, sessions."
+      "description": "Administration : utilisateurs (liste, rôles, suspension, sessions) et liste de tous les workflows."
     },
     {
       "name": "workflows",

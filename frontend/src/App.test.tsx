@@ -375,6 +375,22 @@ describe("<App />", () => {
             permissions,
           });
         }
+        if (url.includes("/admin/workflows")) {
+          return jsonResponse({
+            items: [
+              {
+                owner_id: "user-2",
+                owner_email: "alice@example.io",
+                id: "wf-draft",
+                name: "Factures",
+                node_count: 2,
+              },
+            ],
+            total: 1,
+            offset: 0,
+            limit: 50,
+          });
+        }
         if (url.includes("/admin/users")) {
           return jsonResponse({
             items: [
@@ -406,6 +422,21 @@ describe("<App />", () => {
         await screen.findByRole("heading", { name: "Administration des utilisateurs" }),
       ).toBeInTheDocument();
       expect(await screen.findByText("(vous)")).toBeInTheDocument();
+      // Super-admin : workflows de tous les comptes (#243).
+      expect(await screen.findByText("Factures")).toBeInTheDocument();
+    });
+
+    it("`users.admin` sans `*` : comptes, mais pas les workflows des autres", async () => {
+      const fetchImpl = backend(["users.admin"]);
+      globalThis.fetch = fetchImpl;
+      render(<App sessionOptions={authedSession("user-1")} />);
+      fireEvent.click(await screen.findByRole("tab", { name: "Administration" }));
+      expect(await screen.findByText("(vous)")).toBeInTheDocument();
+      expect(
+        screen.queryByRole("region", { name: "Workflows de tous les comptes" }),
+      ).not.toBeInTheDocument();
+      const urls = vi.mocked(fetchImpl).mock.calls.map(([input]) => String(input));
+      expect(urls.some((u) => u.includes("/admin/workflows"))).toBe(false);
     });
 
     it("sans `users.admin`, pas d'onglet", async () => {

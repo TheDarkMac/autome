@@ -41,11 +41,13 @@ function fakeApi(items: AdminUser[] = [ME, ALICE, BOSS], total = items.length): 
       invitation_sent: true,
     })),
     resendInvitation: vi.fn().mockResolvedValue(undefined),
+    listAllWorkflows: vi.fn().mockResolvedValue({ items: [], total: 0, offset: 0, limit: 50 }),
   };
 }
 
 function row(email: string): HTMLElement {
-  return screen.getByText(email).closest("tr") as HTMLElement;
+  const accounts = screen.getByRole("table", { name: "Comptes" });
+  return within(accounts).getByText(email).closest("tr") as HTMLElement;
 }
 
 async function renderPanel(
@@ -61,7 +63,7 @@ async function renderPanel(
       {...(props.pageSize !== undefined ? { pageSize: props.pageSize } : {})}
     />,
   );
-  await waitFor(() => expect(screen.getByText("alice@example.io")).toBeInTheDocument());
+  await waitFor(() => expect(row("alice@example.io")).toBeInTheDocument());
 }
 
 describe("<AdminPanel />", () => {
@@ -187,16 +189,20 @@ describe("<AdminPanel />", () => {
     await renderPanel(api, { pageSize: 1 });
     expect(api.listUsers).toHaveBeenLastCalledWith({ q: "", offset: 0, limit: 1 });
 
+    const pager = screen.getByRole("navigation", { name: "Pagination des comptes" });
     await act(async () => {
-      fireEvent.click(screen.getByRole("button", { name: "Suivant" }));
+      fireEvent.click(within(pager).getByRole("button", { name: "Suivant" }));
     });
     expect(api.listUsers).toHaveBeenLastCalledWith({ q: "", offset: 1, limit: 1 });
 
-    fireEvent.change(screen.getByLabelText("Rechercher par email"), {
-      target: { value: " alice " },
-    });
+    const search = screen.getByLabelText("Rechercher par email");
+    fireEvent.change(search, { target: { value: " alice " } });
     await act(async () => {
-      fireEvent.click(screen.getByRole("button", { name: "Rechercher" }));
+      fireEvent.click(
+        within(search.closest("form") as HTMLElement).getByRole("button", {
+          name: "Rechercher",
+        }),
+      );
     });
     expect(api.listUsers).toHaveBeenLastCalledWith({ q: "alice", offset: 0, limit: 1 });
   });
@@ -323,5 +329,156 @@ describe("<AdminPanel />", () => {
     expect(confirm).toHaveBeenLastCalledWith(expect.stringMatching(/Annuler l'invitation/));
     expect(api.deleteUser).toHaveBeenCalledWith("u-ivy");
     expect(screen.getByRole("status")).toHaveTextContent("Invitation de ivy@example.io annulée.");
+  });
+
+  describe("workflows de tous les comptes (#243)", () => {
+    type AdminWorkflow = Schemas["AdminWorkflow"];
+    const wf = (
+      owner_id: string,
+      owner_email: string | null,
+      id: string,
+      name: string,
+      node_count = 1,
+    ): AdminWorkflow => ({ owner_id, owner_email, id, name, node_count });
+    const LEGACY = wf("", null, "old", "Ancien", 2);
+    const ALICE_WF = wf("u-alice", "alice@example.io", "wf-draft", "Factures", 3);
+    const GONE = wf("u-gone", null, "orphan", "");
+
+    function withWorkflows(items: AdminWorkflow[], total = items.length) {
+      const api = fakeApi();
+      api.listAllWorkflows = vi.fn().mockResolvedValue({ items, total, offset: 0, limit: 50 });
+      return api as typeof api & { listAllWorkflows: ReturnType<typeof vi.fn> };
+    }
+
+    function section(): HTMLElement {
+      return screen.getByRole("region", { name: "Workflows de tous les comptes" });
+    }
+
+    it("un super-admin voit les workflows de tous les comptes avec leur propriétaire", async () => {
+      const api = withWorkflows([LEGACY, ALICE_WF, GONE]);
+      await renderPanel(api);
+      const list = section();
+      await waitFor(() => expect(within(list).getByText("Factures")).toBeInTheDocument());
+      expect(api.listAllWorkflows).toHaveBeenLastCalledWith({ q: "", offset: 0, limit: 50 });
+      const alice = within(list).getByText("Factures").closest("tr") as HTMLElement;
+      expect(within(alice).getByText("wf-draft")).toBeInTheDocument();
+      expect(within(alice).getByText("alice@example.io")).toBeInTheDocument();
+      expect(within(alice).getByText("3")).toBeInTheDocument();
+      expect(within(list).getByText("Sans propriétaire")).toBeInTheDocument();
+      // Sans nom : l'id tient lieu de titre ; compte disparu signalé.
+      expect(within(list).getAllByText("orphan")).toHaveLength(2);
+      expect(within(list).getByText("Compte introuvable (u-gone)")).toBeInTheDocument();
+    });
+
+    it("sans `*`, ni section ni bouton Workflows, et aucun appel", async () => {
+      const api = withWorkflows([ALICE_WF]);
+      await renderPanel(api, { superAdmin: false });
+      expect(
+        screen.queryByRole("region", { name: "Workflows de tous les comptes" }),
+      ).not.toBeInTheDocument();
+      expect(
+        within(row("alice@example.io")).queryByRole("button", { name: /workflows/i }),
+      ).not.toBeInTheDocument();
+      expect(api.listAllWorkflows).not.toHaveBeenCalled();
+    });
+
+    it("filtre par propriétaire depuis la liste des comptes, puis retire le filtre", async () => {
+      const api = withWorkflows([ALICE_WF]);
+      await renderPanel(api);
+      await act(async () => {
+        fireEvent.click(
+          within(row("alice@example.io")).getByRole("button", {
+            name: "Voir les workflows de alice@example.io",
+          }),
+        );
+      });
+      expect(api.listAllWorkflows).toHaveBeenLastCalledWith({
+        owner: "u-alice",
+        q: "",
+        offset: 0,
+        limit: 50,
+      });
+      expect(within(section()).getByText("Propriétaire : alice@example.io")).toBeInTheDocument();
+      await act(async () => {
+        fireEvent.click(
+          within(section()).getByRole("button", { name: "Retirer le filtre par propriétaire" }),
+        );
+      });
+      expect(api.listAllWorkflows).toHaveBeenLastCalledWith({ q: "", offset: 0, limit: 50 });
+    });
+
+    it("filtre par propriétaire depuis une ligne, y compris les workflows sans propriétaire", async () => {
+      const api = withWorkflows([LEGACY, ALICE_WF]);
+      await renderPanel(api);
+      await waitFor(() => expect(within(section()).getByText("Factures")).toBeInTheDocument());
+      await act(async () => {
+        fireEvent.click(
+          within(section()).getByRole("button", { name: "Workflows de Sans propriétaire" }),
+        );
+      });
+      expect(api.listAllWorkflows).toHaveBeenLastCalledWith({
+        owner: "",
+        q: "",
+        offset: 0,
+        limit: 50,
+      });
+      // Filtre actif : le propriétaire n'est plus un lien.
+      expect(
+        within(section()).queryByRole("button", { name: /^Workflows de / }),
+      ).not.toBeInTheDocument();
+    });
+
+    it("recherche par id ou nom et pagine ; un autre propriétaire repart de la première page", async () => {
+      const api = withWorkflows([ALICE_WF], 3);
+      await renderPanel(api, { pageSize: 1 });
+      const list = section();
+      await waitFor(() => expect(within(list).getByText("Factures")).toBeInTheDocument());
+      await act(async () => {
+        fireEvent.click(
+          within(
+            within(list).getByRole("navigation", { name: "Pagination des workflows" }),
+          ).getByRole("button", { name: "Suivant" }),
+        );
+      });
+      expect(api.listAllWorkflows).toHaveBeenLastCalledWith({ q: "", offset: 1, limit: 1 });
+
+      fireEvent.change(within(list).getByLabelText("Rechercher un workflow par id ou nom"), {
+        target: { value: " fact " },
+      });
+      await act(async () => {
+        fireEvent.click(within(list).getByRole("button", { name: "Rechercher" }));
+      });
+      expect(api.listAllWorkflows).toHaveBeenLastCalledWith({ q: "fact", offset: 0, limit: 1 });
+
+      await act(async () => {
+        fireEvent.click(
+          within(list).getByRole("navigation", { name: "Pagination des workflows" })
+            .querySelector("button:last-child") as HTMLElement,
+        );
+      });
+      expect(api.listAllWorkflows).toHaveBeenLastCalledWith({ q: "fact", offset: 1, limit: 1 });
+      const calls = api.listAllWorkflows.mock.calls.length;
+      await act(async () => {
+        fireEvent.click(within(list).getByRole("button", { name: "Workflows de alice@example.io" }));
+      });
+      expect(api.listAllWorkflows).toHaveBeenCalledTimes(calls + 1);
+      expect(api.listAllWorkflows).toHaveBeenLastCalledWith({
+        owner: "u-alice",
+        q: "fact",
+        offset: 0,
+        limit: 1,
+      });
+    });
+
+    it("signale une liste refusée", async () => {
+      const api = fakeApi();
+      api.listAllWorkflows = vi.fn().mockRejectedValue(new ApiError("GET a échoué (403)", 403));
+      await renderPanel(api);
+      expect(
+        await within(section()).findByText(
+          "Liste des workflows indisponible : réservée aux super-administrateurs",
+        ),
+      ).toBeInTheDocument();
+    });
   });
 });

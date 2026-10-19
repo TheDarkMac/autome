@@ -94,7 +94,7 @@ pub struct AdminWorkflow {
     pub node_count: usize,
 }
 
-/// Page de [`list_workflows`].
+/// Page de [`list_all_workflows`].
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct AdminWorkflowListResponse {
     /// Workflows de la page, triés par propriétaire puis par id.
@@ -151,7 +151,7 @@ fn internal(e: impl std::fmt::Display) -> AdminWorkflowsError {
     ),
     security(("bearer" = []))
 )]
-pub async fn list_workflows(
+pub async fn list_all_workflows(
     user: AuthenticatedUser,
     State(state): State<AdminWorkflowsState>,
     Query(q): Query<AdminWorkflowListQuery>,
@@ -213,7 +213,7 @@ async fn audit(state: &AdminWorkflowsState, actor: &str, filter: &WorkflowFilter
 /// Route `/admin/workflows` (à fusionner à plat dans le router racine).
 pub fn admin_workflows_router(state: AdminWorkflowsState) -> Router {
     Router::new()
-        .route("/admin/workflows", get(list_workflows))
+        .route("/admin/workflows", get(list_all_workflows))
         .with_state(state)
 }
 

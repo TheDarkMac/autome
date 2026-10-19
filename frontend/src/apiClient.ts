@@ -46,10 +46,20 @@ export const API_PATHS = {
   adminUserLogoutAll: "/admin/users/{id}/logout-all",
   adminUserVerifyEmail: "/admin/users/{id}/verify-email",
   adminUserInvitation: "/admin/users/{id}/invitation",
+  adminWorkflows: "/admin/workflows",
 } as const;
 
 /** Rôles attribuables par l'administration (#208). */
 export type AssignableRole = "admin" | "editor" | "viewer";
+
+export interface ListAllWorkflowsParams {
+  /** Propriétaire exact ; `""` = workflows sans propriétaire (legacy). */
+  owner?: string;
+  /** Sous-chaîne de l'id ou du nom. */
+  q?: string;
+  offset?: number;
+  limit?: number;
+}
 
 export interface ListUsersParams {
   /** Filtre : sous-chaîne de l'email. */
@@ -117,6 +127,10 @@ export interface ApiClient {
   inviteUser(email: string, role: AssignableRole): Promise<Schemas["InvitedUser"]>;
   /** Renvoie l'invitation d'un compte en attente ; l'ancien lien expire. */
   resendInvitation(id: string): Promise<void>;
+  /** Workflows de tous les comptes (#243) — réservé au super-admin (`*`). */
+  listAllWorkflows(
+    params?: ListAllWorkflowsParams,
+  ): Promise<Schemas["AdminWorkflowListResponse"]>;
 }
 
 /** `true` si les permissions contiennent `permission` (ou le joker `*`). */
@@ -314,6 +328,22 @@ export function createApiClient(fetchImpl: typeof fetch = fetch): ApiClient {
         "POST",
         buildPath(API_PATHS.adminUserInvitation, { id }),
         {},
+      );
+    },
+    listAllWorkflows(params = {}) {
+      return requestJson<Schemas["AdminWorkflowListResponse"]>(
+        fetchImpl,
+        "GET",
+        API_PATHS.adminWorkflows,
+        {
+          query: {
+            // `""` est un filtre (espace legacy) : seul `undefined` l'omet.
+            owner: params.owner,
+            q: params.q?.trim() || undefined,
+            offset: params.offset,
+            limit: params.limit,
+          },
+        },
       );
     },
   };

@@ -9,13 +9,16 @@
 // la place de son titulaire (#231). Un administrateur invite aussi de
 // nouvelles personnes (#241) : le compte apparaît « invitation en attente »
 // jusqu'à ce qu'elle choisisse son mot de passe ; l'invitation peut être
-// renvoyée ou annulée (suppression du compte). Le client API est injecté pour
-// les tests.
+// renvoyée ou annulée (suppression du compte). Un super-admin voit en plus
+// les workflows de tous les comptes (#243), filtrables par propriétaire depuis
+// chaque ligne. Le client API est injecté pour les tests.
 
 import { useCallback, useEffect, useState, type FormEvent } from "react";
 
+import { AdminWorkflows, type OwnerFilter } from "./AdminWorkflows";
 import { ApiError } from "./api";
 import type { ApiClient, AssignableRole, Schemas } from "./apiClient";
+import { Pager } from "./Pager";
 
 type AdminUser = Schemas["AdminUser"];
 
@@ -30,13 +33,17 @@ export type AdminApi = Pick<
   | "verifyUserEmail"
   | "inviteUser"
   | "resendInvitation"
+  | "listAllWorkflows"
 >;
 
 export interface AdminPanelProps {
   api: AdminApi;
   /** Identifiant de l'administrateur connecté (actions sur soi grisées). */
   currentUserId: string;
-  /** L'administrateur détient `*` : rôle `admin` et super-admins gérables. */
+  /**
+   * L'administrateur détient `*` : rôle `admin` et super-admins gérables,
+   * workflows de tous les comptes visibles (#243).
+   */
   superAdmin: boolean;
   pageSize?: number;
   /** Confirmation des actions destructrices. Défaut : `window.confirm`. */
@@ -119,6 +126,13 @@ export function AdminPanel({
   const [notice, setNotice] = useState<{ kind: "ok" | "error"; text: string } | null>(
     null,
   );
+  const [workflowOwner, setWorkflowOwner] = useState<OwnerFilter | null>(null);
+
+  /** Filtre la liste des workflows sur `user` et la fait défiler à l'écran. */
+  function showWorkflowsOf(user: AdminUser): void {
+    setWorkflowOwner({ id: user.id, email: user.email });
+    document.getElementById("admin-workflows")?.scrollIntoView?.({ behavior: "smooth" });
+  }
 
   const reload = useCallback(async () => {
     setLoad({ kind: "loading" });
@@ -319,7 +333,7 @@ export function AdminPanel({
       {load.kind === "ok" && load.items.length > 0 && (
         <>
           <div className="overflow-x-auto rounded-lg border border-neutral-200 bg-white">
-            <table className="w-full text-left text-sm">
+            <table aria-label="Comptes" className="w-full text-left text-sm">
               <thead className="border-b border-neutral-200 bg-neutral-50 text-neutral-500">
                 <tr>
                   <th scope="col" className="px-3 py-2 font-medium">
@@ -353,6 +367,7 @@ export function AdminPanel({
                     onDelete={() => onDelete(user)}
                     onVerifyEmail={() => onVerifyEmail(user)}
                     onResend={() => onResend(user)}
+                    {...(superAdmin ? { onWorkflows: () => showWorkflowsOf(user) } : {})}
                   />
                 ))}
               </tbody>
@@ -364,8 +379,18 @@ export function AdminPanel({
             total={load.total}
             pageSize={pageSize}
             onChange={setOffset}
+            label="Pagination des comptes"
           />
         </>
+      )}
+
+      {superAdmin && (
+        <AdminWorkflows
+          api={api}
+          owner={workflowOwner}
+          onOwnerChange={setWorkflowOwner}
+          pageSize={pageSize}
+        />
       )}
     </section>
   );
@@ -456,6 +481,7 @@ function UserRow({
   onDelete,
   onVerifyEmail,
   onResend,
+  onWorkflows,
 }: {
   user: AdminUser;
   self: boolean;
@@ -467,6 +493,8 @@ function UserRow({
   onDelete: () => void;
   onVerifyEmail: () => void;
   onResend: () => void;
+  /** Super-admin seulement : filtre la liste des workflows sur ce compte. */
+  onWorkflows?: () => void;
 }): JSX.Element {
   // Un super-admin n'est gérable que par un super-admin (refus 403 sinon).
   const locked = busy || (user.role === "admin" && !superAdmin);
@@ -527,6 +555,16 @@ function UserRow({
       <td className="px-3 py-2 text-neutral-500">{created}</td>
       <td className="px-3 py-2">
         <div className="flex gap-2">
+          {onWorkflows && (
+            <button
+              type="button"
+              onClick={onWorkflows}
+              aria-label={`Voir les workflows de ${user.email}`}
+              className="rounded-md border border-neutral-200 px-2 py-1 text-xs text-neutral-700 hover:bg-neutral-50"
+            >
+              Workflows
+            </button>
+          )}
           {user.invitation_pending && (
             <button
               type="button"
@@ -583,43 +621,5 @@ function UserRow({
         </div>
       </td>
     </tr>
-  );
-}
-
-function Pager({
-  offset,
-  count,
-  total,
-  pageSize,
-  onChange,
-}: {
-  offset: number;
-  count: number;
-  total: number;
-  pageSize: number;
-  onChange: (offset: number) => void;
-}): JSX.Element {
-  return (
-    <nav aria-label="Pagination" className="mt-3 flex items-center gap-3 text-sm">
-      <span className="text-neutral-500">
-        {offset + 1}–{offset + count} sur {total}
-      </span>
-      <button
-        type="button"
-        disabled={offset === 0}
-        onClick={() => onChange(Math.max(0, offset - pageSize))}
-        className="rounded-md border border-neutral-200 px-2 py-1 text-neutral-700 hover:bg-neutral-50 disabled:opacity-60"
-      >
-        Précédent
-      </button>
-      <button
-        type="button"
-        disabled={offset + count >= total}
-        onClick={() => onChange(offset + pageSize)}
-        className="rounded-md border border-neutral-200 px-2 py-1 text-neutral-700 hover:bg-neutral-50 disabled:opacity-60"
-      >
-        Suivant
-      </button>
-    </nav>
   );
 }
