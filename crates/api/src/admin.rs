@@ -13,6 +13,7 @@
 //! | POST    | `/admin/users/{id}/enable`       | —            | 200 + [`AdminUser`]  |
 //! | POST    | `/admin/users/{id}/logout-all`   | —            | 204                  |
 //! | POST    | `/admin/users/{id}/verify-email` | —            | 200 + [`AdminUser`]  |
+//! | DELETE  | `/admin/users/{id}/mfa`          | —            | 200 + [`AdminUser`]  |
 //! | DELETE  | `/admin/users/{id}`              | —            | 204                  |
 //!
 //! Règles :
@@ -49,26 +50,33 @@
 //!   (`invitation_sent`) et peut renvoyer l'invitation tant que le compte n'a
 //!   pas choisi son mot de passe (409 ensuite) ; le renvoi invalide les liens
 //!   précédents. Annuler une invitation, c'est supprimer le compte ;
+//! - la **réinitialisation du second facteur** (#245, cf. [`crate::mfa`])
+//!   rend l'accès à qui a perdu son téléphone et ses codes de secours : la
+//!   MFA du compte est supprimée, la connexion se fait de nouveau au seul mot
+//!   de passe, puis le titulaire se réenrôle. Mêmes garde-fous (`*` pour un
+//!   compte super-admin, 409 sur son propre compte : passer par
+//!   `/auth/mfa/disable`, qui exige un code) ; le dernier administrateur
+//!   passe par `autome-api reset-mfa <email>` ;
 //! - compte inconnu : 404 ; chaque appel produit un event d'audit
 //!   `admin.users_list` / `admin.user_get` / `admin.user_role` /
 //!   `admin.user_disable` / `admin.user_enable` / `admin.user_logout_all` /
 //!   `admin.user_verify_email` / `admin.user_delete` / `admin.user_invite` /
-//!   `admin.user_invite_resend` (ressource = compte visé, ou son pseudonyme une fois
-//!   effacé).
+//!   `admin.user_invite_resend` / `admin.user_mfa_reset` (ressource = compte
+//!   visé, ou son pseudonyme une fois effacé).
 
 use std::collections::HashSet;
 use std::sync::Arc;
 
 use autome_core::{
     has_usable_password, normalize_email, role_of, unusable_password_hash, validate_email,
-    AuditEvent, AuditOutcome, AuditSink, Role, UserStore, UserSummary, PERM_USERS_ADMIN,
-    PERM_WILDCARD, ROLE_ADMIN, ROLE_EDITOR,
+    AuditEvent, AuditOutcome, AuditSink, InMemoryMfaStore, MfaStore, Role, UserStore, UserSummary,
+    PERM_USERS_ADMIN, PERM_WILDCARD, ROLE_ADMIN, ROLE_EDITOR,
 };
 use axum::{
     extract::{FromRef, Path, Query, State},
     http::StatusCode,
     response::{IntoResponse, Response},
-    routing::{get, post, put},
+    routing::{delete, get, post, put},
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
@@ -96,6 +104,8 @@ pub struct AdminState {
     /// Invitations (#241) ; `None` = indisponibles (503), faute d'envoi
     /// d'email configuré.
     pub invitation: Option<Invitation>,
+    /// Second facteur des comptes (#245) : état affiché, réinitialisation.
+    pub mfa: Arc<dyn MfaStore>,
 }
 
 impl AdminState {
@@ -106,7 +116,14 @@ impl AdminState {
             users,
             erasure: None,
             invitation: None,
+            mfa: Arc::new(InMemoryMfaStore::new()),
         }
+    }
+
+    /// Branche le store du second facteur (#245), partagé avec les comptes.
+    pub fn with_mfa(mut self, mfa: Arc<dyn MfaStore>) -> Self {
+        self.mfa = mfa;
+        self
     }
 
     /// Active les invitations de comptes (#241).
@@ -160,6 +177,8 @@ pub struct AdminUser {
     /// Invitation en attente (#241) : le compte n'a pas encore choisi son mot
     /// de passe et ne peut pas se connecter.
     pub invitation_pending: bool,
+    /// Second facteur actif (#245).
+    pub mfa_enabled: bool,
     /// Création du compte (millisecondes Unix).
     pub created_at_ms: i64,
 }
@@ -176,9 +195,38 @@ impl From<UserSummary> for AdminUser {
             disabled: user.disabled,
             email_verified: user.email_verified,
             invitation_pending: !user.password_set,
+            // Lu dans le store du second facteur (cf. `with_mfa_flags`).
+            mfa_enabled: false,
             created_at_ms: user.created_at_ms,
         }
     }
+}
+
+/// Renseigne `mfa_enabled` des comptes `users`, en une lecture (#245).
+async fn with_mfa_flags(
+    state: &AdminState,
+    users: Vec<UserSummary>,
+) -> Result<Vec<AdminUser>, AdminError> {
+    let ids: Vec<String> = users.iter().map(|u| u.id.clone()).collect();
+    let enabled = state.mfa.enabled_among(&ids).await.map_err(internal)?;
+    Ok(users
+        .into_iter()
+        .map(|u| {
+            let mfa_enabled = enabled.contains(&u.id);
+            AdminUser {
+                mfa_enabled,
+                ..AdminUser::from(u)
+            }
+        })
+        .collect())
+}
+
+/// Vue d'administration d'un compte, second facteur compris.
+async fn admin_view(state: &AdminState, user: UserSummary) -> Result<AdminUser, AdminError> {
+    Ok(with_mfa_flags(state, vec![user])
+        .await?
+        .pop()
+        .expect("un compte en entrée, un en sortie"))
 }
 
 /// Page de [`list_users`].
@@ -345,7 +393,7 @@ async fn refuse_self(
 /// Relit le compte après une écriture (vue à jour pour la réponse).
 async fn reload(state: &AdminState, id: &str) -> Result<AdminUser, AdminError> {
     match state.users.summary(id).await.map_err(internal)? {
-        Some(user) => Ok(user.into()),
+        Some(user) => admin_view(state, user).await,
         // Compte disparu entre l'écriture et la relecture.
         None => Err(AdminError::NotFound),
     }
@@ -394,7 +442,7 @@ pub async fn list_users(
     )
     .await;
     Ok(Json(UserListResponse {
-        items: page.items.into_iter().map(AdminUser::from).collect(),
+        items: with_mfa_flags(&state, page.items).await?,
         total: page.total,
         offset,
         limit,
@@ -600,7 +648,10 @@ pub async fn get_user(
         Value::Null,
     )
     .await;
-    found.map(|u| Json(u.into())).ok_or(AdminError::NotFound)
+    match found {
+        Some(u) => Ok(Json(admin_view(&state, u).await?)),
+        None => Err(AdminError::NotFound),
+    }
 }
 
 /// `PUT /admin/users/{id}/role` — remplace les permissions du compte par
@@ -912,6 +963,10 @@ pub async fn delete_user(
     else {
         return Err(AdminError::NotFound);
     };
+    // En PostgreSQL, le second facteur est parti avec le compte (cascade).
+    if let Err(e) = state.mfa.disable(&account.id).await {
+        tracing::warn!(error = %e, "second facteur du compte effacé non supprimé");
+    }
     audit(
         &state,
         user.user_id(),
@@ -926,6 +981,100 @@ pub async fn delete_user(
     )
     .await;
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// `DELETE /admin/users/{id}/mfa` — réinitialise le second facteur du compte
+/// (téléphone et codes de secours perdus) : il se connecte de nouveau au seul
+/// mot de passe et peut se réenrôler. Idempotent.
+#[utoipa::path(
+    delete,
+    path = "/admin/users/{id}/mfa",
+    tag = "admin",
+    params(("id" = String, Path, description = "Identifiant du compte")),
+    responses(
+        (status = 200, description = "Second facteur réinitialisé", body = AdminUser),
+        (status = 401, description = "Token absent ou invalide"),
+        (status = 403, description = "Manque `users.admin`, ou `*` pour un compte super-admin"),
+        (status = 404, description = "Compte inconnu"),
+        (status = 409, description = "Son propre compte (passer par `/auth/mfa/disable`)")
+    ),
+    security(("bearer" = []))
+)]
+pub async fn reset_user_mfa(
+    user: AuthenticatedUser,
+    State(state): State<AdminState>,
+    Path(id): Path<String>,
+) -> Result<Json<AdminUser>, AdminError> {
+    const ACTION: &str = "admin.user_mfa_reset";
+    state
+        .auth
+        .require_permission(&user, PERM_USERS_ADMIN)
+        .await?;
+    // Sur soi-même, la désactivation exige un code : une session volée ne
+    // doit pas retirer le second facteur par ce chemin.
+    if id == user.user_id() {
+        return Err(refuse_self(
+            &state,
+            &user,
+            ACTION,
+            "cannot reset your own mfa here: use /auth/mfa/disable",
+        )
+        .await);
+    }
+    target_for_change(&state, &user, &id, ACTION).await?;
+    let had_mfa = state.mfa.disable(&id).await.map_err(internal)?;
+    tracing::info!(target_id = %id, had_mfa, "second facteur réinitialisé par un administrateur");
+    audit(
+        &state,
+        user.user_id(),
+        ACTION,
+        &id,
+        AuditOutcome::Success,
+        json!({ "had_mfa": had_mfa }),
+    )
+    .await;
+    Ok(Json(reload(&state, &id).await?))
+}
+
+/// Issue de [`reset_mfa_by_operator`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OperatorMfaReset {
+    /// Second facteur supprimé (`had_mfa` : il y en avait un).
+    Reset {
+        /// Identifiant du compte.
+        user_id: String,
+        /// Un enrôlement (actif ou en attente) existait.
+        had_mfa: bool,
+    },
+    /// Aucun compte pour cet email.
+    UnknownEmail,
+}
+
+/// Récupération hors API (`autome-api reset-mfa <email>`, #245) : supprime le
+/// second facteur du compte de `email` — dernier administrateur qui a perdu
+/// son téléphone et ses codes de secours. Exige un accès à l'infrastructure ;
+/// audité `admin.user_mfa_reset` sous l'acteur `cli`.
+pub async fn reset_mfa_by_operator(
+    users: &(dyn UserStore + Send + Sync),
+    mfa: &dyn MfaStore,
+    audit: &(dyn AuditSink + Send + Sync),
+    email: &str,
+    now_ms: i64,
+) -> autome_core::Result<OperatorMfaReset> {
+    let Some(account) = users.find_by_email(&normalize_email(email)).await? else {
+        return Ok(OperatorMfaReset::UnknownEmail);
+    };
+    let had_mfa = mfa.disable(&account.id).await?;
+    let event = AuditEvent::new(now_ms, "cli", "admin.user_mfa_reset", AuditOutcome::Success)
+        .with_resource(&account.id)
+        .with_metadata(json!({ "had_mfa": had_mfa }));
+    if let Err(e) = audit.record(event).await {
+        tracing::error!(error = %e, "événement d'audit non enregistré");
+    }
+    Ok(OperatorMfaReset::Reset {
+        user_id: account.id,
+        had_mfa,
+    })
 }
 
 /// Issue de [`promote_admin`].
@@ -999,6 +1148,7 @@ pub fn admin_router(state: AdminState) -> Router {
         .route("/admin/users/:id/logout-all", post(logout_user))
         .route("/admin/users/:id/verify-email", post(verify_user_email))
         .route("/admin/users/:id/invitation", post(resend_invitation))
+        .route("/admin/users/:id/mfa", delete(reset_user_mfa))
         .with_state(state)
 }
 
@@ -1061,6 +1211,7 @@ mod tests {
         revocation: Arc<InMemoryRevocationStore>,
         audit: Arc<InMemoryAuditSink>,
         workflows: Arc<InMemoryWorkflowRepository>,
+        mfa: Arc<InMemoryMfaStore>,
     }
 
     impl Fixture {
@@ -1097,13 +1248,15 @@ mod tests {
                     public_url: "https://app.example.io".into(),
                 },
             );
+            let mfa = Arc::new(InMemoryMfaStore::new());
             let app = admin_router(
                 AdminState::new(
                     auth.clone(),
                     Arc::clone(&users) as Arc<dyn UserStore + Send + Sync>,
                 )
                 .with_erasure(erasure)
-                .with_invitation(invitation),
+                .with_invitation(invitation)
+                .with_mfa(mfa.clone()),
             );
             Self {
                 app,
@@ -1114,6 +1267,7 @@ mod tests {
                 revocation,
                 audit,
                 workflows,
+                mfa,
             }
         }
 
@@ -2040,5 +2194,187 @@ mod tests {
                 .unwrap();
             assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE, "{uri}");
         }
+    }
+
+    // ───── Second facteur (#245) ─────
+
+    /// MFA active pour `user_id` (secret opaque : l'API n'en lit rien ici).
+    async fn with_active_mfa(f: &Fixture, user_id: &str) {
+        f.mfa.begin_enrollment(user_id, "sealed").await.unwrap();
+        assert!(f
+            .mfa
+            .enable(user_id, "sealed", 1, &["h".to_string()])
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn the_list_and_the_detail_show_who_has_a_second_factor() {
+        let f = Fixture::new();
+        let admin = f.account("root@example.io", Role::super_admin()).await;
+        let alice = f.account("alice@example.io", Role::editor()).await;
+        let bob = f.account("bob@example.io", Role::editor()).await;
+        with_active_mfa(&f, &alice).await;
+        // Enrôlement en attente : pas actif.
+        f.mfa.begin_enrollment(&bob, "sealed").await.unwrap();
+
+        let list = json_body(f.call("GET", "/admin/users", &admin, None).await).await;
+        let flags: Vec<(String, bool)> = list["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|u| {
+                (
+                    u["email"].as_str().unwrap().to_string(),
+                    u["mfa_enabled"].as_bool().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            flags,
+            vec![
+                ("root@example.io".to_string(), false),
+                ("alice@example.io".to_string(), true),
+                ("bob@example.io".to_string(), false),
+            ]
+        );
+        let one = json_body(
+            f.call("GET", &format!("/admin/users/{alice}"), &admin, None)
+                .await,
+        )
+        .await;
+        assert_eq!(one["mfa_enabled"], true);
+    }
+
+    #[tokio::test]
+    async fn an_admin_resets_a_lost_second_factor() {
+        let f = Fixture::new();
+        let admin = f.account("root@example.io", Role::super_admin()).await;
+        let alice = f.account("alice@example.io", Role::editor()).await;
+        with_active_mfa(&f, &alice).await;
+
+        let r = f
+            .call("DELETE", &format!("/admin/users/{alice}/mfa"), &admin, None)
+            .await;
+        assert_eq!(r.status(), StatusCode::OK);
+        let user = json_body(r).await;
+        assert_eq!(user["mfa_enabled"], false);
+        assert_eq!(f.mfa.get(&alice).await.unwrap(), None);
+        // Idempotent.
+        let r = f
+            .call("DELETE", &format!("/admin/users/{alice}/mfa"), &admin, None)
+            .await;
+        assert_eq!(r.status(), StatusCode::OK);
+        let events = f.audit.list().await.unwrap();
+        let resets: Vec<_> = events
+            .iter()
+            .filter(|e| e.action == "admin.user_mfa_reset")
+            .map(|e| e.metadata["had_mfa"].as_bool().unwrap())
+            .collect();
+        assert_eq!(resets, vec![true, false]);
+        let r = f
+            .call("DELETE", "/admin/users/nobody/mfa", &admin, None)
+            .await;
+        assert_eq!(r.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn mfa_reset_follows_the_escalation_and_self_rules() {
+        let f = Fixture::new();
+        let root = f.account("root@example.io", Role::super_admin()).await;
+        let other_root = f.account("root2@example.io", Role::super_admin()).await;
+        let helpdesk = f.account("help@example.io", users_admin_only()).await;
+        let editor = f.account("ed@example.io", Role::editor()).await;
+        for id in [&root, &other_root, &editor] {
+            with_active_mfa(&f, id).await;
+        }
+
+        // Sans `users.admin` : 403.
+        let r = f
+            .call("DELETE", &format!("/admin/users/{root}/mfa"), &editor, None)
+            .await;
+        assert_eq!(r.status(), StatusCode::FORBIDDEN);
+        // `users.admin` seul ne touche pas un super-admin.
+        let r = f
+            .call(
+                "DELETE",
+                &format!("/admin/users/{root}/mfa"),
+                &helpdesk,
+                None,
+            )
+            .await;
+        assert_eq!(r.status(), StatusCode::FORBIDDEN);
+        assert!(f.mfa.get(&root).await.unwrap().is_some());
+        // … mais un éditeur, si.
+        let r = f
+            .call(
+                "DELETE",
+                &format!("/admin/users/{editor}/mfa"),
+                &helpdesk,
+                None,
+            )
+            .await;
+        assert_eq!(r.status(), StatusCode::OK);
+        // Sur soi-même : 409, même super-admin.
+        let r = f
+            .call("DELETE", &format!("/admin/users/{root}/mfa"), &root, None)
+            .await;
+        assert_eq!(r.status(), StatusCode::CONFLICT);
+        assert!(f.mfa.get(&root).await.unwrap().is_some());
+        // Un super-admin réinitialise celui d'un autre super-admin.
+        let r = f
+            .call(
+                "DELETE",
+                &format!("/admin/users/{other_root}/mfa"),
+                &root,
+                None,
+            )
+            .await;
+        assert_eq!(r.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn the_operator_resets_the_last_admin_second_factor() {
+        let f = Fixture::new();
+        let root = f.account("root@example.io", Role::super_admin()).await;
+        with_active_mfa(&f, &root).await;
+        let outcome = reset_mfa_by_operator(
+            f.users.as_ref(),
+            f.mfa.as_ref(),
+            f.audit.as_ref(),
+            " ROOT@example.io ",
+            NOW * 1_000,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            outcome,
+            OperatorMfaReset::Reset {
+                user_id: root.clone(),
+                had_mfa: true
+            }
+        );
+        assert_eq!(f.mfa.get(&root).await.unwrap(), None);
+        let event = f
+            .audit
+            .list()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|e| e.action == "admin.user_mfa_reset")
+            .unwrap();
+        assert_eq!(event.actor, "cli");
+        assert_eq!(
+            reset_mfa_by_operator(
+                f.users.as_ref(),
+                f.mfa.as_ref(),
+                f.audit.as_ref(),
+                "nobody@example.io",
+                NOW * 1_000,
+            )
+            .await
+            .unwrap(),
+            OperatorMfaReset::UnknownEmail
+        );
     }
 }

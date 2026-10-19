@@ -46,6 +46,13 @@ use utoipa::{
         crate::accounts::accept_invitation,
         crate::accounts::me,
         crate::accounts::delete_account,
+        // second facteur (#245)
+        crate::mfa::mfa_status,
+        crate::mfa::mfa_setup,
+        crate::mfa::mfa_enable,
+        crate::mfa::mfa_disable,
+        crate::mfa::mfa_recovery_codes,
+        crate::mfa::mfa_verify,
         // administration des utilisateurs (#208)
         crate::admin::list_users,
         crate::admin::invite_user,
@@ -57,6 +64,7 @@ use utoipa::{
         crate::admin::logout_user,
         crate::admin::verify_user_email,
         crate::admin::delete_user,
+        crate::admin::reset_user_mfa,
         // liste d'administration des workflows (#243)
         crate::admin_workflows::list_all_workflows,
         // workflows (F7.1)
@@ -94,6 +102,15 @@ use utoipa::{
         crate::accounts::SignupPending,
         crate::accounts::TokenResponse,
         crate::accounts::MeResponse,
+        crate::mfa::MfaChallenge,
+        crate::mfa::MfaVerifyBody,
+        crate::mfa::MfaSetupBody,
+        crate::mfa::MfaCodeBody,
+        crate::mfa::MfaDisableBody,
+        crate::mfa::MfaSetup,
+        crate::mfa::MfaEnabled,
+        crate::mfa::RecoveryCodes,
+        crate::mfa::MfaStatus,
         crate::admin::AdminUser,
         crate::admin::UserListResponse,
         crate::admin::RoleBody,
@@ -117,7 +134,7 @@ use utoipa::{
     )),
     tags(
         (name = "probes", description = "Sondes de l'orchestrateur : vivant (`/livez`) et prêt (`/readyz`)."),
-        (name = "auth", description = "Comptes : inscription, connexion, rotation des jetons."),
+        (name = "auth", description = "Comptes : inscription, connexion, rotation des jetons, second facteur (TOTP)."),
         (name = "admin", description = "Administration : utilisateurs (liste, rôles, suspension, sessions) et liste de tous les workflows."),
         (name = "workflows", description = "CRUD des workflows."),
         (name = "runs", description = "Déclenchement et suivi des runs."),
@@ -249,12 +266,20 @@ mod tests {
             "/auth/refresh",
             "/auth/email/verify",
             "/auth/email/resend",
+            "/auth/mfa/verify",
         ] {
             let op = &spec["paths"][path]["post"];
             assert!(op.is_object(), "{path} doit figurer dans la spec");
             // Endpoints publics : ils émettent les jetons, pas de bearer exigé.
             assert!(op["security"].is_null(), "{path} ne doit pas exiger bearer");
         }
+        // Second facteur (#245) : le login peut répondre par un défi.
+        assert!(spec["paths"]["/auth/login"]["post"]["responses"]["202"].is_object());
+        for path in ["/auth/mfa/setup", "/auth/mfa/enable", "/auth/mfa/disable"] {
+            let security = &spec["paths"][path]["post"]["security"];
+            assert!(security.is_array(), "{path} doit exiger bearer");
+        }
+        assert!(spec["paths"]["/admin/users/{id}/mfa"]["delete"].is_object());
     }
 
     #[tokio::test]

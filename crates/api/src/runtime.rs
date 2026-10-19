@@ -18,16 +18,17 @@ use autome_connectors::{
     CredentialService, EgressPolicy, OAuthCredentialService, ReqwestHttpClient,
 };
 use autome_core::{
-    AccountEraser, Config, InMemoryLoginThrottle, InMemoryPermissionStore, InMemoryRevocationStore,
-    InMemoryRunStateStore, InMemoryTriggerScheduleStore, InMemoryUserStore,
-    InMemoryWebhookEndpointStore, InMemoryWorkflowRepository, LoginThrottleStore, NoopAuditSink,
-    Queue, QueueRunDispatcher, Result, RevocationStore, RunDispatcher, RunStateStore,
-    TriggerScheduleStore, UserStore, WebhookEndpointStore, WorkflowRepository,
+    AccountEraser, Config, InMemoryLoginThrottle, InMemoryMfaStore, InMemoryPermissionStore,
+    InMemoryRevocationStore, InMemoryRunStateStore, InMemoryTriggerScheduleStore,
+    InMemoryUserStore, InMemoryWebhookEndpointStore, InMemoryWorkflowRepository,
+    LoginThrottleStore, MfaStore, NoopAuditSink, Queue, QueueRunDispatcher, Result,
+    RevocationStore, RunDispatcher, RunStateStore, TriggerScheduleStore, UserStore,
+    WebhookEndpointStore, WorkflowRepository,
 };
 use autome_persistence::{
     connect, connector_cipher, run_migrations, PgAccountEraser, PgAuditSink, PgConnectorTokenStore,
-    PgLoginThrottle, PgPermissionStore, PgRevocationStore, PgRunStateStore, PgTriggerScheduleStore,
-    PgUserStore, PgWebhookEndpointStore, PgWorkflowRepository,
+    PgLoginThrottle, PgMfaStore, PgPermissionStore, PgRevocationStore, PgRunStateStore,
+    PgTriggerScheduleStore, PgUserStore, PgWebhookEndpointStore, PgWorkflowRepository,
 };
 
 use crate::auth::{token_service_from_config, AuthState};
@@ -84,6 +85,9 @@ pub struct Backends {
     /// Effacement d'un compte et de ses données (#229) : une transaction en
     /// `postgres`, étape par étape sur les stores en mémoire sinon.
     pub eraser: Arc<dyn AccountEraser>,
+    /// Second facteur des comptes (#245), partagé par les comptes et
+    /// l'administration.
+    pub mfa: Arc<dyn MfaStore>,
 }
 
 /// Assemble les backends. En `Postgres`, **un seul pool** est partagé par tous
@@ -137,6 +141,7 @@ pub fn build_backends(
                 webhooks,
                 schedules,
                 eraser,
+                mfa: Arc::new(InMemoryMfaStore::new()),
             })
         }
         PersistenceMode::Postgres => {
@@ -164,6 +169,7 @@ pub fn build_backends(
                 webhooks: Arc::new(PgWebhookEndpointStore::new(pool.clone())),
                 schedules: Arc::new(PgTriggerScheduleStore::new(pool.clone())),
                 eraser: Arc::new(PgAccountEraser::new(pool.clone())),
+                mfa: Arc::new(PgMfaStore::new(pool.clone())),
                 users: Arc::new(PgUserStore::new(pool)),
             })
         }
