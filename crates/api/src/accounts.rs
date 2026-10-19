@@ -5,7 +5,7 @@
 //!
 //! | Méthode | Path            | Body                    | Succès                      |
 //! |---------|-----------------|-------------------------|-----------------------------|
-//! | POST    | `/auth/signup`  | `{ email, password }`   | 201 + [`TokenResponse`]     |
+//! | POST    | `/auth/signup`  | `{ email, password }`   | 201 + [`TokenResponse`], ou 202 (email à vérifier) |
 //! | POST    | `/auth/login`   | `{ email, password }`   | 200 + [`TokenResponse`]     |
 //! | POST    | `/auth/refresh` | `{ refresh_token }`     | 200 + [`TokenResponse`]     |
 //! | POST    | `/auth/logout`  | `{ refresh_token }`     | 204                         |
@@ -13,14 +13,16 @@
 //! | POST    | `/auth/password` | `{ current_password, new_password }` (Bearer) | 200 + [`TokenResponse`] |
 //! | POST    | `/auth/password/forgot` | `{ email }`      | 202                         |
 //! | POST    | `/auth/password/reset`  | `{ token, new_password }` | 204               |
+//! | POST    | `/auth/email/verify`    | `{ token }`      | 204                         |
+//! | POST    | `/auth/email/resend`    | `{ email }`      | 202                         |
 //! | GET     | `/auth/me`      | — (Bearer requis)       | 200 + [`MeResponse`]        |
 //! | DELETE  | `/auth/me`      | `{ current_password }` (Bearer) | 204                 |
 //!
 //! Contrat aligné sur le frontend (`frontend/src/auth.ts`) : 400 saisie
-//! invalide, 401 identifiants/jeton refusés, 403 compte suspendu (connexion
-//! avec le bon mot de passe), 409 email déjà pris, 429 trop de tentatives
-//! (`Retry-After`), 503 réinitialisation indisponible (aucun envoi d'email
-//! configuré).
+//! invalide, 401 identifiants/jeton refusés, 403 compte suspendu ou email non
+//! vérifié (connexion avec le bon mot de passe), 409 email déjà pris, 429 trop
+//! de tentatives (`Retry-After`), 503 réinitialisation ou vérification
+//! indisponible (aucun envoi d'email configuré).
 //!
 //! Choix de sécurité :
 //! - **Argon2id** ([`PasswordHasher`]) exécuté dans `spawn_blocking` : ~50 ms
@@ -83,10 +85,20 @@
 //!   [`crate::erasure`]). Un compte qui détient `*` est refusé (409) : un
 //!   autre administrateur doit d'abord lui retirer ce rôle, si bien que
 //!   l'instance n'est jamais laissée sans administrateur par ce chemin.
+//! - La **vérification de l'email** (#231, cf. [`crate::email_verification`]),
+//!   quand elle est active : l'inscription crée un compte non vérifié, lui
+//!   envoie un lien **en tâche de fond** et répond 202 **sans jetons** ; la
+//!   connexion d'un compte non vérifié est refusée (403, après vérification
+//!   du mot de passe : seul le titulaire l'apprend). Le renvoi du lien suit
+//!   le modèle du mot de passe oublié (toujours 202, quotas par email et par
+//!   IP). Une réinitialisation du mot de passe réussie vérifie aussi
+//!   l'adresse : elle prouve la même possession de la boîte, et rend son
+//!   compte à qui se serait vu « réserver » son adresse par un tiers.
 //! - Chaque inscription/connexion/déconnexion/changement ou réinitialisation
 //!   de mot de passe produit un event d'audit `auth.signup` / `auth.login` /
 //!   `auth.logout` / `auth.logout_all` / `auth.password_change` /
-//!   `auth.password_reset_request` / `auth.password_reset` ; la suppression,
+//!   `auth.password_reset_request` / `auth.password_reset` /
+//!   `auth.email_verify_request` / `auth.email_verify` ; la suppression,
 //!   `auth.account_delete` sous le pseudonyme du compte effacé.
 
 use std::collections::HashSet;
@@ -111,6 +123,7 @@ use utoipa::ToSchema;
 
 use crate::auth::{bearer_token, AuthState, AuthenticatedUser};
 use crate::client_ip::{ClientIpPolicy, IpKeyer};
+use crate::email_verification::{EmailVerification, VerifyTokens};
 use crate::erasure::{erase_account, Erasure};
 use crate::password_reset::{PasswordReset, ResetTokens};
 
@@ -128,6 +141,9 @@ pub const DEFAULT_SIGNUP_IP_MAX_ATTEMPTS: u32 = 10;
 /// Quota par défaut des demandes de réinitialisation par adresse IP et par
 /// fenêtre (#204).
 pub const DEFAULT_RESET_IP_MAX_ATTEMPTS: u32 = 10;
+/// Quota par défaut des renvois du lien de vérification par adresse IP et
+/// par fenêtre (#231).
+pub const DEFAULT_VERIFY_IP_MAX_ATTEMPTS: u32 = 10;
 
 /// Anti-bruteforce par adresse IP cliente (#190). Un quota à 0 désactive le
 /// compteur correspondant.
@@ -144,13 +160,16 @@ pub struct IpThrottle {
     /// Demandes de réinitialisation du mot de passe tolérées par IP et par
     /// fenêtre (#204).
     pub reset_max: u32,
+    /// Renvois du lien de vérification tolérés par IP et par fenêtre (#231).
+    pub verify_max: u32,
 }
 
 impl IpThrottle {
     /// Depuis l'environnement : `AUTOME_TRUSTED_PROXIES`,
     /// `AUTOME_LOGIN_IP_MAX_ATTEMPTS` (défaut 50), `AUTOME_SIGNUP_IP_MAX_ATTEMPTS`
-    /// (défaut 10), `AUTOME_RESET_IP_MAX_ATTEMPTS` (défaut 10) ; clé HMAC
-    /// dérivée d'`ENCRYPTION_KEY`.
+    /// (défaut 10), `AUTOME_RESET_IP_MAX_ATTEMPTS` (défaut 10),
+    /// `AUTOME_VERIFY_IP_MAX_ATTEMPTS` (défaut 10) ; clé HMAC dérivée
+    /// d'`ENCRYPTION_KEY`.
     pub fn from_env(config: &Config) -> Result<Self, String> {
         Self::from_source(config, |name| std::env::var(name).ok())
     }
@@ -183,6 +202,10 @@ impl IpThrottle {
                 "AUTOME_RESET_IP_MAX_ATTEMPTS",
                 DEFAULT_RESET_IP_MAX_ATTEMPTS,
             )?,
+            verify_max: quota(
+                "AUTOME_VERIFY_IP_MAX_ATTEMPTS",
+                DEFAULT_VERIFY_IP_MAX_ATTEMPTS,
+            )?,
         })
     }
 }
@@ -208,6 +231,9 @@ pub struct AccountsState {
     pub password_reset: Option<PasswordReset>,
     /// Suppression de compte (#229) ; `None` = indisponible (503).
     pub erasure: Option<Erasure>,
+    /// Vérification de l'email (#231) ; `None` = désactivée : les comptes
+    /// sont créés vérifiés, la connexion n'est pas conditionnée.
+    pub email_verification: Option<EmailVerification>,
     /// Hash leurre vérifié quand l'email est inconnu (égalisation du temps).
     dummy_hash: Arc<str>,
 }
@@ -230,6 +256,7 @@ impl AccountsState {
             signup_permissions: Role::editor().permissions,
             password_reset: None,
             erasure: None,
+            email_verification: None,
             dummy_hash: dummy_hash.into(),
         })
     }
@@ -256,6 +283,12 @@ impl AccountsState {
     /// Active la suppression de compte en libre-service (#229).
     pub fn with_erasure(mut self, erasure: Erasure) -> Self {
         self.erasure = Some(erasure);
+        self
+    }
+
+    /// Exige la vérification de l'email à l'inscription (#231).
+    pub fn with_email_verification(mut self, verification: EmailVerification) -> Self {
+        self.email_verification = Some(verification);
         self
     }
 }
@@ -313,6 +346,30 @@ pub struct ResetPasswordBody {
     pub token: String,
     /// Nouveau mot de passe (8 à 1024 caractères).
     pub new_password: String,
+}
+
+/// Body de `/auth/email/verify`.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct VerifyEmailBody {
+    /// Jeton reçu par email (fragment `#verify=` du lien).
+    pub token: String,
+}
+
+/// Body de `/auth/email/resend`.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct ResendVerificationBody {
+    /// Adresse email du compte (normalisée côté serveur).
+    pub email: String,
+}
+
+/// Réponse 202 de `/auth/signup` quand l'adresse doit être vérifiée (#231) :
+/// aucun jeton, un lien de vérification part vers `email`.
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct SignupPending {
+    /// Adresse normalisée à laquelle le lien est envoyé.
+    pub email: String,
+    /// Toujours `true` : connexion possible après vérification.
+    pub verification_required: bool,
 }
 
 /// Paire de jetons émise par signup/login/refresh.
@@ -421,6 +478,7 @@ fn ip_counter(
     let max = match scope {
         LOGIN_IP_SCOPE => ip.login_max,
         RESET_IP_SCOPE => ip.reset_max,
+        VERIFY_IP_SCOPE => ip.verify_max,
         _ => ip.signup_max,
     };
     if max == 0 {
@@ -469,6 +527,7 @@ async fn check_ip(
 const LOGIN_IP_SCOPE: &str = "login-ip";
 const SIGNUP_IP_SCOPE: &str = "signup-ip";
 const RESET_IP_SCOPE: &str = "reset-ip";
+const VERIFY_IP_SCOPE: &str = "verify-ip";
 
 fn token_response(access_token: String, refresh_token: String) -> TokenResponse {
     TokenResponse {
@@ -481,6 +540,9 @@ fn token_response(access_token: String, refresh_token: String) -> TokenResponse 
 
 /// Message du refus de connexion d'un compte suspendu (#208).
 const ACCOUNT_DISABLED: &str = "account disabled";
+/// Message du refus de connexion d'un compte dont l'email n'est pas vérifié
+/// (#231).
+const EMAIL_NOT_VERIFIED: &str = "email not verified";
 
 /// Émet une paire à la version de session courante de l'utilisateur (#186).
 async fn issue_pair(state: &AccountsState, user_id: &str) -> Result<TokenResponse, AccountError> {
@@ -519,14 +581,17 @@ async fn is_enabled(state: &AccountsState, user_id: &str) -> Result<bool, Accoun
         .is_some_and(|u| !u.disabled))
 }
 
-/// `POST /auth/signup` — crée un compte (rôle `editor`) et le connecte.
+/// `POST /auth/signup` — crée un compte (rôle `editor`) et le connecte ; si
+/// la vérification de l'email est exigée (#231), il reste non vérifié, un
+/// lien lui est envoyé et la réponse (202) ne porte aucun jeton.
 #[utoipa::path(
     post,
     path = "/auth/signup",
     tag = "auth",
     request_body = CredentialsBody,
     responses(
-        (status = 201, description = "Compte créé", body = TokenResponse),
+        (status = 201, description = "Compte créé et connecté (vérification de l'email désactivée)", body = TokenResponse),
+        (status = 202, description = "Compte créé, email de vérification envoyé : connexion possible après vérification", body = SignupPending),
         (status = 400, description = "Email ou mot de passe invalide"),
         (status = 409, description = "Email déjà enregistré"),
         (status = 429, description = "Trop d'inscriptions depuis cette adresse — voir `Retry-After`")
@@ -537,7 +602,7 @@ pub async fn signup(
     peer: Option<ConnectInfo<SocketAddr>>,
     headers: HeaderMap,
     Json(body): Json<CredentialsBody>,
-) -> Result<(StatusCode, Json<TokenResponse>), AccountError> {
+) -> Result<Response, AccountError> {
     let email = normalize_email(&body.email);
     validate_email(&email).map_err(|e| AccountError::BadRequest(e.to_string()))?;
     validate_password(&body.password).map_err(|e| AccountError::BadRequest(e.to_string()))?;
@@ -553,7 +618,12 @@ pub async fn signup(
 
     let user = match state
         .users
-        .create(&email, &hash, &state.signup_permissions)
+        .create(
+            &email,
+            &hash,
+            &state.signup_permissions,
+            state.email_verification.is_none(),
+        )
         .await
         .map_err(internal)?
     {
@@ -564,10 +634,20 @@ pub async fn signup(
         }
     };
     audit(&state, &user.id, "auth.signup", AuditOutcome::Success).await;
-    Ok((
-        StatusCode::CREATED,
-        Json(issue_pair(&state, &user.id).await?),
-    ))
+    let Some(verification) = state.email_verification.clone() else {
+        return Ok((
+            StatusCode::CREATED,
+            Json(issue_pair(&state, &user.id).await?),
+        )
+            .into_response());
+    };
+    let pending = SignupPending {
+        email: user.email.clone(),
+        verification_required: true,
+    };
+    // En tâche de fond : la durée de la réponse ne dépend pas du SMTP.
+    tokio::spawn(async move { send_verification_link(&state, &verification, &user, now).await });
+    Ok((StatusCode::ACCEPTED, Json(pending)).into_response())
 }
 
 /// `POST /auth/login` — échange email + mot de passe contre une paire de jetons.
@@ -579,7 +659,7 @@ pub async fn signup(
     responses(
         (status = 200, description = "Connecté", body = TokenResponse),
         (status = 401, description = "Identifiants invalides"),
-        (status = 403, description = "Compte suspendu par un administrateur"),
+        (status = 403, description = "Compte suspendu par un administrateur (`account disabled`), ou adresse email pas encore vérifiée (`email not verified`)"),
         (status = 429, description = "Trop d'échecs (compte ou adresse IP) — voir `Retry-After`")
     )
 )]
@@ -642,6 +722,13 @@ pub async fn login(
                 if let Err(e) = state.throttle.refund(key).await {
                     tracing::warn!(error = %e, "remboursement du compteur IP impossible");
                 }
+            }
+            // Bon mot de passe, adresse non vérifiée (#231) : pas de session.
+            // La vérification ne fait que passer à vrai : la lecture du
+            // compte ci-dessus suffit.
+            if state.email_verification.is_some() && !user.email_verified {
+                audit(&state, &user.id, "auth.login", AuditOutcome::Denied).await;
+                return Err(AccountError::Forbidden(EMAIL_NOT_VERIFIED));
             }
             audit(&state, &user.id, "auth.login", AuditOutcome::Success).await;
             Ok(Json(issue_pair_at(&state, &user.id, sv)?))
@@ -1099,6 +1186,17 @@ pub async fn reset_password(
         .bump_session_version(&account.id)
         .await
         .map_err(internal)?;
+    // Le lien a été reçu dans la boîte du compte : l'adresse est prouvée
+    // (#231). Sans effet si elle a changé entre-temps.
+    if !account.email_verified {
+        if let Err(e) = state
+            .users
+            .mark_email_verified(&account.id, &account.email)
+            .await
+        {
+            tracing::warn!(error = %e, "vérification de l'email après réinitialisation impossible");
+        }
+    }
     // Le compte a pu être bloqué par les échecs qui ont motivé la demande.
     for key in [
         email_throttle_key(&account.email),
@@ -1120,6 +1218,156 @@ pub async fn reset_password(
         AuditOutcome::Success,
     )
     .await;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Message des liens de vérification refusés (même réponse quelle que soit la
+/// raison : mal formé, expiré, falsifié, adresse changée, compte disparu).
+const INVALID_VERIFY_TOKEN: &str = "invalid or expired verification link";
+
+/// Envoie un lien de vérification à `user` (tâche de fond de [`signup`] et
+/// [`resend_verification`]). Les erreurs sont journalisées (jamais le jeton).
+async fn send_verification_link(
+    state: &AccountsState,
+    verification: &EmailVerification,
+    user: &autome_core::UserRecord,
+    now: i64,
+) {
+    const ACTION: &str = "auth.email_verify_request";
+    let token = verification.tokens.issue(&user.id, &user.email, now);
+    match verification
+        .mail
+        .mailer
+        .send(&verification.mail_for(&user.email, &token))
+        .await
+    {
+        Ok(()) => {
+            tracing::info!(user_id = %user.id, "lien de vérification de l'email envoyé");
+            audit(state, &user.id, ACTION, AuditOutcome::Success).await;
+        }
+        Err(e) => {
+            tracing::error!(user_id = %user.id, error = %e, "envoi du lien de vérification impossible");
+            audit(state, &user.id, ACTION, AuditOutcome::Failure).await;
+        }
+    }
+}
+
+/// `POST /auth/email/resend` — renvoie un lien de vérification à l'adresse,
+/// **si** un compte non vérifié lui correspond.
+///
+/// Toujours 202 pour une adresse bien formée : comme pour le mot de passe
+/// oublié, la recherche du compte et l'envoi ont lieu en tâche de fond.
+#[utoipa::path(
+    post,
+    path = "/auth/email/resend",
+    tag = "auth",
+    request_body = ResendVerificationBody,
+    responses(
+        (status = 202, description = "Demande prise en compte (email envoyé si un compte non vérifié existe)"),
+        (status = 400, description = "Email invalide"),
+        (status = 429, description = "Trop de demandes (adresse email ou IP) — voir `Retry-After`"),
+        (status = 503, description = "Vérification de l'email désactivée sur ce déploiement")
+    )
+)]
+pub async fn resend_verification(
+    State(state): State<AccountsState>,
+    peer: Option<ConnectInfo<SocketAddr>>,
+    headers: HeaderMap,
+    Json(body): Json<ResendVerificationBody>,
+) -> Result<StatusCode, AccountError> {
+    const ACTION: &str = "auth.email_verify_request";
+    let Some(verification) = state.email_verification.clone() else {
+        return Err(AccountError::Unavailable(
+            "email verification is not enabled",
+        ));
+    };
+    let email = normalize_email(&body.email);
+    validate_email(&email).map_err(|e| AccountError::BadRequest(e.to_string()))?;
+    let now = state.auth.clock.now_unix_seconds();
+    // Par IP (emails en masse), puis par adresse (une même boîte inondée) ;
+    // indépendant de l'existence du compte.
+    let ip = ip_counter(&state, VERIFY_IP_SCOPE, peer.map(|c| c.0), &headers);
+    check_ip(&state, &ip, ACTION, &email, now).await?;
+    if let LoginAttempt::Blocked { retry_after_secs } = state
+        .throttle
+        .begin_attempt(&format!("verify:{email}"), verification.email_max, now)
+        .await
+        .map_err(internal)?
+    {
+        audit(&state, &email, ACTION, AuditOutcome::Denied).await;
+        return Err(AccountError::TooManyAttempts(retry_after_secs));
+    }
+
+    tokio::spawn(async move {
+        let user = match state.users.find_by_email(&email).await {
+            Ok(user) => user,
+            Err(e) => {
+                tracing::error!(error = %e, "vérification : recherche du compte impossible");
+                return;
+            }
+        };
+        match user {
+            None => audit(&state, &email, ACTION, AuditOutcome::Failure).await,
+            // Déjà vérifié (rien à faire) ou suspendu (le lien ne lui rendrait
+            // pas l'accès).
+            Some(user) if user.email_verified || user.disabled => {
+                audit(&state, &user.id, ACTION, AuditOutcome::Denied).await
+            }
+            Some(user) => send_verification_link(&state, &verification, &user, now).await,
+        }
+    });
+    Ok(StatusCode::ACCEPTED)
+}
+
+/// `POST /auth/email/verify` — consomme un lien de vérification : l'adresse
+/// du compte est marquée vérifiée et la connexion devient possible. Réponse
+/// 204 : l'utilisateur se connecte ensuite (le lien n'ouvre pas de session).
+/// Un lien déjà utilisé reste accepté tant qu'il n'a pas expiré (idempotent).
+#[utoipa::path(
+    post,
+    path = "/auth/email/verify",
+    tag = "auth",
+    request_body = VerifyEmailBody,
+    responses(
+        (status = 204, description = "Adresse vérifiée"),
+        (status = 400, description = "Lien invalide ou expiré"),
+        (status = 503, description = "Vérification de l'email désactivée sur ce déploiement")
+    )
+)]
+pub async fn verify_email(
+    State(state): State<AccountsState>,
+    Json(body): Json<VerifyEmailBody>,
+) -> Result<StatusCode, AccountError> {
+    const ACTION: &str = "auth.email_verify";
+    let Some(verification) = state.email_verification.as_ref() else {
+        return Err(AccountError::Unavailable(
+            "email verification is not enabled",
+        ));
+    };
+    let invalid = || AccountError::BadRequest(INVALID_VERIFY_TOKEN.into());
+    let token = VerifyTokens::parse(&body.token).ok_or_else(invalid)?;
+    let now = state.auth.clock.now_unix_seconds();
+    let account = state
+        .users
+        .find_by_id(token.user_id)
+        .await
+        .map_err(internal)?
+        .filter(|a| verification.tokens.verify(&token, &a.email, now));
+    // Écriture conditionnelle sur l'adresse liée au jeton.
+    let verified = match &account {
+        Some(a) => state
+            .users
+            .mark_email_verified(&a.id, &a.email)
+            .await
+            .map_err(internal)?,
+        None => false,
+    };
+    if !verified {
+        audit(&state, token.user_id, ACTION, AuditOutcome::Failure).await;
+        return Err(invalid());
+    }
+    tracing::info!(user_id = %token.user_id, "adresse email vérifiée");
+    audit(&state, token.user_id, ACTION, AuditOutcome::Success).await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1275,7 +1523,8 @@ pub async fn delete_account(
 }
 
 /// Sous-router `/signup`, `/login`, `/refresh`, `/logout`,
-/// `/password/forgot`, `/password/reset` (publics), `/logout-all`,
+/// `/password/forgot`, `/password/reset`, `/email/verify`, `/email/resend`
+/// (publics), `/logout-all`,
 /// `/password` et `/me` (Bearer) — à imbriquer sous `/auth` avec
 /// [`crate::auth::protected_router`].
 pub fn accounts_router(state: AccountsState) -> Router {
@@ -1288,6 +1537,8 @@ pub fn accounts_router(state: AccountsState) -> Router {
         .route("/password", post(change_password))
         .route("/password/forgot", post(forgot_password))
         .route("/password/reset", post(reset_password))
+        .route("/email/verify", post(verify_email))
+        .route("/email/resend", post(resend_verification))
         .route("/me", get(me).delete(delete_account))
         .with_state(state)
 }
@@ -1363,6 +1614,19 @@ mod tests {
         hasher: Arc<dyn PasswordHasher + Send + Sync>,
         ip_throttle: Option<IpThrottle>,
     ) -> Harness {
+        harness_build(hasher, ip_throttle, false)
+    }
+
+    /// Harness où la vérification de l'email est exigée (#231).
+    fn harness_verify(ip_throttle: Option<IpThrottle>) -> Harness {
+        harness_build(Arc::new(PlainHasher), ip_throttle, true)
+    }
+
+    fn harness_build(
+        hasher: Arc<dyn PasswordHasher + Send + Sync>,
+        ip_throttle: Option<IpThrottle>,
+        email_verification: bool,
+    ) -> Harness {
         let clock = Arc::new(MovableClock(Mutex::new(START)));
         let perms = Arc::new(InMemoryPermissionStore::new());
         let users = Arc::new(InMemoryUserStore::new(perms.clone()));
@@ -1375,16 +1639,20 @@ mod tests {
         )
         .with_clock(clock.clone());
         let mailer = MemoryMailer::new();
-        let reset = PasswordReset::new(
-            ResetTokens::new(b"test-encryption-key"),
-            MailSettings {
-                mailer: Arc::new(mailer.clone()),
-                public_url: "https://app.example.io".into(),
-            },
-        );
+        let mail = MailSettings {
+            mailer: Arc::new(mailer.clone()),
+            public_url: "https://app.example.io".into(),
+        };
+        let reset = PasswordReset::new(ResetTokens::new(b"test-encryption-key"), mail.clone());
         let mut accounts = AccountsState::new(auth.clone(), users.clone(), hasher)
             .unwrap()
             .with_password_reset(reset);
+        if email_verification {
+            accounts = accounts.with_email_verification(EmailVerification::new(
+                VerifyTokens::new(b"test-encryption-key"),
+                mail,
+            ));
+        }
         if let Some(ip) = ip_throttle {
             accounts = accounts.with_ip_throttle(ip);
         }
@@ -1428,6 +1696,7 @@ mod tests {
             login_max,
             signup_max,
             reset_max: 0,
+            verify_max: 0,
         };
         harness_full(Arc::new(PlainHasher), Some(ip))
     }
@@ -1616,7 +1885,12 @@ mod tests {
     async fn login_with_malformed_stored_hash_is_401_not_500() {
         let h = harness();
         h.users
-            .create("legacy@example.io", "argon2-placeholder", &HashSet::new())
+            .create(
+                "legacy@example.io",
+                "argon2-placeholder",
+                &HashSet::new(),
+                true,
+            )
             .await
             .unwrap();
         let resp = post(&h.app, "/login", creds("legacy@example.io", "anything-1")).await;
@@ -2754,6 +3028,7 @@ mod tests {
             login_max: 0,
             signup_max: 0,
             reset_max: 2,
+            verify_max: 0,
         };
         let h = harness_full(Arc::new(PlainHasher), Some(ip));
         for email in ["a@example.io", "b@example.io"] {
@@ -3186,5 +3461,245 @@ mod tests {
 
         let wrong = post(&h.app, "/login", creds("joe@example.io", "wrong-horse")).await;
         assert_eq!(wrong.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    // ── Vérification de l'email (#231) ──────────────────────────────────
+
+    /// Jeton du lien `…/#verify=<jeton>` contenu dans l'email.
+    fn verify_token_in(mail: &OutgoingMail) -> String {
+        let (_, rest) = mail.body.split_once("#verify=").expect("lien attendu");
+        rest.split_whitespace().next().unwrap().to_string()
+    }
+
+    fn verify_body(token: &str) -> serde_json::Value {
+        json!({ "token": token })
+    }
+
+    /// Inscrit `email` (vérification exigée) et renvoie le jeton reçu.
+    async fn signup_pending(h: &Harness, email: &str, password: &str) -> String {
+        let before = h.mailer.sent().len();
+        let r = post(&h.app, "/signup", creds(email, password)).await;
+        assert_eq!(r.status(), StatusCode::ACCEPTED);
+        let mails = wait_mails(h, before + 1).await;
+        verify_token_in(mails.last().expect("email envoyé"))
+    }
+
+    #[tokio::test]
+    async fn signup_sends_a_link_and_login_waits_for_it() {
+        let h = harness_verify(None);
+        let r = post(&h.app, "/signup", creds(" Eva@Example.io ", "eva-password")).await;
+        assert_eq!(r.status(), StatusCode::ACCEPTED);
+        let body: serde_json::Value = serde_json::from_str(&text(r).await).unwrap();
+        assert_eq!(
+            body,
+            json!({ "email": "eva@example.io", "verification_required": true }),
+            "aucun jeton avant vérification"
+        );
+        let mails = wait_mails(&h, 1).await;
+        assert_eq!(mails[0].to, "eva@example.io");
+        assert_eq!(
+            mails[0].subject,
+            crate::email_verification::VERIFY_MAIL_SUBJECT
+        );
+        assert!(mails[0].body.contains("https://app.example.io/#verify="));
+        let token = verify_token_in(&mails[0]);
+        let user = h
+            .users
+            .find_by_email("eva@example.io")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!user.email_verified);
+        wait_audit(&h, "auth.email_verify_request", AuditOutcome::Success).await;
+
+        // Bon mot de passe, adresse non vérifiée : 403 explicite. Mauvais mot
+        // de passe : le 401 habituel (rien n'est révélé à un tiers).
+        let r = post(&h.app, "/login", creds("eva@example.io", "eva-password")).await;
+        assert_eq!(r.status(), StatusCode::FORBIDDEN);
+        assert_eq!(text(r).await, EMAIL_NOT_VERIFIED);
+        let r = post(&h.app, "/login", creds("eva@example.io", "wrong-password")).await;
+        assert_eq!(r.status(), StatusCode::UNAUTHORIZED);
+
+        let r = post(&h.app, "/email/verify", verify_body(&token)).await;
+        assert_eq!(r.status(), StatusCode::NO_CONTENT);
+        assert!(
+            h.users
+                .find_by_id(&user.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .email_verified
+        );
+        let r = post(&h.app, "/login", creds("eva@example.io", "eva-password")).await;
+        assert_eq!(r.status(), StatusCode::OK);
+        let pair = tokens(r).await;
+        assert_eq!(verify(&pair.access_token).sub, user.id);
+
+        // Lien rouvert : sans effet, toujours accepté avant expiration.
+        let r = post(&h.app, "/email/verify", verify_body(&token)).await;
+        assert_eq!(r.status(), StatusCode::NO_CONTENT);
+
+        let events = h.audit.list().await.unwrap();
+        assert!(events
+            .iter()
+            .any(|e| e.action == "auth.login" && e.outcome == AuditOutcome::Denied));
+        assert!(events.iter().any(|e| e.action == "auth.email_verify"
+            && e.outcome == AuditOutcome::Success
+            && e.actor == user.id));
+    }
+
+    #[tokio::test]
+    async fn bad_expired_or_foreign_verification_links_are_refused() {
+        let h = harness_verify(None);
+        let token = signup_pending(&h, "fay@example.io", "fay-password").await;
+        let user = h
+            .users
+            .find_by_email("fay@example.io")
+            .await
+            .unwrap()
+            .unwrap();
+
+        // Mal formé, falsifié, ou jeton de réinitialisation du même compte.
+        let mut forged = token.clone();
+        forged.replace_range(
+            forged.len() - 1..,
+            if token.ends_with('0') { "1" } else { "0" },
+        );
+        let reset = ResetTokens::new(b"test-encryption-key").issue(&user.id, &user.email, START);
+        for bad in ["", "pas-un-jeton", forged.as_str(), reset.as_str()] {
+            let r = post(&h.app, "/email/verify", verify_body(bad)).await;
+            assert_eq!(r.status(), StatusCode::BAD_REQUEST, "{bad:?}");
+            assert_eq!(text(r).await, INVALID_VERIFY_TOKEN);
+        }
+
+        h.clock
+            .advance(crate::email_verification::VERIFY_TTL_SECONDS);
+        let r = post(&h.app, "/email/verify", verify_body(&token)).await;
+        assert_eq!(r.status(), StatusCode::BAD_REQUEST, "expiré");
+        assert!(
+            !h.users
+                .find_by_id(&user.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .email_verified
+        );
+        wait_audit(&h, "auth.email_verify", AuditOutcome::Failure).await;
+    }
+
+    #[tokio::test]
+    async fn the_link_can_be_resent_only_to_unverified_accounts() {
+        let h = harness_verify(None);
+        let first = signup_pending(&h, "gus@example.io", "gus-password").await;
+
+        // Inconnu : même réponse, aucun email.
+        let r = post(&h.app, "/email/resend", forgot("nobody@example.io")).await;
+        assert_eq!(r.status(), StatusCode::ACCEPTED);
+        wait_audit(&h, "auth.email_verify_request", AuditOutcome::Failure).await;
+        assert_eq!(h.mailer.sent().len(), 1);
+
+        // Non vérifié : nouveau lien, l'ancien reste valable.
+        h.clock.advance(1);
+        let r = post(&h.app, "/email/resend", forgot("GUS@example.io")).await;
+        assert_eq!(r.status(), StatusCode::ACCEPTED);
+        let mails = wait_mails(&h, 2).await;
+        let second = verify_token_in(&mails[1]);
+        assert_ne!(first, second);
+        let r = post(&h.app, "/email/verify", verify_body(&first)).await;
+        assert_eq!(r.status(), StatusCode::NO_CONTENT);
+
+        // Vérifié : plus rien n'est envoyé.
+        let r = post(&h.app, "/email/resend", forgot("gus@example.io")).await;
+        assert_eq!(r.status(), StatusCode::ACCEPTED);
+        wait_audit(&h, "auth.email_verify_request", AuditOutcome::Denied).await;
+        assert_eq!(h.mailer.sent().len(), 2);
+
+        // Adresse invalide : 400 ; quota par adresse épuisé : 429.
+        let r = post(&h.app, "/email/resend", forgot("pas-une-adresse")).await;
+        assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+        for _ in 0..crate::email_verification::DEFAULT_VERIFY_EMAIL_MAX_REQUESTS {
+            post(&h.app, "/email/resend", forgot("flood@example.io")).await;
+        }
+        let r = post(&h.app, "/email/resend", forgot("flood@example.io")).await;
+        assert_eq!(r.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(r.headers().contains_key(header::RETRY_AFTER));
+    }
+
+    #[tokio::test]
+    async fn resending_is_limited_per_ip() {
+        let ip = IpThrottle {
+            policy: ClientIpPolicy::parse("").unwrap(),
+            keyer: IpKeyer::new(b"test-ip-key"),
+            login_max: 0,
+            signup_max: 0,
+            reset_max: 0,
+            verify_max: 2,
+        };
+        let h = harness_verify(Some(ip));
+        for email in ["a@example.io", "b@example.io"] {
+            let r = post_from(&h.app, "/email/resend", "203.0.113.7", None, forgot(email)).await;
+            assert_eq!(r.status(), StatusCode::ACCEPTED);
+        }
+        let r = post_from(
+            &h.app,
+            "/email/resend",
+            "203.0.113.7",
+            None,
+            forgot("c@example.io"),
+        )
+        .await;
+        assert_eq!(r.status(), StatusCode::TOO_MANY_REQUESTS);
+        let r = post_from(
+            &h.app,
+            "/email/resend",
+            "198.51.100.1",
+            None,
+            forgot("c@example.io"),
+        )
+        .await;
+        assert_eq!(r.status(), StatusCode::ACCEPTED, "autre adresse IP");
+    }
+
+    #[tokio::test]
+    async fn a_password_reset_also_verifies_the_address() {
+        let h = harness_verify(None);
+        // Adresse « réservée » par un tiers qui ne la possède pas : la
+        // titulaire reprend le compte par le mot de passe oublié.
+        signup_pending(&h, "hal@example.io", "squatter-password").await;
+        let r = post(&h.app, "/password/forgot", forgot("hal@example.io")).await;
+        assert_eq!(r.status(), StatusCode::ACCEPTED);
+        let mails = wait_mails(&h, 2).await;
+        let token = token_in(&mails[1]);
+        let r = post(
+            &h.app,
+            "/password/reset",
+            reset_body(&token, "owner-password"),
+        )
+        .await;
+        assert_eq!(r.status(), StatusCode::NO_CONTENT);
+        let r = post(&h.app, "/login", creds("hal@example.io", "owner-password")).await;
+        assert_eq!(r.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn without_verification_signup_logs_in_and_the_endpoints_are_unavailable() {
+        let h = harness();
+        let r = post(&h.app, "/signup", creds("ivy@example.io", "ivy-password")).await;
+        assert_eq!(r.status(), StatusCode::CREATED);
+        tokens(r).await;
+        assert!(
+            h.users
+                .find_by_email("ivy@example.io")
+                .await
+                .unwrap()
+                .unwrap()
+                .email_verified,
+            "créé vérifié"
+        );
+        assert!(h.mailer.sent().is_empty());
+        let r = post(&h.app, "/email/verify", verify_body("x")).await;
+        assert_eq!(r.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let r = post(&h.app, "/email/resend", forgot("ivy@example.io")).await;
+        assert_eq!(r.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 }

@@ -221,7 +221,8 @@ mod tests {
 
         async fn seed(&self, email: &str, workflows: usize) -> String {
             let perms: HashSet<String> = ["workflows.read".to_string()].into();
-            let CreateUser::Created(user) = self.users.create(email, "h", &perms).await.unwrap()
+            let CreateUser::Created(user) =
+                self.users.create(email, "h", &perms, true).await.unwrap()
             else {
                 panic!("compte");
             };
