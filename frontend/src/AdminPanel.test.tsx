@@ -294,6 +294,7 @@ describe("<AdminPanel />", () => {
     await renderPanel(api, { confirm });
     const line = row("ivy@example.io");
     expect(within(line).getByText("Invitation en attente")).toBeInTheDocument();
+    expect(within(line).queryByText("Actif")).toBeNull();
     expect(within(line).queryByText("Email non vérifié")).toBeNull();
     expect(within(line).queryByRole("button", { name: /Vérifier/ })).toBeNull();
     expect(
