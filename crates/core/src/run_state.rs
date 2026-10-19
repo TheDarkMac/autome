@@ -1,38 +1,37 @@
 //! Persistance de l'état d'exécution d'un run (F5.4).
 //!
-//! Permet à un run de **reprendre après crash** d'un worker et de
+//! Permet à un run de **reprendre après une interruption** du worker et de
 //! **nettoyer les orphelins** (runs marqués `running` depuis trop
-//! longtemps = worker mort en cours).
+//! longtemps).
 //!
 //! Le contrat reste agnostique du backend : trait [`RunStateStore`] +
-//! impl de référence [`InMemoryRunStateStore`]. Un store PostgreSQL/sqlx
-//! sera branché ultérieurement contre les tables `runs` / `run_steps`
-//! déjà posées par F1.5 (cf. `migrations/0003_runs.sql`).
+//! impl de référence [`InMemoryRunStateStore`] ; l'impl PostgreSQL vit dans
+//! `autome-persistence` (tables `runs`, `run_steps`, `run_outbox`).
 //!
-//! ## Mode d'emploi côté worker (futur)
+//! ## Cycle de vie d'un run (#239)
 //!
-//! ```ignore
-//! // À chaque transition de node, le worker checkpoint :
-//! store.checkpoint(&snapshot).await?;
-//!
-//! // Au démarrage, on cherche les runs orphelins :
-//! let cutoff = now_ms - max_run_age_ms;
-//! for orphan in store.list_orphans(cutoff).await? {
-//!     store.mark_failed(&orphan.run_id, "orphan: worker mort", now_ms).await?;
-//! }
-//!
-//! // Reprise : si un run est interrompu (status=Running au démarrage),
-//! // le store renvoie son dernier état → le worker recrée le contexte
-//! // et continue à partir de `next_node`.
+//! ```text
+//! enqueue (run queued + message, une transaction : outbox)
+//!   → publication du message (dispatcher, sinon relais du worker)
+//!   → try_claim (queued → running, tentative + 1)
+//!   → record_progress avant / après chaque nœud, heartbeat
+//!   → finish (état final)
+//!   ↘ requeue (interruption : running → queued, message republié)
 //! ```
+//!
+//! **Tentative** ([`RunCheckpoint::attempt`]) : incrémentée à chaque prise en
+//! charge, elle sert de jeton de *fencing*. Progression, battement, remise en
+//! file et état final ne s'écrivent que pour la tentative en cours : un worker
+//! qui a perdu la main (run repris ailleurs) ne peut plus rien écrire.
 
 use std::collections::{BTreeMap, HashMap};
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::queue::Message;
 use crate::workflow::repo::Pagination;
 use crate::{Error, Result};
 
@@ -53,8 +52,7 @@ pub enum RunStatus {
     Failed,
 }
 
-/// Snapshot d'un run à un instant T. Persisté en base à chaque transition
-/// de node pour permettre la reprise après crash.
+/// Snapshot d'un run à un instant T.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RunCheckpoint {
     /// Identifiant du run (UUID côté base — string ici pour rester agnostique).
@@ -68,17 +66,19 @@ pub struct RunCheckpoint {
     pub trigger_type: String,
     /// État courant.
     pub status: RunStatus,
-    /// Timestamp Unix (ms) du démarrage effectif (transition `Queued` → `Running`).
+    /// Timestamp Unix (ms) du démarrage effectif de la tentative en cours
+    /// (transition `Queued` → `Running`).
     pub started_at_ms: Option<i64>,
     /// Timestamp Unix (ms) de fin (transition vers `Succeeded`/`Failed`).
     pub finished_at_ms: Option<i64>,
     /// Timestamp Unix (ms) de création (insertion initiale du run).
     pub created_at_ms: i64,
-    /// Sorties calculées par node, indexées par `node_id`. Permet de
-    /// rejouer un run en reprenant à `next_node` sans recalculer ce qui
-    /// est déjà fait.
+    /// Sorties calculées par node, indexées par `node_id` (écrites avec
+    /// l'état final).
     pub outputs: BTreeMap<String, Value>,
-    /// Prochain `node_id` à exécuter. `None` quand `status` est terminal.
+    /// Nœud **en cours** : écrit avant son exécution, effacé une fois son
+    /// issue enregistrée (#239). Après une interruption, `Some(n)` signifie
+    /// que `n` a pu produire ses effets.
     pub next_node: Option<String>,
     /// Message d'erreur en cas de `Failed`.
     pub error: Option<String>,
@@ -89,6 +89,17 @@ pub struct RunCheckpoint {
     /// par propriétaire), visible des seuls super-admins.
     #[serde(default)]
     pub owner_id: Option<String>,
+    /// Tentative en cours : `0` tant que le run n'a jamais été pris,
+    /// incrémentée à chaque prise en charge (jeton de fencing, #239).
+    #[serde(default)]
+    pub attempt: i32,
+    /// Dernier battement du worker qui exécute le run (ms Unix).
+    #[serde(default)]
+    pub heartbeat_at_ms: Option<i64>,
+    /// Point de reprise du moteur, enregistré après chaque nœud. Format
+    /// interne au worker : jamais sérialisé dans les réponses de l'API.
+    #[serde(skip)]
+    pub resume_state: Option<Value>,
 }
 
 impl RunCheckpoint {
@@ -114,6 +125,9 @@ impl RunCheckpoint {
             next_node: None,
             error: None,
             owner_id: None,
+            attempt: 0,
+            heartbeat_at_ms: None,
+            resume_state: None,
         }
     }
 
@@ -122,6 +136,51 @@ impl RunCheckpoint {
         self.owner_id = owner_id;
         self
     }
+}
+
+// ────────────────────── Outbox (#239) ──────────────────────
+
+/// Message de file d'un run, enregistré **avec** le run (pattern Outbox) et
+/// gardé jusqu'à sa fin pour pouvoir être republié à chaque reprise.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OutboxMessage {
+    /// Run concerné.
+    pub run_id: String,
+    /// Queue cible.
+    pub queue: String,
+    /// Génération : `0` à la création, incrémentée à chaque remise en file.
+    pub generation: i32,
+    /// Message à publier (sa clé d'idempotence suit la génération, cf.
+    /// [`outbox_idempotency_key`]).
+    pub message: Message,
+}
+
+/// Clé d'idempotence du message d'un run pour une génération : le `run_id`
+/// seul à la création, suffixé ensuite — le worker qui a traité une
+/// génération ne doit pas ignorer la suivante.
+pub fn outbox_idempotency_key(run_id: &str, generation: i32) -> String {
+    if generation == 0 {
+        run_id.to_string()
+    } else {
+        format!("{run_id}#{generation}")
+    }
+}
+
+/// Progression d'une tentative, enregistrée par le worker autour de chaque
+/// nœud ([`RunStateStore::record_progress`]).
+#[derive(Debug, Clone, PartialEq)]
+pub enum RunProgress {
+    /// `node` va s'exécuter : il devient le nœud en cours (`next_node`).
+    Starting {
+        /// Nœud qui démarre.
+        node: String,
+    },
+    /// Le dernier nœud est traité : plus de nœud en cours, nouveau point de
+    /// reprise.
+    Done {
+        /// Point de reprise du moteur.
+        resume_state: Value,
+    },
 }
 
 // ────────────────────── RunStateStore ──────────────────────
@@ -135,11 +194,30 @@ pub trait RunStateStore: Send + Sync {
     /// Persiste un snapshot — crée si inconnu, écrase sinon (last-write-wins).
     async fn checkpoint(&self, snapshot: &RunCheckpoint) -> Result<()>;
 
-    /// Écrit l'état final d'un run **seulement s'il existe encore** (même
-    /// écriture que [`checkpoint`](Self::checkpoint), propriétaire compris) ;
-    /// `false` si le run est inconnu. Le worker l'utilise après exécution : un
-    /// run effacé pendant qu'il tournait (suppression de compte, #229) n'est
-    /// pas recréé avec ses sorties.
+    /// Crée le run et son message de file **ensemble** (une transaction en
+    /// PostgreSQL) : ni run sans message, ni message sans run (#239). Le
+    /// message reste « à publier » jusqu'à [`mark_published`](Self::mark_published).
+    async fn enqueue(&self, snapshot: &RunCheckpoint, message: &OutboxMessage) -> Result<()>;
+
+    /// Messages encore à publier, créés (ou remis en file) avant
+    /// `created_before_ms`, plus anciens d'abord, au plus `limit`.
+    async fn pending_outbox(
+        &self,
+        created_before_ms: i64,
+        limit: usize,
+    ) -> Result<Vec<OutboxMessage>>;
+
+    /// Marque publié le message de `run_id` **de cette génération** ; sans
+    /// effet si le message a été remis en file depuis (nouvelle génération)
+    /// ou n'existe plus.
+    async fn mark_published(&self, run_id: &str, generation: i32, now_ms: i64) -> Result<()>;
+
+    /// Écrit l'état final d'un run **seulement s'il existe encore et que sa
+    /// tentative est toujours `snapshot.attempt`** (même écriture que
+    /// [`checkpoint`](Self::checkpoint), propriétaire compris) et retire son
+    /// message de file ; `false` sinon. Le worker l'utilise après exécution :
+    /// un run effacé pendant qu'il tournait (#229) n'est pas recréé, un run
+    /// repris par un autre worker n'est pas écrasé (#239).
     async fn finish(&self, snapshot: &RunCheckpoint) -> Result<bool>;
 
     /// Charge le dernier snapshot d'un run, ou `None`.
@@ -155,9 +233,10 @@ pub trait RunStateStore: Send + Sync {
     async fn mark_failed(&self, run_id: &str, reason: &str, now_ms: i64) -> Result<()>;
 
     /// **Prise en charge atomique** d'un run par un worker : `Queued → Running`
-    /// (pose `started_at_ms = now_ms`) **seulement si** le run est encore
-    /// `Queued`. Renvoie le checkpoint réclamé, ou `None` si le run est inconnu
-    /// ou déjà pris/terminé. Entre N répliques recevant la même livraison, une
+    /// **seulement si** le run est encore `Queued` ; pose `started_at_ms` et le
+    /// battement à `now_ms`, incrémente la tentative. Renvoie le checkpoint
+    /// réclamé (point de reprise compris), ou `None` si le run est inconnu ou
+    /// déjà pris/terminé. Entre N répliques recevant la même livraison, une
     /// seule obtient `Some` : c'est ce qui rend l'exécution *au plus une fois*.
     async fn try_claim(&self, run_id: &str, now_ms: i64) -> Result<Option<RunCheckpoint>>;
 
@@ -166,6 +245,40 @@ pub trait RunStateStore: Send + Sync {
     /// Contrairement à [`mark_failed`](Self::mark_failed), n'écrase jamais un
     /// run qui vient de réussir : sûr pour le balayage des orphelins.
     async fn fail_if_running(&self, run_id: &str, reason: &str, now_ms: i64) -> Result<bool>;
+
+    /// Enregistre la progression de la tentative `attempt` (et son battement)
+    /// **seulement si** le run est `Running` sous cette tentative ; `false`
+    /// sinon (repris ailleurs, remis en file, clos, effacé) : le worker doit
+    /// alors s'arrêter.
+    async fn record_progress(
+        &self,
+        run_id: &str,
+        attempt: i32,
+        progress: &RunProgress,
+        now_ms: i64,
+    ) -> Result<bool>;
+
+    /// Battement de la tentative `attempt` ; `false` dans les mêmes cas que
+    /// [`record_progress`](Self::record_progress).
+    async fn heartbeat(&self, run_id: &str, attempt: i32, now_ms: i64) -> Result<bool>;
+
+    /// Runs `Running` dont le dernier battement est strictement antérieur à
+    /// `before_ms` (worker tué ou coupé). Les runs sans battement (pris par un
+    /// worker antérieur à #239) n'en font pas partie.
+    async fn list_stale(&self, before_ms: i64) -> Result<Vec<RunCheckpoint>>;
+
+    /// **Remise en file** de la tentative `attempt` : `Running → Queued`
+    /// (point de reprise et nœud en cours conservés, battement effacé) et
+    /// message de file repassé « à publier » sous une nouvelle génération,
+    /// renvoyé pour être republié. `None` si le run n'est plus `Running` sous
+    /// cette tentative, ou s'il n'a pas de message (run antérieur à l'outbox,
+    /// qui ne peut pas être republié).
+    async fn requeue(
+        &self,
+        run_id: &str,
+        attempt: i32,
+        now_ms: i64,
+    ) -> Result<Option<OutboxMessage>>;
 
     /// Liste paginée des runs d'un workflow, triés par `created_at_ms`
     /// décroissant (plus récent d'abord), ordre stabilisé par `run_id` à
@@ -194,10 +307,34 @@ pub struct RunListPage {
 
 // ────────────────────── InMemoryRunStateStore ──────────────────────
 
-/// Impl de référence, in-process, thread-safe (`Mutex<HashMap>`).
+/// Message de l'outbox en mémoire et son état de publication.
+#[derive(Debug, Clone)]
+struct OutboxRow {
+    message: OutboxMessage,
+    created_at_ms: i64,
+    published: bool,
+}
+
+#[derive(Debug, Default)]
+struct Inner {
+    runs: HashMap<String, RunCheckpoint>,
+    outbox: HashMap<String, OutboxRow>,
+}
+
+impl Inner {
+    /// Run `Running` sous la tentative `attempt`, s'il existe.
+    fn running(&mut self, run_id: &str, attempt: i32) -> Option<&mut RunCheckpoint> {
+        self.runs
+            .get_mut(run_id)
+            .filter(|c| c.status == RunStatus::Running && c.attempt == attempt)
+    }
+}
+
+/// Impl de référence, in-process, thread-safe (un `Mutex` sur les runs et
+/// leurs messages, pour que l'outbox reste atomique comme en base).
 #[derive(Debug, Default)]
 pub struct InMemoryRunStateStore {
-    inner: Mutex<HashMap<String, RunCheckpoint>>,
+    inner: Mutex<Inner>,
 }
 
 impl InMemoryRunStateStore {
@@ -206,68 +343,121 @@ impl InMemoryRunStateStore {
         Self::default()
     }
 
-    /// Supprime tous les runs de `owner` (suppression de compte, #229) et
-    /// renvoie leur nombre. Les runs sans propriétaire ne sont jamais touchés.
-    pub fn remove_owner(&self, owner: &str) -> Result<usize> {
-        let mut map = self
-            .inner
+    fn lock(&self) -> Result<MutexGuard<'_, Inner>> {
+        self.inner
             .lock()
-            .map_err(|_| Error::Invalid("run_state lock empoisonné".into()))?;
-        let before = map.len();
-        map.retain(|_, c| c.owner_id.as_deref() != Some(owner));
-        Ok(before - map.len())
+            .map_err(|_| Error::Invalid("run_state lock empoisonné".into()))
+    }
+
+    /// Supprime tous les runs de `owner` (suppression de compte, #229) et
+    /// leurs messages, et renvoie leur nombre. Les runs sans propriétaire ne
+    /// sont jamais touchés.
+    pub fn remove_owner(&self, owner: &str) -> Result<usize> {
+        let mut inner = self.lock()?;
+        let before = inner.runs.len();
+        inner
+            .runs
+            .retain(|_, c| c.owner_id.as_deref() != Some(owner));
+        let Inner { runs, outbox } = &mut *inner;
+        outbox.retain(|id, _| runs.contains_key(id));
+        Ok(before - runs.len())
     }
 }
 
 #[async_trait]
 impl RunStateStore for InMemoryRunStateStore {
     async fn checkpoint(&self, snapshot: &RunCheckpoint) -> Result<()> {
-        let mut map = self
-            .inner
-            .lock()
-            .map_err(|_| Error::Invalid("run_state lock empoisonné".into()))?;
+        let mut inner = self.lock()?;
         // Propriétaire immuable (même règle que l'impl PostgreSQL) : un
         // checkpoint ultérieur ne peut ni l'effacer ni le changer.
         let mut snap = snapshot.clone();
-        if let Some(existing) = map.get(&snapshot.run_id) {
+        if let Some(existing) = inner.runs.get(&snapshot.run_id) {
             if existing.owner_id.is_some() {
                 snap.owner_id = existing.owner_id.clone();
             }
         }
-        map.insert(snapshot.run_id.clone(), snap);
+        inner.runs.insert(snapshot.run_id.clone(), snap);
+        Ok(())
+    }
+
+    async fn enqueue(&self, snapshot: &RunCheckpoint, message: &OutboxMessage) -> Result<()> {
+        let mut inner = self.lock()?;
+        if inner.runs.contains_key(&snapshot.run_id) {
+            return Err(Error::Invalid(format!(
+                "enqueue : run {} déjà existant",
+                snapshot.run_id
+            )));
+        }
+        inner.runs.insert(snapshot.run_id.clone(), snapshot.clone());
+        inner.outbox.insert(
+            snapshot.run_id.clone(),
+            OutboxRow {
+                message: message.clone(),
+                created_at_ms: snapshot.created_at_ms,
+                published: false,
+            },
+        );
+        Ok(())
+    }
+
+    async fn pending_outbox(
+        &self,
+        created_before_ms: i64,
+        limit: usize,
+    ) -> Result<Vec<OutboxMessage>> {
+        let inner = self.lock()?;
+        let mut pending: Vec<&OutboxRow> = inner
+            .outbox
+            .values()
+            .filter(|r| !r.published && r.created_at_ms < created_before_ms)
+            .collect();
+        pending.sort_by(|a, b| {
+            a.created_at_ms
+                .cmp(&b.created_at_ms)
+                .then_with(|| a.message.run_id.cmp(&b.message.run_id))
+        });
+        Ok(pending
+            .into_iter()
+            .take(limit)
+            .map(|r| r.message.clone())
+            .collect())
+    }
+
+    async fn mark_published(&self, run_id: &str, generation: i32, _now_ms: i64) -> Result<()> {
+        let mut inner = self.lock()?;
+        if let Some(row) = inner.outbox.get_mut(run_id) {
+            if row.message.generation == generation {
+                row.published = true;
+            }
+        }
         Ok(())
     }
 
     async fn finish(&self, snapshot: &RunCheckpoint) -> Result<bool> {
-        let mut map = self
-            .inner
-            .lock()
-            .map_err(|_| Error::Invalid("run_state lock empoisonné".into()))?;
-        let Some(existing) = map.get_mut(&snapshot.run_id) else {
+        let mut inner = self.lock()?;
+        let Some(existing) = inner.runs.get_mut(&snapshot.run_id) else {
             return Ok(false);
         };
+        if existing.attempt != snapshot.attempt {
+            return Ok(false);
+        }
         let owner = existing.owner_id.clone();
         *existing = snapshot.clone();
         if owner.is_some() {
             existing.owner_id = owner;
         }
+        inner.outbox.remove(&snapshot.run_id);
         Ok(true)
     }
 
     async fn load(&self, run_id: &str) -> Result<Option<RunCheckpoint>> {
-        let map = self
-            .inner
-            .lock()
-            .map_err(|_| Error::Invalid("run_state lock empoisonné".into()))?;
-        Ok(map.get(run_id).cloned())
+        Ok(self.lock()?.runs.get(run_id).cloned())
     }
 
     async fn list_orphans(&self, older_than_ms: i64) -> Result<Vec<RunCheckpoint>> {
-        let map = self
-            .inner
-            .lock()
-            .map_err(|_| Error::Invalid("run_state lock empoisonné".into()))?;
-        let mut orphans: Vec<RunCheckpoint> = map
+        let inner = self.lock()?;
+        let mut orphans: Vec<RunCheckpoint> = inner
+            .runs
             .values()
             .filter(|c| {
                 matches!(c.status, RunStatus::Running)
@@ -281,11 +471,9 @@ impl RunStateStore for InMemoryRunStateStore {
     }
 
     async fn mark_failed(&self, run_id: &str, reason: &str, now_ms: i64) -> Result<()> {
-        let mut map = self
-            .inner
-            .lock()
-            .map_err(|_| Error::Invalid("run_state lock empoisonné".into()))?;
-        let snap = map
+        let mut inner = self.lock()?;
+        let snap = inner
+            .runs
             .get_mut(run_id)
             .ok_or_else(|| Error::Invalid(format!("mark_failed : run {run_id} inconnu")))?;
         if matches!(snap.status, RunStatus::Failed) {
@@ -294,18 +482,18 @@ impl RunStateStore for InMemoryRunStateStore {
         snap.status = RunStatus::Failed;
         snap.error = Some(reason.to_string());
         snap.finished_at_ms = Some(now_ms);
+        inner.outbox.remove(run_id);
         Ok(())
     }
 
     async fn try_claim(&self, run_id: &str, now_ms: i64) -> Result<Option<RunCheckpoint>> {
-        let mut map = self
-            .inner
-            .lock()
-            .map_err(|_| Error::Invalid("run_state lock empoisonné".into()))?;
-        match map.get_mut(run_id) {
+        let mut inner = self.lock()?;
+        match inner.runs.get_mut(run_id) {
             Some(snap) if snap.status == RunStatus::Queued => {
                 snap.status = RunStatus::Running;
                 snap.started_at_ms = Some(now_ms);
+                snap.heartbeat_at_ms = Some(now_ms);
+                snap.attempt += 1;
                 Ok(Some(snap.clone()))
             }
             _ => Ok(None),
@@ -313,19 +501,89 @@ impl RunStateStore for InMemoryRunStateStore {
     }
 
     async fn fail_if_running(&self, run_id: &str, reason: &str, now_ms: i64) -> Result<bool> {
-        let mut map = self
-            .inner
-            .lock()
-            .map_err(|_| Error::Invalid("run_state lock empoisonné".into()))?;
-        match map.get_mut(run_id) {
+        let mut inner = self.lock()?;
+        match inner.runs.get_mut(run_id) {
             Some(snap) if snap.status == RunStatus::Running => {
                 snap.status = RunStatus::Failed;
                 snap.error = Some(reason.to_string());
                 snap.finished_at_ms = Some(now_ms);
+                inner.outbox.remove(run_id);
                 Ok(true)
             }
             _ => Ok(false),
         }
+    }
+
+    async fn record_progress(
+        &self,
+        run_id: &str,
+        attempt: i32,
+        progress: &RunProgress,
+        now_ms: i64,
+    ) -> Result<bool> {
+        let mut inner = self.lock()?;
+        let Some(snap) = inner.running(run_id, attempt) else {
+            return Ok(false);
+        };
+        match progress {
+            RunProgress::Starting { node } => snap.next_node = Some(node.clone()),
+            RunProgress::Done { resume_state } => {
+                snap.next_node = None;
+                snap.resume_state = Some(resume_state.clone());
+            }
+        }
+        snap.heartbeat_at_ms = Some(now_ms);
+        Ok(true)
+    }
+
+    async fn heartbeat(&self, run_id: &str, attempt: i32, now_ms: i64) -> Result<bool> {
+        let mut inner = self.lock()?;
+        let Some(snap) = inner.running(run_id, attempt) else {
+            return Ok(false);
+        };
+        snap.heartbeat_at_ms = Some(now_ms);
+        Ok(true)
+    }
+
+    async fn list_stale(&self, before_ms: i64) -> Result<Vec<RunCheckpoint>> {
+        let inner = self.lock()?;
+        let mut stale: Vec<RunCheckpoint> = inner
+            .runs
+            .values()
+            .filter(|c| {
+                c.status == RunStatus::Running && c.heartbeat_at_ms.is_some_and(|t| t < before_ms)
+            })
+            .cloned()
+            .collect();
+        stale.sort_by(|a, b| a.run_id.cmp(&b.run_id));
+        Ok(stale)
+    }
+
+    async fn requeue(
+        &self,
+        run_id: &str,
+        attempt: i32,
+        now_ms: i64,
+    ) -> Result<Option<OutboxMessage>> {
+        let mut inner = self.lock()?;
+        if inner.running(run_id, attempt).is_none() {
+            return Ok(None);
+        }
+        let Some(row) = inner.outbox.get_mut(run_id) else {
+            return Ok(None);
+        };
+        row.message.generation += 1;
+        row.message.message.headers.insert(
+            "idempotency-key".into(),
+            outbox_idempotency_key(run_id, row.message.generation),
+        );
+        row.created_at_ms = now_ms;
+        row.published = false;
+        let message = row.message.clone();
+        let snap = inner.runs.get_mut(run_id).expect("run vérifié");
+        snap.status = RunStatus::Queued;
+        snap.heartbeat_at_ms = None;
+        Ok(Some(message))
     }
 
     async fn list_by_workflow(
@@ -334,11 +592,9 @@ impl RunStateStore for InMemoryRunStateStore {
         owner: Option<&str>,
         paging: Pagination,
     ) -> Result<RunListPage> {
-        let map = self
-            .inner
-            .lock()
-            .map_err(|_| Error::Invalid("run_state lock empoisonné".into()))?;
-        let mut all: Vec<RunCheckpoint> = map
+        let inner = self.lock()?;
+        let mut all: Vec<RunCheckpoint> = inner
+            .runs
             .values()
             .filter(|c| c.workflow_id == workflow_id)
             .filter(|c| owner.is_none() || c.owner_id.as_deref() == owner)
@@ -833,6 +1089,258 @@ mod tests {
         assert_eq!(store.remove_owner("alice").unwrap(), 0);
         assert!(store.load("b").await.unwrap().is_some());
         assert!(store.load("x").await.unwrap().is_some());
+    }
+
+    // ───── Outbox et reprise (#239) ─────
+
+    fn outbox_for(run_id: &str) -> OutboxMessage {
+        OutboxMessage {
+            run_id: run_id.into(),
+            queue: "runs".into(),
+            generation: 0,
+            message: Message::new(json!({ "run_id": run_id, "payload": { "k": 1 } }))
+                .with_header("idempotency-key", outbox_idempotency_key(run_id, 0)),
+        }
+    }
+
+    /// Run en file avec son message, puis pris par un worker.
+    async fn claimed(store: &InMemoryRunStateStore, run_id: &str) -> RunCheckpoint {
+        store
+            .enqueue(&run_with_created(run_id, "wf", 10), &outbox_for(run_id))
+            .await
+            .unwrap();
+        store.mark_published(run_id, 0, 11).await.unwrap();
+        store.try_claim(run_id, 100).await.unwrap().unwrap()
+    }
+
+    #[tokio::test]
+    async fn enqueue_writes_the_run_and_a_pending_message() {
+        let store = InMemoryRunStateStore::new();
+        store
+            .enqueue(&run_with_created("r", "wf", 10), &outbox_for("r"))
+            .await
+            .unwrap();
+        assert_eq!(
+            store.load("r").await.unwrap().unwrap().status,
+            RunStatus::Queued
+        );
+        // Seuil strict sur la date de création : le relais laisse au
+        // dispatcher le temps de publier lui-même.
+        assert!(store.pending_outbox(10, 10).await.unwrap().is_empty());
+        assert_eq!(
+            store.pending_outbox(11, 10).await.unwrap(),
+            vec![outbox_for("r")]
+        );
+        // Un id déjà pris est refusé, sans toucher au run existant.
+        assert!(store
+            .enqueue(&run_with_created("r", "wf", 99), &outbox_for("r"))
+            .await
+            .is_err());
+        store.mark_published("r", 0, 12).await.unwrap();
+        assert!(store.pending_outbox(i64::MAX, 10).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn pending_outbox_is_ordered_and_bounded() {
+        let store = InMemoryRunStateStore::new();
+        for (id, created) in [("c", 30), ("a", 10), ("b", 20)] {
+            store
+                .enqueue(&run_with_created(id, "wf", created), &outbox_for(id))
+                .await
+                .unwrap();
+        }
+        let ids: Vec<String> = store
+            .pending_outbox(i64::MAX, 2)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|m| m.run_id)
+            .collect();
+        assert_eq!(ids, vec!["a", "b"]);
+    }
+
+    #[tokio::test]
+    async fn claim_starts_a_new_attempt_with_a_heartbeat() {
+        let store = InMemoryRunStateStore::new();
+        let first = claimed(&store, "r").await;
+        assert_eq!(first.attempt, 1);
+        assert_eq!(first.heartbeat_at_ms, Some(100));
+        store.requeue("r", 1, 200).await.unwrap().unwrap();
+        let second = store.try_claim("r", 300).await.unwrap().unwrap();
+        assert_eq!(second.attempt, 2);
+        assert_eq!(second.started_at_ms, Some(300));
+    }
+
+    #[tokio::test]
+    async fn progress_and_heartbeat_are_fenced_by_the_attempt() {
+        let store = InMemoryRunStateStore::new();
+        claimed(&store, "r").await;
+        let starting = RunProgress::Starting { node: "a".into() };
+        assert!(store.record_progress("r", 1, &starting, 150).await.unwrap());
+        let cp = store.load("r").await.unwrap().unwrap();
+        assert_eq!(cp.next_node.as_deref(), Some("a"));
+        assert_eq!(cp.heartbeat_at_ms, Some(150));
+
+        let done = RunProgress::Done {
+            resume_state: json!({ "done": ["a"] }),
+        };
+        assert!(store.record_progress("r", 1, &done, 160).await.unwrap());
+        let cp = store.load("r").await.unwrap().unwrap();
+        assert_eq!(cp.next_node, None);
+        assert_eq!(cp.resume_state, Some(json!({ "done": ["a"] })));
+        assert!(store.heartbeat("r", 1, 170).await.unwrap());
+
+        // Autre tentative, run remis en file, inconnu : rien n'est écrit.
+        assert!(!store.record_progress("r", 2, &starting, 180).await.unwrap());
+        assert!(!store.heartbeat("r", 2, 180).await.unwrap());
+        store.requeue("r", 1, 190).await.unwrap().unwrap();
+        assert!(!store.record_progress("r", 1, &starting, 200).await.unwrap());
+        assert!(!store.heartbeat("r", 1, 200).await.unwrap());
+        assert!(!store.heartbeat("ghost", 1, 200).await.unwrap());
+        assert_eq!(
+            store.load("r").await.unwrap().unwrap().heartbeat_at_ms,
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn list_stale_returns_running_runs_whose_heartbeat_stopped() {
+        let store = InMemoryRunStateStore::new();
+        claimed(&store, "old").await; // battement à 100
+        claimed(&store, "fresh").await;
+        assert!(store.heartbeat("fresh", 1, 500).await.unwrap());
+        // Pris par un worker antérieur à #239 : pas de battement, ignoré.
+        store
+            .checkpoint(&snapshot("legacy", RunStatus::Running, Some(1)))
+            .await
+            .unwrap();
+        let stale: Vec<String> = store
+            .list_stale(400)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|c| c.run_id)
+            .collect();
+        assert_eq!(stale, vec!["old"]);
+        assert!(store.list_stale(100).await.unwrap().is_empty(), "strict");
+    }
+
+    #[tokio::test]
+    async fn requeue_republishes_under_a_new_generation_and_keeps_the_cursor() {
+        let store = InMemoryRunStateStore::new();
+        claimed(&store, "r").await;
+        let done = RunProgress::Done {
+            resume_state: json!({ "cursor": 1 }),
+        };
+        store.record_progress("r", 1, &done, 150).await.unwrap();
+        store
+            .record_progress("r", 1, &RunProgress::Starting { node: "b".into() }, 160)
+            .await
+            .unwrap();
+
+        let msg = store.requeue("r", 1, 200).await.unwrap().unwrap();
+        assert_eq!(msg.generation, 1);
+        assert_eq!(msg.message.body["payload"], json!({ "k": 1 }));
+        assert_eq!(
+            msg.message
+                .headers
+                .get("idempotency-key")
+                .map(String::as_str),
+            Some("r#1")
+        );
+        let cp = store.load("r").await.unwrap().unwrap();
+        assert_eq!(cp.status, RunStatus::Queued);
+        assert_eq!(cp.resume_state, Some(json!({ "cursor": 1 })));
+        assert_eq!(cp.next_node.as_deref(), Some("b"), "nœud en cours gardé");
+        // À publier de nouveau, à partir de la date de remise en file.
+        assert!(store.pending_outbox(200, 10).await.unwrap().is_empty());
+        assert_eq!(store.pending_outbox(201, 10).await.unwrap(), vec![msg]);
+        // Un relais en retard sur la génération 0 ne la masque pas.
+        store.mark_published("r", 0, 210).await.unwrap();
+        assert_eq!(store.pending_outbox(i64::MAX, 10).await.unwrap().len(), 1);
+        store.mark_published("r", 1, 220).await.unwrap();
+        assert!(store.pending_outbox(i64::MAX, 10).await.unwrap().is_empty());
+
+        // Plus `running` : pas de seconde remise en file.
+        assert!(store.requeue("r", 1, 300).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn requeue_refuses_another_attempt_and_runs_without_message() {
+        let store = InMemoryRunStateStore::new();
+        claimed(&store, "r").await;
+        assert!(store.requeue("r", 2, 200).await.unwrap().is_none());
+        assert_eq!(
+            store.load("r").await.unwrap().unwrap().status,
+            RunStatus::Running
+        );
+        // Run antérieur à l'outbox : rien à republier, il reste `running`.
+        store
+            .checkpoint(&snapshot("legacy", RunStatus::Queued, None))
+            .await
+            .unwrap();
+        store.try_claim("legacy", 1).await.unwrap().unwrap();
+        assert!(store.requeue("legacy", 1, 2).await.unwrap().is_none());
+        assert_eq!(
+            store.load("legacy").await.unwrap().unwrap().status,
+            RunStatus::Running
+        );
+    }
+
+    #[tokio::test]
+    async fn finish_is_fenced_by_the_attempt_and_drops_the_message() {
+        let store = InMemoryRunStateStore::new();
+        let mut first = claimed(&store, "r").await;
+        store.requeue("r", 1, 200).await.unwrap().unwrap();
+        let second = store.try_claim("r", 300).await.unwrap().unwrap();
+
+        // Le worker de la première tentative ne peut plus rien écrire.
+        first.status = RunStatus::Succeeded;
+        assert!(!store.finish(&first).await.unwrap());
+        assert_eq!(
+            store.load("r").await.unwrap().unwrap().status,
+            RunStatus::Running
+        );
+
+        let mut done = second;
+        done.status = RunStatus::Succeeded;
+        assert!(store.finish(&done).await.unwrap());
+        // Run terminé : son message (et le payload qu'il porte) disparaît.
+        assert!(store.requeue("r", 2, 400).await.unwrap().is_none());
+        assert!(store.lock().unwrap().outbox.is_empty());
+    }
+
+    #[tokio::test]
+    async fn failing_or_erasing_a_run_drops_its_message() {
+        let store = InMemoryRunStateStore::new();
+        claimed(&store, "f").await;
+        assert!(store.fail_if_running("f", "x", 200).await.unwrap());
+        claimed(&store, "m").await;
+        store.mark_failed("m", "x", 200).await.unwrap();
+        store
+            .enqueue(
+                &run_with_created("e", "wf", 1).with_owner(Some("alice".into())),
+                &outbox_for("e"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(store.remove_owner("alice").unwrap(), 1);
+        assert!(store.lock().unwrap().outbox.is_empty());
+    }
+
+    #[test]
+    fn idempotency_key_follows_the_generation() {
+        assert_eq!(outbox_idempotency_key("run-1", 0), "run-1");
+        assert_eq!(outbox_idempotency_key("run-1", 3), "run-1#3");
+    }
+
+    #[test]
+    fn resume_state_is_never_serialized() {
+        let mut cp = run_with_created("r", "wf", 1);
+        cp.resume_state = Some(json!({ "secret": "payload" }));
+        let json = serde_json::to_value(&cp).unwrap();
+        assert!(json.get("resume_state").is_none());
+        assert_eq!(json["attempt"], 0);
     }
 
     #[test]

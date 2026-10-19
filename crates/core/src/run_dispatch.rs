@@ -2,11 +2,14 @@
 //!
 //! Abstrait l'opération « démarrer un workflow » derrière un trait
 //! [`RunDispatcher`] consommable par l'API publique (F7.2.b). L'impl
-//! [`QueueRunDispatcher`] est la version « production » : elle persiste un
-//! `RunCheckpoint { status: Queued }` dans le [`RunStateStore`] et publie
-//! un `Message { source: "manual" }` sur la [`Queue`] que le worker pool
-//! consommera (F5.2). Les tests des handlers HTTP utilisent un mock pour
-//! observer les appels sans dépendre du chemin queue + worker.
+//! [`QueueRunDispatcher`] est la version « production » : elle enregistre le
+//! `RunCheckpoint { status: Queued }` **et** son message de file dans le
+//! [`RunStateStore`], en une transaction (pattern Outbox, #239), puis publie
+//! le message sur la [`Queue`] que le worker pool consommera (F5.2). Une
+//! publication perdue (broker coupé, process tué) n'abandonne plus le run :
+//! le relais de l'outbox du worker republie les messages restés en attente.
+//! Les tests des handlers HTTP utilisent un mock pour observer les appels
+//! sans dépendre du chemin queue + worker.
 //!
 //! Le contrat est volontairement étroit (`dispatch` renvoie le `run_id`
 //! généré, l'API reste agnostique du format d'identifiant — string en
@@ -16,10 +19,11 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde_json::{json, Value};
+use tracing::warn;
 
 use crate::queue::{Message, Queue};
-use crate::run_state::{RunCheckpoint, RunStateStore};
-use crate::{Error, Result};
+use crate::run_state::{outbox_idempotency_key, OutboxMessage, RunCheckpoint, RunStateStore};
+use crate::Result;
 
 /// Description d'un nouveau run à dispatcher.
 #[derive(Debug, Clone)]
@@ -52,7 +56,7 @@ pub struct DispatchOutcome {
 #[async_trait]
 pub trait RunDispatcher: Send + Sync {
     /// Démarre un nouveau run et renvoie son identifiant. Persiste
-    /// l'état initial (Queued) puis publie un message dispatching.
+    /// l'état initial (Queued) et son message, puis le publie.
     async fn dispatch(&self, req: DispatchRequest) -> Result<DispatchOutcome>;
 }
 
@@ -105,8 +109,6 @@ impl QueueRunDispatcher {
 impl RunDispatcher for QueueRunDispatcher {
     async fn dispatch(&self, req: DispatchRequest) -> Result<DispatchOutcome> {
         let run_id = (self.id_gen)();
-
-        // 1. Persistance de l'état initial (Queued).
         let checkpoint = RunCheckpoint::queued(
             &run_id,
             &req.workflow_id,
@@ -115,9 +117,6 @@ impl RunDispatcher for QueueRunDispatcher {
             req.now_ms,
         )
         .with_owner(req.owner_id);
-        self.store.checkpoint(&checkpoint).await?;
-
-        // 2. Publication sur la queue (le worker la consommera).
         let body = json!({
             "run_id": &run_id,
             "workflow_id": &req.workflow_id,
@@ -125,18 +124,35 @@ impl RunDispatcher for QueueRunDispatcher {
             "trigger_type": &req.trigger_type,
             "payload": req.payload,
         });
-        let msg = Message::new(body)
-            .with_header("idempotency-key", &run_id)
+        let message = Message::new(body)
+            .with_header("idempotency-key", outbox_idempotency_key(&run_id, 0))
             .with_header("trigger-source", &req.trigger_type);
-        self.queue
-            .publish(&self.queue_name, msg)
-            .await
-            .map_err(|e| {
-                // Si la publication échoue, le run reste à `Queued` dans le store
-                // — un sweep d'orphelins (F5.4.c) finira par le marquer Failed.
-                // On propage l'erreur telle quelle au caller HTTP.
-                Error::Invalid(format!("dispatch : publication échouée : {e}"))
-            })?;
+        let outbox = OutboxMessage {
+            run_id: run_id.clone(),
+            queue: self.queue_name.clone(),
+            generation: 0,
+            message,
+        };
+
+        // 1. Run et message ensemble : une fois écrits, le run partira.
+        self.store.enqueue(&checkpoint, &outbox).await?;
+
+        // 2. Publication immédiate. Un échec n'est pas celui du dispatch : le
+        //    relais de l'outbox republiera le message resté en attente.
+        match self.queue.publish(&self.queue_name, outbox.message).await {
+            Ok(()) => {
+                if let Err(e) = self.store.mark_published(&run_id, 0, req.now_ms).await {
+                    // Message republié par le relais : doublon écarté par le
+                    // claim du worker.
+                    warn!(run_id, error = %e, "publication du run non marquée dans l'outbox");
+                }
+            }
+            Err(e) => warn!(
+                run_id,
+                error = %e,
+                "publication du run différée : le relais de l'outbox la reprendra"
+            ),
+        }
 
         Ok(DispatchOutcome { run_id })
     }
@@ -278,6 +294,77 @@ mod tests {
     async fn dispatcher_is_send_sync() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<QueueRunDispatcher>();
+    }
+
+    /// File dont la publication échoue (broker coupé).
+    struct DownQueue;
+
+    #[async_trait]
+    impl Queue for DownQueue {
+        async fn publish(&self, _: &str, _: Message) -> Result<()> {
+            Err(crate::Error::Invalid("broker injoignable".into()))
+        }
+        async fn poll(&self, _: &str) -> Result<Option<crate::Delivery>> {
+            Ok(None)
+        }
+        async fn ack(&self, _: &crate::DeliveryId) -> Result<()> {
+            Ok(())
+        }
+        async fn nack(&self, _: &crate::DeliveryId, _: crate::Nack) -> Result<()> {
+            Ok(())
+        }
+        async fn depth(&self, _: &str) -> Result<usize> {
+            Ok(0)
+        }
+    }
+
+    #[tokio::test]
+    async fn published_message_is_marked_in_the_outbox() {
+        let (d, _, store) = make_dispatcher();
+        d.dispatch(sample_request()).await.unwrap();
+        assert!(store.pending_outbox(i64::MAX, 10).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn failed_publication_keeps_the_run_and_its_message_for_the_relay() {
+        let store: Arc<InMemoryRunStateStore> = Arc::new(InMemoryRunStateStore::new());
+        let d = QueueRunDispatcher::new(
+            Arc::new(DownQueue),
+            Arc::clone(&store) as Arc<dyn RunStateStore + Send + Sync>,
+        )
+        .with_id_generator(|| "r-down".into());
+        // Le run est créé : la publication sera reprise par le relais.
+        let outcome = d.dispatch(sample_request()).await.unwrap();
+        assert_eq!(outcome.run_id, "r-down");
+        assert_eq!(
+            store.load("r-down").await.unwrap().unwrap().status,
+            RunStatus::Queued
+        );
+        let pending = store.pending_outbox(i64::MAX, 10).await.unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].queue, "runs");
+        assert_eq!(pending[0].generation, 0);
+        assert_eq!(pending[0].message.body["run_id"], "r-down");
+        assert_eq!(
+            pending[0].message.body["payload"],
+            json!({ "input": "hello" })
+        );
+        assert_eq!(
+            pending[0]
+                .message
+                .headers
+                .get("idempotency-key")
+                .map(String::as_str),
+            Some("r-down")
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_refuses_an_existing_run_id() {
+        let (d, queue, _) = make_dispatcher();
+        d.dispatch(sample_request()).await.unwrap();
+        assert!(d.dispatch(sample_request()).await.is_err());
+        assert_eq!(queue.depth("runs").await.unwrap(), 1, "rien de republié");
     }
 
     #[tokio::test]
