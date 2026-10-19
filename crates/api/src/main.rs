@@ -274,10 +274,7 @@ async fn invite_command(
     )
     .await?
     {
-        Invited::Created { user, sent: true } => {
-            tracing::info!(user_id = %user.id, "invitation envoyée");
-            Ok(())
-        }
+        Invited::Created { sent: true, .. } => Ok(()),
         Invited::Created { user, sent: false } => Err(format!(
             "compte {} créé mais invitation non envoyée : la renvoyer depuis l'administration",
             user.id

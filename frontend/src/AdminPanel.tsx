@@ -502,21 +502,23 @@ function UserRow({
       </td>
       <td className="px-3 py-2">
         {user.disabled ? (
-          <span className="rounded bg-rose-50 px-2 py-0.5 text-xs font-medium text-rose-700">
+          <span className="mr-1 rounded bg-rose-50 px-2 py-0.5 text-xs font-medium text-rose-700">
             Suspendu
           </span>
         ) : (
-          <span className="rounded bg-emerald-50 px-2 py-0.5 text-xs font-medium text-emerald-700">
-            Actif
-          </span>
+          !user.invitation_pending && (
+            <span className="mr-1 rounded bg-emerald-50 px-2 py-0.5 text-xs font-medium text-emerald-700">
+              Actif
+            </span>
+          )
         )}
         {user.invitation_pending ? (
-          <span className="ml-1 rounded bg-sky-50 px-2 py-0.5 text-xs font-medium text-sky-800">
+          <span className="rounded bg-sky-50 px-2 py-0.5 text-xs font-medium text-sky-800">
             Invitation en attente
           </span>
         ) : (
           !user.email_verified && (
-            <span className="ml-1 rounded bg-amber-50 px-2 py-0.5 text-xs font-medium text-amber-800">
+            <span className="rounded bg-amber-50 px-2 py-0.5 text-xs font-medium text-amber-800">
               Email non vérifié
             </span>
           )
