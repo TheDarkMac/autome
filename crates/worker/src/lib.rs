@@ -58,6 +58,7 @@ pub mod dispatch;
 pub mod executor;
 pub mod liveness;
 pub mod metrics;
+pub mod outbox;
 pub mod probe;
 pub mod shutdown;
 pub mod triggers;
@@ -66,7 +67,7 @@ pub use dispatch::{
 };
 pub use executor::{reap_orphans, RunExecutor};
 pub use liveness::PoolLiveness;
-pub use metrics::WorkerMetrics;
+pub use metrics::{RequeueReason, WorkerMetrics};
 pub use shutdown::{drain, DrainOutcome, InFlightRuns};
 pub use triggers::TriggerLoop;
 

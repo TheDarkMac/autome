@@ -17,6 +17,10 @@
 //! | `autome_worker_run_duration_seconds` | histogram | `status` |
 //! | `autome_worker_runs_in_flight` | gauge | — |
 //! | `autome_worker_orphan_runs_reaped_total` | counter | — |
+//! | `autome_worker_runs_requeued_total` | counter | `reason` : `shutdown`, `stale` |
+//! | `autome_worker_runs_resumed_total` | counter | — |
+//! | `autome_worker_outbox_relayed_total` | counter | — |
+//! | `autome_worker_outbox_errors_total` | counter | — |
 //! | `autome_worker_trigger_runs_total` | counter | `kind` : `schedule`, `polling` ; `result` : `dispatched`, `failed` |
 //! | `autome_worker_trigger_missed_total` | counter | — |
 //! | `autome_worker_trigger_poll_errors_total` | counter | — |
@@ -90,6 +94,24 @@ impl RunOutcome {
     }
 }
 
+/// Pourquoi un run a été remis en file (#239).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum RequeueReason {
+    /// Interrompu par l'arrêt de ce worker.
+    Shutdown,
+    /// Sans battement depuis le bail (worker arrêté ou coupé).
+    Stale,
+}
+
+impl RequeueReason {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Shutdown => "shutdown",
+            Self::Stale => "stale",
+        }
+    }
+}
+
 /// Type de déclencheur planifié.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum TriggerKind {
@@ -133,6 +155,10 @@ struct Inner {
     queue_errors: u64,
     runs: BTreeMap<RunOutcome, Histogram>,
     orphans_reaped: u64,
+    requeued: BTreeMap<RequeueReason, u64>,
+    resumed: u64,
+    outbox_relayed: u64,
+    outbox_errors: u64,
     trigger_runs: BTreeMap<(TriggerKind, bool), u64>,
     trigger_missed: u64,
     trigger_poll_errors: u64,
@@ -179,6 +205,26 @@ impl WorkerMetrics {
     /// `n` runs orphelins clos en échec par le balayage.
     pub fn orphans_reaped(&self, n: u64) {
         self.lock().orphans_reaped += n;
+    }
+
+    /// `n` runs remis en file pour `reason`.
+    pub fn runs_requeued(&self, reason: RequeueReason, n: u64) {
+        *self.lock().requeued.entry(reason).or_insert(0) += n;
+    }
+
+    /// Run repris à son point de reprise (tentative suivante).
+    pub fn run_resumed(&self) {
+        self.lock().resumed += 1;
+    }
+
+    /// `n` messages de l'outbox publiés par le relais.
+    pub fn outbox_relayed(&self, n: u64) {
+        self.lock().outbox_relayed += n;
+    }
+
+    /// Passe du relais ou de la remise en file en échec.
+    pub fn outbox_error(&self) {
+        self.lock().outbox_errors += 1;
     }
 
     /// Run déclenché par la planification (`dispatched`), ou perdu faute
@@ -280,6 +326,38 @@ impl WorkerMetrics {
             "Interrupted runs closed as failed by the orphan sweep.",
             inner.orphans_reaped,
         );
+        write_header(
+            &mut out,
+            "autome_worker_runs_requeued_total",
+            "counter",
+            "Interrupted runs put back in the queue, by reason.",
+        );
+        for reason in [RequeueReason::Shutdown, RequeueReason::Stale] {
+            let n = inner.requeued.get(&reason).copied().unwrap_or(0);
+            let _ = writeln!(
+                out,
+                "autome_worker_runs_requeued_total{{reason=\"{}\"}} {n}",
+                reason.label()
+            );
+        }
+        counter(
+            &mut out,
+            "autome_worker_runs_resumed_total",
+            "Runs resumed from their checkpoint by this worker.",
+            inner.resumed,
+        );
+        counter(
+            &mut out,
+            "autome_worker_outbox_relayed_total",
+            "Run messages published by the outbox relay.",
+            inner.outbox_relayed,
+        );
+        counter(
+            &mut out,
+            "autome_worker_outbox_errors_total",
+            "Failed outbox relay or stale-run requeue passes.",
+            inner.outbox_errors,
+        );
 
         write_header(
             &mut out,
@@ -355,6 +433,10 @@ mod tests {
             "autome_worker_run_duration_seconds_count{status=\"succeeded\"} 0",
             "autome_worker_runs_in_flight 0",
             "autome_worker_orphan_runs_reaped_total 0",
+            "autome_worker_runs_requeued_total{reason=\"stale\"} 0",
+            "autome_worker_runs_resumed_total 0",
+            "autome_worker_outbox_relayed_total 0",
+            "autome_worker_outbox_errors_total 0",
             "autome_worker_trigger_runs_total{kind=\"polling\",result=\"failed\"} 0",
             "autome_worker_trigger_missed_total 0",
             "autome_worker_draining 0",
@@ -375,6 +457,11 @@ mod tests {
         m.run_finished(RunOutcome::Succeeded, Duration::from_secs(40));
         m.run_finished(RunOutcome::Failed, Duration::from_secs(2));
         m.orphans_reaped(3);
+        m.runs_requeued(RequeueReason::Shutdown, 2);
+        m.runs_requeued(RequeueReason::Stale, 1);
+        m.run_resumed();
+        m.outbox_relayed(4);
+        m.outbox_error();
         m.trigger_run(TriggerKind::of("schedule"), true);
         m.trigger_run(TriggerKind::of("polling"), false);
         m.trigger_missed();
@@ -398,6 +485,11 @@ mod tests {
             "autome_worker_run_duration_seconds_count{status=\"failed\"} 1",
             "autome_worker_runs_in_flight 2",
             "autome_worker_orphan_runs_reaped_total 3",
+            "autome_worker_runs_requeued_total{reason=\"shutdown\"} 2",
+            "autome_worker_runs_requeued_total{reason=\"stale\"} 1",
+            "autome_worker_runs_resumed_total 1",
+            "autome_worker_outbox_relayed_total 4",
+            "autome_worker_outbox_errors_total 1",
             "autome_worker_trigger_runs_total{kind=\"schedule\",result=\"dispatched\"} 1",
             "autome_worker_trigger_runs_total{kind=\"polling\",result=\"failed\"} 1",
             "autome_worker_trigger_runs_total{kind=\"polling\",result=\"dispatched\"} 0",
