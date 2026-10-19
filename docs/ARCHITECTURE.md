@@ -312,8 +312,21 @@ erDiagram
 - File *au moins une fois*, exécution *au plus une fois* : le worker réclame
   le run en base (`RunStateStore::try_claim`, `queued → running` atomique) ;
   une livraison dupliquée d'un run déjà pris ou terminé est acquittée sans
-  ré-exécution, sur n'importe quelle réplique (#174). Un run interrompu n'est
-  pas rejoué : `reap_orphans` le clôt en `failed` après `AUTOME_RUN_TIMEOUT_SECS`.
+  ré-exécution, sur n'importe quelle réplique (#174).
+- **Outbox** (#239) : le run `queued` et son message sont écrits dans la même
+  transaction (`RunStateStore::enqueue`, table `run_outbox`) ; le dispatcher
+  publie aussitôt, un relais du worker republie ce qui est resté en attente.
+  Le message est gardé jusqu'à la fin du run pour être republié à chaque
+  reprise (génération + clé d'idempotence `<run_id>#<n>`).
+- **Reprise** (#239) : le moteur expose un point de reprise sérialisable
+  (`autome_engine::Cursor` : nœuds traités, contexte, branches actives,
+  empreinte du graphe) et un `RunObserver` appelé avant / après chaque nœud.
+  Le worker écrit le nœud en cours *avant* de l'exécuter et le point de
+  reprise *après* ; un run interrompu (arrêt au prochain nœud, battement
+  expiré) est remis en file (`requeue`) et repris là où il s'était arrêté. Un
+  nœud interrompu en cours d'exécution n'est rejoué que s'il est rejouable
+  (`autome_engine::rerunnable`). Toutes les écritures sont gardées par la
+  tentative (`runs.attempt`, jeton de *fencing*).
 - Broker : reconnexion à la demande après perte de RabbitMQ, `DeliveryId` lié à
   la génération du canal (un `ack` périmé est ignoré), publisher confirms
   réels ; backoff du worker pendant une panne (#180).

@@ -43,10 +43,11 @@ spec:
         app.kubernetes.io/name: worker
         app.kubernetes.io/part-of: autome
     spec:
-      # Arrêt borné (#200) : SIGTERM ⇒ plus de nouveaux runs, au plus
-      # AUTOME_WORKER_SHUTDOWN_TIMEOUT_SECS (25 s) pour finir ceux en cours,
-      # puis clôture en échec des runs interrompus. Pour des workflows longs,
-      # augmenter les deux ensemble (grâce > délai d'arrêt + ~10 s).
+      # Arrêt borné (#200, #239) : SIGTERM ⇒ plus de nouveaux runs, chaque
+      # run en cours s'arrête au prochain nœud et est remis en file ; au plus
+      # AUTOME_WORKER_SHUTDOWN_TIMEOUT_SECS (25 s) pour un nœud long, puis
+      # remise en file en plein nœud. Pour des nœuds longs, augmenter les deux
+      # ensemble (grâce > délai d'arrêt + ~10 s).
       terminationGracePeriodSeconds: 35
       securityContext:
         runAsNonRoot: true
