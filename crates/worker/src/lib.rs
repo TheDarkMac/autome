@@ -49,9 +49,12 @@ use async_trait::async_trait;
 use autome_core::{Delivery, Nack, Queue, Result};
 use tokio::task::JoinHandle;
 
+use crate::metrics::DeliveryOutcome;
+
 pub mod dispatch;
 pub mod executor;
 pub mod liveness;
+pub mod metrics;
 pub mod probe;
 pub mod shutdown;
 pub mod triggers;
@@ -60,6 +63,7 @@ pub use dispatch::{
 };
 pub use executor::{reap_orphans, RunExecutor};
 pub use liveness::PoolLiveness;
+pub use metrics::WorkerMetrics;
 pub use shutdown::{drain, DrainOutcome, InFlightRuns};
 pub use triggers::TriggerLoop;
 
@@ -168,6 +172,8 @@ pub struct WorkerPool {
     poll_idle_sleep: Duration,
     /// Battements des consommateurs, lus par la sonde de liveness (#192).
     liveness: Arc<PoolLiveness>,
+    /// Sort des livraisons et erreurs de file (#235).
+    metrics: Arc<WorkerMetrics>,
 }
 
 impl WorkerPool {
@@ -190,7 +196,15 @@ impl WorkerPool {
             concurrency,
             poll_idle_sleep: Duration::from_millis(50),
             liveness: Arc::new(PoolLiveness::new(concurrency, liveness::now_ms())),
+            metrics: Arc::new(WorkerMetrics::new()),
         }
+    }
+
+    /// Builder : registre où compter les livraisons et les erreurs de file
+    /// (#235) ; par défaut un registre propre au pool.
+    pub fn with_metrics(mut self, metrics: Arc<WorkerMetrics>) -> Self {
+        self.metrics = metrics;
+        self
     }
 
     /// Battements des consommateurs (à passer à la sonde de liveness).
@@ -222,6 +236,7 @@ impl WorkerPool {
         if let Some(key) = &key {
             if self.idempotency.is_done(key) {
                 self.queue.ack(&delivery.id).await?;
+                self.metrics.delivery(DeliveryOutcome::Deduplicated);
                 return Ok(ProcessOutcome::Deduplicated);
             }
         }
@@ -237,6 +252,7 @@ impl WorkerPool {
             HandlerVerdict::Retry => self.queue.nack(&delivery.id, Nack::Requeue).await?,
             HandlerVerdict::DeadLetter => self.queue.nack(&delivery.id, Nack::DeadLetter).await?,
         }
+        self.metrics.delivery(DeliveryOutcome::from(&verdict));
         // Marquée seulement une fois le sort du message fixé : un `Retry`
         // doit pouvoir être retraité à la redélivrance.
         if let (Some(key), false) = (&key, verdict == HandlerVerdict::Retry) {
@@ -289,6 +305,7 @@ async fn worker_loop(pool: &WorkerPool, shutdown: &AtomicBool, id: usize) {
                 }
             }
             Err(e) => {
+                pool.metrics.queue_error();
                 failures = failures.saturating_add(1);
                 let pause = error_backoff(pool.poll_idle_sleep, failures);
                 tracing::error!(
@@ -440,6 +457,76 @@ mod tests {
     }
 
     // ───── F5.2.a — process_one ─────
+
+    // ───── #235 — métriques ─────
+
+    /// File dont chaque opération échoue (broker injoignable).
+    struct DownQueue;
+
+    #[async_trait]
+    impl Queue for DownQueue {
+        async fn publish(&self, _name: &str, _msg: Message) -> Result<()> {
+            Err(autome_core::Error::Invalid("broker down".into()))
+        }
+        async fn poll(&self, _name: &str) -> Result<Option<Delivery>> {
+            Err(autome_core::Error::Invalid("broker down".into()))
+        }
+        async fn ack(&self, _id: &DeliveryId) -> Result<()> {
+            Err(autome_core::Error::Invalid("broker down".into()))
+        }
+        async fn nack(&self, _id: &DeliveryId, _verdict: Nack) -> Result<()> {
+            Err(autome_core::Error::Invalid("broker down".into()))
+        }
+        async fn depth(&self, _name: &str) -> Result<usize> {
+            Err(autome_core::Error::Invalid("broker down".into()))
+        }
+    }
+
+    #[tokio::test]
+    async fn deliveries_are_counted_by_outcome() {
+        let q = Arc::new(InMemoryQueue::new());
+        for _ in 0..2 {
+            let msg = Message::new(json!({})).with_header("idempotency-key", "k");
+            q.publish("runs", msg).await.unwrap();
+        }
+        q.publish("runs", Message::new(json!({}))).await.unwrap();
+        let metrics = Arc::new(WorkerMetrics::new());
+        let (pool, _) = build(Arc::clone(&q), HandlerVerdict::DeadLetter);
+        let pool = pool.with_metrics(Arc::clone(&metrics));
+        for _ in 0..3 {
+            pool.process_one().await.unwrap();
+        }
+        assert_eq!(pool.process_one().await.unwrap(), ProcessOutcome::Idle);
+
+        let out = metrics.render(metrics::Gauges::default());
+        assert!(out.contains("autome_worker_deliveries_total{outcome=\"dead_letter\"} 2\n"));
+        assert!(out.contains("autome_worker_deliveries_total{outcome=\"deduplicated\"} 1\n"));
+        assert!(out.contains("autome_worker_deliveries_total{outcome=\"ack\"} 0\n"));
+        assert!(out.contains("autome_worker_queue_errors_total 0\n"));
+    }
+
+    #[tokio::test]
+    async fn queue_errors_are_counted() {
+        let handler: Arc<dyn Handler + Send + Sync> = Arc::new(|_d: &Delivery| HandlerVerdict::Ok);
+        let idem: Arc<dyn IdempotencyStore + Send + Sync> =
+            Arc::new(InMemoryIdempotencyStore::new());
+        let metrics = Arc::new(WorkerMetrics::new());
+        let pool = WorkerPool::new(Arc::new(DownQueue), handler, idem, "runs", 1)
+            .with_idle_sleep(Duration::from_millis(1))
+            .with_metrics(Arc::clone(&metrics));
+        let running = pool.start();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        running.stop().await;
+
+        let out = metrics.render(metrics::Gauges::default());
+        let errors: u64 = out
+            .lines()
+            .find_map(|l| l.strip_prefix("autome_worker_queue_errors_total "))
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!(errors >= 2, "{errors}");
+    }
 
     #[tokio::test]
     async fn process_one_empty_queue_is_idle() {

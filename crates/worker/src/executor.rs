@@ -40,7 +40,7 @@
 //! [`tokio::task::spawn_blocking`].
 
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use autome_connectors::{EgressPolicy, HttpAction, HttpClient, ReqwestHttpClient};
@@ -52,6 +52,7 @@ use autome_engine::{Dag, Engine, RunContext, StepStatus};
 use tracing::{debug, error, info, warn, Instrument};
 
 use crate::dispatch::{dispatch_action, CredentialResolver};
+use crate::metrics::{RunOutcome, WorkerMetrics};
 use crate::shutdown::InFlightRuns;
 use crate::{Handler, HandlerVerdict};
 
@@ -70,6 +71,8 @@ pub struct RunExecutor<C = ReqwestHttpClient> {
     resolver: Arc<dyn CredentialResolver>,
     /// Runs réclamés et pas encore terminés (arrêt borné, #200).
     in_flight: Arc<InFlightRuns>,
+    /// Runs terminés et leur durée (#235).
+    metrics: Arc<WorkerMetrics>,
 }
 
 impl RunExecutor {
@@ -106,7 +109,15 @@ where
             http,
             resolver,
             in_flight: Arc::new(InFlightRuns::default()),
+            metrics: Arc::new(WorkerMetrics::new()),
         }
+    }
+
+    /// Builder : registre où compter les runs terminés (#235) ; par défaut
+    /// un registre propre à l'executor.
+    pub fn with_metrics(mut self, metrics: Arc<WorkerMetrics>) -> Self {
+        self.metrics = metrics;
+        self
     }
 
     /// Runs en cours d'exécution (à passer à [`crate::drain`]).
@@ -311,6 +322,7 @@ where
         // Prise en charge atomique Queued → Running : une seule réplique
         // exécute le run, même si la livraison est dupliquée.
         let started_ms = now_ms();
+        let started = Instant::now();
         let mut checkpoint = match self.store.try_claim(run_id, started_ms).await {
             Ok(Some(cp)) => cp,
             Ok(None) => return self.unclaimed(run_id).await,
@@ -357,6 +369,8 @@ where
                 if let Err(e) = self.store.fail_if_running(run_id, &reason, now_ms()).await {
                     error!(error = %e, "échec du run non persisté");
                 }
+                self.metrics
+                    .run_finished(RunOutcome::Failed, started.elapsed());
                 return HandlerVerdict::DeadLetter;
             }
         };
@@ -402,6 +416,12 @@ where
         }
 
         let duration_ms = now_ms().saturating_sub(started_ms);
+        let outcome = if report.status == RunStatus::Succeeded {
+            RunOutcome::Succeeded
+        } else {
+            RunOutcome::Failed
+        };
+        self.metrics.run_finished(outcome, started.elapsed());
         match report.status {
             RunStatus::Succeeded => {
                 info!(status = "succeeded", duration_ms, "run terminé");
@@ -602,6 +622,30 @@ mod tests {
         let cp = store.load("run-bad").await.unwrap().unwrap();
         assert_eq!(cp.status, RunStatus::Failed);
         assert!(cp.error.is_some());
+    }
+
+    #[tokio::test]
+    async fn finished_runs_are_counted_by_status_but_duplicates_are_not() {
+        let repo = Arc::new(InMemoryWorkflowRepository::new());
+        let store = Arc::new(InMemoryRunStateStore::new());
+        seed(&repo, &store, trigger_only("wf-ok"), "run-ok").await;
+        seed(&repo, &store, unsupported_action("wf-bad"), "run-bad").await;
+        let metrics = Arc::new(WorkerMetrics::new());
+        let exec = RunExecutor::new(repo, Arc::clone(&store) as Arc<_>, resolver())
+            .with_metrics(Arc::clone(&metrics));
+
+        exec.handle(&delivery("run-ok", "wf-ok")).await;
+        exec.handle(&delivery("run-bad", "wf-bad")).await;
+        // Redélivrance d'un run terminé : acquittée, pas comptée comme run.
+        assert_eq!(
+            exec.handle(&delivery("run-ok", "wf-ok")).await,
+            HandlerVerdict::Ok
+        );
+
+        let out = metrics.render(crate::metrics::Gauges::default());
+        assert!(out.contains("autome_worker_runs_total{status=\"succeeded\"} 1\n"));
+        assert!(out.contains("autome_worker_runs_total{status=\"failed\"} 1\n"));
+        assert!(out.contains("autome_worker_run_duration_seconds_count{status=\"succeeded\"} 1\n"));
     }
 
     #[tokio::test]

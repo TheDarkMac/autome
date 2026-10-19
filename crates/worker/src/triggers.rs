@@ -37,6 +37,8 @@ use autome_core::{
 use serde_json::{json, Value};
 use tokio::task::JoinHandle;
 
+use crate::metrics::{TriggerKind, WorkerMetrics};
+
 /// Retard au-delà duquel une échéance `schedule` est sautée (5 min).
 pub const MISFIRE_GRACE_MS: i64 = 5 * 60_000;
 /// Échéances traitées au plus par passe.
@@ -83,6 +85,8 @@ pub struct TriggerLoop {
     store: Arc<dyn TriggerScheduleStore>,
     dispatcher: Arc<dyn RunDispatcher + Send + Sync>,
     http: Arc<dyn HttpClient + Send + Sync>,
+    /// Runs déclenchés, échéances manquées, polls en échec (#235).
+    metrics: Arc<WorkerMetrics>,
 }
 
 impl TriggerLoop {
@@ -97,7 +101,15 @@ impl TriggerLoop {
             store,
             dispatcher,
             http,
+            metrics: Arc::new(WorkerMetrics::new()),
         }
+    }
+
+    /// Builder : registre où compter les déclenchements (#235) ; par défaut
+    /// un registre propre à la boucle.
+    pub fn with_metrics(mut self, metrics: Arc<WorkerMetrics>) -> Self {
+        self.metrics = metrics;
+        self
     }
 
     /// Une passe à l'instant `now_ms`. `Err` seulement si les échéances ne
@@ -185,6 +197,7 @@ impl TriggerLoop {
                 "planification : échéance manquée (retard), sautée"
             );
             out.missed += 1;
+            self.metrics.trigger_missed();
             return Ok(());
         }
         let payload = json!({
@@ -229,6 +242,7 @@ impl TriggerLoop {
                     error = %e,
                     "polling : poll en échec, nouvel essai à la prochaine échéance"
                 );
+                self.metrics.trigger_poll_error();
                 return 0;
             }
         };
@@ -275,7 +289,10 @@ impl TriggerLoop {
             now_ms,
             owner_id: Some(slot.owner_id.clone()),
         };
-        match self.dispatcher.dispatch(request).await {
+        let result = self.dispatcher.dispatch(request).await;
+        self.metrics
+            .trigger_run(TriggerKind::of(&slot.trigger_type), result.is_ok());
+        match result {
             Ok(outcome) => {
                 tracing::info!(
                     run_id = %outcome.run_id,
@@ -327,6 +344,7 @@ impl TriggerLoop {
                         Ok(outcome) if outcome.processed == BATCH_SIZE => continue,
                         Ok(_) => break,
                         Err(e) => {
+                            self.metrics.trigger_tick_error();
                             tracing::error!(error = %e, "planification : échéances illisibles");
                             break;
                         }
@@ -597,6 +615,67 @@ mod tests {
             store.due(i64::MAX, 10).await.unwrap()[0].next_fire_ms,
             Some(T0 + 2 * MIN)
         );
+    }
+
+    #[tokio::test]
+    async fn firings_misses_failed_dispatches_and_poll_errors_are_counted() {
+        use crate::metrics::Gauges;
+        let metrics = Arc::new(WorkerMetrics::new());
+
+        // Intervalle : un run déclenché, puis une échéance trop en retard.
+        let h = harness(json!(null));
+        let lp = h.lp.clone().with_metrics(Arc::clone(&metrics));
+        sync(&h, "schedule", json!({ "interval_seconds": 60 })).await;
+        lp.tick(T0).await.unwrap();
+        assert_eq!(lp.tick(T0 + MIN).await.unwrap().fired, 1);
+        assert_eq!(lp.tick(T0 + 12 * MIN).await.unwrap().missed, 1);
+
+        // Polling : poll en échec.
+        let p = harness(json!(null));
+        let lp = p.lp.clone().with_metrics(Arc::clone(&metrics));
+        sync(
+            &p,
+            "polling",
+            json!({ "url": "https://api.example/items", "interval_seconds": 30 }),
+        )
+        .await;
+        lp.tick(T0).await.unwrap();
+        p.http.set(Err("connexion refusée".into()));
+        assert_eq!(polls(lp.tick(T0).await.unwrap()).await, 0);
+
+        // Dispatch impossible : run perdu.
+        let store = Arc::new(InMemoryTriggerScheduleStore::new());
+        let failing = Arc::new(Recorder {
+            fail: true,
+            ..Recorder::default()
+        });
+        let lp = TriggerLoop::new(store.clone(), failing, FakeHttp::new(json!(null)))
+            .with_metrics(Arc::clone(&metrics));
+        store
+            .sync(
+                "alice",
+                "wf",
+                &[ScheduledTrigger {
+                    node_id: "t".into(),
+                    trigger_type: "schedule".into(),
+                    params: json!({ "interval_seconds": 60 }),
+                }],
+            )
+            .await
+            .unwrap();
+        lp.tick(T0).await.unwrap();
+        lp.tick(T0 + MIN).await.unwrap();
+
+        let out = metrics.render(Gauges::default());
+        for line in [
+            "autome_worker_trigger_runs_total{kind=\"schedule\",result=\"dispatched\"} 1",
+            "autome_worker_trigger_runs_total{kind=\"schedule\",result=\"failed\"} 1",
+            "autome_worker_trigger_runs_total{kind=\"polling\",result=\"dispatched\"} 0",
+            "autome_worker_trigger_missed_total 1",
+            "autome_worker_trigger_poll_errors_total 1",
+        ] {
+            assert!(out.contains(&format!("{line}\n")), "{line} absent :\n{out}");
+        }
     }
 
     #[tokio::test]
