@@ -552,6 +552,7 @@ comptes sont publics ; tout le reste exige `Authorization: Bearer <access_token>
 | POST | `/auth/password/forgot` | `{"email"}` | 202 demande prise en compte (que le compte existe ou non) · 400 email invalide · 429 trop de demandes · 503 aucun envoi d'email configuré |
 | POST | `/auth/password/reset` | `{"token","new_password"}` | 204 mot de passe remplacé, sessions fermées · 400 lien invalide, expiré ou déjà utilisé, ou mot de passe invalide · 503 non configuré |
 | GET | `/auth/me` | — (Bearer requis) | 200 `{"id","email","role","permissions"}` · 401 session invalide ou compte suspendu |
+| DELETE | `/auth/me` | `{"current_password"}` (Bearer requis) | 204 compte et données effacés, sessions fermées · 401 session invalide ou compte suspendu · 403 mot de passe actuel incorrect · 409 compte administrateur (`*`) · 429 trop d'essais |
 
 - Paire de jetons : `{"access_token","refresh_token","token_type":"Bearer","expires_in":900}`.
   Access valable 15 min, refresh 7 jours et **à usage unique** (rotation) : de
@@ -584,6 +585,15 @@ comptes sont publics ; tout le reste exige `Authorization: Bearer <access_token>
   reste connecté. Mot de passe actuel incorrect = **403** (pas 401, que le
   frontend interpréterait comme une session expirée). Onglet « Compte » du
   frontend ; audit `auth.password_change`.
+- **Suppression du compte** (#229) : `DELETE /auth/me` efface définitivement
+  le compte et ses données (voir « Suppression de compte (droit à
+  l'effacement) » plus bas). Elle exige le mot de passe actuel, avec le même
+  compteur d'essais que le changement de mot de passe (403 s'il est faux, 429
+  au-delà). Un compte qui détient `*` est refusé (409) : un autre
+  administrateur doit d'abord lui retirer ce rôle, si bien que l'instance n'est
+  jamais laissée sans administrateur par ce chemin. Onglet « Compte » du
+  frontend (mot de passe + email retapé) ; audit `auth.account_delete` sous le
+  pseudonyme du compte.
 - **Mot de passe oublié** (#204) : « Mot de passe oublié ? » sur la page de
   connexion appelle `/auth/password/forgot`, qui répond **toujours 202** : la
   recherche du compte et l'envoi de l'email ont lieu en tâche de fond, si bien
@@ -687,6 +697,7 @@ Onglet « Administration » du frontend, visible des seuls comptes qui détienne
 | POST | `/admin/users/{id}/disable` | — | 200 compte suspendu, sessions fermées · 403 · 404 · 409 son propre compte |
 | POST | `/admin/users/{id}/enable` | — | 200 compte réactivé · 403 · 404 |
 | POST | `/admin/users/{id}/logout-all` | — | 204 sessions du compte fermées · 403 · 404 |
+| DELETE | `/admin/users/{id}` | — | 204 compte et données effacés · 403 · 404 · 409 son propre compte |
 
 Un compte vaut `{"id","email","role","permissions","disabled","created_at_ms"}`
 (jamais le hash du mot de passe). Règles :
@@ -699,8 +710,8 @@ Un compte vaut `{"id","email","role","permissions","disabled","created_at_ms"}`
   déconnecter un compte qui détient `*`, exige soi-même `*` (403 sinon) — un
   compte qui n'a que `users.admin` gère les autres comptes mais ne crée pas de
   super-admin.
-- **Pas de verrouillage** : un administrateur ne change pas son propre rôle et
-  ne se suspend pas lui-même (409).
+- **Pas de verrouillage** : un administrateur ne change pas son propre rôle,
+  ne se suspend pas et ne se supprime pas lui-même par ces routes (409).
 - **Suspension** : réversible ; le compte garde ses workflows, runs et
   permissions. Toutes ses sessions sont fermées (version de session), sa
   connexion répond 403 « account disabled » — seulement avec le bon mot de
@@ -709,13 +720,18 @@ Un compte vaut `{"id","email","role","permissions","disabled","created_at_ms"}`
   réchapper : le drapeau est écrit avant la fermeture des sessions et relu par
   la connexion après lecture de la version. Réactiver ne rouvre pas les
   anciennes sessions.
+- **Suppression** (#229) : définitive, contrairement à la suspension — le
+  compte et toutes ses données sont effacés (voir « Suppression de compte
+  (droit à l'effacement) »), par exemple pour une demande reçue hors de
+  l'application. Bouton « Supprimer » de l'onglet, confirmé.
 - Chaque action est auditée sous l'administrateur, ressource = compte visé :
   `admin.users_list`, `admin.user_get`, `admin.user_role` (avec `from`/`to`),
-  `admin.user_disable`, `admin.user_enable`, `admin.user_logout_all` ; les refus
-  (403/409) sont audités `Denied`.
-- Pas de suppression de compte ni de création par un administrateur : un
-  compte s'inscrit lui-même (`/auth/signup`), puis un administrateur ajuste
-  son rôle.
+  `admin.user_disable`, `admin.user_enable`, `admin.user_logout_all`,
+  `admin.user_delete` (ressource = pseudonyme du compte effacé, avec le nombre
+  de workflows, runs et tokens supprimés) ; les refus (403/409) sont audités
+  `Denied`.
+- Pas de création de compte par un administrateur : un compte s'inscrit
+  lui-même (`/auth/signup`), puis un administrateur ajuste son rôle.
 
 **Premier administrateur** : l'API n'en crée jamais (aucune promotion par
 HTTP). Inscrire le compte, puis le promouvoir depuis l'infrastructure — la
@@ -753,6 +769,53 @@ les IP de leur côté — leur durée de conservation est à régler et à docum
 avec le reste. Mentionner ce traitement dans la politique de confidentialité et
 le registre des traitements ; le faire valider par le DPO ou un juriste avant
 une mise en production réelle.
+
+### Suppression de compte (droit à l'effacement)
+
+RGPD, art. 17 (#229). L'utilisateur supprime son compte depuis l'onglet
+« Compte » (`DELETE /auth/me`) ; un administrateur peut le faire pour lui
+(`DELETE /admin/users/{id}`), par exemple sur une demande reçue par email.
+
+**Effacé**, en une transaction PostgreSQL (un échec n'efface rien) :
+
+| Donnée | Table(s) |
+|---|---|
+| Compte : email, hash du mot de passe | `users` (et `credentials`, 0004, par cascade) |
+| Permissions | `user_permissions` |
+| Workflows de son espace, toutes versions | `workflows`, `workflow_versions` |
+| URL webhook et échéances planifiées de ces workflows | `webhook_endpoints`, `trigger_schedules` (cascade) |
+| Runs dont il est propriétaire et sorties des nœuds | `runs`, `run_steps` |
+| Tokens OAuth des connecteurs | `connector_tokens` |
+
+**Pseudonymisé, pas supprimé** : le journal d'audit (`audit_events`), qui trace
+aussi les actions des administrateurs et l'effacement lui-même. Les
+événements dont l'acteur ou la ressource est l'id du compte **ou son email**
+(échecs de connexion, demandes de réinitialisation) reçoivent un pseudonyme
+aléatoire `erased:<16 hex>`, propre à l'effacement : les événements du compte
+restent groupés, mais plus rien ne les relie à la personne.
+
+**Conservé** : la ligne `session_versions` du compte (un id aléatoire et un
+entier ; la supprimer revaliderait ses anciens jetons) et les `jti` révoqués.
+Les compteurs anti-bruteforce du compte (déjà hachés) sont remis à zéro.
+
+Toutes les sessions du compte sont fermées **avant** l'effacement. Un run en
+cours d'exécution n'est pas recréé : le worker n'écrit l'état final d'un run
+que s'il existe encore (`RunStateStore::finish`) et abandonne sinon (log
+`run effacé pendant son exécution`). L'email redevient libre pour une
+nouvelle inscription.
+
+**Limites**, à traiter hors de l'application ou plus tard :
+
+- les tokens OAuth sont supprimés chez Autome mais **pas révoqués chez le
+  provider** (Slack, Google, Notion, GitHub) : l'utilisateur peut retirer
+  l'accès depuis le compte du service ;
+- un message déjà en file pour un run effacé est écarté par le worker en
+  *dead letter* (`run introuvable`) ; son contenu (payload du déclencheur) reste
+  dans la DLQ RabbitMQ jusqu'à sa purge ;
+- sauvegardes de la base et journaux de l'ingress : selon leur propre durée de
+  conservation ;
+- pas d'export des données (portabilité, art. 20) ni de délai de grâce : la
+  suppression est immédiate.
 
 ---
 
