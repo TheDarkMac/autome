@@ -4,7 +4,8 @@
 // seul juge : le panneau grise ce qu'il refuserait (son propre compte, le
 // rôle `admin` et les super-admins sans `*`) et traduit ses refus en clair.
 // Suspendre un compte ou fermer ses sessions est confirmé, comme la
-// déconnexion de tous ses appareils. Le client API est injecté pour les tests.
+// déconnexion de tous ses appareils ; la suppression définitive d'un compte
+// et de ses données (#229) aussi. Le client API est injecté pour les tests.
 
 import { useCallback, useEffect, useState, type FormEvent } from "react";
 
@@ -15,7 +16,7 @@ type AdminUser = Schemas["AdminUser"];
 
 export type AdminApi = Pick<
   ApiClient,
-  "listUsers" | "setUserRole" | "disableUser" | "enableUser" | "logoutUser"
+  "listUsers" | "setUserRole" | "disableUser" | "enableUser" | "logoutUser" | "deleteUser"
 >;
 
 export interface AdminPanelProps {
@@ -136,6 +137,27 @@ export function AdminPanel({
     void runAction(user, () => api.disableUser(user.id), `${user.email} suspendu.`);
   }
 
+  function onDelete(user: AdminUser): void {
+    const message = `Supprimer définitivement ${user.email} ? Son compte, ses workflows, ses exécutions et ses connexions aux services seront effacés. Cette action est irréversible.`;
+    if (!confirm(message)) return;
+    void runAction(
+      user,
+      async () => {
+        await api.deleteUser(user.id);
+        setLoad((l) =>
+          l.kind === "ok"
+            ? {
+                ...l,
+                items: l.items.filter((u) => u.id !== user.id),
+                total: Math.max(0, l.total - 1),
+              }
+            : l,
+        );
+      },
+      `${user.email} supprimé, ainsi que ses données.`,
+    );
+  }
+
   function onLogout(user: AdminUser): void {
     if (!confirm(`Fermer toutes les sessions de ${user.email} ?`)) return;
     void runAction(
@@ -237,6 +259,7 @@ export function AdminPanel({
                     onRole={(role) => onRole(user, role)}
                     onToggle={() => onToggle(user)}
                     onLogout={() => onLogout(user)}
+                    onDelete={() => onDelete(user)}
                   />
                 ))}
               </tbody>
@@ -263,6 +286,7 @@ function UserRow({
   onRole,
   onToggle,
   onLogout,
+  onDelete,
 }: {
   user: AdminUser;
   self: boolean;
@@ -271,6 +295,7 @@ function UserRow({
   onRole: (role: AssignableRole) => void;
   onToggle: () => void;
   onLogout: () => void;
+  onDelete: () => void;
 }): JSX.Element {
   // Un super-admin n'est gérable que par un super-admin (refus 403 sinon).
   const locked = busy || (user.role === "admin" && !superAdmin);
@@ -335,6 +360,15 @@ function UserRow({
             className="rounded-md border border-neutral-200 px-2 py-1 text-xs text-neutral-700 hover:bg-neutral-50 disabled:opacity-60"
           >
             Fermer les sessions
+          </button>
+          <button
+            type="button"
+            onClick={onDelete}
+            disabled={locked || self}
+            aria-label={`Supprimer ${user.email}`}
+            className="rounded-md border border-rose-200 px-2 py-1 text-xs text-rose-700 hover:bg-rose-50 disabled:opacity-60"
+          >
+            Supprimer
           </button>
         </div>
       </td>

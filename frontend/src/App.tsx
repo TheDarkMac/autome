@@ -31,7 +31,11 @@ import {
 } from "./runs";
 import { useRunPolling } from "./useRunPolling";
 import { useSession, type UseSessionOptions } from "./useSession";
-import { useWorkflowEditor, type UseWorkflowEditorOptions } from "./useWorkflowEditor";
+import {
+  lastWorkflowKey,
+  useWorkflowEditor,
+  type UseWorkflowEditorOptions,
+} from "./useWorkflowEditor";
 import { WorkflowBar } from "./WorkflowBar";
 
 type Status =
@@ -67,6 +71,7 @@ export function App({
     logout,
     logoutAll,
     changePassword,
+    deleteAccount,
     authFetch,
   } = useSession(sessionOptions);
   const [logoutAllError, setLogoutAllError] = useState<string | null>(null);
@@ -104,6 +109,24 @@ export function App({
     // Le serveur a fermé toutes les sessions, celle de cet appareil comprise.
     if (session) logout();
   }, [session, logout]);
+
+  // Suppression du compte (#229) : `deleteAccount` ferme la session locale ;
+  // le dernier workflow retenu pour ce compte dans ce navigateur est oublié.
+  const onDeleteAccount = useCallback(
+    async (currentPassword: string) => {
+      const userId = session?.userId;
+      await deleteAccount(currentPassword);
+      if (userId) {
+        try {
+          window.localStorage.removeItem(lastWorkflowKey(userId));
+        } catch {
+          // Stockage indisponible : rien à oublier.
+        }
+      }
+      setLoginNotice("Votre compte et vos données ont été supprimés.");
+    },
+    [deleteAccount, session],
+  );
 
   // Ferme la session sur tous les appareils (#186) — action destructrice,
   // confirmée ; en cas d'échec, la session locale reste ouverte et l'erreur
@@ -337,6 +360,7 @@ export function App({
           <AccountPanel
             {...(me ? { email: me.email } : {})}
             changePassword={changePassword}
+            deleteAccount={onDeleteAccount}
           />
         </div>
       ) : view === "connectors" ? (

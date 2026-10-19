@@ -1,7 +1,7 @@
 import { act, fireEvent, render, screen } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 
-import { AccountPanel } from "./AccountPanel";
+import { AccountPanel, DELETE_CONFIRMATION_WORD } from "./AccountPanel";
 import { validatePasswordChange } from "./auth";
 
 function fill(current: string, next: string, confirm: string): void {
@@ -69,5 +69,70 @@ describe("<AccountPanel />", () => {
 
     expect(screen.getByRole("alert")).toHaveTextContent("mot de passe actuel incorrect");
     expect(screen.getByLabelText("Nouveau mot de passe")).toHaveValue("new-password");
+  });
+});
+
+describe("<AccountPanel /> — suppression du compte (#229)", () => {
+  const noChange = vi.fn();
+
+  function fillDelete(password: string, confirmation: string): void {
+    fireEvent.change(screen.getByLabelText("Votre mot de passe"), {
+      target: { value: password },
+    });
+    fireEvent.change(screen.getByLabelText(/pour confirmer/), {
+      target: { value: confirmation },
+    });
+  }
+
+  function deleteButton(): HTMLElement {
+    return screen.getByRole("button", { name: "Supprimer définitivement mon compte" });
+  }
+
+  it("est masquée sans action de suppression", () => {
+    render(<AccountPanel email="a@b.io" changePassword={noChange} />);
+    expect(screen.queryByRole("form", { name: "Supprimer mon compte" })).toBeNull();
+  });
+
+  it("liste ce qui sera effacé et exige le mot de passe et l'email retapé", async () => {
+    const deleteAccount = vi.fn().mockResolvedValue(undefined);
+    render(
+      <AccountPanel email="sam@example.io" changePassword={noChange} deleteAccount={deleteAccount} />,
+    );
+    const form = screen.getByRole("form", { name: "Supprimer mon compte" });
+    expect(form).toHaveTextContent(/workflows/);
+    expect(form).toHaveTextContent(/exécutions/);
+    expect(form).toHaveTextContent(/connexions aux services/);
+    expect(form).toHaveTextContent(/identifiant\s+anonyme/);
+    expect(deleteButton()).toBeDisabled();
+
+    fillDelete("the-password", "autre@example.io");
+    expect(deleteButton()).toBeDisabled();
+    fillDelete("the-password", "  SAM@example.io ");
+    expect(deleteButton()).toBeEnabled();
+    await act(async () => {
+      fireEvent.click(deleteButton());
+    });
+    expect(deleteAccount).toHaveBeenCalledWith("the-password");
+  });
+
+  it("affiche le refus du serveur et permet de réessayer", async () => {
+    const deleteAccount = vi
+      .fn()
+      .mockRejectedValue(new Error("mot de passe actuel incorrect"));
+    render(
+      <AccountPanel email="sam@example.io" changePassword={noChange} deleteAccount={deleteAccount} />,
+    );
+    fillDelete("wrong", "sam@example.io");
+    await act(async () => {
+      fireEvent.click(deleteButton());
+    });
+    expect(screen.getByRole("alert")).toHaveTextContent("mot de passe actuel incorrect");
+    expect(deleteButton()).toBeEnabled();
+  });
+
+  it("sans email connu, la confirmation est un mot fixe", () => {
+    render(<AccountPanel changePassword={noChange} deleteAccount={vi.fn()} />);
+    fillDelete("the-password", DELETE_CONFIRMATION_WORD);
+    expect(deleteButton()).toBeEnabled();
   });
 });
