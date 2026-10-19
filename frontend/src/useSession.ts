@@ -2,7 +2,8 @@
 //
 // Source de vérité de l'authentification côté SPA :
 //   - charge la session depuis le `SessionStore` au montage ;
-//   - expose `login` / `signup` / `logout` (qui ferme aussi la session
+//   - expose `login` / `signup` (sans session si l'adresse doit d'abord
+//     être vérifiée — #231) / `logout` (qui ferme aussi la session
 //     côté serveur, au mieux — #184), `logoutAll` (toutes les sessions,
 //     tous appareils — #186), `changePassword` (#196) et `deleteAccount`
 //     (#229) ;
@@ -49,13 +50,23 @@ export interface UseSessionOptions {
   deleteAccountImpl?: typeof apiDeleteAccount;
 }
 
+/** Inscription en attente de la vérification de l'adresse (#231). */
+export interface PendingVerification {
+  /** Adresse (normalisée par le serveur) à laquelle le lien est parti. */
+  readonly email: string;
+}
+
 export interface UseSessionResult {
   session: Session | null;
   /** `true` tant que le chargement initial depuis le store n'est pas fait. */
   loading: boolean;
   authenticated: boolean;
   login: (creds: Credentials) => Promise<void>;
-  signup: (creds: Credentials) => Promise<void>;
+  /**
+   * Crée le compte et ouvre la session ; renvoie l'adresse à vérifier (sans
+   * session) quand le serveur l'exige (#231), `null` sinon.
+   */
+  signup: (creds: Credentials) => Promise<PendingVerification | null>;
   logout: () => void;
   /**
    * Ferme toutes les sessions de l'utilisateur côté serveur puis la session
@@ -190,8 +201,11 @@ export function useSession(options: UseSessionOptions = {}): UseSessionResult {
   );
 
   const signup = useCallback(
-    async (creds: Credentials) => {
-      apply(await signupImpl(creds));
+    async (creds: Credentials): Promise<PendingVerification | null> => {
+      const result = await signupImpl(creds);
+      if (result.kind === "verificationRequired") return { email: result.email };
+      apply(result.tokens);
+      return null;
     },
     [apply, signupImpl],
   );

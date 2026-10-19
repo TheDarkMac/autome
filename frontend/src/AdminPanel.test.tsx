@@ -14,6 +14,7 @@ function user(id: string, email: string, extra: Partial<AdminUser> = {}): AdminU
     role: "editor",
     permissions: ["workflows.read"],
     disabled: false,
+    email_verified: true,
     created_at_ms: Date.UTC(2026, 9, 1),
     ...extra,
   };
@@ -33,6 +34,7 @@ function fakeApi(items: AdminUser[] = [ME, ALICE, BOSS], total = items.length): 
     enableUser: vi.fn(async (id: string) => ({ ...ALICE, id, disabled: false })),
     logoutUser: vi.fn().mockResolvedValue(undefined),
     deleteUser: vi.fn().mockResolvedValue(undefined),
+    verifyUserEmail: vi.fn(async (id: string) => ({ ...ALICE, id, email_verified: true })),
   };
 }
 
@@ -107,6 +109,32 @@ describe("<AdminPanel />", () => {
     });
     expect(api.enableUser).toHaveBeenCalledWith("u-alice");
     expect(within(row("alice@example.io")).getByText("Actif")).toBeInTheDocument();
+  });
+
+  it("signale une adresse non vérifiée et la vérifie après confirmation (#231)", async () => {
+    const pending = user("u-pending", "pending@example.io", { email_verified: false });
+    const api = fakeApi([ME, ALICE, pending]);
+    api.verifyUserEmail = vi.fn(async (id: string) => ({ ...pending, id, email_verified: true }));
+    const confirm = vi.fn().mockReturnValueOnce(false).mockReturnValue(true);
+    await renderPanel(api, { confirm });
+    expect(within(row("alice@example.io")).queryByText("Email non vérifié")).toBeNull();
+    expect(within(row("alice@example.io")).queryByRole("button", { name: /Vérifier/ })).toBeNull();
+    const line = (): HTMLElement => row("pending@example.io");
+    expect(within(line()).getByText("Email non vérifié")).toBeInTheDocument();
+
+    const verify = (): HTMLElement =>
+      within(line()).getByRole("button", { name: "Vérifier l'adresse de pending@example.io" });
+    await act(async () => {
+      fireEvent.click(verify());
+    });
+    expect(api.verifyUserEmail).not.toHaveBeenCalled();
+    await act(async () => {
+      fireEvent.click(verify());
+    });
+    expect(confirm).toHaveBeenLastCalledWith(expect.stringMatching(/lui appartient/));
+    expect(api.verifyUserEmail).toHaveBeenCalledWith("u-pending");
+    expect(within(line()).queryByText("Email non vérifié")).toBeNull();
+    expect(screen.getByRole("status")).toHaveTextContent("Adresse pending@example.io vérifiée.");
   });
 
   it("ferme les sessions d'un compte après confirmation", async () => {

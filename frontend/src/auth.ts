@@ -9,13 +9,16 @@
 //
 // Contrat HTTP attendu (frontend-first, comme `runs.ts`/`credentials.ts`) :
 //   - POST /auth/login    { email, password }      → TokenPair
-//   - POST /auth/signup   { email, password }      → TokenPair
+//   - POST /auth/signup   { email, password }      → 201 TokenPair, ou 202
+//     { email, verification_required } quand l'adresse doit être vérifiée (#231)
 //   - POST /auth/refresh  { refresh_token }        → TokenPair
 //   - POST /auth/logout   { refresh_token } (+ Bearer access) → 204
 //   - POST /auth/logout-all (Bearer access)        → 204
 //   - POST /auth/password { current_password, new_password } (Bearer) → TokenPair
 //   - POST /auth/password/forgot { email }          → 202 (compte existant ou non)
 //   - POST /auth/password/reset  { token, new_password } → 204
+//   - POST /auth/email/verify    { token }          → 204 (#231)
+//   - POST /auth/email/resend    { email }          → 202 (compte existant ou non)
 //   - GET  /auth/whoami   (Bearer access)          → "hello <sub>"
 //   - GET  /auth/me       (Bearer access)          → { id, email, role, permissions } (cf. apiClient)
 //
@@ -38,6 +41,25 @@ export interface JwtClaims {
   readonly kind: "access" | "refresh";
 }
 
+/** Issue d'une inscription : connecté, ou adresse à vérifier d'abord (#231). */
+export type SignupResult =
+  | { readonly kind: "signedIn"; readonly tokens: TokenPair }
+  | { readonly kind: "verificationRequired"; readonly email: string };
+
+/**
+ * Connexion refusée (403) parce que l'adresse n'est pas encore vérifiée
+ * (#231) : l'interface propose alors de renvoyer le lien.
+ */
+export class EmailNotVerifiedError extends ApiError {
+  constructor(public readonly email: string) {
+    super(
+      "votre adresse email n'est pas encore vérifiée : ouvrez le lien reçu par email",
+      403,
+    );
+    this.name = "EmailNotVerifiedError";
+  }
+}
+
 /** Identifiants saisis dans le formulaire login/signup. */
 export interface Credentials {
   readonly email: string;
@@ -50,14 +72,25 @@ export async function login(
   creds: Credentials,
   fetchImpl: typeof fetch = fetch,
 ): Promise<TokenPair> {
-  return postCredentials("/auth/login", creds, fetchImpl);
+  const res = await postCredentials("/auth/login", creds, fetchImpl);
+  return parseTokenPair(await res.json());
 }
 
+/**
+ * Crée un compte. Si le serveur exige la vérification de l'adresse (202), il
+ * n'émet aucun jeton : un lien part vers `email` et la connexion attendra.
+ */
 export async function signup(
   creds: Credentials,
   fetchImpl: typeof fetch = fetch,
-): Promise<TokenPair> {
-  return postCredentials("/auth/signup", creds, fetchImpl);
+): Promise<SignupResult> {
+  const res = await postCredentials("/auth/signup", creds, fetchImpl);
+  if (res.status === 202) {
+    const body = ((await res.json().catch(() => null)) ?? {}) as Record<string, unknown>;
+    const email = typeof body["email"] === "string" ? body["email"] : creds.email.trim();
+    return { kind: "verificationRequired", email };
+  }
+  return { kind: "signedIn", tokens: parseTokenPair(await res.json()) };
 }
 
 /** Échange le refresh token contre une nouvelle paire (rotation). */
@@ -289,6 +322,73 @@ export async function resetPassword(
 /** Corps de la réponse 400 du serveur pour un jeton refusé. */
 const INVALID_RESET_LINK = "invalid or expired reset link";
 
+/**
+ * Renvoie un lien de vérification de l'adresse (#231). Le serveur répond 202
+ * que le compte existe ou non (et rien n'est envoyé s'il est déjà vérifié).
+ */
+export async function resendVerification(
+  email: string,
+  fetchImpl: typeof fetch = fetch,
+): Promise<void> {
+  const trimmed = email.trim();
+  if (!EMAIL_RE.test(trimmed)) throw new ApiError("Email invalide.", 400);
+  const res = await postJson("/auth/email/resend", { email: trimmed }, fetchImpl);
+  if (res.status === 400) throw new ApiError("Email invalide.", 400);
+  if (res.status === 429) throw new ApiError(tooManyAttemptsMessage(res), 429);
+  if (res.status === 503) {
+    throw new ApiError(
+      "la vérification de l'email n'est pas activée sur ce serveur",
+      503,
+    );
+  }
+  if (!res.ok) {
+    throw new ApiError(
+      `POST /auth/email/resend a échoué (${res.status})`,
+      res.status,
+    );
+  }
+}
+
+/** Consomme le lien de vérification reçu par email (#231). */
+export async function verifyEmail(
+  token: string,
+  fetchImpl: typeof fetch = fetch,
+): Promise<void> {
+  const res = await postJson("/auth/email/verify", { token }, fetchImpl);
+  if (res.status === 400) {
+    throw new ApiError(
+      "ce lien de vérification est invalide ou expiré : connectez-vous pour en recevoir un nouveau",
+      400,
+    );
+  }
+  if (res.status === 503) {
+    throw new ApiError(
+      "la vérification de l'email n'est pas activée sur ce serveur",
+      503,
+    );
+  }
+  if (!res.ok) {
+    throw new ApiError(
+      `POST /auth/email/verify a échoué (${res.status})`,
+      res.status,
+    );
+  }
+}
+
+/** Préfixe du fragment des liens de vérification (`…/#verify=<jeton>`). */
+export const VERIFY_HASH_PREFIX = "#verify=";
+
+/** Jeton de vérification porté par le fragment de l'URL, ou `null`. */
+export function readVerifyToken(hash: string): string | null {
+  return readHashToken(hash, VERIFY_HASH_PREFIX);
+}
+
+function readHashToken(hash: string, prefix: string): string | null {
+  if (!hash.startsWith(prefix)) return null;
+  const token = hash.slice(prefix.length).trim();
+  return token.length > 0 ? token : null;
+}
+
 /** Préfixe du fragment des liens envoyés par email (`…/#reset=<jeton>`). */
 export const RESET_HASH_PREFIX = "#reset=";
 
@@ -298,9 +398,7 @@ export const RESET_HASH_PREFIX = "#reset=";
  * serveur qui sert le frontend.
  */
 export function readResetToken(hash: string): string | null {
-  if (!hash.startsWith(RESET_HASH_PREFIX)) return null;
-  const token = hash.slice(RESET_HASH_PREFIX.length).trim();
-  return token.length > 0 ? token : null;
+  return readHashToken(hash, RESET_HASH_PREFIX);
 }
 
 /** Récupère le `sub` de l'utilisateur courant via `/auth/whoami`. */
@@ -327,11 +425,15 @@ export async function whoami(
   return m?.[1] ?? text;
 }
 
+/** Corps de la réponse 403 du login pour une adresse non vérifiée (#231). */
+const EMAIL_NOT_VERIFIED = "email not verified";
+
+/** POST login/signup ; renvoie la réponse réussie, lève sinon. */
 async function postCredentials(
   path: string,
   creds: Credentials,
   fetchImpl: typeof fetch,
-): Promise<TokenPair> {
+): Promise<Response> {
   const errors = validateCredentials(creds);
   if (errors.length > 0) {
     throw new ApiError(errors.join(" "), 400);
@@ -345,6 +447,9 @@ async function postCredentials(
     throw new ApiError("email ou mot de passe incorrect", 401);
   }
   if (res.status === 403) {
+    if ((await res.text().catch(() => "")) === EMAIL_NOT_VERIFIED) {
+      throw new EmailNotVerifiedError(creds.email.trim());
+    }
     throw new ApiError("ce compte est suspendu : contactez un administrateur", 403);
   }
   if (res.status === 409) {
@@ -356,7 +461,7 @@ async function postCredentials(
   if (!res.ok) {
     throw new ApiError(`POST ${path} a échoué (${res.status})`, res.status);
   }
-  return parseTokenPair(await res.json());
+  return res;
 }
 
 /**

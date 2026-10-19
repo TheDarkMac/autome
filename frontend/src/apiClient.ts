@@ -44,6 +44,7 @@ export const API_PATHS = {
   adminUserDisable: "/admin/users/{id}/disable",
   adminUserEnable: "/admin/users/{id}/enable",
   adminUserLogoutAll: "/admin/users/{id}/logout-all",
+  adminUserVerifyEmail: "/admin/users/{id}/verify-email",
 } as const;
 
 /** Rôles attribuables par l'administration (#208). */
@@ -106,6 +107,8 @@ export interface ApiClient {
   logoutUser(id: string): Promise<void>;
   /** Efface définitivement un autre compte et ses données (#229). */
   deleteUser(id: string): Promise<void>;
+  /** Marque vérifiée l'adresse email d'un compte (#231). */
+  verifyUserEmail(id: string): Promise<Schemas["AdminUser"]>;
 }
 
 /** `true` si les permissions contiennent `permission` (ou le joker `*`). */
@@ -283,6 +286,14 @@ export function createApiClient(fetchImpl: typeof fetch = fetch): ApiClient {
     },
     deleteUser(id) {
       return requestVoid(fetchImpl, "DELETE", buildPath(API_PATHS.adminUser, { id }));
+    },
+    verifyUserEmail(id) {
+      return requestJson<Schemas["AdminUser"]>(
+        fetchImpl,
+        "POST",
+        buildPath(API_PATHS.adminUserVerifyEmail, { id }),
+        { body: {} },
+      );
     },
   };
 }

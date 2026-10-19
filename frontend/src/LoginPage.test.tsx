@@ -2,7 +2,12 @@ import { describe, expect, it, vi } from "vitest";
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 
 import { ApiError } from "./api";
-import { LoginPage, RESET_REQUESTED_MESSAGE } from "./LoginPage";
+import { EmailNotVerifiedError } from "./auth";
+import {
+  LoginPage,
+  RESET_REQUESTED_MESSAGE,
+  VERIFICATION_RESENT_MESSAGE,
+} from "./LoginPage";
 
 function fill(email: string, password: string): void {
   fireEvent.change(screen.getByLabelText("Email"), { target: { value: email } });
@@ -156,5 +161,61 @@ describe("<LoginPage />", () => {
       );
       expect(screen.getByRole("status")).toHaveTextContent("Mot de passe réinitialisé");
     });
+  });
+});
+
+describe("<LoginPage /> — vérification de l'email (#231)", () => {
+  it("après une inscription à vérifier, invite à ouvrir le lien et le renvoie", async () => {
+    const signup = vi.fn().mockResolvedValue({ email: "new@b.io" });
+    const resendVerification = vi.fn().mockResolvedValue(undefined);
+    render(
+      <LoginPage login={vi.fn()} signup={signup} resendVerification={resendVerification} />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Créer un compte" }));
+    fill("New@b.io", "longenough");
+    fireEvent.click(screen.getByRole("button", { name: "Créer le compte" }));
+
+    const notice = await screen.findByRole("region", { name: "Vérification de l'email" });
+    expect(notice).toHaveTextContent("Votre compte est créé.");
+    expect(notice).toHaveTextContent("new@b.io");
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Renvoyer le lien" }));
+    });
+    expect(resendVerification).toHaveBeenCalledWith("new@b.io");
+    expect(screen.getByRole("status")).toHaveTextContent(VERIFICATION_RESENT_MESSAGE);
+
+    fireEvent.click(screen.getByRole("button", { name: "Retour à la connexion" }));
+    expect(screen.getByRole("form", { name: "Connexion" })).toBeInTheDocument();
+  });
+
+  it("une connexion refusée faute de vérification mène au même écran", async () => {
+    const login = vi.fn().mockRejectedValue(new EmailNotVerifiedError("a@b.io"));
+    const resendVerification = vi
+      .fn()
+      .mockRejectedValue(new ApiError("trop de tentatives : réessayez dans 5 min", 429));
+    render(
+      <LoginPage login={login} signup={vi.fn()} resendVerification={resendVerification} />,
+    );
+    fill("a@b.io", "longenough");
+    fireEvent.click(screen.getByRole("button", { name: "Se connecter" }));
+
+    expect(
+      await screen.findByRole("region", { name: "Vérification de l'email" }),
+    ).toHaveTextContent("Votre adresse n'est pas encore vérifiée.");
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Renvoyer le lien" }));
+    });
+    expect(screen.getByRole("alert")).toHaveTextContent("réessayez dans 5 min");
+  });
+
+  it("une inscription connectée d'emblée ne montre pas l'écran", async () => {
+    const signup = vi.fn().mockResolvedValue(null);
+    render(<LoginPage login={vi.fn()} signup={signup} />);
+    fireEvent.click(screen.getByRole("button", { name: "Créer un compte" }));
+    fill("new@b.io", "longenough");
+    fireEvent.click(screen.getByRole("button", { name: "Créer le compte" }));
+    await waitFor(() => expect(signup).toHaveBeenCalled());
+    expect(screen.queryByRole("region", { name: "Vérification de l'email" })).toBeNull();
   });
 });

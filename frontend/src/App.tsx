@@ -11,8 +11,11 @@ import { AccountPanel } from "./AccountPanel";
 import { AdminPanel } from "./AdminPanel";
 import {
   readResetToken,
+  readVerifyToken,
   requestPasswordReset as apiRequestPasswordReset,
+  resendVerification as apiResendVerification,
   resetPassword as apiResetPassword,
+  verifyEmail as apiVerifyEmail,
 } from "./auth";
 import { ConnectorsPanel } from "./ConnectorsPanel";
 import type { CanvasNode, WireGraph } from "./graph";
@@ -31,6 +34,7 @@ import {
 } from "./runs";
 import { useRunPolling } from "./useRunPolling";
 import { useSession, type UseSessionOptions } from "./useSession";
+import { VerifyEmailPage } from "./VerifyEmailPage";
 import {
   lastWorkflowKey,
   useWorkflowEditor,
@@ -53,6 +57,10 @@ export interface AppProps {
   requestPasswordResetImpl?: typeof apiRequestPasswordReset;
   /** Réinitialisation par jeton (#204), injectable pour les tests. */
   resetPasswordImpl?: typeof apiResetPassword;
+  /** Vérification de l'adresse par jeton (#231), injectable pour les tests. */
+  verifyEmailImpl?: typeof apiVerifyEmail;
+  /** Renvoi du lien de vérification (#231), injectable pour les tests. */
+  resendVerificationImpl?: typeof apiResendVerification;
   /** Options du workflow ouvert (#225), injectables pour les tests. */
   editorOptions?: UseWorkflowEditorOptions;
 }
@@ -61,6 +69,8 @@ export function App({
   sessionOptions,
   requestPasswordResetImpl = apiRequestPasswordReset,
   resetPasswordImpl = apiResetPassword,
+  verifyEmailImpl = apiVerifyEmail,
+  resendVerificationImpl = apiResendVerification,
   editorOptions,
 }: AppProps = {}): JSX.Element {
   const {
@@ -76,31 +86,41 @@ export function App({
   } = useSession(sessionOptions);
   const [logoutAllError, setLogoutAllError] = useState<string | null>(null);
 
-  // Lien de réinitialisation (#204) : jeton lu une fois dans le fragment,
-  // puis retiré de la barre d'adresse (et de l'historique).
+  // Liens reçus par email — réinitialisation (#204), vérification de
+  // l'adresse (#231) : jeton lu une fois dans le fragment, puis retiré de la
+  // barre d'adresse (et de l'historique).
   const [resetToken, setResetToken] = useState<string | null>(() =>
     readResetToken(window.location.hash),
+  );
+  const [verifyToken, setVerifyToken] = useState<string | null>(() =>
+    readVerifyToken(window.location.hash),
   );
   const [loginNotice, setLoginNotice] = useState<string | null>(null);
   // Lien collé dans un onglet où l'app est déjà ouverte : seul le fragment
   // change, sans rechargement.
   useEffect(() => {
     const onHashChange = (): void => {
-      const token = readResetToken(window.location.hash);
-      if (token) setResetToken(token);
+      const reset = readResetToken(window.location.hash);
+      if (reset) setResetToken(reset);
+      const verify = readVerifyToken(window.location.hash);
+      if (verify) setVerifyToken(verify);
     };
     window.addEventListener("hashchange", onHashChange);
     return () => window.removeEventListener("hashchange", onHashChange);
   }, []);
   useEffect(() => {
-    if (resetToken) {
+    if (resetToken || verifyToken) {
       window.history.replaceState(
         null,
         "",
         window.location.pathname + window.location.search,
       );
     }
-  }, [resetToken]);
+  }, [resetToken, verifyToken]);
+  const onVerifyDone = useCallback(() => {
+    setVerifyToken(null);
+    setLoginNotice("Adresse email vérifiée : vous pouvez vous connecter.");
+  }, []);
   const onResetDone = useCallback(() => {
     setResetToken(null);
     setLoginNotice(
@@ -286,11 +306,22 @@ export function App({
       />
     );
   }
+  if (verifyToken) {
+    return (
+      <VerifyEmailPage
+        token={verifyToken}
+        verifyEmail={verifyEmailImpl}
+        onDone={onVerifyDone}
+        onCancel={() => setVerifyToken(null)}
+      />
+    );
+  }
   if (!session) {
     return (
       <LoginPage
         login={login}
         signup={signup}
+        resendVerification={(email) => resendVerificationImpl(email)}
         requestPasswordReset={(email) => requestPasswordResetImpl(email)}
         notice={loginNotice}
       />

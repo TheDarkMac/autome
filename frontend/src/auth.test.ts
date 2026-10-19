@@ -5,18 +5,22 @@ import {
   changePassword,
   decodeJwt,
   deleteAccount,
+  EmailNotVerifiedError,
   isTokenExpired,
   login,
   logout,
   logoutAll,
   readResetToken,
+  readVerifyToken,
   refresh,
   requestPasswordReset,
+  resendVerification,
   resetPassword,
   signup,
   tokenExpiresAtMs,
   validateCredentials,
   validatePasswordReset,
+  verifyEmail,
   whoami,
   type TokenPair,
 } from "./auth";
@@ -454,5 +458,79 @@ describe("whoami", () => {
     await expect(whoami("a.b.c", fetchImpl)).rejects.toMatchObject({
       status: 401,
     });
+  });
+});
+
+describe("vérification de l'email (#231)", () => {
+  it("signup 201 ouvre la session, 202 attend la vérification sans jetons", async () => {
+    const signedIn = await signup(
+      { email: "a@b.io", password: "longenough" },
+      vi.fn().mockResolvedValue(jsonResponse(TOKENS, 201)),
+    );
+    expect(signedIn).toEqual({
+      kind: "signedIn",
+      tokens: { accessToken: "a.b.c", refreshToken: "d.e.f" },
+    });
+    const pending = await signup(
+      { email: " A@b.io ", password: "longenough" },
+      vi
+        .fn()
+        .mockResolvedValue(
+          jsonResponse({ email: "a@b.io", verification_required: true }, 202),
+        ),
+    );
+    expect(pending).toEqual({ kind: "verificationRequired", email: "a@b.io" });
+  });
+
+  it("distingue au login l'adresse non vérifiée du compte suspendu", async () => {
+    const call = (body: string) =>
+      login(
+        { email: " a@b.io ", password: "longenough" },
+        vi.fn().mockResolvedValue(new Response(body, { status: 403 })),
+      );
+    const err = await call("email not verified").catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(EmailNotVerifiedError);
+    expect(err).toMatchObject({ status: 403, email: "a@b.io", message: /pas encore vérifiée/ });
+    await expect(call("account disabled")).rejects.toMatchObject({
+      status: 403,
+      message: /suspendu/,
+    });
+  });
+
+  it("resendVerification POST /auth/email/resend et traduit 429 et 503", async () => {
+    const fetchImpl = vi.fn().mockResolvedValue(new Response(null, { status: 202 }));
+    await resendVerification(" a@b.io ", fetchImpl);
+    const [url, init] = fetchImpl.mock.calls[0]!;
+    expect(url).toMatch(/\/auth\/email\/resend$/);
+    expect(JSON.parse(init.body)).toEqual({ email: "a@b.io" });
+
+    const call = (res: Response) => resendVerification("a@b.io", vi.fn().mockResolvedValue(res));
+    await expect(
+      call(new Response("", { status: 429, headers: { "Retry-After": "60" } })),
+    ).rejects.toMatchObject({ status: 429, message: /1 min/ });
+    await expect(call(new Response("", { status: 503 }))).rejects.toMatchObject({
+      status: 503,
+    });
+    await expect(resendVerification("pas-une-adresse", vi.fn())).rejects.toMatchObject({
+      status: 400,
+    });
+  });
+
+  it("verifyEmail envoie le jeton ; un lien refusé est expliqué", async () => {
+    const fetchImpl = vi.fn().mockResolvedValue(new Response(null, { status: 204 }));
+    await verifyEmail("uid.1.mac", fetchImpl);
+    const [url, init] = fetchImpl.mock.calls[0]!;
+    expect(url).toMatch(/\/auth\/email\/verify$/);
+    expect(JSON.parse(init.body)).toEqual({ token: "uid.1.mac" });
+    await expect(
+      verifyEmail("x", vi.fn().mockResolvedValue(new Response("", { status: 400 }))),
+    ).rejects.toMatchObject({ status: 400, message: /invalide ou expiré/ });
+  });
+
+  it("lit le jeton du fragment #verify=", () => {
+    expect(readVerifyToken("#verify=uid.1.mac")).toBe("uid.1.mac");
+    expect(readVerifyToken("#verify=")).toBeNull();
+    expect(readVerifyToken("#reset=uid.1.mac")).toBeNull();
+    expect(readResetToken("#verify=uid.1.mac")).toBeNull();
   });
 });

@@ -1,7 +1,11 @@
-// Page de connexion / inscription (F8.6.a) et demande de lien de
-// réinitialisation du mot de passe (#204).
+// Page de connexion / inscription (F8.6.a), demande de lien de
+// réinitialisation du mot de passe (#204) et attente de la vérification de
+// l'adresse (#231).
 //
 // Formulaire unique avec bascule login ↔ signup ↔ « mot de passe oublié ».
+// Une inscription qui exige la vérification de l'adresse, ou une connexion
+// refusée faute de vérification, mène à l'écran « vérifiez votre boîte »
+// (renvoi du lien possible).
 // La validation client (`validateCredentials`) évite les allers-retours
 // inutiles ; les erreurs serveur (401/409/…) remontent via
 // `ApiError.message`. Découplé du hook : reçoit `login`/`signup` (et
@@ -9,13 +13,24 @@
 
 import { useState, type FormEvent } from "react";
 
-import { validateCredentials, type Credentials } from "./auth";
+import {
+  EmailNotVerifiedError,
+  validateCredentials,
+  type Credentials,
+} from "./auth";
+import type { PendingVerification } from "./useSession";
 
-type Mode = "login" | "signup" | "forgot";
+type Mode = "login" | "signup" | "forgot" | "verify";
+
+/** Pourquoi l'écran de vérification est affiché. */
+type VerifyReason = "signup" | "login";
 
 export interface LoginPageProps {
   login: (creds: Credentials) => Promise<void>;
-  signup: (creds: Credentials) => Promise<void>;
+  /** Inscription ; une adresse renvoyée ⇒ à vérifier avant connexion (#231). */
+  signup: (creds: Credentials) => Promise<PendingVerification | null | void>;
+  /** Renvoi du lien de vérification (#231) ; absent ⇒ pas de bouton. */
+  resendVerification?: (email: string) => Promise<void>;
   /** Demande d'un lien de réinitialisation ; absent ⇒ pas de lien « oublié ». */
   requestPasswordReset?: (email: string) => Promise<void>;
   /** Information affichée au-dessus du formulaire (ex. après réinitialisation). */
@@ -28,9 +43,14 @@ export interface LoginPageProps {
 export const RESET_REQUESTED_MESSAGE =
   "Si un compte correspond à cette adresse, un email contenant un lien de réinitialisation vient d'être envoyé. Le lien est valable 30 minutes.";
 
+/** Confirmation d'un renvoi : identique que le compte attende ou non (#231). */
+export const VERIFICATION_RESENT_MESSAGE =
+  "Si ce compte attend encore sa vérification, un nouveau lien vient d'être envoyé. Il est valable 24 heures.";
+
 export function LoginPage({
   login,
   signup,
+  resendVerification,
   requestPasswordReset,
   notice = null,
   initialMode = "login",
@@ -41,8 +61,27 @@ export function LoginPage({
   const [error, setError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const [resetRequested, setResetRequested] = useState(false);
+  const [pending, setPending] = useState<{ email: string; reason: VerifyReason } | null>(
+    null,
+  );
 
   const isSignup = mode === "signup";
+
+  if (mode === "verify" && pending) {
+    return (
+      <VerifyEmailNotice
+        email={pending.email}
+        reason={pending.reason}
+        resendVerification={resendVerification}
+        onBack={() => {
+          setMode("login");
+          setPending(null);
+          setPassword("");
+          setError(null);
+        }}
+      />
+    );
+  }
 
   if (mode === "forgot" && requestPasswordReset) {
     return (
@@ -74,9 +113,22 @@ export function LoginPage({
     }
     setSubmitting(true);
     try {
-      await (isSignup ? signup(creds) : login(creds));
+      if (isSignup) {
+        const awaiting = await signup(creds);
+        if (awaiting) {
+          setPending({ email: awaiting.email, reason: "signup" });
+          setMode("verify");
+        }
+      } else {
+        await login(creds);
+      }
       // Succès : le parent (App) re-rend hors de la page de login.
     } catch (err) {
+      if (err instanceof EmailNotVerifiedError) {
+        setPending({ email: err.email, reason: "login" });
+        setMode("verify");
+        return;
+      }
       setError(err instanceof Error ? err.message : "Échec de l'authentification.");
     } finally {
       setSubmitting(false);
@@ -177,6 +229,96 @@ export function LoginPage({
           </button>
         </p>
       </form>
+    </main>
+  );
+}
+
+/** Attente de la vérification de l'adresse, avec renvoi du lien (#231). */
+function VerifyEmailNotice({
+  email,
+  reason,
+  resendVerification,
+  onBack,
+}: {
+  email: string;
+  reason: VerifyReason;
+  resendVerification?: ((email: string) => Promise<void>) | undefined;
+  onBack: () => void;
+}): JSX.Element {
+  const [error, setError] = useState<string | null>(null);
+  const [sending, setSending] = useState(false);
+  const [resent, setResent] = useState(false);
+
+  async function resend(): Promise<void> {
+    if (!resendVerification) return;
+    setError(null);
+    setSending(true);
+    try {
+      await resendVerification(email);
+      setResent(true);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Échec du renvoi.");
+    } finally {
+      setSending(false);
+    }
+  }
+
+  return (
+    <main className="flex min-h-screen items-center justify-center bg-neutral-50 px-4">
+      <section
+        aria-label="Vérification de l'email"
+        className="w-full max-w-sm rounded-xl border border-neutral-200 bg-white p-8 shadow-sm"
+      >
+        <h1 className="text-lg font-semibold text-neutral-900">
+          Vérifiez votre boîte email
+        </h1>
+        <p className="mt-3 text-sm text-neutral-600">
+          {reason === "signup"
+            ? "Votre compte est créé. "
+            : "Votre adresse n'est pas encore vérifiée. "}
+          Un lien de confirmation a été envoyé à{" "}
+          <strong className="font-medium text-neutral-900">{email}</strong>.
+          Ouvrez-le (il est valable 24 heures), puis connectez-vous.
+        </p>
+
+        {resent && (
+          <p
+            role="status"
+            className="mt-4 rounded-md bg-emerald-50 px-3 py-2 text-sm text-emerald-800"
+          >
+            {VERIFICATION_RESENT_MESSAGE}
+          </p>
+        )}
+        {error && (
+          <p
+            role="alert"
+            className="mt-4 rounded-md bg-rose-50 px-3 py-2 text-sm text-rose-700"
+          >
+            {error}
+          </p>
+        )}
+
+        {resendVerification && (
+          <button
+            type="button"
+            onClick={() => void resend()}
+            disabled={sending}
+            className="mt-6 w-full rounded-md border border-neutral-300 bg-white px-4 py-2 text-sm font-medium text-neutral-900 transition hover:bg-neutral-50 disabled:opacity-50"
+          >
+            {sending ? "Envoi…" : "Renvoyer le lien"}
+          </button>
+        )}
+
+        <p className="mt-4 text-center text-sm text-neutral-500">
+          <button
+            type="button"
+            onClick={onBack}
+            className="font-medium text-sky-700 hover:underline"
+          >
+            Retour à la connexion
+          </button>
+        </p>
+      </section>
     </main>
   );
 }

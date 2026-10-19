@@ -88,6 +88,20 @@ describe("<App />", () => {
     expect(resetPasswordImpl).toHaveBeenCalledWith("uid.1.mac", "new-password");
   });
 
+  it("vérifie l'adresse depuis le lien #verify= puis revient à la connexion (#231)", async () => {
+    globalThis.fetch = vi.fn().mockResolvedValue(jsonResponse(sampleSpec)) as typeof fetch;
+    window.history.replaceState(null, "", "/#verify=uid.1.mac");
+    const verifyEmailImpl = vi.fn().mockResolvedValue(undefined);
+    render(
+      <App sessionOptions={{ store: memorySessionStore() }} verifyEmailImpl={verifyEmailImpl} />,
+    );
+    expect(await screen.findByRole("form", { name: "Connexion" })).toBeInTheDocument();
+    expect(screen.getByRole("status")).toHaveTextContent(/Adresse email vérifiée/);
+    expect(verifyEmailImpl).toHaveBeenCalledWith("uid.1.mac");
+    // Le jeton quitte la barre d'adresse.
+    expect(window.location.hash).toBe("");
+  });
+
   it("réagit à un lien #reset= collé dans l'onglet déjà ouvert (#204)", async () => {
     globalThis.fetch = vi.fn().mockResolvedValue(jsonResponse(sampleSpec)) as typeof fetch;
     window.history.replaceState(null, "", "/");
