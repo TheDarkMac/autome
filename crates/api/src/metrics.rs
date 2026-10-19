@@ -19,6 +19,10 @@ use std::fmt::Write as _;
 use std::sync::Mutex;
 use std::time::Instant;
 
+use autome_core::prometheus::{
+    escape_label as escape, write_header, Histogram, CONTENT_TYPE, DEFAULT_BUCKETS,
+};
+
 use axum::{
     body::Body,
     extract::{MatchedPath, State},
@@ -28,46 +32,6 @@ use axum::{
     routing::get,
     Router,
 };
-
-/// Bornes supérieures (`le`) des buckets du histogram de latence, en secondes.
-/// Reprend les buckets par défaut de Prometheus (`prometheus.DefBuckets`).
-const BUCKETS: &[f64] = &[
-    0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
-];
-
-/// Histogram cumulatif sur les bornes [`BUCKETS`].
-///
-/// `le_counts[i]` compte les observations `<= BUCKETS[i]` (déjà cumulatif :
-/// chaque observation incrémente tous les buckets qui la couvrent). `count`
-/// est le total (équivaut au bucket `+Inf`) et `sum` la somme des valeurs.
-#[derive(Clone)]
-struct Histogram {
-    le_counts: Vec<u64>,
-    count: u64,
-    sum: f64,
-}
-
-impl Default for Histogram {
-    fn default() -> Self {
-        Self {
-            le_counts: vec![0; BUCKETS.len()],
-            count: 0,
-            sum: 0.0,
-        }
-    }
-}
-
-impl Histogram {
-    fn observe(&mut self, value: f64) {
-        for (i, &bound) in BUCKETS.iter().enumerate() {
-            if value <= bound {
-                self.le_counts[i] += 1;
-            }
-        }
-        self.count += 1;
-        self.sum += value;
-    }
-}
 
 #[derive(Default)]
 struct Inner {
@@ -113,7 +77,7 @@ impl Metrics {
         inner
             .durations
             .entry((method.to_owned(), path.to_owned()))
-            .or_default()
+            .or_insert_with(|| Histogram::new(DEFAULT_BUCKETS))
             .observe(duration_secs);
     }
 
@@ -123,13 +87,21 @@ impl Metrics {
         let mut out = String::new();
 
         // Gauge in-flight.
-        out.push_str("# HELP autome_http_requests_in_flight In-flight HTTP requests.\n");
-        out.push_str("# TYPE autome_http_requests_in_flight gauge\n");
+        write_header(
+            &mut out,
+            "autome_http_requests_in_flight",
+            "gauge",
+            "In-flight HTTP requests.",
+        );
         let _ = writeln!(out, "autome_http_requests_in_flight {}", inner.in_flight);
 
         // Counter total.
-        out.push_str("# HELP autome_http_requests_total Total number of HTTP requests.\n");
-        out.push_str("# TYPE autome_http_requests_total counter\n");
+        write_header(
+            &mut out,
+            "autome_http_requests_total",
+            "counter",
+            "Total number of HTTP requests.",
+        );
         for ((method, path, status), count) in &inner.requests {
             let _ = writeln!(
                 out,
@@ -142,70 +114,18 @@ impl Metrics {
         }
 
         // Histogram latence.
-        out.push_str(
-            "# HELP autome_http_request_duration_seconds HTTP request latency in seconds.\n",
+        write_header(
+            &mut out,
+            "autome_http_request_duration_seconds",
+            "histogram",
+            "HTTP request latency in seconds.",
         );
-        out.push_str("# TYPE autome_http_request_duration_seconds histogram\n");
         for ((method, path), hist) in &inner.durations {
-            let (m, p) = (escape(method), escape(path));
-            for (i, &bound) in BUCKETS.iter().enumerate() {
-                let _ = writeln!(
-                    out,
-                    "autome_http_request_duration_seconds_bucket{{method=\"{}\",path=\"{}\",le=\"{}\"}} {}",
-                    m,
-                    p,
-                    fmt_f64(bound),
-                    hist.le_counts[i]
-                );
-            }
-            let _ = writeln!(
-                out,
-                "autome_http_request_duration_seconds_bucket{{method=\"{}\",path=\"{}\",le=\"+Inf\"}} {}",
-                m, p, hist.count
-            );
-            let _ = writeln!(
-                out,
-                "autome_http_request_duration_seconds_sum{{method=\"{}\",path=\"{}\"}} {}",
-                m,
-                p,
-                fmt_f64(hist.sum)
-            );
-            let _ = writeln!(
-                out,
-                "autome_http_request_duration_seconds_count{{method=\"{}\",path=\"{}\"}} {}",
-                m, p, hist.count
-            );
+            let labels = format!("method=\"{}\",path=\"{}\"", escape(method), escape(path));
+            hist.write(&mut out, "autome_http_request_duration_seconds", &labels);
         }
 
         out
-    }
-}
-
-/// Échappe une valeur de label selon le format Prometheus : `\`, `"` et saut
-/// de ligne. Les labels du projet n'en contiennent normalement pas, mais le
-/// rendu doit rester valide quoi qu'il arrive.
-fn escape(value: &str) -> String {
-    let mut out = String::with_capacity(value.len());
-    for c in value.chars() {
-        match c {
-            '\\' => out.push_str("\\\\"),
-            '"' => out.push_str("\\\""),
-            '\n' => out.push_str("\\n"),
-            _ => out.push(c),
-        }
-    }
-    out
-}
-
-/// Formate un flottant sans notation scientifique ni `.0` superflu
-/// (`1.0` → `1`, `0.005` → `0.005`), conforme aux valeurs `le` Prometheus.
-fn fmt_f64(v: f64) -> String {
-    if v.fract() == 0.0 && v.is_finite() {
-        format!("{}", v as i64)
-    } else {
-        let s = format!("{v:.6}");
-        let trimmed = s.trim_end_matches('0').trim_end_matches('.');
-        trimmed.to_owned()
     }
 }
 
@@ -236,13 +156,7 @@ pub async fn track_metrics(
 
 /// Handler de la route d'exposition.
 async fn render_handler(State(metrics): State<std::sync::Arc<Metrics>>) -> impl IntoResponse {
-    (
-        [(
-            header::CONTENT_TYPE,
-            "text/plain; version=0.0.4; charset=utf-8",
-        )],
-        metrics.render(),
-    )
+    ([(header::CONTENT_TYPE, CONTENT_TYPE)], metrics.render())
 }
 
 /// Sous-router exposant `GET /metrics` (à merger au niveau racine).
@@ -332,14 +246,6 @@ mod tests {
         m.record("GET", "/a\"b\\c", 200, 0.01);
         let out = m.render();
         assert!(out.contains("path=\"/a\\\"b\\\\c\""));
-    }
-
-    #[test]
-    fn fmt_f64_drops_trailing_zeros() {
-        assert_eq!(fmt_f64(1.0), "1");
-        assert_eq!(fmt_f64(0.005), "0.005");
-        assert_eq!(fmt_f64(2.5), "2.5");
-        assert_eq!(fmt_f64(0.202), "0.202");
     }
 
     #[tokio::test]
