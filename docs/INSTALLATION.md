@@ -56,7 +56,8 @@ cp .env.example .env
 | `AUTOME_WORKER_CONCURRENCY` | Worker : tâches consommatrices par process | `4` | selon charge |
 | `AUTOME_RUN_TIMEOUT_SECS` | Worker : au-delà, un run encore `running` est clos en `failed` (min. 60) | `3600` | > durée du plus long run |
 | `AUTOME_SCHEDULER_TICK_SECS` | Worker : période de la boucle des déclencheurs `schedule` / `polling` (s, `0` = désactivée) | `10` | `10` |
-| `AUTOME_SMTP_URL` | Relais SMTP des emails (mot de passe oublié) : `smtps://user:pass@hôte` (TLS, 465) ou `smtp://hôte:587?tls=required` (STARTTLS). Contient un mot de passe : à mettre dans un secret | *(non défini : liens journalisés en `dev`)* | **requis pour le mot de passe oublié** (sinon 503) |
+| `AUTOME_SMTP_URL` | Relais SMTP des emails (mot de passe oublié, vérification de l'adresse) : `smtps://user:pass@hôte` (TLS, 465) ou `smtp://hôte:587?tls=required` (STARTTLS). Contient un mot de passe : à mettre dans un secret | *(non défini : liens journalisés en `dev`)* | **requis pour le mot de passe oublié** (sinon 503) et la vérification de l'email (sinon comptes créés vérifiés) |
+| `AUTOME_EMAIL_VERIFICATION` | `required` : un compte inscrit ne se connecte qu'après avoir ouvert le lien reçu par email (dès qu'un envoi d'email est possible) ; `off` : comptes créés vérifiés (#231) | `required` | `required` |
 | `AUTOME_MAIL_FROM` | Expéditeur des emails, ex. `Autome <no-reply@exemple.fr>` | *(non défini)* | obligatoire avec `AUTOME_SMTP_URL` |
 | `AUTOME_CORS_ORIGINS` | Origines du **frontend** autorisées à appeler l'API depuis le navigateur (`scheme://hôte[:port]`, séparées par des virgules ; ni joker, ni chemin — refus de démarrer sinon). Vide = aucune | `http://localhost:5173,http://localhost:8081` | **obligatoire** si le frontend est servi sur une autre origine que l'API |
 | `AUTOME_PUBLIC_URL` | URL publique du **frontend**, base des liens envoyés par email (jamais déduite de l'en-tête `Host`) | `http://localhost:5173` | obligatoire avec `AUTOME_SMTP_URL` |
@@ -543,14 +544,16 @@ comptes sont publics ; tout le reste exige `Authorization: Bearer <access_token>
 
 | Méthode | Path | Body | Réponse |
 |---|---|---|---|
-| POST | `/auth/signup` | `{"email","password"}` | 201 + paire de jetons · 400 saisie invalide · 409 email déjà pris |
-| POST | `/auth/login` | `{"email","password"}` | 200 + paire de jetons · 401 identifiants invalides · 403 compte suspendu · 429 trop d'échecs (`Retry-After`) |
+| POST | `/auth/signup` | `{"email","password"}` | 201 + paire de jetons (vérification désactivée) · 202 `{"email","verification_required":true}` sans jetons, lien de vérification envoyé · 400 saisie invalide · 409 email déjà pris |
+| POST | `/auth/login` | `{"email","password"}` | 200 + paire de jetons · 401 identifiants invalides · 403 `account disabled` (compte suspendu) ou `email not verified` · 429 trop d'échecs (`Retry-After`) |
 | POST | `/auth/refresh` | `{"refresh_token"}` | 200 + nouvelle paire · 401 refresh invalide, expiré ou déjà utilisé |
 | POST | `/auth/logout` | `{"refresh_token"}` (+ `Authorization: Bearer <access_token>` facultatif) | 204 session fermée (aussi si déjà fermée) · 401 refresh invalide ou expiré |
 | POST | `/auth/logout-all` | — (`Authorization: Bearer <access_token>` requis) | 204 toutes les sessions fermées · 401 access absent, invalide ou déjà révoqué |
 | POST | `/auth/password` | `{"current_password","new_password"}` (Bearer requis) | 200 + nouvelle paire · 400 nouveau mot de passe invalide ou identique · 403 mot de passe actuel incorrect · 409 changé entre-temps · 429 trop d'essais |
 | POST | `/auth/password/forgot` | `{"email"}` | 202 demande prise en compte (que le compte existe ou non) · 400 email invalide · 429 trop de demandes · 503 aucun envoi d'email configuré |
 | POST | `/auth/password/reset` | `{"token","new_password"}` | 204 mot de passe remplacé, sessions fermées · 400 lien invalide, expiré ou déjà utilisé, ou mot de passe invalide · 503 non configuré |
+| POST | `/auth/email/verify` | `{"token"}` | 204 adresse vérifiée · 400 lien invalide ou expiré · 503 vérification désactivée |
+| POST | `/auth/email/resend` | `{"email"}` | 202 demande prise en compte (que le compte existe ou non) · 400 email invalide · 429 trop de demandes · 503 vérification désactivée |
 | GET | `/auth/me` | — (Bearer requis) | 200 `{"id","email","role","permissions"}` · 401 session invalide ou compte suspendu |
 | DELETE | `/auth/me` | `{"current_password"}` (Bearer requis) | 204 compte et données effacés, sessions fermées · 401 session invalide ou compte suspendu · 403 mot de passe actuel incorrect · 409 compte administrateur (`*`) · 429 trop d'essais |
 
@@ -619,6 +622,29 @@ comptes sont publics ; tout le reste exige `Authorization: Bearer <access_token>
   compris — est écrit dans les journaux de l'API
   (`docker compose logs api | grep reset=`) ; en `prod`, la fonction est
   désactivée (503) et le frontend affiche « pas disponible sur ce serveur ».
+- **Vérification de l'email** (#231) : dès qu'un envoi d'email est possible
+  (SMTP, ou journal en `dev`) et sauf `AUTOME_EMAIL_VERIFICATION=off`,
+  `/auth/signup` crée un compte **non vérifié**, lui envoie en tâche de fond un
+  lien `AUTOME_PUBLIC_URL/#verify=<jeton>` et répond **202 sans jetons** ; le
+  frontend affiche « Vérifiez votre boîte email ». Tant que le lien n'est pas
+  ouvert, la connexion répond **403 `email not verified`** — seulement avec le
+  bon mot de passe, sinon 401 comme d'habitude. Le jeton est sans état, comme
+  celui du mot de passe oublié, mais sous une clé distincte (un lien de
+  réinitialisation n'est jamais pris pour un lien de vérification) et lié à
+  l'**email** du compte ; il vaut **24 h** et reste accepté s'il est rouvert.
+  `/auth/email/resend` renvoie un lien : toujours 202 (aucun email si le compte
+  n'existe pas, est déjà vérifié ou suspendu), 3 demandes par adresse et
+  `AUTOME_VERIFY_IP_MAX_ATTEMPTS` (défaut 10) par IP et par fenêtre de 15 min.
+  Une **réinitialisation du mot de passe** réussie vérifie aussi l'adresse :
+  elle prouve la même possession de la boîte, si bien qu'une adresse
+  « réservée » par un tiers qui ne la possède pas se récupère par « Mot de
+  passe oublié ». Les comptes antérieurs à la migration `0020` sont tenus pour
+  vérifiés. Sans envoi d'email possible (`prod` sans SMTP), les comptes sont
+  créés vérifiés et les deux routes répondent 503. En `dev` sans SMTP (cas de
+  compose), le lien est dans les journaux (`docker compose logs api | grep
+  verify=`) ou l'adresse se vérifie depuis l'infrastructure :
+  `docker compose exec api autome-api verify-email <email>`. Audit
+  `auth.email_verify_request` / `auth.email_verify`.
 - Mot de passe : 8 à 1024 caractères, haché en **Argon2id**. L'email est
   normalisé (trim + minuscules).
 - Un compte créé par `signup` reçoit le rôle **editor** (CRUD workflows, runs,
@@ -638,7 +664,8 @@ comptes sont publics ; tout le reste exige `Authorization: Bearer <access_token>
   15 min : au plus `AUTOME_LOGIN_IP_MAX_ATTEMPTS` (défaut 50) échecs de
   connexion — une connexion réussie ne compte pas, pour les bureaux derrière un
   même NAT —, `AUTOME_SIGNUP_IP_MAX_ATTEMPTS` (défaut 10) inscriptions et
-  `AUTOME_RESET_IP_MAX_ATTEMPTS` (défaut 10) demandes de réinitialisation ;
+  `AUTOME_RESET_IP_MAX_ATTEMPTS` (défaut 10) demandes de réinitialisation et
+  `AUTOME_VERIFY_IP_MAX_ATTEMPTS` (défaut 10) renvois du lien de vérification ;
   au-delà, 429 + `Retry-After`. `0` désactive un quota. Les IPv6 sont comptées
   par préfixe `/64`. Compteurs partagés entre répliques comme celui des emails.
 - **IP réelle derrière un proxy** : `X-Forwarded-For` n'est lu que si la
@@ -697,9 +724,10 @@ Onglet « Administration » du frontend, visible des seuls comptes qui détienne
 | POST | `/admin/users/{id}/disable` | — | 200 compte suspendu, sessions fermées · 403 · 404 · 409 son propre compte |
 | POST | `/admin/users/{id}/enable` | — | 200 compte réactivé · 403 · 404 |
 | POST | `/admin/users/{id}/logout-all` | — | 204 sessions du compte fermées · 403 · 404 |
+| POST | `/admin/users/{id}/verify-email` | — | 200 compte, adresse vérifiée · 403 · 404 |
 | DELETE | `/admin/users/{id}` | — | 204 compte et données effacés · 403 · 404 · 409 son propre compte |
 
-Un compte vaut `{"id","email","role","permissions","disabled","created_at_ms"}`
+Un compte vaut `{"id","email","role","permissions","disabled","email_verified","created_at_ms"}`
 (jamais le hash du mot de passe). Règles :
 
 - Le **rôle** n'est qu'une vue des permissions : `admin` = `*`, `editor` et
@@ -724,10 +752,15 @@ Un compte vaut `{"id","email","role","permissions","disabled","created_at_ms"}`
   compte et toutes ses données sont effacés (voir « Suppression de compte
   (droit à l'effacement) »), par exemple pour une demande reçue hors de
   l'application. Bouton « Supprimer » de l'onglet, confirmé.
+- **Vérification de l'email** (#231) : à la place du titulaire (lien perdu,
+  envoi d'emails en panne), l'adresse actuelle du compte est marquée vérifiée
+  et sa connexion devient possible. Badge « Email non vérifié » et bouton
+  « Vérifier l'email » de l'onglet, confirmé — à réserver aux adresses dont on
+  sait qu'elles appartiennent au titulaire.
 - Chaque action est auditée sous l'administrateur, ressource = compte visé :
   `admin.users_list`, `admin.user_get`, `admin.user_role` (avec `from`/`to`),
   `admin.user_disable`, `admin.user_enable`, `admin.user_logout_all`,
-  `admin.user_delete` (ressource = pseudonyme du compte effacé, avec le nombre
+  `admin.user_verify_email`, `admin.user_delete` (ressource = pseudonyme du compte effacé, avec le nombre
   de workflows, runs et tokens supprimés) ; les refus (403/409) sont audités
   `Denied`.
 - Pas de création de compte par un administrateur : un compte s'inscrit
@@ -745,10 +778,15 @@ docker compose exec api autome-api promote-admin admin@example.com
 kubectl -n autome exec deploy/api -- autome-api promote-admin admin@example.com
 ```
 
-Elle donne le rôle `admin` (`*`) et réactive le compte s'il était suspendu —
-c'est aussi le recours si plus aucun administrateur n'a accès. Audit
-`admin.user_promote` sous l'acteur `cli`. Email inconnu : code de sortie non
-nul et message `aucun compte pour …`.
+Elle donne le rôle `admin` (`*`), réactive le compte s'il était suspendu et
+vérifie son adresse email — c'est aussi le recours si plus aucun
+administrateur n'a accès. Audit `admin.user_promote` sous l'acteur `cli`. Email
+inconnu : code de sortie non nul et message `aucun compte pour …`.
+
+`autome-api verify-email <email>` (mêmes prérequis) vérifie seulement
+l'adresse d'un compte, sans toucher à ses droits — envoi d'emails en panne,
+tests de bout en bout (`scripts/compose-smoke.sh`). Audit
+`admin.user_verify_email` sous l'acteur `cli`.
 
 ### Données personnelles (adresses IP)
 
@@ -850,6 +888,7 @@ npm run test       # Vitest
 | `TLS partiellement configuré` au démarrage | Une seule des deux variables TLS positionnée | Définir `AUTOME_TLS_CERT` **et** `AUTOME_TLS_KEY`, ou aucune |
 | « Mot de passe oublié » répond 503 / « pas disponible sur ce serveur » | Profil `prod` sans `AUTOME_SMTP_URL` | Définir `AUTOME_SMTP_URL`, `AUTOME_MAIL_FROM` et `AUTOME_PUBLIC_URL` |
 | Aucun email de réinitialisation reçu | Relais SMTP refusé/injoignable (log `envoi du lien de réinitialisation impossible`), quota atteint, ou adresse sans compte | Vérifier `AUTOME_SMTP_URL` et les journaux de l'API ; en `dev` sans SMTP, le lien est dans les journaux |
+| Connexion refusée « adresse email pas encore vérifiée » (403 `email not verified`) | Lien de vérification pas encore ouvert (#231) | Ouvrir le lien reçu ou cliquer « Renvoyer le lien » ; en `dev` sans SMTP, le lien est dans les journaux de l'API ; sinon `autome-api verify-email <email>` ou l'onglet Administration |
 | Console du navigateur : `blocked by CORS policy` / préflight `OPTIONS` en 405 ; l'interface ne charge rien | Origine du frontend absente de `AUTOME_CORS_ORIGINS` (aucune par défaut en `prod`) | Ajouter l'origine exacte du frontend (schéma + hôte + port) à `AUTOME_CORS_ORIGINS` et redémarrer l'API |
 | Port déjà utilisé (`address already in use`) | 8080/8081/3000/9090/5432/15672 occupé | Libérer le port ou ajuster `APP_HTTP_ADDR` / les mappings du compose |
 | `docker compose` échoue à joindre `db`/`queue` | Services pas encore *healthy* | Attendre les healthchecks (`depends_on … service_healthy`) puis relancer |

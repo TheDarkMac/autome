@@ -11,6 +11,11 @@
 #   scripts/compose-smoke.sh                      # API sur http://localhost:8080
 #   AUTOME_API=http://host:8080 scripts/compose-smoke.sh
 #
+# Vérification de l'email (#231) : la pile de dev n'a pas de SMTP, le lien
+# n'est que journalisé. Si l'inscription répond 202, l'adresse est vérifiée
+# par la commande d'exploitation `autome-api verify-email` dans le conteneur
+# de l'API (`SMOKE_VERIFY_CMD` pour une autre pile).
+#
 # Crée un compte jetable (email unique) et un workflow trigger-only — aucun
 # effet de bord externe.
 set -euo pipefail
@@ -34,9 +39,19 @@ done
 curl -fsS "$API/readyz" >/dev/null || fail "API pas prête sur $API ($(curl -s "$API/readyz"))"
 
 echo "→ inscription + connexion ($EMAIL)"
-curl -fsS -H 'content-type: application/json' \
+SIGNUP_STATUS="$(curl -sS -o /dev/null -w '%{http_code}' -H 'content-type: application/json' \
   -d "{\"email\":\"$EMAIL\",\"password\":\"$PASSWORD\"}" \
-  "$API/auth/signup" >/dev/null || fail "signup refusé"
+  "$API/auth/signup")" || fail "signup refusé"
+case "$SIGNUP_STATUS" in
+  201) ;;
+  202)
+    echo "  adresse à vérifier : autome-api verify-email"
+    # shellcheck disable=SC2086 # commande et arguments à découper
+    ${SMOKE_VERIFY_CMD:-docker compose exec -T api autome-api} verify-email "$EMAIL" \
+      || fail "vérification de l'email impossible"
+    ;;
+  *) fail "signup refusé (HTTP $SIGNUP_STATUS)" ;;
+esac
 TOKEN="$(curl -fsS -H 'content-type: application/json' \
   -d "{\"email\":\"$EMAIL\",\"password\":\"$PASSWORD\"}" \
   "$API/auth/login" | json_field access_token)" || fail "login refusé"
