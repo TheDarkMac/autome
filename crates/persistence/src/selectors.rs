@@ -122,12 +122,23 @@ fn queue_connect_timeout() -> Duration {
 /// réseau pendant `AUTOME_QUEUE_CONNECT_TIMEOUT_SECS` (défaut 60 s) : le
 /// broker peut être démarré sans accepter encore les connexions.
 pub async fn build_queue(config: &Config, mode: QueueMode) -> Result<Arc<dyn Queue + Send + Sync>> {
+    build_consuming_queue(config, mode, crate::rabbitmq::DEFAULT_PREFETCH).await
+}
+
+/// [`build_queue`] pour un consommateur (#237) : en `Rabbitmq`, le broker
+/// pousse jusqu'à `prefetch` messages non acquittés d'avance à
+/// [`Queue::receive`] (le worker y met sa concurrence). Sans effet en mémoire.
+pub async fn build_consuming_queue(
+    config: &Config,
+    mode: QueueMode,
+    prefetch: u16,
+) -> Result<Arc<dyn Queue + Send + Sync>> {
     match mode {
         QueueMode::Memory => Ok(Arc::new(InMemoryQueue::new())),
         QueueMode::Rabbitmq => {
             let queue =
                 RabbitMqQueue::connect_retrying(&config.queue_url, queue_connect_timeout()).await?;
-            Ok(Arc::new(queue))
+            Ok(Arc::new(queue.with_prefetch(prefetch)))
         }
     }
 }
