@@ -45,7 +45,10 @@ pub use rbac::{
 pub use run_dispatch::{
     random_run_id, DispatchOutcome, DispatchRequest, QueueRunDispatcher, RunDispatcher,
 };
-pub use run_state::{InMemoryRunStateStore, RunCheckpoint, RunListPage, RunStateStore, RunStatus};
+pub use run_state::{
+    outbox_idempotency_key, InMemoryRunStateStore, OutboxMessage, RunCheckpoint, RunListPage,
+    RunProgress, RunStateStore, RunStatus,
+};
 pub use scheduler::{
     default_dedup_key, DedupKeyFn, DedupLock, InMemoryDedupLock, RunningScheduler, Scheduler,
 };

@@ -1,8 +1,15 @@
-//! [`RunStateStore`] adossé à PostgreSQL (tables `runs` + `run_steps`), **async**.
+//! [`RunStateStore`] adossé à PostgreSQL (tables `runs`, `run_steps` et
+//! `run_outbox`), **async**.
 //!
 //! Un `RunCheckpoint` se projette sur une ligne `runs` (scalaires, `next_node`,
-//! `error`) et N lignes `run_steps` (la map `outputs`). IDs logiques en TEXT
-//! (migration `0009`).
+//! `error`, tentative, battement, point de reprise) et N lignes `run_steps` (la
+//! map `outputs`). IDs logiques en TEXT (migration `0009`).
+//!
+//! **Outbox** (#239, migration `0021`) : le message de file d'un run vit dans
+//! `run_outbox`, écrit dans la transaction qui crée le run et retiré par
+//! l'écriture de son état final. Les transitions gardées par la tentative
+//! (`attempt`) sont des `UPDATE … WHERE attempt = $n` : une seule instruction,
+//! le verrou de ligne sérialise les écrivains concurrents.
 //!
 //! Nombre d'instructions **indépendant du nombre de nodes et de runs** (#198,
 //! AUDIT §10) : un checkpoint écrit toutes ses sorties en un seul upsert
@@ -12,7 +19,10 @@
 use std::collections::{BTreeMap, HashMap};
 
 use async_trait::async_trait;
-use autome_core::{Error, Pagination, RunCheckpoint, RunListPage, RunStateStore, RunStatus};
+use autome_core::{
+    Error, Message, OutboxMessage, Pagination, RunCheckpoint, RunListPage, RunProgress,
+    RunStateStore, RunStatus,
+};
 use serde_json::Value;
 use tokio_postgres::Row;
 
@@ -135,12 +145,33 @@ impl PgRunStateStore {
             next_node: run.get("next_node"),
             error: run.get("error"),
             owner_id: run.get("owner_id"),
+            attempt: run.get("attempt"),
+            heartbeat_at_ms: run.get("heartbeat_at_ms"),
+            resume_state: run.get("resume_state"),
         })
     }
 }
 
 const RUN_COLS: &str = "id, workflow_id, version, status, trigger_type, \
-                        started_at_ms, finished_at_ms, created_at_ms, next_node, error, owner_id";
+                        started_at_ms, finished_at_ms, created_at_ms, next_node, error, owner_id, \
+                        attempt, heartbeat_at_ms, resume_state";
+
+/// Colonnes d'un message de l'outbox, dans l'ordre de [`row_to_outbox`].
+const OUTBOX_COLS: &str = "run_id, queue, generation, headers, body";
+
+fn row_to_outbox(row: &Row) -> autome_core::Result<OutboxMessage> {
+    let headers: Value = row.get("headers");
+    Ok(OutboxMessage {
+        run_id: row.get("run_id"),
+        queue: row.get("queue"),
+        generation: row.get("generation"),
+        message: Message {
+            headers: serde_json::from_value(headers)
+                .map_err(|e| storage_err("outbox headers", e))?,
+            body: row.get("body"),
+        },
+    })
+}
 
 #[async_trait]
 impl RunStateStore for PgRunStateStore {
@@ -156,8 +187,9 @@ impl RunStateStore for PgRunStateStore {
         tx.execute(
             "INSERT INTO runs \
              (id, workflow_id, version, status, trigger_type, started_at_ms, \
-              finished_at_ms, created_at_ms, next_node, error, owner_id) \
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) \
+              finished_at_ms, created_at_ms, next_node, error, owner_id, \
+              attempt, heartbeat_at_ms, resume_state) \
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) \
              ON CONFLICT (id) DO UPDATE SET \
                workflow_id = EXCLUDED.workflow_id, version = EXCLUDED.version, \
                status = EXCLUDED.status, trigger_type = EXCLUDED.trigger_type, \
@@ -165,7 +197,9 @@ impl RunStateStore for PgRunStateStore {
                finished_at_ms = EXCLUDED.finished_at_ms, \
                created_at_ms = EXCLUDED.created_at_ms, \
                next_node = EXCLUDED.next_node, error = EXCLUDED.error, \
-               owner_id = COALESCE(runs.owner_id, EXCLUDED.owner_id)",
+               owner_id = COALESCE(runs.owner_id, EXCLUDED.owner_id), \
+               attempt = EXCLUDED.attempt, heartbeat_at_ms = EXCLUDED.heartbeat_at_ms, \
+               resume_state = EXCLUDED.resume_state",
             &[
                 &snapshot.run_id,
                 &snapshot.workflow_id,
@@ -178,6 +212,9 @@ impl RunStateStore for PgRunStateStore {
                 &snapshot.next_node,
                 &snapshot.error,
                 &snapshot.owner_id,
+                &snapshot.attempt,
+                &snapshot.heartbeat_at_ms,
+                &snapshot.resume_state,
             ],
         )
         .await
@@ -195,14 +232,17 @@ impl RunStateStore for PgRunStateStore {
             .await
             .map_err(|e| storage_err("begin", e))?;
         // `UPDATE` seul, jamais d'insertion : un run effacé entre-temps
-        // (#229) n'est pas recréé. Le verrou de ligne sérialise l'écriture
-        // avec un effacement concurrent ; `owner_id` reste celui en place.
+        // (#229) n'est pas recréé. Gardé par la tentative : un run repris par
+        // un autre worker n'est pas écrasé (#239). Le verrou de ligne
+        // sérialise l'écriture avec un effacement concurrent ; `owner_id`
+        // reste celui en place.
         let n = tx
             .execute(
                 "UPDATE runs SET workflow_id = $2, version = $3, status = $4, \
                    trigger_type = $5, started_at_ms = $6, finished_at_ms = $7, \
-                   created_at_ms = $8, next_node = $9, error = $10 \
-                 WHERE id = $1",
+                   created_at_ms = $8, next_node = $9, error = $10, \
+                   heartbeat_at_ms = $12, resume_state = $13 \
+                 WHERE id = $1 AND attempt = $11",
                 &[
                     &snapshot.run_id,
                     &snapshot.workflow_id,
@@ -214,6 +254,9 @@ impl RunStateStore for PgRunStateStore {
                     &snapshot.created_at_ms,
                     &snapshot.next_node,
                     &snapshot.error,
+                    &snapshot.attempt,
+                    &snapshot.heartbeat_at_ms,
+                    &snapshot.resume_state,
                 ],
             )
             .await
@@ -222,6 +265,14 @@ impl RunStateStore for PgRunStateStore {
             return Ok(false);
         }
         write_steps(&tx, snapshot).await?;
+        // Run terminé : son message (et le payload qu'il porte) n'a plus lieu
+        // d'être.
+        tx.execute(
+            "DELETE FROM run_outbox WHERE run_id = $1",
+            &[&snapshot.run_id],
+        )
+        .await
+        .map_err(|e| storage_err("finish outbox", e))?;
         tx.commit().await.map_err(|e| storage_err("commit", e))?;
         Ok(true)
     }
@@ -264,14 +315,17 @@ impl RunStateStore for PgRunStateStore {
         now_ms: i64,
     ) -> autome_core::Result<()> {
         let client = self.pool.get().await.map_err(|e| storage_err("pool", e))?;
-        let n = client
-            .execute(
-                "UPDATE runs SET status = 'failed', error = $2, finished_at_ms = $3 \
-                 WHERE id = $1",
+        let n: i64 = client
+            .query_one(
+                "WITH f AS (UPDATE runs SET status = 'failed', error = $2, finished_at_ms = $3 \
+                   WHERE id = $1 RETURNING id), \
+                 d AS (DELETE FROM run_outbox WHERE run_id IN (SELECT id FROM f)) \
+                 SELECT count(*) FROM f",
                 &[&run_id, &reason, &now_ms],
             )
             .await
-            .map_err(|e| storage_err("mark_failed", e))?;
+            .map_err(|e| storage_err("mark_failed", e))?
+            .get(0);
         if n == 0 {
             return Err(Error::Invalid(format!("run inconnu : {run_id}")));
         }
@@ -290,7 +344,8 @@ impl RunStateStore for PgRunStateStore {
         let row = client
             .query_opt(
                 &format!(
-                    "UPDATE runs SET status = 'running', started_at_ms = $2 \
+                    "UPDATE runs SET status = 'running', started_at_ms = $2, \
+                       heartbeat_at_ms = $2, attempt = attempt + 1 \
                      WHERE id = $1 AND status = 'queued' RETURNING {RUN_COLS}"
                 ),
                 &[&run_id, &now_ms],
@@ -310,15 +365,203 @@ impl RunStateStore for PgRunStateStore {
         now_ms: i64,
     ) -> autome_core::Result<bool> {
         let client = self.pool.get().await.map_err(|e| storage_err("pool", e))?;
-        let n = client
-            .execute(
-                "UPDATE runs SET status = 'failed', error = $2, finished_at_ms = $3 \
-                 WHERE id = $1 AND status = 'running'",
+        let n: i64 = client
+            .query_one(
+                "WITH f AS (UPDATE runs SET status = 'failed', error = $2, finished_at_ms = $3 \
+                   WHERE id = $1 AND status = 'running' RETURNING id), \
+                 d AS (DELETE FROM run_outbox WHERE run_id IN (SELECT id FROM f)) \
+                 SELECT count(*) FROM f",
                 &[&run_id, &reason, &now_ms],
             )
             .await
-            .map_err(|e| storage_err("fail_if_running", e))?;
+            .map_err(|e| storage_err("fail_if_running", e))?
+            .get(0);
         Ok(n == 1)
+    }
+
+    async fn enqueue(
+        &self,
+        snapshot: &RunCheckpoint,
+        message: &OutboxMessage,
+    ) -> autome_core::Result<()> {
+        let mut client = self.pool.get().await.map_err(|e| storage_err("pool", e))?;
+        let tx = client
+            .transaction()
+            .await
+            .map_err(|e| storage_err("begin", e))?;
+        // `INSERT` simple : un id déjà pris échoue (clé primaire) au lieu
+        // d'écraser un run existant.
+        tx.execute(
+            "INSERT INTO runs \
+             (id, workflow_id, version, status, trigger_type, started_at_ms, \
+              finished_at_ms, created_at_ms, next_node, error, owner_id) \
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)",
+            &[
+                &snapshot.run_id,
+                &snapshot.workflow_id,
+                &snapshot.version,
+                &status_to_str(snapshot.status),
+                &snapshot.trigger_type,
+                &snapshot.started_at_ms,
+                &snapshot.finished_at_ms,
+                &snapshot.created_at_ms,
+                &snapshot.next_node,
+                &snapshot.error,
+                &snapshot.owner_id,
+            ],
+        )
+        .await
+        .map_err(|e| storage_err("enqueue run", e))?;
+        let headers = serde_json::to_value(&message.message.headers)?;
+        tx.execute(
+            "INSERT INTO run_outbox (run_id, queue, generation, headers, body, created_at_ms) \
+             VALUES ($1, $2, $3, $4, $5, $6)",
+            &[
+                &message.run_id,
+                &message.queue,
+                &message.generation,
+                &headers,
+                &message.message.body,
+                &snapshot.created_at_ms,
+            ],
+        )
+        .await
+        .map_err(|e| storage_err("enqueue outbox", e))?;
+        tx.commit().await.map_err(|e| storage_err("commit", e))?;
+        Ok(())
+    }
+
+    async fn pending_outbox(
+        &self,
+        created_before_ms: i64,
+        limit: usize,
+    ) -> autome_core::Result<Vec<OutboxMessage>> {
+        let client = self.pool.get().await.map_err(|e| storage_err("pool", e))?;
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let rows = client
+            .query(
+                &format!(
+                    "SELECT {OUTBOX_COLS} FROM run_outbox \
+                     WHERE published_at_ms IS NULL AND created_at_ms < $1 \
+                     ORDER BY created_at_ms, run_id LIMIT $2"
+                ),
+                &[&created_before_ms, &limit],
+            )
+            .await
+            .map_err(|e| storage_err("pending_outbox", e))?;
+        rows.iter().map(row_to_outbox).collect()
+    }
+
+    async fn mark_published(
+        &self,
+        run_id: &str,
+        generation: i32,
+        now_ms: i64,
+    ) -> autome_core::Result<()> {
+        let client = self.pool.get().await.map_err(|e| storage_err("pool", e))?;
+        client
+            .execute(
+                "UPDATE run_outbox SET published_at_ms = $3 \
+                 WHERE run_id = $1 AND generation = $2",
+                &[&run_id, &generation, &now_ms],
+            )
+            .await
+            .map_err(|e| storage_err("mark_published", e))?;
+        Ok(())
+    }
+
+    async fn record_progress(
+        &self,
+        run_id: &str,
+        attempt: i32,
+        progress: &RunProgress,
+        now_ms: i64,
+    ) -> autome_core::Result<bool> {
+        let client = self.pool.get().await.map_err(|e| storage_err("pool", e))?;
+        let n = match progress {
+            RunProgress::Starting { node } => {
+                client
+                    .execute(
+                        "UPDATE runs SET next_node = $3, heartbeat_at_ms = $4 \
+                     WHERE id = $1 AND status = 'running' AND attempt = $2",
+                        &[&run_id, &attempt, node, &now_ms],
+                    )
+                    .await
+            }
+            RunProgress::Done { resume_state } => client
+                .execute(
+                    "UPDATE runs SET next_node = NULL, resume_state = $3, heartbeat_at_ms = $4 \
+                     WHERE id = $1 AND status = 'running' AND attempt = $2",
+                    &[&run_id, &attempt, resume_state, &now_ms],
+                )
+                .await,
+        }
+        .map_err(|e| storage_err("record_progress", e))?;
+        Ok(n == 1)
+    }
+
+    async fn heartbeat(
+        &self,
+        run_id: &str,
+        attempt: i32,
+        now_ms: i64,
+    ) -> autome_core::Result<bool> {
+        let client = self.pool.get().await.map_err(|e| storage_err("pool", e))?;
+        let n = client
+            .execute(
+                "UPDATE runs SET heartbeat_at_ms = $3 \
+                 WHERE id = $1 AND status = 'running' AND attempt = $2",
+                &[&run_id, &attempt, &now_ms],
+            )
+            .await
+            .map_err(|e| storage_err("heartbeat", e))?;
+        Ok(n == 1)
+    }
+
+    async fn list_stale(&self, before_ms: i64) -> autome_core::Result<Vec<RunCheckpoint>> {
+        let client = self.pool.get().await.map_err(|e| storage_err("pool", e))?;
+        let rows = client
+            .query(
+                &format!(
+                    "SELECT {RUN_COLS} FROM runs \
+                     WHERE status = 'running' AND heartbeat_at_ms < $1 ORDER BY id"
+                ),
+                &[&before_ms],
+            )
+            .await
+            .map_err(|e| storage_err("list_stale", e))?;
+        Self::rows_to_checkpoints(&client, &rows).await
+    }
+
+    async fn requeue(
+        &self,
+        run_id: &str,
+        attempt: i32,
+        now_ms: i64,
+    ) -> autome_core::Result<Option<OutboxMessage>> {
+        let client = self.pool.get().await.map_err(|e| storage_err("pool", e))?;
+        // Une instruction : le run repasse `queued` (s'il est encore à cette
+        // tentative et a un message) et son message est remis à publier sous
+        // la génération suivante. Clé d'idempotence : même format que
+        // `autome_core::outbox_idempotency_key` (`<run_id>#<génération>`).
+        // Dans `SET`, `o.generation` est l'ancienne valeur.
+        let row = client
+            .query_opt(
+                "WITH r AS (UPDATE runs SET status = 'queued', heartbeat_at_ms = NULL \
+                   WHERE id = $1 AND status = 'running' AND attempt = $2 \
+                     AND EXISTS (SELECT 1 FROM run_outbox WHERE run_id = $1) \
+                   RETURNING id) \
+                 UPDATE run_outbox o SET generation = o.generation + 1, \
+                   published_at_ms = NULL, created_at_ms = $3, \
+                   headers = jsonb_set(o.headers, '{idempotency-key}', \
+                     to_jsonb(o.run_id || '#' || (o.generation + 1))) \
+                 FROM r WHERE o.run_id = r.id \
+                 RETURNING o.run_id, o.queue, o.generation, o.headers, o.body",
+                &[&run_id, &attempt, &now_ms],
+            )
+            .await
+            .map_err(|e| storage_err("requeue", e))?;
+        row.as_ref().map(row_to_outbox).transpose()
     }
 
     async fn list_by_workflow(
