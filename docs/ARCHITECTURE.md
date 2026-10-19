@@ -109,6 +109,11 @@ flowchart TB
   rôle (transaction), les suspend (`users.disabled_at`, migration `0017`, plus
   fermeture des sessions par version) et ferme leurs sessions. Le premier
   administrateur naît hors HTTP : `autome-api promote-admin <email>`.
+- **Liste d'administration des workflows** (#243) : `api::admin_workflows`
+  (`/admin/workflows`, super-admin `*`) est la seule lecture qui traverse les
+  espaces d'ids : `WorkflowRepository::list_all` (tri `(owner_id, id)`, clé
+  primaire) renvoie un résumé par workflow, sans le graphe ;
+  `UserStore::emails` résout les propriétaires de la page en une requête.
 - **Invitations** (#241) : `api::invitation` crée le compte au rôle choisi
   avec un hash **inutilisable** (préfixe `!`, `core::unusable_password_hash`) :
   « invitation en attente » n'est qu'une vue du hash, sans colonne. Le lien
