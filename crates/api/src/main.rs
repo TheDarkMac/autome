@@ -13,6 +13,10 @@ use autome_api::admin::{admin_router, promote_admin, AdminState, Promotion};
 use autome_api::auth::protected_router;
 use autome_api::cors::{allowed_origins_from_env, with_cors};
 use autome_api::credentials::{credentials_router, CredentialsState};
+use autome_api::email_verification::{
+    verification_required_from_source, verify_email_by_operator, EmailVerification,
+    OperatorVerification, VerifyTokens,
+};
 use autome_api::erasure::Erasure;
 use autome_api::mail::MailSettings;
 use autome_api::metrics::{metrics_router, with_metrics, Metrics};
@@ -127,13 +131,21 @@ fn erasure(backends: &Backends) -> Erasure {
     Erasure::new(backends.eraser.clone(), backends.login_throttle.clone())
 }
 
+/// Fonctions qui envoient des emails : mot de passe oublié (#204) et
+/// vérification de l'adresse (#231).
+#[derive(Debug, Default)]
+struct MailFeatures {
+    password_reset: Option<PasswordReset>,
+    email_verification: Option<EmailVerification>,
+}
+
 /// État des endpoints de comptes : Argon2id sur les stores de `backends`,
-/// anti-bruteforce par email et par adresse IP (#190), mot de passe oublié
-/// si un envoi d'email est configuré (#204).
+/// anti-bruteforce par email et par adresse IP (#190), mot de passe oublié et
+/// vérification de l'email si un envoi d'email est configuré (#204, #231).
 fn accounts_state(
     backends: &Backends,
     ip_throttle: IpThrottle,
-    password_reset: Option<PasswordReset>,
+    mail: MailFeatures,
 ) -> autome_core::Result<AccountsState> {
     let accounts = AccountsState::new(
         backends.auth.clone(),
@@ -143,26 +155,87 @@ fn accounts_state(
     .with_throttle(backends.login_throttle.clone())
     .with_ip_throttle(ip_throttle)
     .with_erasure(erasure(backends));
-    Ok(match password_reset {
+    let accounts = match mail.password_reset {
         Some(reset) => accounts.with_password_reset(reset),
+        None => accounts,
+    };
+    Ok(match mail.email_verification {
+        Some(verification) => accounts.with_email_verification(verification),
         None => accounts,
     })
 }
 
-/// Mot de passe oublié (#204) : `None` sans envoi d'email possible (`prod`
-/// sans `AUTOME_SMTP_URL`). Configuration invalide ⇒ refus de démarrer.
-fn password_reset(config: &Config) -> Result<Option<PasswordReset>, String> {
-    let Some(mail) = MailSettings::from_env(config.profile)? else {
+/// Fonctions d'email depuis l'environnement (`AUTOME_SMTP_URL`…,
+/// `AUTOME_EMAIL_VERIFICATION`). Configuration invalide ⇒ refus de démarrer.
+fn mail_features(config: &Config) -> Result<MailFeatures, String> {
+    let required = verification_required_from_source(
+        std::env::var("AUTOME_EMAIL_VERIFICATION").ok().as_deref(),
+    )?;
+    Ok(mail_features_from(
+        config,
+        MailSettings::from_env(config.profile)?,
+        required,
+    ))
+}
+
+/// Sans envoi d'email possible (`prod` sans SMTP), ni mot de passe oublié
+/// (503) ni vérification de l'email (comptes créés vérifiés) ; la
+/// vérification peut aussi être désactivée (`required = false`).
+fn mail_features_from(config: &Config, mail: Option<MailSettings>, required: bool) -> MailFeatures {
+    let Some(mail) = mail else {
         tracing::warn!(
-            "mot de passe oublié désactivé : AUTOME_SMTP_URL absent (503 sur /auth/password/forgot)"
+            "mot de passe oublié et vérification de l'email désactivés : AUTOME_SMTP_URL absent \
+             (503 sur /auth/password/forgot, comptes créés vérifiés)"
         );
-        return Ok(None);
+        return MailFeatures::default();
     };
     tracing::info!(public_url = %mail.public_url, "mot de passe oublié activé");
-    Ok(Some(PasswordReset::new(
-        ResetTokens::from_config(config),
-        mail,
-    )))
+    let email_verification = if required {
+        tracing::info!("vérification de l'email exigée à l'inscription");
+        Some(EmailVerification::new(
+            VerifyTokens::from_config(config),
+            mail.clone(),
+        ))
+    } else {
+        tracing::warn!("vérification de l'email désactivée (AUTOME_EMAIL_VERIFICATION=off)");
+        None
+    };
+    MailFeatures {
+        password_reset: Some(PasswordReset::new(ResetTokens::from_config(config), mail)),
+        email_verification,
+    }
+}
+
+/// `autome-api verify-email <email>` (#231) : marque vérifiée l'adresse d'un
+/// compte existant dans la base `DATABASE_URL`, puis s'arrête (envoi d'emails
+/// en panne, tests de bout en bout). Exige l'accès à l'infrastructure.
+async fn verify_email_command(
+    config: &Config,
+    email: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if PersistenceMode::from_env()? != PersistenceMode::Postgres {
+        return Err("verify-email requiert AUTOME_PERSISTENCE=postgres (les comptes en mémoire ne survivent pas au processus)".into());
+    }
+    let pool = connect(&config.database_url)?;
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_millis() as i64;
+    match verify_email_by_operator(
+        &PgUserStore::new(pool.clone()),
+        &PgAuditSink::new(pool),
+        email,
+        now_ms,
+    )
+    .await?
+    {
+        OperatorVerification::Verified { user_id, already } => {
+            tracing::info!(%user_id, already, "adresse email vérifiée");
+            Ok(())
+        }
+        OperatorVerification::UnknownEmail => {
+            Err(format!("aucun compte pour {email} : inscrivez-le d'abord").into())
+        }
+    }
 }
 
 /// `autome-api promote-admin <email>` (#208) : promeut un compte existant
@@ -216,10 +289,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
             return promote_admin_command(&config, email).await;
         }
+        Some("verify-email") => {
+            let [_, email] = args.as_slice() else {
+                return Err("usage : autome-api verify-email <email>".into());
+            };
+            return verify_email_command(&config, email).await;
+        }
         Some(other) => {
-            return Err(
-                format!("commande inconnue « {other} » (seule : promote-admin <email>)").into(),
+            return Err(format!(
+                "commande inconnue « {other} » (promote-admin <email>, verify-email <email>)"
             )
+            .into())
         }
     }
 
@@ -291,9 +371,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         login_max = ip_throttle.login_max,
         signup_max = ip_throttle.signup_max,
         reset_max = ip_throttle.reset_max,
+        verify_max = ip_throttle.verify_max,
         "limitation des tentatives par adresse IP"
     );
-    let accounts = accounts_state(&backends, ip_throttle, password_reset(&config)?)?;
+    let accounts = accounts_state(&backends, ip_throttle, mail_features(&config)?)?;
     // Webhooks (#202) : quota invalide ⇒ refus de démarrer.
     let webhook_max = max_per_window_from_env()?;
     tracing::info!(
@@ -364,9 +445,13 @@ mod tests {
         let backends =
             build_backends(&config, PersistenceMode::Memory, queue).expect("backends in-memory");
         let ip_throttle = IpThrottle::from_source(&config, |_| None).expect("défauts");
-        let reset = password_reset(&config).expect("journal en dev");
-        assert!(reset.is_some(), "dev sans SMTP : liens journalisés");
-        let accounts = accounts_state(&backends, ip_throttle, reset).expect("état comptes");
+        let mail = MailSettings::from_source(config.profile, |_| None).expect("journal en dev");
+        let features = mail_features_from(&config, mail, true);
+        assert!(
+            features.password_reset.is_some() && features.email_verification.is_some(),
+            "dev sans SMTP : liens journalisés"
+        );
+        let accounts = accounts_state(&backends, ip_throttle, features).expect("état comptes");
         let probes = ProbesState::new(vec![]);
         let webhooks = webhooks_state(&backends, &config, 10);
         build_router(
@@ -377,6 +462,21 @@ mod tests {
             Arc::new(Metrics::new()),
             autome_api::cors::allowed_origins(config.profile, None).expect("défauts dev"),
         )
+    }
+
+    #[test]
+    fn email_verification_follows_mail_and_setting() {
+        let config = Config::load(|_| None).expect("config dev par défaut");
+        let mail = || MailSettings::from_source(config.profile, |_| None).unwrap();
+
+        // Sans envoi possible : rien (comptes créés vérifiés).
+        let none = mail_features_from(&config, None, true);
+        assert!(none.password_reset.is_none() && none.email_verification.is_none());
+        // Désactivée explicitement : le mot de passe oublié reste disponible.
+        let off = mail_features_from(&config, mail(), false);
+        assert!(off.password_reset.is_some() && off.email_verification.is_none());
+        let on = mail_features_from(&config, mail(), true);
+        assert!(on.email_verification.is_some());
     }
 
     #[test]

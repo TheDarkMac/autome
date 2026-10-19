@@ -10,6 +10,7 @@
 //! | POST    | `/admin/users/{id}/disable`      | —            | 200 + [`AdminUser`]  |
 //! | POST    | `/admin/users/{id}/enable`       | —            | 200 + [`AdminUser`]  |
 //! | POST    | `/admin/users/{id}/logout-all`   | —            | 204                  |
+//! | POST    | `/admin/users/{id}/verify-email` | —            | 200 + [`AdminUser`]  |
 //! | DELETE  | `/admin/users/{id}`              | —            | 204                  |
 //!
 //! Règles :
@@ -36,10 +37,13 @@
 //!   compte super-admin, 409 sur son propre compte : passer par
 //!   `DELETE /auth/me`) ; l'audit désigne ensuite le compte par son
 //!   pseudonyme ;
+//! - la **vérification de l'email** (#231) peut être faite à la place du
+//!   titulaire (lien perdu, envoi d'emails en panne) : l'adresse actuelle du
+//!   compte est marquée vérifiée et sa connexion devient possible ;
 //! - compte inconnu : 404 ; chaque appel produit un event d'audit
 //!   `admin.users_list` / `admin.user_get` / `admin.user_role` /
 //!   `admin.user_disable` / `admin.user_enable` / `admin.user_logout_all` /
-//!   `admin.user_delete` (ressource = compte visé, ou son pseudonyme une fois
+//!   `admin.user_verify_email` / `admin.user_delete` (ressource = compte visé, ou son pseudonyme une fois
 //!   effacé).
 
 use std::collections::HashSet;
@@ -129,6 +133,8 @@ pub struct AdminUser {
     pub permissions: Vec<String>,
     /// Compte suspendu.
     pub disabled: bool,
+    /// Adresse email vérifiée (#231).
+    pub email_verified: bool,
     /// Création du compte (millisecondes Unix).
     pub created_at_ms: i64,
 }
@@ -143,6 +149,7 @@ impl From<UserSummary> for AdminUser {
             email: user.email,
             permissions,
             disabled: user.disabled,
+            email_verified: user.email_verified,
             created_at_ms: user.created_at_ms,
         }
     }
@@ -595,6 +602,54 @@ pub async fn logout_user(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// `POST /admin/users/{id}/verify-email` — marque vérifiée l'adresse actuelle
+/// du compte (#231) : sa connexion devient possible. Idempotent.
+#[utoipa::path(
+    post,
+    path = "/admin/users/{id}/verify-email",
+    tag = "admin",
+    params(("id" = String, Path, description = "Identifiant du compte")),
+    responses(
+        (status = 200, description = "Adresse vérifiée", body = AdminUser),
+        (status = 401, description = "Token absent ou invalide"),
+        (status = 403, description = "Manque `users.admin`, ou `*` pour un compte super-admin"),
+        (status = 404, description = "Compte inconnu")
+    ),
+    security(("bearer" = []))
+)]
+pub async fn verify_user_email(
+    user: AuthenticatedUser,
+    State(state): State<AdminState>,
+    Path(id): Path<String>,
+) -> Result<Json<AdminUser>, AdminError> {
+    const ACTION: &str = "admin.user_verify_email";
+    state
+        .auth
+        .require_permission(&user, PERM_USERS_ADMIN)
+        .await?;
+    let target = target_for_change(&state, &user, &id, ACTION).await?;
+    if !state
+        .users
+        .mark_email_verified(&id, &target.email)
+        .await
+        .map_err(internal)?
+    {
+        // Effacé, ou son adresse a changé entre la lecture et l'écriture.
+        return Err(AdminError::NotFound);
+    }
+    tracing::info!(target_id = %id, "adresse email vérifiée par un administrateur");
+    audit(
+        &state,
+        user.user_id(),
+        ACTION,
+        &id,
+        AuditOutcome::Success,
+        json!({ "already": target.email_verified }),
+    )
+    .await;
+    Ok(Json(reload(&state, &id).await?))
+}
+
 /// `DELETE /admin/users/{id}` — efface définitivement le compte et toutes
 /// ses données (RGPD, droit à l'effacement) ; ses sessions sont fermées.
 #[utoipa::path(
@@ -673,8 +728,9 @@ pub enum Promotion {
 }
 
 /// Amorçage hors API (`autome-api promote-admin <email>`) : donne le rôle
-/// `admin` (wildcard `*`) au compte de `email` et le réactive s'il était
-/// suspendu — outil de création du premier administrateur et de
+/// `admin` (wildcard `*`) au compte de `email`, le réactive s'il était
+/// suspendu et vérifie son adresse (#231 : sans quoi il ne pourrait pas se
+/// connecter si l'envoi d'emails est en panne) — outil de création du premier administrateur et de
 /// récupération après un verrouillage. Il exige un accès à l'infrastructure
 /// (base de données) : jamais exposé par HTTP. Audité `admin.user_promote`
 /// sous l'acteur `cli`.
@@ -697,9 +753,17 @@ pub async fn promote_admin(
     if account.disabled {
         users.set_disabled(&account.id, false).await?;
     }
+    if !account.email_verified {
+        users
+            .mark_email_verified(&account.id, &account.email)
+            .await?;
+    }
     let event = AuditEvent::new(now_ms, "cli", "admin.user_promote", AuditOutcome::Success)
         .with_resource(&account.id)
-        .with_metadata(json!({ "reactivated": account.disabled }));
+        .with_metadata(json!({
+            "reactivated": account.disabled,
+            "email_verified": !account.email_verified,
+        }));
     if let Err(e) = audit.record(event).await {
         tracing::error!(error = %e, "événement d'audit non enregistré");
     }
@@ -718,6 +782,7 @@ pub fn admin_router(state: AdminState) -> Router {
         .route("/admin/users/:id/disable", post(disable_user))
         .route("/admin/users/:id/enable", post(enable_user))
         .route("/admin/users/:id/logout-all", post(logout_user))
+        .route("/admin/users/:id/verify-email", post(verify_user_email))
         .with_state(state)
 }
 
@@ -801,7 +866,7 @@ mod tests {
         async fn account(&self, email: &str, role: Role) -> String {
             match self
                 .users
-                .create(email, "$argon2id$h", &role.permissions)
+                .create(email, "$argon2id$h", &role.permissions, true)
                 .await
                 .unwrap()
             {
@@ -1172,6 +1237,104 @@ mod tests {
         }
         let actions: Vec<String> = fx.actions().await.into_iter().map(|a| a.0).collect();
         assert_eq!(actions, ["admin.user_disable", "admin.user_enable"]);
+    }
+
+    #[tokio::test]
+    async fn an_administrator_can_verify_an_address() {
+        let fx = Fixture::new();
+        let manager = fx.account("manager@example.io", users_admin_only()).await;
+        let root = fx.account("root@example.io", Role::super_admin()).await;
+        let CreateUser::Created(alice) = fx
+            .users
+            .create(
+                "alice@example.io",
+                "$argon2id$h",
+                &Role::editor().permissions,
+                false,
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("création");
+        };
+        let res = fx
+            .call("GET", &format!("/admin/users/{}", alice.id), &manager, None)
+            .await;
+        assert_eq!(json_body(res).await["email_verified"], false);
+
+        let res = fx
+            .call(
+                "POST",
+                &format!("/admin/users/{}/verify-email", alice.id),
+                &manager,
+                None,
+            )
+            .await;
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(json_body(res).await["email_verified"], true);
+        assert!(
+            fx.users
+                .find_by_id(&alice.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .email_verified
+        );
+        let event = fx.audit.list().await.unwrap().pop().unwrap();
+        assert_eq!(event.action, "admin.user_verify_email");
+        assert_eq!(event.actor, manager);
+        assert_eq!(event.resource.as_deref(), Some(alice.id.as_str()));
+
+        // Super-admin visé sans `*` : 403 ; compte inconnu : 404.
+        let res = fx
+            .call(
+                "POST",
+                &format!("/admin/users/{root}/verify-email"),
+                &manager,
+                None,
+            )
+            .await;
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+        let res = fx
+            .call(
+                "POST",
+                "/admin/users/00000000-0000-0000-0000-00000000dead/verify-email",
+                &manager,
+                None,
+            )
+            .await;
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn promote_admin_also_verifies_the_address() {
+        let fx = Fixture::new();
+        let CreateUser::Created(alice) = fx
+            .users
+            .create(
+                "alice@example.io",
+                "$argon2id$h",
+                &Role::viewer().permissions,
+                false,
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("création");
+        };
+        promote_admin(fx.users.as_ref(), fx.audit.as_ref(), "alice@example.io", 42)
+            .await
+            .unwrap();
+        assert!(
+            fx.users
+                .find_by_id(&alice.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .email_verified
+        );
+        let event = fx.audit.list().await.unwrap().pop().unwrap();
+        assert_eq!(event.metadata["email_verified"], true);
     }
 
     #[tokio::test]

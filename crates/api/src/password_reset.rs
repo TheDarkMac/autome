@@ -19,10 +19,9 @@
 //! d'accès) ni dans l'en-tête `Referer`.
 
 use autome_core::Config;
-use hmac::{Hmac, Mac};
-use sha2::{Digest, Sha256};
 
 use crate::mail::{MailSettings, OutgoingMail};
+use crate::signed_link::{LinkTokens, ParsedLinkToken};
 
 /// Durée de validité d'un lien de réinitialisation (30 min).
 pub const RESET_TTL_SECONDS: i64 = 30 * 60;
@@ -31,12 +30,13 @@ pub const RESET_TTL_SECONDS: i64 = 30 * 60;
 pub const DEFAULT_RESET_EMAIL_MAX_REQUESTS: u32 = 3;
 /// Objet de l'email de réinitialisation.
 pub const RESET_MAIL_SUBJECT: &str = "Réinitialisation de votre mot de passe Autome";
+/// Préfixe de domaine de la clé des jetons de réinitialisation.
+const RESET_DOMAIN: &str = "autome/password-reset/v1";
 
-/// Émission et vérification des jetons de réinitialisation.
+/// Émission et vérification des jetons de réinitialisation : jetons liés au
+/// hash actuel du mot de passe (cf. [`crate::signed_link`]).
 #[derive(Clone)]
-pub struct ResetTokens {
-    key: [u8; 32],
-}
+pub struct ResetTokens(LinkTokens);
 
 impl std::fmt::Debug for ResetTokens {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -45,25 +45,13 @@ impl std::fmt::Debug for ResetTokens {
 }
 
 /// Jeton découpé, pas encore vérifié.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ParsedResetToken<'a> {
-    /// Compte visé (`users.id`).
-    pub user_id: &'a str,
-    /// Expiration (secondes Unix).
-    pub expires_at: i64,
-    mac: Vec<u8>,
-}
+pub type ParsedResetToken<'a> = ParsedLinkToken<'a>;
 
 impl ResetTokens {
     /// Clé dérivée de `secret` (séparation de domaine : elle diffère de toute
     /// autre clé tirée du même secret).
     pub fn new(secret: &[u8]) -> Self {
-        let mut hasher = Sha256::new();
-        hasher.update(b"autome/password-reset/v1\0");
-        hasher.update(secret);
-        Self {
-            key: hasher.finalize().into(),
-        }
+        Self(LinkTokens::new(RESET_DOMAIN, secret, RESET_TTL_SECONDS))
     }
 
     /// Clé dérivée d'`ENCRYPTION_KEY`. La changer invalide les liens en cours.
@@ -71,59 +59,22 @@ impl ResetTokens {
         Self::new(config.encryption_key.expose().as_bytes())
     }
 
-    fn mac(&self, user_id: &str, expires_at: i64, password_hash: &str) -> Hmac<Sha256> {
-        let mut mac =
-            Hmac::<Sha256>::new_from_slice(&self.key).expect("HMAC accepte toute longueur");
-        // Champs séparés par un octet nul : aucune concaténation ambiguë.
-        mac.update(user_id.as_bytes());
-        mac.update(b"\0");
-        mac.update(expires_at.to_string().as_bytes());
-        mac.update(b"\0");
-        mac.update(password_hash.as_bytes());
-        mac
-    }
-
     /// Jeton pour le compte `user_id` dont le hash actuel est `password_hash`,
     /// valable [`RESET_TTL_SECONDS`] à partir de `now`.
     pub fn issue(&self, user_id: &str, password_hash: &str, now: i64) -> String {
-        let expires_at = now.saturating_add(RESET_TTL_SECONDS);
-        let mac = self
-            .mac(user_id, expires_at, password_hash)
-            .finalize()
-            .into_bytes();
-        format!("{user_id}.{expires_at}.{}", hex(&mac))
+        self.0.issue(user_id, password_hash, now)
     }
 
     /// Découpe `token` sans le vérifier ; `None` s'il est mal formé.
     pub fn parse(token: &str) -> Option<ParsedResetToken<'_>> {
-        let mut parts = token.split('.');
-        let (user_id, expires_at, mac) = (parts.next()?, parts.next()?, parts.next()?);
-        // L'identifiant vient d'une saisie non fiable et finit dans l'audit :
-        // forme d'un `users.id` (UUID) seulement.
-        let id_ok = !user_id.is_empty()
-            && user_id.len() <= 64
-            && user_id
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '-');
-        if parts.next().is_some() || !id_ok {
-            return None;
-        }
-        Some(ParsedResetToken {
-            user_id,
-            expires_at: expires_at.parse().ok()?,
-            mac: unhex(mac)?,
-        })
+        LinkTokens::parse(token)
     }
 
     /// `true` si `token` est authentique, non expiré à `now`, et émis pour le
     /// hash **actuel** `password_hash` du compte (comparaison à temps
     /// constant).
     pub fn verify(&self, token: &ParsedResetToken<'_>, password_hash: &str, now: i64) -> bool {
-        token.expires_at > now
-            && self
-                .mac(token.user_id, token.expires_at, password_hash)
-                .verify_slice(&token.mac)
-                .is_ok()
+        self.0.verify(token, password_hash, now)
     }
 }
 
@@ -174,23 +125,11 @@ impl PasswordReset {
     }
 }
 
-fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
-}
-
-fn unhex(s: &str) -> Option<Vec<u8>> {
-    if s.len() != 64 || !s.is_ascii() {
-        return None;
-    }
-    (0..s.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok())
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+
+    use sha2::{Digest, Sha256};
 
     use super::*;
     use crate::mail::MemoryMailer;
@@ -276,9 +215,9 @@ mod tests {
         webhook.update(b"autome/webhook/v1\0");
         webhook.update(b"encryption-key");
         let webhook: [u8; 32] = webhook.finalize().into();
-        assert_ne!(tokens().key, webhook);
+        assert_ne!(tokens().0.key, webhook);
         assert_ne!(
-            tokens().key,
+            tokens().0.key,
             <[u8; 32]>::from(Sha256::digest(b"encryption-key"))
         );
         assert_eq!(format!("{:?}", tokens()), "ResetTokens(<redacted>)");

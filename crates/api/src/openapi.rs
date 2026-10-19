@@ -41,6 +41,8 @@ use utoipa::{
         crate::accounts::change_password,
         crate::accounts::forgot_password,
         crate::accounts::reset_password,
+        crate::accounts::verify_email,
+        crate::accounts::resend_verification,
         crate::accounts::me,
         crate::accounts::delete_account,
         // administration des utilisateurs (#208)
@@ -50,6 +52,7 @@ use utoipa::{
         crate::admin::disable_user,
         crate::admin::enable_user,
         crate::admin::logout_user,
+        crate::admin::verify_user_email,
         crate::admin::delete_user,
         // workflows (F7.1)
         crate::workflows::list_workflows,
@@ -80,6 +83,9 @@ use utoipa::{
         crate::accounts::ForgotPasswordBody,
         crate::accounts::ResetPasswordBody,
         crate::accounts::DeleteAccountBody,
+        crate::accounts::VerifyEmailBody,
+        crate::accounts::ResendVerificationBody,
+        crate::accounts::SignupPending,
         crate::accounts::TokenResponse,
         crate::accounts::MeResponse,
         crate::admin::AdminUser,
@@ -227,7 +233,13 @@ mod tests {
     #[tokio::test]
     async fn openapi_documents_public_account_endpoints() {
         let spec = fetch_spec().await;
-        for path in ["/auth/signup", "/auth/login", "/auth/refresh"] {
+        for path in [
+            "/auth/signup",
+            "/auth/login",
+            "/auth/refresh",
+            "/auth/email/verify",
+            "/auth/email/resend",
+        ] {
             let op = &spec["paths"][path]["post"];
             assert!(op.is_object(), "{path} doit figurer dans la spec");
             // Endpoints publics : ils émettent les jetons, pas de bearer exigé.
