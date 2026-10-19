@@ -6,7 +6,11 @@
 // Suspendre un compte ou fermer ses sessions est confirmé, comme la
 // déconnexion de tous ses appareils ; la suppression définitive d'un compte
 // et de ses données (#229) aussi, ainsi que la vérification d'une adresse à
-// la place de son titulaire (#231). Le client API est injecté pour les tests.
+// la place de son titulaire (#231). Un administrateur invite aussi de
+// nouvelles personnes (#241) : le compte apparaît « invitation en attente »
+// jusqu'à ce qu'elle choisisse son mot de passe ; l'invitation peut être
+// renvoyée ou annulée (suppression du compte). Le client API est injecté pour
+// les tests.
 
 import { useCallback, useEffect, useState, type FormEvent } from "react";
 
@@ -24,6 +28,8 @@ export type AdminApi = Pick<
   | "logoutUser"
   | "deleteUser"
   | "verifyUserEmail"
+  | "inviteUser"
+  | "resendInvitation"
 >;
 
 export interface AdminPanelProps {
@@ -50,6 +56,38 @@ type Load =
   | { kind: "loading" }
   | { kind: "error"; message: string }
   | { kind: "ok"; items: AdminUser[]; total: number };
+
+/** Message lisible d'un refus d'invitation (#241). */
+function describeInvite(e: unknown): string {
+  if (e instanceof ApiError) {
+    switch (e.status) {
+      case 400:
+        return "email invalide";
+      case 403:
+        return "seul un super-administrateur peut inviter un administrateur";
+      case 409:
+        return "un compte existe déjà pour cet email";
+      case 503:
+        return "invitations indisponibles : aucun envoi d'email n'est configuré sur le serveur";
+    }
+  }
+  return (e as Error).message;
+}
+
+/** Message lisible d'un refus de renvoi d'invitation (#241). */
+function describeResend(e: unknown): string {
+  if (e instanceof ApiError) {
+    switch (e.status) {
+      case 409:
+        return "compte déjà activé ou suspendu : rien à renvoyer";
+      case 502:
+        return "l'email n'a pas pu être envoyé (l'ancien lien n'est plus valable) : réessayez";
+      case 503:
+        return "invitations indisponibles : aucun envoi d'email n'est configuré sur le serveur";
+    }
+  }
+  return describe(e);
+}
 
 /** Message lisible d'un refus du serveur. */
 function describe(e: unknown): string {
@@ -107,6 +145,7 @@ export function AdminPanel({
     user: AdminUser,
     run: () => Promise<AdminUser | void>,
     success: string,
+    explain: (e: unknown) => string = describe,
   ): Promise<void> {
     setBusy(user.id);
     setNotice(null);
@@ -121,7 +160,7 @@ export function AdminPanel({
       }
       setNotice({ kind: "ok", text: success });
     } catch (e) {
-      setNotice({ kind: "error", text: `${user.email} : ${describe(e)}` });
+      setNotice({ kind: "error", text: `${user.email} : ${explain(e)}` });
     } finally {
       setBusy(null);
     }
@@ -145,7 +184,9 @@ export function AdminPanel({
   }
 
   function onDelete(user: AdminUser): void {
-    const message = `Supprimer définitivement ${user.email} ? Son compte, ses workflows, ses exécutions et ses connexions aux services seront effacés. Cette action est irréversible.`;
+    const message = user.invitation_pending
+      ? `Annuler l'invitation de ${user.email} ? Le compte sera supprimé et le lien envoyé ne fonctionnera plus.`
+      : `Supprimer définitivement ${user.email} ? Son compte, ses workflows, ses exécutions et ses connexions aux services seront effacés. Cette action est irréversible.`;
     if (!confirm(message)) return;
     void runAction(
       user,
@@ -161,8 +202,39 @@ export function AdminPanel({
             : l,
         );
       },
-      `${user.email} supprimé, ainsi que ses données.`,
+      user.invitation_pending
+        ? `Invitation de ${user.email} annulée.`
+        : `${user.email} supprimé, ainsi que ses données.`,
     );
+  }
+
+  function onResend(user: AdminUser): void {
+    void runAction(
+      user,
+      () => api.resendInvitation(user.id),
+      `Invitation renvoyée à ${user.email} ; le lien précédent ne fonctionne plus.`,
+      describeResend,
+    );
+  }
+
+  async function onInvite(email: string, role: AssignableRole): Promise<boolean> {
+    setNotice(null);
+    try {
+      const invited = await api.inviteUser(email, role);
+      setNotice(
+        invited.invitation_sent
+          ? { kind: "ok", text: `Invitation envoyée à ${invited.user.email}.` }
+          : {
+              kind: "error",
+              text: `Compte créé pour ${invited.user.email}, mais l'email n'est pas parti : renvoyez l'invitation.`,
+            },
+      );
+      await reload();
+      return true;
+    } catch (e) {
+      setNotice({ kind: "error", text: `Invitation refusée : ${describeInvite(e)}` });
+      return false;
+    }
   }
 
   function onVerifyEmail(user: AdminUser): void {
@@ -195,6 +267,8 @@ export function AdminPanel({
           plus se connecter et toutes ses sessions sont fermées.
         </p>
       </header>
+
+      <InviteForm superAdmin={superAdmin} onInvite={onInvite} />
 
       <form role="search" onSubmit={onSearch} className="mb-4 flex gap-2">
         <label htmlFor="admin-search" className="sr-only">
@@ -278,6 +352,7 @@ export function AdminPanel({
                     onLogout={() => onLogout(user)}
                     onDelete={() => onDelete(user)}
                     onVerifyEmail={() => onVerifyEmail(user)}
+                    onResend={() => onResend(user)}
                   />
                 ))}
               </tbody>
@@ -296,6 +371,80 @@ export function AdminPanel({
   );
 }
 
+/** Formulaire d'invitation (#241) : email et rôle du futur compte. */
+function InviteForm({
+  superAdmin,
+  onInvite,
+}: {
+  superAdmin: boolean;
+  /** `true` si l'invitation est créée (le formulaire se vide). */
+  onInvite: (email: string, role: AssignableRole) => Promise<boolean>;
+}): JSX.Element {
+  const [email, setEmail] = useState("");
+  const [role, setRole] = useState<AssignableRole>("editor");
+  const [sending, setSending] = useState(false);
+
+  async function onSubmit(e: FormEvent<HTMLFormElement>): Promise<void> {
+    e.preventDefault();
+    if (!email.trim()) return;
+    setSending(true);
+    if (await onInvite(email, role)) {
+      setEmail("");
+      setRole("editor");
+    }
+    setSending(false);
+  }
+
+  return (
+    <form
+      aria-label="Inviter une personne"
+      onSubmit={(e) => void onSubmit(e)}
+      className="mb-6 flex flex-wrap items-end gap-2 rounded-lg border border-neutral-200 bg-white p-4"
+    >
+      <div className="min-w-56 flex-1">
+        <label htmlFor="invite-email" className="block text-sm font-medium text-neutral-700">
+          Inviter par email
+        </label>
+        <input
+          id="invite-email"
+          type="email"
+          placeholder="prenom.nom@exemple.fr"
+          value={email}
+          onChange={(e) => setEmail(e.target.value)}
+          className="mt-1 w-full rounded-md border border-neutral-300 px-3 py-2 text-sm outline-none focus:border-sky-500 focus:ring-1 focus:ring-sky-500"
+        />
+      </div>
+      <div>
+        <label htmlFor="invite-role" className="block text-sm font-medium text-neutral-700">
+          Rôle
+        </label>
+        <select
+          id="invite-role"
+          value={role}
+          onChange={(e) => setRole(e.target.value as AssignableRole)}
+          className="mt-1 rounded-md border border-neutral-300 bg-white px-2 py-2 text-sm"
+        >
+          {ASSIGNABLE.map((r) => (
+            <option key={r} value={r} disabled={r === "admin" && !superAdmin}>
+              {ROLE_LABELS[r]}
+            </option>
+          ))}
+        </select>
+      </div>
+      <button
+        type="submit"
+        disabled={sending || !email.trim()}
+        className="rounded-md bg-neutral-900 px-3 py-2 text-sm font-medium text-white hover:bg-neutral-700 disabled:opacity-50"
+      >
+        {sending ? "Envoi…" : "Inviter"}
+      </button>
+      <p className="w-full text-xs text-neutral-500">
+        La personne reçoit un lien valable 7 jours pour choisir son mot de passe.
+      </p>
+    </form>
+  );
+}
+
 function UserRow({
   user,
   self,
@@ -306,6 +455,7 @@ function UserRow({
   onLogout,
   onDelete,
   onVerifyEmail,
+  onResend,
 }: {
   user: AdminUser;
   self: boolean;
@@ -316,6 +466,7 @@ function UserRow({
   onLogout: () => void;
   onDelete: () => void;
   onVerifyEmail: () => void;
+  onResend: () => void;
 }): JSX.Element {
   // Un super-admin n'est gérable que par un super-admin (refus 403 sinon).
   const locked = busy || (user.role === "admin" && !superAdmin);
@@ -359,16 +510,33 @@ function UserRow({
             Actif
           </span>
         )}
-        {!user.email_verified && (
-          <span className="ml-1 rounded bg-amber-50 px-2 py-0.5 text-xs font-medium text-amber-800">
-            Email non vérifié
+        {user.invitation_pending ? (
+          <span className="ml-1 rounded bg-sky-50 px-2 py-0.5 text-xs font-medium text-sky-800">
+            Invitation en attente
           </span>
+        ) : (
+          !user.email_verified && (
+            <span className="ml-1 rounded bg-amber-50 px-2 py-0.5 text-xs font-medium text-amber-800">
+              Email non vérifié
+            </span>
+          )
         )}
       </td>
       <td className="px-3 py-2 text-neutral-500">{created}</td>
       <td className="px-3 py-2">
         <div className="flex gap-2">
-          {!user.email_verified && (
+          {user.invitation_pending && (
+            <button
+              type="button"
+              onClick={onResend}
+              disabled={locked || user.disabled}
+              aria-label={`Renvoyer l'invitation de ${user.email}`}
+              className="rounded-md border border-neutral-200 px-2 py-1 text-xs text-neutral-700 hover:bg-neutral-50 disabled:opacity-60"
+            >
+              Renvoyer l'invitation
+            </button>
+          )}
+          {!user.email_verified && !user.invitation_pending && (
             <button
               type="button"
               onClick={onVerifyEmail}
@@ -401,10 +569,14 @@ function UserRow({
             type="button"
             onClick={onDelete}
             disabled={locked || self}
-            aria-label={`Supprimer ${user.email}`}
+            aria-label={
+              user.invitation_pending
+                ? `Annuler l'invitation de ${user.email}`
+                : `Supprimer ${user.email}`
+            }
             className="rounded-md border border-rose-200 px-2 py-1 text-xs text-rose-700 hover:bg-rose-50 disabled:opacity-60"
           >
-            Supprimer
+            {user.invitation_pending ? "Annuler l'invitation" : "Supprimer"}
           </button>
         </div>
       </td>

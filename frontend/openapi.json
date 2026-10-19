@@ -83,6 +83,55 @@
             "bearer": []
           }
         ]
+      },
+      "post": {
+        "tags": [
+          "admin"
+        ],
+        "summary": "`POST /admin/users` — invite une personne : compte créé au rôle choisi,\nsans mot de passe utilisable, et email d'invitation envoyé.",
+        "operationId": "invite_user",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/InviteBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "Compte créé, invitation en attente (`invitation_sent` : email parti)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InvitedUser"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Email invalide ou rôle inconnu"
+          },
+          "401": {
+            "description": "Token absent ou invalide"
+          },
+          "403": {
+            "description": "Manque `users.admin`, ou `*` pour le rôle `admin`"
+          },
+          "409": {
+            "description": "Email déjà enregistré"
+          },
+          "503": {
+            "description": "Invitations indisponibles : aucun envoi d'email configuré"
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
       }
     },
     "/admin/users/{id}": {
@@ -260,6 +309,54 @@
           },
           "404": {
             "description": "Compte inconnu"
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/admin/users/{id}/invitation": {
+      "post": {
+        "tags": [
+          "admin"
+        ],
+        "summary": "`POST /admin/users/{id}/invitation` — renvoie l'invitation d'un compte qui\nn'a pas encore choisi son mot de passe ; les liens précédents ne valent\nplus rien.",
+        "operationId": "resend_invitation",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Identifiant du compte",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Nouvelle invitation envoyée"
+          },
+          "401": {
+            "description": "Token absent ou invalide"
+          },
+          "403": {
+            "description": "Manque `users.admin`, ou `*` pour un compte super-admin"
+          },
+          "404": {
+            "description": "Compte inconnu"
+          },
+          "409": {
+            "description": "Compte déjà activé (mot de passe choisi) ou suspendu"
+          },
+          "502": {
+            "description": "Envoi de l'email impossible ; les liens précédents sont invalidés"
+          },
+          "503": {
+            "description": "Invitations indisponibles : aucun envoi d'email configuré"
           }
         },
         "security": [
@@ -476,6 +573,46 @@
           },
           "503": {
             "description": "Vérification de l'email désactivée sur ce déploiement"
+          }
+        }
+      }
+    },
+    "/auth/invitation/accept": {
+      "post": {
+        "tags": [
+          "auth"
+        ],
+        "summary": "`POST /auth/invitation/accept` — consomme un lien d'invitation (#241) : le\nmot de passe choisi remplace le hash inutilisable, l'adresse est marquée\nvérifiée et une paire de jetons est émise (connexion directe).",
+        "operationId": "accept_invitation",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AcceptInvitationBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Invitation acceptée, connecté",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TokenResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Lien invalide, expiré, déjà utilisé ou remplacé par un renvoi, ou mot de passe invalide"
+          },
+          "403": {
+            "description": "Compte suspendu par un administrateur (`account disabled`)"
+          },
+          "503": {
+            "description": "Invitations indisponibles : aucun envoi d'email configuré"
           }
         }
       }
@@ -845,6 +982,9 @@
           },
           "400": {
             "description": "Email ou mot de passe invalide"
+          },
+          "403": {
+            "description": "Inscriptions fermées (`signup closed`) : comptes créés par invitation seulement"
           },
           "409": {
             "description": "Email déjà enregistré"
@@ -1789,6 +1929,24 @@
   },
   "components": {
     "schemas": {
+      "AcceptInvitationBody": {
+        "type": "object",
+        "description": "Body de `/auth/invitation/accept`.",
+        "required": [
+          "token",
+          "password"
+        ],
+        "properties": {
+          "password": {
+            "type": "string",
+            "description": "Mot de passe choisi (8 à 1024 caractères)."
+          },
+          "token": {
+            "type": "string",
+            "description": "Jeton reçu par email (fragment `#invite=` du lien)."
+          }
+        }
+      },
       "AdminUser": {
         "type": "object",
         "description": "Compte vu par l'administration — jamais le hash du mot de passe.",
@@ -1799,6 +1957,7 @@
           "permissions",
           "disabled",
           "email_verified",
+          "invitation_pending",
           "created_at_ms"
         ],
         "properties": {
@@ -1822,6 +1981,10 @@
           "id": {
             "type": "string",
             "description": "Identifiant (`claims.sub`)."
+          },
+          "invitation_pending": {
+            "type": "boolean",
+            "description": "Invitation en attente (#241) : le compte n'a pas encore choisi son mot\nde passe et ne peut pas se connecter."
           },
           "permissions": {
             "type": "array",
@@ -2023,6 +2186,44 @@
           "email": {
             "type": "string",
             "description": "Adresse email du compte (normalisée côté serveur)."
+          }
+        }
+      },
+      "InviteBody": {
+        "type": "object",
+        "description": "Corps de [`invite_user`].",
+        "required": [
+          "email"
+        ],
+        "properties": {
+          "email": {
+            "type": "string",
+            "description": "Adresse de la personne invitée (normalisée côté serveur)."
+          },
+          "role": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`admin`, `editor` ou `viewer` ; défaut `editor`."
+          }
+        }
+      },
+      "InvitedUser": {
+        "type": "object",
+        "description": "Réponse de [`invite_user`].",
+        "required": [
+          "user",
+          "invitation_sent"
+        ],
+        "properties": {
+          "invitation_sent": {
+            "type": "boolean",
+            "description": "L'email d'invitation est parti ; sinon, le renvoyer\n(`POST /admin/users/{id}/invitation`)."
+          },
+          "user": {
+            "$ref": "#/components/schemas/AdminUser",
+            "description": "Compte créé (invitation en attente)."
           }
         }
       },

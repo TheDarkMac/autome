@@ -208,6 +208,49 @@ describe("useSession", () => {
     expect(result.current.session?.userId).toBe("user-1");
   });
 
+  it("acceptInvitation ouvre la session du compte invité (#241)", async () => {
+    const store = memorySessionStore();
+    const acceptInvitationImpl = vi.fn().mockResolvedValue(mkPair("ivy", 10_000));
+    const logoutImpl = vi.fn().mockResolvedValue(undefined);
+    const { result } = renderHook(() =>
+      useSession({ store, acceptInvitationImpl, logoutImpl }),
+    );
+    await act(async () => {
+      await result.current.acceptInvitation("uid.1.mac", "chosen-pw");
+    });
+    expect(acceptInvitationImpl).toHaveBeenCalledWith("uid.1.mac", "chosen-pw");
+    expect(result.current.session?.userId).toBe("ivy");
+    expect(store.read()?.refreshToken).toBe("refresh-ivy");
+    expect(logoutImpl).not.toHaveBeenCalled();
+  });
+
+  it("acceptInvitation ferme d'abord la session déjà ouverte ; un refus ne change rien", async () => {
+    const store = memorySessionStore(mkPair("root", 10_000));
+    const acceptInvitationImpl = vi
+      .fn()
+      .mockRejectedValueOnce(new Error("lien invalide"))
+      .mockResolvedValueOnce(mkPair("ivy", 10_000));
+    const logoutImpl = vi.fn().mockResolvedValue(undefined);
+    const { result } = renderHook(() =>
+      useSession({ store, acceptInvitationImpl, logoutImpl }),
+    );
+    await act(async () => {
+      await expect(result.current.acceptInvitation("bad", "chosen-pw")).rejects.toThrow(
+        "lien invalide",
+      );
+    });
+    expect(result.current.session?.userId).toBe("root");
+    expect(logoutImpl).not.toHaveBeenCalled();
+    await act(async () => {
+      await result.current.acceptInvitation("uid.1.mac", "chosen-pw");
+    });
+    expect(logoutImpl).toHaveBeenCalledWith({
+      accessToken: mkPair("root", 10_000).accessToken,
+      refreshToken: "refresh-root",
+    });
+    expect(result.current.session?.userId).toBe("ivy");
+  });
+
   it("logout sans session n'appelle pas le serveur", () => {
     const logoutImpl = vi.fn().mockResolvedValue(undefined);
     const { result } = renderHook(() =>

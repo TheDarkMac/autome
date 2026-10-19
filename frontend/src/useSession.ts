@@ -5,8 +5,8 @@
 //   - expose `login` / `signup` (sans session si l'adresse doit d'abord
 //     être vérifiée — #231) / `logout` (qui ferme aussi la session
 //     côté serveur, au mieux — #184), `logoutAll` (toutes les sessions,
-//     tous appareils — #186), `changePassword` (#196) et `deleteAccount`
-//     (#229) ;
+//     tous appareils — #186), `changePassword` (#196), `deleteAccount`
+//     (#229) et `acceptInvitation` (#241, connexion directe) ;
 //   - rafraîchit l'access token de manière proactive (timer réarmé à
 //     `skewMs` avant l'expiration) et sur échec, déconnecte proprement.
 //
@@ -16,6 +16,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
 import {
+  acceptInvitation as apiAcceptInvitation,
   changePassword as apiChangePassword,
   deleteAccount as apiDeleteAccount,
   login as apiLogin,
@@ -48,6 +49,7 @@ export interface UseSessionOptions {
   logoutAllImpl?: typeof apiLogoutAll;
   changePasswordImpl?: typeof apiChangePassword;
   deleteAccountImpl?: typeof apiDeleteAccount;
+  acceptInvitationImpl?: typeof apiAcceptInvitation;
 }
 
 /** Inscription en attente de la vérification de l'adresse (#231). */
@@ -86,6 +88,12 @@ export interface UseSessionResult {
    */
   deleteAccount: (currentPassword: string) => Promise<void>;
   /**
+   * Accepte une invitation (#241) et ouvre la session du compte invité ; une
+   * session déjà ouverte dans ce navigateur est d'abord fermée. Rejette sans
+   * rien changer en local si le serveur refuse.
+   */
+  acceptInvitation: (token: string, password: string) => Promise<void>;
+  /**
    * `fetch` authentifié (F8.7.c) : injecte le Bearer courant et, sur 401,
    * rafraîchit le token puis rejoue la requête. Identité **stable** — sûr à
    * passer à `useMemo`/`useEffect` ou à `createApiClient`.
@@ -107,6 +115,7 @@ export function useSession(options: UseSessionOptions = {}): UseSessionResult {
     logoutAllImpl = apiLogoutAll,
     changePasswordImpl = apiChangePassword,
     deleteAccountImpl = apiDeleteAccount,
+    acceptInvitationImpl = apiAcceptInvitation,
   } = options;
 
   // Le store ne doit pas changer entre les rendus : on le fige au montage.
@@ -193,6 +202,21 @@ export function useSession(options: UseSessionOptions = {}): UseSessionResult {
     [apply, authFetch, deleteAccountImpl],
   );
 
+  const acceptInvitation = useCallback(
+    async (token: string, password: string) => {
+      const pair = await acceptInvitationImpl(token, password);
+      const previous = sessionRef.current;
+      if (previous) {
+        logoutImpl({
+          accessToken: previous.accessToken,
+          refreshToken: previous.refreshToken,
+        }).catch(() => undefined);
+      }
+      apply(pair);
+    },
+    [apply, acceptInvitationImpl, logoutImpl],
+  );
+
   const login = useCallback(
     async (creds: Credentials) => {
       apply(await loginImpl(creds));
@@ -240,6 +264,7 @@ export function useSession(options: UseSessionOptions = {}): UseSessionResult {
     logoutAll,
     changePassword,
     deleteAccount,
+    acceptInvitation,
     authFetch,
   };
 }

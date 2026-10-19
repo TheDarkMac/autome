@@ -14,7 +14,11 @@ export interface paths {
         /** `GET /admin/users` — comptes paginés, du plus ancien au plus récent. */
         get: operations["list_users"];
         put?: never;
-        post?: never;
+        /**
+         * `POST /admin/users` — invite une personne : compte créé au rôle choisi,
+         *     sans mot de passe utilisable, et email d'invitation envoyé.
+         */
+        post: operations["invite_user"];
         delete?: never;
         options?: never;
         head?: never;
@@ -76,6 +80,27 @@ export interface paths {
          *     anciennes sessions restent fermées).
          */
         post: operations["enable_user"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/admin/users/{id}/invitation": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * `POST /admin/users/{id}/invitation` — renvoie l'invitation d'un compte qui
+         *     n'a pas encore choisi son mot de passe ; les liens précédents ne valent
+         *     plus rien.
+         */
+        post: operations["resend_invitation"];
         delete?: never;
         options?: never;
         head?: never;
@@ -180,6 +205,27 @@ export interface paths {
          *     Un lien déjà utilisé reste accepté tant qu'il n'a pas expiré (idempotent).
          */
         post: operations["verify_email"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/auth/invitation/accept": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * `POST /auth/invitation/accept` — consomme un lien d'invitation (#241) : le
+         *     mot de passe choisi remplace le hash inutilisable, l'adresse est marquée
+         *     vérifiée et une paire de jetons est émise (connexion directe).
+         */
+        post: operations["accept_invitation"];
         delete?: never;
         options?: never;
         head?: never;
@@ -640,6 +686,13 @@ export interface paths {
 export type webhooks = Record<string, never>;
 export interface components {
     schemas: {
+        /** @description Body de `/auth/invitation/accept`. */
+        AcceptInvitationBody: {
+            /** @description Mot de passe choisi (8 à 1024 caractères). */
+            password: string;
+            /** @description Jeton reçu par email (fragment `#invite=` du lien). */
+            token: string;
+        };
         /** @description Compte vu par l'administration — jamais le hash du mot de passe. */
         AdminUser: {
             /**
@@ -655,6 +708,11 @@ export interface components {
             email_verified: boolean;
             /** @description Identifiant (`claims.sub`). */
             id: string;
+            /**
+             * @description Invitation en attente (#241) : le compte n'a pas encore choisi son mot
+             *     de passe et ne peut pas se connecter.
+             */
+            invitation_pending: boolean;
             /** @description Permissions accordées, triées. */
             permissions: string[];
             /** @description Rôle déduit des permissions : `admin`, `editor`, `viewer` ou `custom`. */
@@ -750,6 +808,23 @@ export interface components {
         ForgotPasswordBody: {
             /** @description Adresse email du compte (normalisée côté serveur). */
             email: string;
+        };
+        /** @description Corps de [`invite_user`]. */
+        InviteBody: {
+            /** @description Adresse de la personne invitée (normalisée côté serveur). */
+            email: string;
+            /** @description `admin`, `editor` ou `viewer` ; défaut `editor`. */
+            role?: string | null;
+        };
+        /** @description Réponse de [`invite_user`]. */
+        InvitedUser: {
+            /**
+             * @description L'email d'invitation est parti ; sinon, le renvoyer
+             *     (`POST /admin/users/{id}/invitation`).
+             */
+            invitation_sent: boolean;
+            /** @description Compte créé (invitation en attente). */
+            user: components["schemas"]["AdminUser"];
         };
         /** @description Réponse de `GET /credentials`. */
         ListCredentialsResponse: {
@@ -952,6 +1027,65 @@ export interface operations {
             };
         };
     };
+    invite_user: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["InviteBody"];
+            };
+        };
+        responses: {
+            /** @description Compte créé, invitation en attente (`invitation_sent` : email parti) */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InvitedUser"];
+                };
+            };
+            /** @description Email invalide ou rôle inconnu */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Token absent ou invalide */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Manque `users.admin`, ou `*` pour le rôle `admin` */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Email déjà enregistré */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Invitations indisponibles : aucun envoi d'email configuré */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
     get_user: {
         parameters: {
             query?: never;
@@ -1140,6 +1274,69 @@ export interface operations {
             };
             /** @description Compte inconnu */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    resend_invitation: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Identifiant du compte */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Nouvelle invitation envoyée */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Token absent ou invalide */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Manque `users.admin`, ou `*` pour un compte super-admin */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Compte inconnu */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Compte déjà activé (mot de passe choisi) ou suspendu */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Envoi de l'email impossible ; les liens précédents sont invalidés */
+            502: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Invitations indisponibles : aucun envoi d'email configuré */
+            503: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -1366,6 +1563,51 @@ export interface operations {
                 content?: never;
             };
             /** @description Vérification de l'email désactivée sur ce déploiement */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    accept_invitation: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AcceptInvitationBody"];
+            };
+        };
+        responses: {
+            /** @description Invitation acceptée, connecté */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TokenResponse"];
+                };
+            };
+            /** @description Lien invalide, expiré, déjà utilisé ou remplacé par un renvoi, ou mot de passe invalide */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Compte suspendu par un administrateur (`account disabled`) */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Invitations indisponibles : aucun envoi d'email configuré */
             503: {
                 headers: {
                     [name: string]: unknown;
@@ -1762,6 +2004,13 @@ export interface operations {
             };
             /** @description Email ou mot de passe invalide */
             400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Inscriptions fermées (`signup closed`) : comptes créés par invitation seulement */
+            403: {
                 headers: {
                     [name: string]: unknown;
                 };

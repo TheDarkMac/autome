@@ -102,6 +102,57 @@ describe("<App />", () => {
     expect(window.location.hash).toBe("");
   });
 
+  it("active un compte invité depuis le lien #invite= et ouvre sa session (#241)", async () => {
+    globalThis.fetch = vi.fn().mockResolvedValue(jsonResponse(sampleSpec)) as typeof fetch;
+    window.history.replaceState(null, "", "/#invite=uid.1.mac");
+    const acceptInvitationImpl = vi.fn().mockResolvedValue({
+      accessToken: `h.${b64url({ sub: "ivy", exp: 9_999_999_999 })}.s`,
+      refreshToken: "r",
+    });
+    render(<App sessionOptions={{ store: memorySessionStore(), acceptInvitationImpl }} />);
+    expect(screen.getByRole("form", { name: "Activation du compte" })).toBeInTheDocument();
+    await waitFor(() => expect(window.location.hash).toBe(""));
+
+    fireEvent.change(screen.getByLabelText("Nouveau mot de passe"), {
+      target: { value: "chosen-pw" },
+    });
+    fireEvent.change(screen.getByLabelText("Confirmation"), {
+      target: { value: "other-pw" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Activer mon compte" }));
+    expect(screen.getByRole("alert")).toHaveTextContent(/confirmation ne correspond pas/);
+    expect(acceptInvitationImpl).not.toHaveBeenCalled();
+
+    fireEvent.change(screen.getByLabelText("Confirmation"), {
+      target: { value: "chosen-pw" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Activer mon compte" }));
+    await waitFor(() =>
+      expect(screen.getByRole("heading", { name: "Autome" })).toBeInTheDocument(),
+    );
+    expect(acceptInvitationImpl).toHaveBeenCalledWith("uid.1.mac", "chosen-pw");
+    expect(screen.getByTestId("current-user")).toHaveTextContent("ivy");
+  });
+
+  it("affiche l'erreur d'un lien d'invitation refusé et permet de revenir (#241)", async () => {
+    globalThis.fetch = vi.fn().mockResolvedValue(jsonResponse(sampleSpec)) as typeof fetch;
+    window.history.replaceState(null, "", "/#invite=uid.1.mac");
+    const acceptInvitationImpl = vi
+      .fn()
+      .mockRejectedValue(new Error("ce lien d'invitation est invalide, expiré ou déjà utilisé"));
+    render(<App sessionOptions={{ store: memorySessionStore(), acceptInvitationImpl }} />);
+    fireEvent.change(screen.getByLabelText("Nouveau mot de passe"), {
+      target: { value: "chosen-pw" },
+    });
+    fireEvent.change(screen.getByLabelText("Confirmation"), {
+      target: { value: "chosen-pw" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Activer mon compte" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent(/invalide, expiré/);
+    fireEvent.click(screen.getByRole("button", { name: "Retour à la connexion" }));
+    expect(screen.getByRole("form", { name: "Connexion" })).toBeInTheDocument();
+  });
+
   it("réagit à un lien #reset= collé dans l'onglet déjà ouvert (#204)", async () => {
     globalThis.fetch = vi.fn().mockResolvedValue(jsonResponse(sampleSpec)) as typeof fetch;
     window.history.replaceState(null, "", "/");
