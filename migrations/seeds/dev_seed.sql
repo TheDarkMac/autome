@@ -8,14 +8,16 @@
 
 BEGIN;
 
-INSERT INTO users (id, email, password_hash, role)
+INSERT INTO users (id, email, password_hash, role, email_verified_at)
 VALUES (
     '00000000-0000-0000-0000-000000000001',
     'dev@autome.local',
     -- Argon2id (PHC) du mot de passe de DEV `autome-dev-password` — connexion
     -- via `POST /auth/login`. Ne jamais réutiliser hors base de dev.
     '$argon2id$v=19$m=19456,t=2,p=1$tgpscoPhcSuThQd6egmrLw$FknLiARlQHDBxMAu8p9aZ9RDLotN21vSC36+JcBpDig',
-    'admin'
+    'admin',
+    -- Adresse tenue pour vérifiée (migration 0020, #231) : connexion directe.
+    now()
 );
 
 -- Super-admin de dev : wildcard RBAC (`user_permissions.user_id` = claims.sub).

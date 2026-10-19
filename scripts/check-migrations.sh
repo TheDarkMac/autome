@@ -94,4 +94,8 @@ echo "    OK  contrainte users_email_unique active"
 assert_count "compte de dev actif" \
   "SELECT count(*) FROM users WHERE disabled_at IS NULL;" 1
 
+# Vérification de l'email (#231) : le compte seedé peut se connecter.
+assert_count "compte de dev vérifié" \
+  "SELECT count(*) FROM users WHERE email_verified_at IS NOT NULL;" 1
+
 echo "==> ✅ Schéma valide : migrations + seed appliqués, invariants OK"

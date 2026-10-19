@@ -27,7 +27,7 @@ async fn setup() -> Option<(PgUserStore, PgPermissionStore, MutexGuard<'static, 
                role TEXT NOT NULL DEFAULT 'user', \
                created_at TIMESTAMPTZ NOT NULL DEFAULT now(), \
                updated_at TIMESTAMPTZ NOT NULL DEFAULT now(), \
-               disabled_at TIMESTAMPTZ NULL);",
+               disabled_at TIMESTAMPTZ NULL, email_verified_at TIMESTAMPTZ NULL);",
         )
         .await
         .expect("schéma de test");
@@ -49,7 +49,7 @@ async fn create_find_and_grant_atomically() {
         .into_iter()
         .collect();
     let CreateUser::Created(alice) = users
-        .create("alice@example.io", "$argon2id$h1", &granted)
+        .create("alice@example.io", "$argon2id$h1", &granted, true)
         .await
         .unwrap()
     else {
@@ -59,7 +59,7 @@ async fn create_find_and_grant_atomically() {
     assert_eq!(perms.permissions_for(&alice.id).await.unwrap(), granted);
 
     let again = users
-        .create("alice@example.io", "$argon2id$h2", &granted)
+        .create("alice@example.io", "$argon2id$h2", &granted, true)
         .await
         .unwrap();
     assert_eq!(again, CreateUser::EmailTaken);
@@ -123,7 +123,11 @@ fn editor() -> HashSet<String> {
 }
 
 async fn created(users: &PgUserStore, email: &str) -> autome_core::UserRecord {
-    match users.create(email, "$argon2id$h", &editor()).await.unwrap() {
+    match users
+        .create(email, "$argon2id$h", &editor(), true)
+        .await
+        .unwrap()
+    {
         CreateUser::Created(record) => record,
         CreateUser::EmailTaken => panic!("email déjà pris"),
     }
@@ -229,4 +233,88 @@ async fn admin_permissions_replacement_and_suspension() {
     assert!(!users.find_by_id(&alice.id).await.unwrap().unwrap().disabled);
     assert!(!users.set_disabled("alice", true).await.unwrap());
     assert_eq!(users.summary("alice").await.unwrap(), None);
+}
+
+#[tokio::test]
+async fn email_verification_is_conditional_on_the_address() {
+    let Some((users, _perms, _serial)) = setup().await else {
+        eprintln!("TEST_DATABASE_URL absent → test PostgreSQL sauté");
+        return;
+    };
+    let CreateUser::Created(alice) = users
+        .create("alice@example.io", "$argon2id$h", &editor(), false)
+        .await
+        .unwrap()
+    else {
+        panic!("compte attendu");
+    };
+    assert!(!alice.email_verified);
+    assert!(
+        !users
+            .find_by_id(&alice.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .email_verified
+    );
+    assert!(
+        !users
+            .summary(&alice.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .email_verified
+    );
+
+    // Autre adresse, compte inconnu, id non UUID : rien n'est écrit.
+    assert!(!users
+        .mark_email_verified(&alice.id, "old@example.io")
+        .await
+        .unwrap());
+    assert!(!users
+        .mark_email_verified("00000000-0000-0000-0000-00000000dead", "alice@example.io")
+        .await
+        .unwrap());
+    assert!(!users
+        .mark_email_verified("alice", "alice@example.io")
+        .await
+        .unwrap());
+    assert!(
+        !users
+            .find_by_id(&alice.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .email_verified
+    );
+
+    assert!(users
+        .mark_email_verified(&alice.id, "alice@example.io")
+        .await
+        .unwrap());
+    assert!(users
+        .mark_email_verified(&alice.id, "alice@example.io")
+        .await
+        .unwrap());
+    assert!(
+        users
+            .find_by_email("alice@example.io")
+            .await
+            .unwrap()
+            .unwrap()
+            .email_verified
+    );
+    let page = users.list(None, 0, 10).await.unwrap();
+    assert!(page.items[0].email_verified);
+
+    let bob = created(&users, "bob@example.io").await;
+    assert!(bob.email_verified, "créé vérifié");
+    assert!(
+        users
+            .find_by_id(&bob.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .email_verified
+    );
 }

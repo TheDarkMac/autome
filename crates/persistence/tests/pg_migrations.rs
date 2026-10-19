@@ -55,4 +55,26 @@ async fn applies_all_then_is_idempotent() {
             .get(0);
         assert!(exists, "table absente après migration : {table}");
     }
+
+    // Reprise par 0020 (#231) : un compte créé avant la migration est tenu
+    // pour vérifié à sa date de création — personne n'est mis à la porte.
+    client
+        .batch_execute(
+            "ALTER TABLE users DROP COLUMN email_verified_at; \
+             DELETE FROM schema_migrations WHERE name = '0020_email_verification.sql'; \
+             INSERT INTO users (email, password_hash, created_at) \
+             VALUES ('legacy@example.io', 'h', '2020-01-01T00:00:00Z');",
+        )
+        .await
+        .unwrap();
+    assert_eq!(run_migrations(&pool).await.expect("run 3"), 1);
+    let backfilled: bool = client
+        .query_one(
+            "SELECT email_verified_at = created_at FROM users WHERE email = 'legacy@example.io'",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert!(backfilled, "compte antérieur vérifié à sa date de création");
 }
