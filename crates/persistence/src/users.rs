@@ -8,7 +8,7 @@
 //! deux ne laisse ni compte sans droits ni droits orphelins. Il en va de même
 //! du remplacement des permissions par l'administration (#208).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use async_trait::async_trait;
 use autome_core::{CreateUser, Error, UserPage, UserRecord, UserStore, UserSummary};
@@ -317,6 +317,28 @@ impl UserStore for PgUserStore {
             .await
             .map_err(|e| storage_err("mark_email_verified", e))?;
         Ok(n == 1)
+    }
+
+    async fn emails(&self, ids: &[String]) -> autome_core::Result<HashMap<String, String>> {
+        // Un id qui n'est pas un UUID ne désigne aucun compte (et ferait
+        // échouer le cast) : filtré ici, la requête reste sur la clé primaire.
+        let ids: Vec<&str> = ids
+            .iter()
+            .map(String::as_str)
+            .filter(|id| is_uuid(id))
+            .collect();
+        if ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let client = self.pool.get().await.map_err(|e| storage_err("pool", e))?;
+        let rows = client
+            .query(
+                "SELECT id::text, email FROM users WHERE id = ANY($1::text[]::uuid[])",
+                &[&ids],
+            )
+            .await
+            .map_err(|e| storage_err("emails", e))?;
+        Ok(rows.iter().map(|r| (r.get(0), r.get(1))).collect())
     }
 }
 

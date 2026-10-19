@@ -62,10 +62,65 @@ pub struct WorkflowPage {
     pub total: usize,
 }
 
+/// Filtre de [`WorkflowRepository::list_all`] (#243).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WorkflowFilter {
+    /// Espace exact (`Some("")` = [`LEGACY_NAMESPACE`]) ; `None` = tous.
+    pub owner: Option<String>,
+    /// Sous-chaîne cherchée dans l'id ou le nom, sans tenir compte de la
+    /// casse ; `None` (ou vide) = pas de recherche.
+    pub query: Option<String>,
+}
+
+impl WorkflowFilter {
+    /// Recherche normalisée (minuscules), `None` si absente ou vide.
+    pub fn needle(&self) -> Option<String> {
+        self.query
+            .as_deref()
+            .map(str::trim)
+            .filter(|q| !q.is_empty())
+            .map(str::to_lowercase)
+    }
+
+    /// `true` si le workflow `(owner, graph)` passe le filtre.
+    pub fn matches(&self, owner: &str, graph: &WorkflowGraph) -> bool {
+        if self.owner.as_deref().is_some_and(|o| o != owner) {
+            return false;
+        }
+        self.needle().is_none_or(|q| {
+            graph.id.0.to_lowercase().contains(&q) || graph.name.to_lowercase().contains(&q)
+        })
+    }
+}
+
+/// Résumé d'un workflow pour la liste d'administration (#243) : son espace
+/// et de quoi le reconnaître, sans le graphe (paramètres des nœuds).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkflowListing {
+    /// Propriétaire (espace d'ids) ; [`LEGACY_NAMESPACE`] si aucun.
+    pub owner: String,
+    /// Id dans l'espace du propriétaire.
+    pub id: WorkflowId,
+    /// Nom affiché.
+    pub name: String,
+    /// Nombre de nœuds de la version courante.
+    pub node_count: usize,
+}
+
+/// Page de [`WorkflowRepository::list_all`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkflowListingPage {
+    /// Résumés de la page, triés par `(owner, id)`.
+    pub items: Vec<WorkflowListing>,
+    /// Nombre total d'entrées correspondant au filtre (hors pagination).
+    pub total: usize,
+}
+
 /// Contrat de persistance d'un workflow. Toutes les opérations portent sur
 /// l'espace d'ids de `owner` : un workflow d'un autre espace n'existe pas
-/// pour elles. Aucun contrôle d'accès ici — l'appelant choisit l'espace
-/// (API : celui de l'utilisateur authentifié).
+/// pour elles — sauf [`Self::list_all`], la vue d'administration. Aucun
+/// contrôle d'accès ici — l'appelant choisit l'espace (API : celui de
+/// l'utilisateur authentifié).
 #[async_trait]
 pub trait WorkflowRepository: Send + Sync {
     /// Crée un workflow dans l'espace de `owner`. `Err` (message contenant
@@ -85,6 +140,15 @@ pub trait WorkflowRepository: Send + Sync {
     /// Supprime un workflow de l'espace de `owner`. `Ok(false)` si inconnu
     /// (idempotent côté caller).
     async fn delete(&self, owner: &str, id: &WorkflowId) -> Result<bool>;
+
+    /// Liste d'administration (#243) : workflows de **tous** les espaces
+    /// correspondant à `filter`, triés par `(owner, id)`, paginés. Réservée
+    /// aux super-admins par l'appelant.
+    async fn list_all(
+        &self,
+        filter: &WorkflowFilter,
+        paging: Pagination,
+    ) -> Result<WorkflowListingPage>;
 }
 
 /// Clé de stockage : `(propriétaire, id)`. `BTreeMap` ⇒ itération triée par
@@ -159,6 +223,29 @@ impl WorkflowRepository for InMemoryWorkflowRepository {
 
     async fn delete(&self, owner: &str, id: &WorkflowId) -> Result<bool> {
         Ok(self.lock()?.remove(&key(owner, &id.0)).is_some())
+    }
+
+    async fn list_all(
+        &self,
+        filter: &WorkflowFilter,
+        paging: Pagination,
+    ) -> Result<WorkflowListingPage> {
+        let map = self.lock()?;
+        let matching = map
+            .iter()
+            .filter(|((owner, _), graph)| filter.matches(owner, graph));
+        let total = matching.clone().count();
+        let items = matching
+            .skip(paging.offset)
+            .take(paging.limit)
+            .map(|((owner, _), graph)| WorkflowListing {
+                owner: owner.clone(),
+                id: graph.id.clone(),
+                name: graph.name.clone(),
+                node_count: graph.nodes.len(),
+            })
+            .collect();
+        Ok(WorkflowListingPage { items, total })
     }
 }
 
@@ -358,5 +445,122 @@ mod tests {
         assert!(repo.update("alice", sample("b-1")).await.is_err());
         assert!(!repo.delete("alice", &wid("b-1")).await.unwrap());
         assert!(repo.get("bob", &wid("b-1")).await.unwrap().is_some());
+    }
+
+    // ───── Liste d'administration (#243) ─────
+
+    async fn three_namespaces() -> InMemoryWorkflowRepository {
+        let repo = InMemoryWorkflowRepository::new();
+        let mut invoices = sample("wf-b");
+        invoices.name = "Factures mensuelles".into();
+        repo.create("bob", invoices).await.unwrap();
+        repo.create("alice", sample("wf-z")).await.unwrap();
+        repo.create("alice", sample("wf-a")).await.unwrap();
+        repo.create(LEGACY_NAMESPACE, sample("old")).await.unwrap();
+        repo
+    }
+
+    fn listed(page: &WorkflowListingPage) -> Vec<(String, String)> {
+        page.items
+            .iter()
+            .map(|w| (w.owner.clone(), w.id.0.clone()))
+            .collect()
+    }
+
+    fn pair(owner: &str, id: &str) -> (String, String) {
+        (owner.to_string(), id.to_string())
+    }
+
+    #[tokio::test]
+    async fn list_all_spans_every_namespace_sorted_by_owner_then_id() {
+        let repo = three_namespaces().await;
+        let page = repo
+            .list_all(&WorkflowFilter::default(), Pagination::default())
+            .await
+            .unwrap();
+        assert_eq!(page.total, 4);
+        assert_eq!(
+            listed(&page),
+            vec![
+                pair("", "old"),
+                pair("alice", "wf-a"),
+                pair("alice", "wf-z"),
+                pair("bob", "wf-b"),
+            ]
+        );
+        let bob = &page.items[3];
+        assert_eq!(bob.name, "Factures mensuelles");
+        assert_eq!(bob.node_count, 1);
+    }
+
+    #[tokio::test]
+    async fn list_all_filters_by_exact_owner_including_legacy() {
+        let repo = three_namespaces().await;
+        let only = |owner: &str| WorkflowFilter {
+            owner: Some(owner.into()),
+            query: None,
+        };
+        let alice = repo
+            .list_all(&only("alice"), Pagination::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            listed(&alice),
+            vec![pair("alice", "wf-a"), pair("alice", "wf-z")]
+        );
+        let legacy = repo
+            .list_all(&only(LEGACY_NAMESPACE), Pagination::default())
+            .await
+            .unwrap();
+        assert_eq!(listed(&legacy), vec![pair("", "old")]);
+        let prefix = repo
+            .list_all(&only("ali"), Pagination::default())
+            .await
+            .unwrap();
+        assert_eq!(prefix.total, 0, "propriétaire exact, pas un préfixe");
+    }
+
+    #[tokio::test]
+    async fn list_all_searches_id_or_name_case_insensitively() {
+        let repo = three_namespaces().await;
+        let search = |q: &str| WorkflowFilter {
+            owner: None,
+            query: Some(q.into()),
+        };
+        let by_name = repo
+            .list_all(&search("  FACTURES "), Pagination::default())
+            .await
+            .unwrap();
+        assert_eq!(listed(&by_name), vec![pair("bob", "wf-b")]);
+        let by_id = repo
+            .list_all(&search("WF-"), Pagination::default())
+            .await
+            .unwrap();
+        assert_eq!(by_id.total, 3);
+        let blank = repo
+            .list_all(&search("  "), Pagination::default())
+            .await
+            .unwrap();
+        assert_eq!(blank.total, 4, "recherche vide = pas de recherche");
+    }
+
+    #[tokio::test]
+    async fn list_all_paginates_with_the_filtered_total() {
+        let repo = three_namespaces().await;
+        let page = repo
+            .list_all(
+                &WorkflowFilter::default(),
+                Pagination {
+                    offset: 1,
+                    limit: 2,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(page.total, 4);
+        assert_eq!(
+            listed(&page),
+            vec![pair("alice", "wf-a"), pair("alice", "wf-z")]
+        );
     }
 }

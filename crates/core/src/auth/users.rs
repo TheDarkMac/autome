@@ -167,6 +167,11 @@ pub trait UserStore: Send + Sync {
     /// encore `email` : un lien émis pour une autre adresse ne vérifie rien.
     /// Idempotent ; `false` si le compte est inconnu ou son email différent.
     async fn mark_email_verified(&self, id: &str, email: &str) -> Result<bool>;
+
+    /// Emails des comptes `ids`, en une lecture (liste d'administration des
+    /// workflows, #243). Les ids inconnus ou mal formés sont absents du
+    /// résultat.
+    async fn emails(&self, ids: &[String]) -> Result<HashMap<String, String>>;
 }
 
 /// Normalise un email : espaces de bord retirés, minuscules.
@@ -423,6 +428,16 @@ impl UserStore for InMemoryUserStore {
             }
             _ => Ok(false),
         }
+    }
+
+    async fn emails(&self, ids: &[String]) -> Result<HashMap<String, String>> {
+        let wanted: HashSet<&str> = ids.iter().map(String::as_str).collect();
+        Ok(self
+            .lock()?
+            .values()
+            .filter(|u| wanted.contains(u.record.id.as_str()))
+            .map(|u| (u.record.id.clone(), u.record.email.clone()))
+            .collect())
     }
 }
 
@@ -817,5 +832,30 @@ mod tests {
                 .unwrap(),
             CreateUser::Created(_)
         ));
+    }
+
+    #[tokio::test]
+    async fn emails_resolves_known_ids_in_one_call() {
+        let (users, _) = store();
+        let alice = created(&users, "alice@example.io").await;
+        let bob = created(&users, "bob@example.io").await;
+        let _carol = created(&users, "carol@example.io").await;
+        let found = users
+            .emails(&[
+                alice.id.clone(),
+                bob.id.clone(),
+                "".into(),
+                "inconnu".into(),
+            ])
+            .await
+            .unwrap();
+        assert_eq!(
+            found,
+            HashMap::from([
+                (alice.id, "alice@example.io".to_string()),
+                (bob.id, "bob@example.io".to_string()),
+            ])
+        );
+        assert!(users.emails(&[]).await.unwrap().is_empty());
     }
 }

@@ -6,9 +6,15 @@
 //! servie par `get`/`list`. `update` publie une nouvelle version (historique
 //! conservé). IDs logiques en TEXT (migration `0009`), namespacés par
 //! propriétaire : clé `(owner_id, id)` (migration `0014`, #188).
+//! `list_all` (#243) parcourt tous les espaces dans l'ordre de cette clé ;
+//! il lit le nom dans `workflows.name` et ne renvoie du graphe que le nombre
+//! de nœuds.
 
 use async_trait::async_trait;
-use autome_core::{Error, Pagination, WorkflowGraph, WorkflowId, WorkflowPage, WorkflowRepository};
+use autome_core::{
+    Error, Pagination, WorkflowFilter, WorkflowGraph, WorkflowId, WorkflowListing,
+    WorkflowListingPage, WorkflowPage, WorkflowRepository,
+};
 
 use crate::pool::PgPool;
 
@@ -175,5 +181,60 @@ impl WorkflowRepository for PgWorkflowRepository {
             .await
             .map_err(|e| storage_err("delete", e))?;
         Ok(n > 0)
+    }
+
+    async fn list_all(
+        &self,
+        filter: &WorkflowFilter,
+        paging: Pagination,
+    ) -> autome_core::Result<WorkflowListingPage> {
+        // `$1` NULL = tous les espaces ; `$2` NULL = pas de recherche (déjà en
+        // minuscules). `strpos` plutôt que `LIKE` : aucun caractère joker à
+        // échapper dans la saisie.
+        const WHERE: &str = "($1::text IS NULL OR w.owner_id = $1) \
+             AND ($2::text IS NULL OR strpos(lower(w.id), $2) > 0 \
+                  OR strpos(lower(w.name), $2) > 0)";
+        let owner = filter.owner.as_deref();
+        let needle = filter.needle();
+        let client = self.pool.get().await.map_err(|e| storage_err("pool", e))?;
+        let total: i64 = client
+            .query_one(
+                &format!("SELECT count(*) FROM workflows w WHERE {WHERE}"),
+                &[&owner, &needle],
+            )
+            .await
+            .map_err(|e| storage_err("list_all count", e))?
+            .get(0);
+        let limit = paging.limit as i64;
+        let offset = paging.offset as i64;
+        let rows = client
+            .query(
+                &format!(
+                    "SELECT w.owner_id, w.id, w.name, \
+                       COALESCE(jsonb_array_length(v.graph -> 'nodes'), 0) \
+                     FROM workflows w \
+                     JOIN workflow_versions v \
+                       ON v.owner_id = w.owner_id AND v.workflow_id = w.id \
+                      AND v.version = w.current_version \
+                     WHERE {WHERE} \
+                     ORDER BY w.owner_id, w.id LIMIT $3 OFFSET $4"
+                ),
+                &[&owner, &needle, &limit, &offset],
+            )
+            .await
+            .map_err(|e| storage_err("list_all", e))?;
+        let items = rows
+            .iter()
+            .map(|r| WorkflowListing {
+                owner: r.get(0),
+                id: WorkflowId::new(r.get::<_, String>(1)),
+                name: r.get(2),
+                node_count: r.get::<_, i32>(3).max(0) as usize,
+            })
+            .collect();
+        Ok(WorkflowListingPage {
+            items,
+            total: total as usize,
+        })
     }
 }
