@@ -54,7 +54,8 @@ cp .env.example .env
 | `AUTOME_LOG_FORMAT` | Format des logs (API + worker) : `json` ou `text` | `text` | `json` (défaut en `prod`) |
 | `RUST_LOG` | Niveau des logs, syntaxe `EnvFilter` (ex. `info,autome_worker=debug`) | `info` | `info` |
 | `AUTOME_WORKER_CONCURRENCY` | Worker : tâches consommatrices par process ; aussi le *prefetch* RabbitMQ (messages poussés d'avance au process) | `4` | selon charge |
-| `AUTOME_RUN_TIMEOUT_SECS` | Worker : au-delà, un run encore `running` est clos en `failed` (min. 60) | `3600` | > durée du plus long run |
+| `AUTOME_RUN_TIMEOUT_SECS` | Worker : au-delà, une tentative encore `running` est close en `failed` (min. 60) | `3600` | > durée du plus long run |
+| `AUTOME_RUN_LEASE_SECS` | Worker : bail d'un run en cours (min. 10) ; sans battement depuis ce délai (worker tué), le run est remis en file et repris par un autre worker | `60` | `60` |
 | `AUTOME_SCHEDULER_TICK_SECS` | Worker : période de la boucle des déclencheurs `schedule` / `polling` (s, `0` = désactivée) | `10` | `10` |
 | `AUTOME_SMTP_URL` | Relais SMTP des emails (mot de passe oublié, vérification de l'adresse) : `smtps://user:pass@hôte` (TLS, 465) ou `smtp://hôte:587?tls=required` (STARTTLS). Contient un mot de passe : à mettre dans un secret | *(non défini : liens journalisés en `dev`)* | **requis pour le mot de passe oublié** (sinon 503) et la vérification de l'email (sinon comptes créés vérifiés) |
 | `AUTOME_EMAIL_VERIFICATION` | `required` : un compte inscrit ne se connecte qu'après avoir ouvert le lien reçu par email (dès qu'un envoi d'email est possible) ; `off` : comptes créés vérifiés (#231) | `required` | `required` |
@@ -118,12 +119,42 @@ l'exécuter (`queued → running`, atomique) : une seule réplique gagne, les
 livraisons dupliquées d'un run déjà pris ou terminé sont acquittées sans
 ré-exécution.
 
-Corollaire : un run interrompu en cours d'exécution (worker tué, pod évincé)
-**n'est pas rejoué**. Toutes les 60 s, chaque worker clôt en `failed` les runs
-encore `running` au-delà de `AUTOME_RUN_TIMEOUT_SECS` (défaut 1 h), avec une
-erreur explicite ; relancer le workflow si besoin. Réglez ce délai au-dessus de
-la durée du plus long run légitime : sinon un run encore actif serait affiché
-en échec jusqu'à ce que son état final le corrige.
+Les runs ne se perdent pas entre l'API et la file : le run `queued` et son
+message sont écrits **dans la même transaction** (table `run_outbox`, #239),
+puis publiés. Si la publication échoue (broker coupé, process tué au mauvais
+moment), le run est quand même accepté et toutes les 5 s un worker publie les
+messages restés en attente ; un message publié deux fois est écarté par le
+claim.
+
+**Reprise des runs interrompus (#239).** Avant chaque nœud, le worker
+l'enregistre comme *nœud en cours* (`next_node`) ; après, il enregistre le
+*point de reprise* du moteur et efface le nœud en cours. Un nœud ne démarre
+jamais sans ces deux écritures. Un run interrompu est remis en file et repris
+par un autre worker à son point de reprise — les nœuds déjà exécutés ne sont
+pas rejoués :
+
+- **arrêt du worker** (déploiement, mise à l'échelle) : il s'arrête au
+  prochain nœud, cf. C.5 ;
+- **worker tué** (OOM, nœud perdu) : il bat toutes les `AUTOME_RUN_LEASE_SECS`
+  / 4 ; un run sans battement depuis `AUTOME_RUN_LEASE_SECS` (défaut 60 s) est
+  remis en file par un autre worker.
+
+Si un nœud était **en cours** au moment de l'interruption, son effet est
+incertain (le message Slack est peut-être parti). Il n'est rejoué que s'il est
+sans effet (trigger, `if`, `switch`) ou si sa politique d'erreur autorise déjà
+plusieurs tentatives (`"_error": { "max_attempts": 2 }` ou plus) ; sinon le run
+est clos en `failed` avec un motif qui nomme le nœud — relancer le workflow si
+besoin. Un run est aussi clos en `failed`, sans reprise, si son workflow a été
+modifié depuis l'interruption (nœuds, paramètres ou arêtes ; déplacer un nœud
+dans l'éditeur ne compte pas) ou après 10 tentatives. Chaque écriture du
+worker est gardée par le numéro de tentative : un worker qui a perdu la main
+(coupé du réseau puis revenu) n'écrit plus rien et s'arrête au prochain nœud.
+
+Toutes les 60 s, chaque worker clôt aussi en `failed` les runs dont la
+tentative est encore `running` au-delà de `AUTOME_RUN_TIMEOUT_SECS` (défaut
+1 h), avec une erreur explicite. Réglez ce délai au-dessus de la durée du plus
+long run légitime : sinon un run encore actif serait affiché en échec jusqu'à
+ce que son état final le corrige.
 
 ### Tokens des connecteurs (par utilisateur)
 
@@ -437,20 +468,22 @@ doit dépasser `délai + drain` : `terminationGracePeriodSeconds: 35` dans
 suit la même séquence (`AUTOME_SHUTDOWN_DELAY_SECS=0` pour s'arrêter sans
 attendre).
 
-**Arrêt borné du worker (#200).** Sur `SIGTERM` / `SIGINT`, le worker cesse
-de prendre de nouveaux runs, `/readyz` répond 503 `draining` (`/livez` reste
-200), et les runs en cours ont `AUTOME_WORKER_SHUTDOWN_TIMEOUT_SECS` (défaut
-**25 s**) pour se terminer normalement. À l'échéance, ceux qui tournent encore
-sont **clos tout de suite en `failed`** — « worker arrêté pendant
-l'exécution : run interrompu (non rejoué, à relancer) » — au lieu de rester
-`running` jusqu'au balayage des orphelins (jusqu'à `AUTOME_RUN_TIMEOUT_SECS`).
-Ils ne sont pas rejoués : des nodes ont pu avoir déjà produit leurs effets
-(livraison *au plus une fois*) ; leur message, non acquitté, est redélivré à
-un autre worker puis acquitté sans exécution. Périodes de grâce :
-`terminationGracePeriodSeconds: 35` (`k8s/worker.yaml`),
-`stop_grace_period: 35s` (compose). **Workflows longs** : augmenter ensemble
-`AUTOME_WORKER_SHUTDOWN_TIMEOUT_SECS` et la période de grâce (grâce = délai +
-~10 s), sinon un déploiement interrompra les runs de plus de 25 s.
+**Arrêt borné du worker (#200, #239).** Sur `SIGTERM` / `SIGINT`, le worker
+cesse de prendre de nouveaux runs, `/readyz` répond 503 `draining` (`/livez`
+reste 200), et chaque run en cours **s'arrête au prochain nœud** : son point
+de reprise est enregistré, il est remis en file et un autre worker le reprend
+sans rien rejouer. Un nœud long a `AUTOME_WORKER_SHUTDOWN_TIMEOUT_SECS`
+(défaut **25 s**) pour se terminer. À l'échéance, les runs encore dans un
+nœud sont remis en file tout de suite ; le worker qui les reprend applique la
+règle du nœud en cours (rejoué seulement s'il est rejouable, sinon `failed` :
+livraison *au plus une fois*). Un run créé avant #239 (sans message dans
+l'outbox) ne peut pas être remis en file : il est clos en `failed` — « worker
+arrêté pendant l'exécution : run interrompu (non rejoué, à relancer) ».
+Périodes de grâce : `terminationGracePeriodSeconds: 35` (`k8s/worker.yaml`),
+`stop_grace_period: 35s` (compose). **Nœuds longs** (appel HTTP lent,
+boucle) : augmenter ensemble `AUTOME_WORKER_SHUTDOWN_TIMEOUT_SECS` et la
+période de grâce (grâce = délai + ~10 s), sinon un déploiement interrompra ces
+nœuds en cours.
 
 ### C.6 Monitoring
 
@@ -475,6 +508,10 @@ compose, Service headless `worker` en k8s) ; un label `instance` par pod.
 | `autome_worker_run_duration_seconds{status}` | histogram | durée entre le claim et l'état final (buckets 0,1 s → 1 h) |
 | `autome_worker_runs_in_flight` | gauge | runs en cours sur ce worker |
 | `autome_worker_orphan_runs_reaped_total` | counter | runs interrompus clos par le balayage des orphelins |
+| `autome_worker_runs_requeued_total{reason}` | counter | runs remis en file : `shutdown` (arrêt de ce worker), `stale` (sans battement, remis par ce worker) |
+| `autome_worker_runs_resumed_total` | counter | runs repris à leur point de reprise par ce worker |
+| `autome_worker_outbox_relayed_total` | counter | messages de run publiés par le relais de l'outbox (publication du dispatcher perdue) |
+| `autome_worker_outbox_errors_total` | counter | passes du relais ou de la remise en file en échec (broker ou base indisponible) |
 | `autome_worker_trigger_runs_total{kind,result}` | counter | runs des déclencheurs `schedule` / `polling` : `dispatched`, ou `failed` (déclenchement perdu) |
 | `autome_worker_trigger_missed_total` | counter | échéances `schedule` sautées (plus de 5 min de retard) |
 | `autome_worker_trigger_poll_errors_total` | counter | polls en échec (réseau, statut HTTP, réponse illisible) |
@@ -487,7 +524,9 @@ valeurs fixes : **aucun id de run, de workflow ni d'utilisateur**. Comme
 pas sortir du réseau interne (non publié en compose, Service headless sans
 Ingress en k8s). Exemples d'alertes : `rate(autome_worker_queue_errors_total[5m]) > 0`,
 `sum(rate(autome_worker_runs_total{status="failed"}[15m])) / sum(rate(autome_worker_runs_total[15m])) > 0.2`,
-`increase(autome_worker_trigger_runs_total{result="failed"}[15m]) > 0`.
+`increase(autome_worker_trigger_runs_total{result="failed"}[15m]) > 0`,
+`increase(autome_worker_runs_requeued_total{reason="stale"}[15m]) > 0` (workers
+tués), `increase(autome_worker_outbox_errors_total[5m]) > 0`.
 
 **Logs** : en `prod`, l'API et le worker écrivent **une ligne JSON par
 événement** sur la sortie standard, prête pour un collecteur (Loki, Fluent Bit,
