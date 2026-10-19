@@ -318,3 +318,55 @@ async fn email_verification_is_conditional_on_the_address() {
             .email_verified
     );
 }
+
+#[tokio::test]
+async fn an_invited_account_has_no_password_until_it_chooses_one() {
+    let Some((users, _perms, _serial)) = setup().await else {
+        eprintln!("TEST_DATABASE_URL absent → test PostgreSQL sauté");
+        return;
+    };
+    let invited = autome_core::unusable_password_hash();
+    let CreateUser::Created(alice) = users
+        .create("alice@example.io", &invited, &editor(), false)
+        .await
+        .unwrap()
+    else {
+        panic!("compte attendu");
+    };
+    created(&users, "bob@example.io").await;
+    let page = users.list(None, 0, 10).await.unwrap();
+    assert!(!page.items[0].password_set, "invitation en attente");
+    assert!(page.items[1].password_set);
+    assert!(
+        !users
+            .summary(&alice.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .password_set
+    );
+
+    // Renvoi : nouveau hash inutilisable, l'ancien ne vaut plus.
+    let resent = autome_core::unusable_password_hash();
+    assert!(users
+        .update_password(&alice.id, &invited, &resent)
+        .await
+        .unwrap());
+    assert!(!users
+        .update_password(&alice.id, &invited, "$argon2id$x")
+        .await
+        .unwrap());
+    // Acceptation.
+    assert!(users
+        .update_password(&alice.id, &resent, "$argon2id$chosen")
+        .await
+        .unwrap());
+    assert!(
+        users
+            .summary(&alice.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .password_set
+    );
+}

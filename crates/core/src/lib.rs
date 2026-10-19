@@ -28,11 +28,12 @@ pub mod workflow;
 pub use action::Action;
 pub use audit::{AuditEvent, AuditOutcome, AuditSink, InMemoryAuditSink, NoopAuditSink};
 pub use auth::{
-    email_throttle_key, erasure_pseudonym, normalize_email, validate_email, validate_password,
-    AccountEraser, Argon2PasswordHasher, Claims, CreateUser, ErasureReport, InMemoryLoginThrottle,
-    InMemoryRevocationStore, InMemoryUserStore, LoginAttempt, LoginThrottleStore, PasswordHasher,
-    RevocationStore, TokenKind, TokenService, TokenState, UserPage, UserRecord, UserStore,
-    UserSummary, ERASED_PREFIX, LOGIN_WINDOW_SECONDS, MAX_LOGIN_FAILURES,
+    email_throttle_key, erasure_pseudonym, has_usable_password, normalize_email,
+    unusable_password_hash, validate_email, validate_password, AccountEraser, Argon2PasswordHasher,
+    Claims, CreateUser, ErasureReport, InMemoryLoginThrottle, InMemoryRevocationStore,
+    InMemoryUserStore, LoginAttempt, LoginThrottleStore, PasswordHasher, RevocationStore,
+    TokenKind, TokenService, TokenState, UserPage, UserRecord, UserStore, UserSummary,
+    ERASED_PREFIX, LOGIN_WINDOW_SECONDS, MAX_LOGIN_FAILURES, UNUSABLE_PASSWORD_PREFIX,
 };
 pub use config::{Config, Profile, Secret};
 pub use health::HealthCheck;

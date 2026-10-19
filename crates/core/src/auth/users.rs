@@ -22,6 +22,15 @@
 //! vérifié ou non (selon que le déploiement exige la preuve de possession de
 //! l'adresse), puis [`UserStore::mark_email_verified`] le passe à vérifié.
 //! C'est l'API qui refuse la connexion d'un compte non vérifié.
+//!
+//! Un compte **invité** par un administrateur (#241) est créé sans mot de
+//! passe : son hash est inutilisable ([`unusable_password_hash`], préfixe
+//! [`UNUSABLE_PASSWORD_PREFIX`], qui n'est jamais celui d'une chaîne PHC —
+//! même convention que les *unusable passwords* de Django). Aucune
+//! vérification ne peut réussir contre lui ; l'acceptation de l'invitation le
+//! remplace par [`UserStore::update_password`]. « Invitation en attente »
+//! n'est donc qu'une vue du hash ([`has_usable_password`]), sans colonne ni
+//! état à synchroniser.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -39,6 +48,24 @@ pub const MIN_PASSWORD_LENGTH: usize = 8;
 pub const MAX_PASSWORD_LENGTH: usize = 1024;
 /// Longueur maximale d'une adresse email (RFC 5321).
 pub const MAX_EMAIL_LENGTH: usize = 254;
+/// Préfixe des hashs inutilisables (#241) : une chaîne PHC commence par `$`.
+pub const UNUSABLE_PASSWORD_PREFIX: &str = "!";
+
+/// Hash qui ne correspond à aucun mot de passe, pour un compte invité (#241).
+/// Aléatoire (128 bits) : en tirer un nouveau invalide les liens liés à
+/// l'ancien (cf. le renvoi d'une invitation).
+pub fn unusable_password_hash() -> String {
+    let mut b = [0u8; 16];
+    rand::thread_rng().fill_bytes(&mut b);
+    let hex: String = b.iter().map(|x| format!("{x:02x}")).collect();
+    format!("{UNUSABLE_PASSWORD_PREFIX}invited${hex}")
+}
+
+/// `false` pour un hash inutilisable ([`unusable_password_hash`]) : le compte
+/// n'a pas encore choisi son mot de passe.
+pub fn has_usable_password(password_hash: &str) -> bool {
+    !password_hash.starts_with(UNUSABLE_PASSWORD_PREFIX)
+}
 
 /// Compte utilisateur tel que stocké.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -66,6 +93,9 @@ pub struct UserSummary {
     pub disabled: bool,
     /// Adresse email vérifiée (#231).
     pub email_verified: bool,
+    /// Mot de passe choisi : `false` tant qu'une invitation est en attente
+    /// (#241, cf. [`has_usable_password`]).
+    pub password_set: bool,
     /// Création du compte, en millisecondes Unix.
     pub created_at_ms: i64,
     /// Permissions accordées.
@@ -254,6 +284,7 @@ impl InMemoryUserStore {
                 email: record.email,
                 disabled: record.disabled,
                 email_verified: record.email_verified,
+                password_set: has_usable_password(&record.password_hash),
                 created_at_ms,
             });
         }
@@ -443,6 +474,54 @@ mod tests {
         assert!(validate_password("éééééééé").is_ok());
         assert!(validate_password(&"x".repeat(MAX_PASSWORD_LENGTH)).is_ok());
         assert!(validate_password(&"x".repeat(MAX_PASSWORD_LENGTH + 1)).is_err());
+    }
+
+    #[test]
+    fn unusable_hashes_are_random_and_never_phc() {
+        let (a, b) = (unusable_password_hash(), unusable_password_hash());
+        assert_ne!(a, b);
+        assert!(a.starts_with(UNUSABLE_PASSWORD_PREFIX));
+        assert!(!has_usable_password(&a));
+        assert!(has_usable_password(
+            "$argon2id$v=19$m=19456,t=2,p=1$c2FsdA$aGFzaA"
+        ));
+        // Aucune vérification ne réussit contre lui (chaîne PHC invalide).
+        let hasher = crate::Argon2PasswordHasher::new();
+        assert!(crate::PasswordHasher::verify(&hasher, "", &a).is_err());
+    }
+
+    #[tokio::test]
+    async fn summary_reports_whether_a_password_was_chosen() {
+        let (users, _) = store();
+        let invited = unusable_password_hash();
+        let CreateUser::Created(alice) = users
+            .create("alice@example.io", &invited, &HashSet::new(), false)
+            .await
+            .unwrap()
+        else {
+            panic!("création");
+        };
+        assert!(
+            !users
+                .summary(&alice.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .password_set
+        );
+        assert!(users
+            .update_password(&alice.id, &invited, "$argon2id$hash")
+            .await
+            .unwrap());
+        assert!(
+            users
+                .summary(&alice.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .password_set
+        );
+        assert!(users.list(None, 0, 10).await.unwrap().items[0].password_set);
     }
 
     #[test]
