@@ -23,7 +23,7 @@ pub mod triggers;
 pub mod webhook;
 
 pub use credentials::{CredentialService, CredentialSummary, OAuthCredentialService, ProviderInfo};
-pub use egress::{is_public_ip, EgressError, EgressPolicy};
+pub use egress::{is_public_ip, proxy_vars_set, EgressError, EgressPolicy, PROXY_ENV_VARS};
 
 pub use github::{
     verify_github_signature, GithubAuth, GithubCloseIssue, GithubCommentIssue, GithubConnector,
