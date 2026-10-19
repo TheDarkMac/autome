@@ -1,4 +1,5 @@
-//! Serveur de sondes du worker (#192) : `GET /livez` et `GET /readyz`.
+//! Serveur de sondes du worker (#192) : `GET /livez`, `GET /readyz` et
+//! `GET /metrics` (#235).
 //!
 //! Le worker ne sert pas d'API : un serveur HTTP/1.1 minimal suffit (une
 //! requête par connexion, réponse puis fermeture), sans tirer de framework web
@@ -9,18 +10,25 @@
 //! - `/readyz` : PostgreSQL et broker joignables
 //!   ([`autome_persistence::run_checks`]) — échec ⇒ « pas prêt » (déploiement
 //!   progressif suspendu), sans redémarrage. Pendant l'arrêt (#200) : 503
-//!   `draining`, et `/livez` reste 200 (les consommateurs ne bouclent plus).
+//!   `draining`, et `/livez` reste 200 (les consommateurs ne bouclent plus) ;
+//! - `/metrics` : registre [`WorkerMetrics`] au format texte Prometheus,
+//!   servi aussi pendant l'arrêt. Aucun id de run, de workflow ni d'utilisateur
+//!   dans les séries (labels bornés), d'où l'absence d'authentification, comme
+//!   pour `/metrics` de l'API : le port ne doit pas sortir du réseau interne.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use autome_core::prometheus::CONTENT_TYPE;
 use autome_core::HealthCheck;
 use autome_persistence::{run_checks, CHECK_TIMEOUT};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
 use crate::liveness::{now_ms, PoolLiveness};
+use crate::metrics::{Gauges, WorkerMetrics};
+use crate::shutdown::InFlightRuns;
 
 /// Délai laissé au client pour envoyer sa ligne de requête.
 const READ_TIMEOUT: Duration = Duration::from_secs(2);
@@ -39,6 +47,8 @@ pub struct ProbeState {
     busy_limit_ms: i64,
     check_timeout: Duration,
     draining: Arc<AtomicBool>,
+    metrics: Arc<WorkerMetrics>,
+    in_flight: Arc<InFlightRuns>,
 }
 
 impl ProbeState {
@@ -56,7 +66,20 @@ impl ProbeState {
             busy_limit_ms: run_timeout_ms.saturating_add(STALL_MS),
             check_timeout: CHECK_TIMEOUT,
             draining: Arc::new(AtomicBool::new(false)),
+            metrics: Arc::new(WorkerMetrics::new()),
+            in_flight: Arc::new(InFlightRuns::default()),
         }
+    }
+
+    /// `/metrics` sert `metrics`, avec les runs en cours de `in_flight` (#235).
+    pub fn with_metrics(
+        mut self,
+        metrics: Arc<WorkerMetrics>,
+        in_flight: Arc<InFlightRuns>,
+    ) -> Self {
+        self.metrics = metrics;
+        self.in_flight = in_flight;
+        self
     }
 
     /// Arrêt en cours dès que `draining` passe à `true` (#200).
@@ -66,7 +89,15 @@ impl ProbeState {
     }
 
     async fn respond(&self, path: &str) -> (u16, &'static str, String) {
-        if self.draining.load(Ordering::Acquire) {
+        let draining = self.draining.load(Ordering::Acquire);
+        if path == "/metrics" {
+            let gauges = Gauges {
+                runs_in_flight: self.in_flight.len(),
+                draining,
+            };
+            return (200, CONTENT_TYPE, self.metrics.render(gauges));
+        }
+        if draining {
             // Les consommateurs ne bouclent plus : ne pas les déclarer figés.
             return match path {
                 "/livez" => (200, "text/plain", "ok".into()),
@@ -262,7 +293,7 @@ mod tests {
     async fn unknown_paths_and_malformed_requests_are_rejected() {
         let liveness = Arc::new(PoolLiveness::new(1, now_ms()));
         let addr = start(ProbeState::new(liveness, vec![], 3_600_000)).await;
-        assert!(request(addr, "GET /metrics HTTP/1.1\r\n\r\n")
+        assert!(request(addr, "GET /nope HTTP/1.1\r\n\r\n")
             .await
             .starts_with("HTTP/1.1 404 "));
         assert!(request(addr, "POST /livez HTTP/1.1\r\n\r\n")
@@ -287,6 +318,42 @@ mod tests {
         assert!(ready.ends_with(r#"{"checks":{},"status":"draining"}"#));
         let live = request(addr, "GET /livez HTTP/1.1\r\n\r\n").await;
         assert!(live.starts_with("HTTP/1.1 200 "), "{live}");
+    }
+
+    #[tokio::test]
+    async fn metrics_are_served_in_prometheus_text_format_even_while_draining() {
+        use crate::metrics::{DeliveryOutcome, RunOutcome};
+
+        let liveness = Arc::new(PoolLiveness::new(1, now_ms()));
+        let metrics = Arc::new(WorkerMetrics::new());
+        let in_flight = Arc::new(InFlightRuns::default());
+        let draining = Arc::new(AtomicBool::new(false));
+        let addr = start(
+            ProbeState::new(liveness, vec![], 3_600_000)
+                .with_metrics(metrics.clone(), in_flight.clone())
+                .with_draining(draining.clone()),
+        )
+        .await;
+
+        metrics.delivery(DeliveryOutcome::Ack);
+        metrics.run_finished(RunOutcome::Succeeded, Duration::from_millis(300));
+        let _running = in_flight.track("run-1");
+        let res = request(addr, "GET /metrics HTTP/1.1\r\nHost: x\r\n\r\n").await;
+        let (head, body) = res.split_once("\r\n\r\n").unwrap();
+        assert!(head.starts_with("HTTP/1.1 200 OK\r\n"), "{head}");
+        assert!(head.contains("Content-Type: text/plain; version=0.0.4; charset=utf-8\r\n"));
+        assert!(head.contains(&format!("Content-Length: {}\r\n", body.len())));
+        assert!(body.contains("autome_worker_deliveries_total{outcome=\"ack\"} 1\n"));
+        assert!(body.contains("autome_worker_runs_total{status=\"succeeded\"} 1\n"));
+        assert!(body.contains("autome_worker_runs_in_flight 1\n"));
+        assert!(body.contains("autome_worker_draining 0\n"));
+        // Aucun identifiant de run dans les séries.
+        assert!(!body.contains("run-1"));
+
+        draining.store(true, Ordering::SeqCst);
+        let res = request(addr, "GET /metrics HTTP/1.1\r\n\r\n").await;
+        assert!(res.starts_with("HTTP/1.1 200 OK\r\n"), "{res}");
+        assert!(res.contains("autome_worker_draining 1\n"));
     }
 
     #[test]

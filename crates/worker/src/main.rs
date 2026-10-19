@@ -26,7 +26,9 @@
 //! - `AUTOME_WORKER_PROBE_ADDR` : sondes `GET /livez` (consommateurs vivants,
 //!   un run en cours comptant jusqu'à `AUTOME_RUN_TIMEOUT_SECS`) et
 //!   `GET /readyz` (base et broker joignables) — défaut `127.0.0.1:9091`,
-//!   `0.0.0.0:9091` dans l'image ; vide = désactivées (#192).
+//!   `0.0.0.0:9091` dans l'image ; vide = désactivées (#192). Le même port
+//!   sert `GET /metrics` (format Prometheus, #235) : livraisons, runs et
+//!   leur durée, erreurs de file, déclencheurs.
 //!
 //! - `AUTOME_WORKER_SHUTDOWN_TIMEOUT_SECS` : délai laissé aux runs en cours à
 //!   l'arrêt (défaut 25 s, #200).
@@ -60,7 +62,7 @@ use autome_worker::shutdown::shutdown_timeout_from_env;
 use autome_worker::triggers::tick_period_from_env;
 use autome_worker::{
     drain, reap_orphans, ConnectorCredentialsMode, DrainOutcome, Handler, IdempotencyStore,
-    InMemoryIdempotencyStore, RunExecutor, TriggerLoop, WorkerPool,
+    InMemoryIdempotencyStore, RunExecutor, TriggerLoop, WorkerMetrics, WorkerPool,
 };
 
 /// Queue des runs (alignée sur `QueueRunDispatcher::queue_name` par défaut).
@@ -153,16 +155,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
+    // Registre Prometheus (#235), servi par le serveur de sondes.
+    let metrics = Arc::new(WorkerMetrics::new());
+
     // Balayage des orphelins (runs d'un worker tué) : sûr entre répliques,
     // `fail_if_running` ne touche jamais un run terminé.
     let reaper_store = Arc::clone(&store);
+    let reaper_metrics = Arc::clone(&metrics);
     let reaper = tokio::spawn(async move {
         let mut tick = tokio::time::interval(REAP_INTERVAL);
         loop {
             tick.tick().await;
             match reap_orphans(reaper_store.as_ref(), now_ms(), run_timeout_ms).await {
                 Ok(0) => {}
-                Ok(n) => tracing::warn!(runs = n, "runs interrompus clos en échec"),
+                Ok(n) => {
+                    reaper_metrics.orphans_reaped(n as u64);
+                    tracing::warn!(runs = n, "runs interrompus clos en échec");
+                }
                 Err(e) => tracing::error!(error = %e, "balayage des runs orphelins impossible"),
             }
         }
@@ -179,7 +188,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 build_trigger_schedule_store(&config, persistence)?,
                 Arc::new(dispatcher),
                 Arc::new(ReqwestHttpClient::with_policy(EgressPolicy::from_env())),
-            );
+            )
+            .with_metrics(Arc::clone(&metrics));
             Some(triggers.spawn(period, now_ms))
         }
         None => {
@@ -188,7 +198,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    let executor = RunExecutor::new(repo, Arc::clone(&store), resolver);
+    let executor =
+        RunExecutor::new(repo, Arc::clone(&store), resolver).with_metrics(Arc::clone(&metrics));
     // Runs en cours, pour clore ceux qu'un arrêt interromprait (#200).
     let in_flight = executor.in_flight();
     let handler: Arc<dyn Handler + Send + Sync> = Arc::new(executor);
@@ -208,7 +219,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "autome-worker démarré"
     );
 
-    let pool = WorkerPool::new(queue, handler, idempotency, RUNS_QUEUE, concurrency);
+    let pool = WorkerPool::new(queue, handler, idempotency, RUNS_QUEUE, concurrency)
+        .with_metrics(Arc::clone(&metrics));
 
     // Arrêt borné (#200) : délai laissé aux runs en cours ; `/readyz` à 503
     // dès le signal.
@@ -222,9 +234,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let listener = tokio::net::TcpListener::bind(&addr)
                 .await
                 .map_err(|e| format!("AUTOME_WORKER_PROBE_ADDR `{addr}` : {e}"))?;
-            tracing::info!(%addr, "sondes /livez et /readyz en écoute");
+            tracing::info!(%addr, "sondes /livez, /readyz et /metrics en écoute");
             let state = ProbeState::new(pool.liveness(), health_checks, run_timeout_ms)
-                .with_draining(Arc::clone(&draining));
+                .with_draining(Arc::clone(&draining))
+                .with_metrics(Arc::clone(&metrics), Arc::clone(&in_flight));
             Some(tokio::spawn(probe::serve(listener, Arc::new(state))))
         }
         None => {

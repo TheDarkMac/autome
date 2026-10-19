@@ -57,6 +57,16 @@ impl InFlightRuns {
         }
     }
 
+    /// Nombre de runs en cours.
+    pub fn len(&self) -> usize {
+        self.lock().len()
+    }
+
+    /// `true` si aucun run n'est en cours.
+    pub fn is_empty(&self) -> bool {
+        self.lock().is_empty()
+    }
+
     /// Runs en cours, triés.
     pub fn snapshot(&self) -> Vec<String> {
         let mut ids: Vec<String> = self.lock().iter().cloned().collect();
