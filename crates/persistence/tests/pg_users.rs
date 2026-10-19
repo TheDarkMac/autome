@@ -370,3 +370,28 @@ async fn an_invited_account_has_no_password_until_it_chooses_one() {
             .password_set
     );
 }
+
+#[tokio::test]
+async fn emails_of_several_accounts_in_one_query() {
+    let Some((users, _perms, _serial)) = setup().await else {
+        eprintln!("TEST_DATABASE_URL absent → test PostgreSQL sauté");
+        return;
+    };
+    let alice = created(&users, "alice@example.io").await;
+    let bob = created(&users, "bob@example.io").await;
+    let _carol = created(&users, "carol@example.io").await;
+    let found = users
+        .emails(&[
+            alice.id.clone(),
+            bob.id.clone(),
+            String::new(),
+            "pas-un-uuid".into(),
+            "00000000-0000-0000-0000-000000000000".into(),
+        ])
+        .await
+        .unwrap();
+    assert_eq!(found.len(), 2);
+    assert_eq!(found[&alice.id], "alice@example.io");
+    assert_eq!(found[&bob.id], "bob@example.io");
+    assert!(users.emails(&[]).await.unwrap().is_empty());
+}

@@ -57,6 +57,8 @@ use utoipa::{
         crate::admin::logout_user,
         crate::admin::verify_user_email,
         crate::admin::delete_user,
+        // liste d'administration des workflows (#243)
+        crate::admin_workflows::list_workflows,
         // workflows (F7.1)
         crate::workflows::list_workflows,
         crate::workflows::create_workflow,
@@ -97,6 +99,8 @@ use utoipa::{
         crate::admin::RoleBody,
         crate::admin::InviteBody,
         crate::admin::InvitedUser,
+        crate::admin_workflows::AdminWorkflow,
+        crate::admin_workflows::AdminWorkflowListResponse,
         crate::workflows::ListResponse,
         crate::runs::CreateRunBody,
         crate::runs::CreateRunResponse,
@@ -114,7 +118,7 @@ use utoipa::{
     tags(
         (name = "probes", description = "Sondes de l'orchestrateur : vivant (`/livez`) et prêt (`/readyz`)."),
         (name = "auth", description = "Comptes : inscription, connexion, rotation des jetons."),
-        (name = "admin", description = "Administration des utilisateurs : liste, rôles, suspension, sessions."),
+        (name = "admin", description = "Administration : utilisateurs (liste, rôles, suspension, sessions) et liste de tous les workflows."),
         (name = "workflows", description = "CRUD des workflows."),
         (name = "runs", description = "Déclenchement et suivi des runs."),
         (name = "webhooks", description = "Déclencheurs webhook : URL secrètes publiques et leur gestion."),

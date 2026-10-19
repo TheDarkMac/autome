@@ -10,6 +10,7 @@ use std::sync::Arc;
 
 use autome_api::accounts::{accounts_router, AccountsState, IpThrottle};
 use autome_api::admin::{admin_router, promote_admin, AdminState, Promotion};
+use autome_api::admin_workflows::{admin_workflows_router, AdminWorkflowsState};
 use autome_api::auth::protected_router;
 use autome_api::cors::{allowed_origins_from_env, with_cors};
 use autome_api::credentials::{credentials_router, CredentialsState};
@@ -102,6 +103,11 @@ fn build_router(
             protected_router(backends.auth.clone()).merge(accounts_router(accounts)),
         )
         .merge(admin_router(admin))
+        .merge(admin_workflows_router(AdminWorkflowsState {
+            auth: backends.auth.clone(),
+            workflows: backends.workflows.clone(),
+            users: backends.users.clone(),
+        }))
         .merge(workflows_routes)
         .merge(runs_router(runs_state))
         .merge(webhooks_router(webhooks))

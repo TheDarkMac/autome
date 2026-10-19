@@ -7,7 +7,9 @@
 //! Modules :
 //! - [`accounts`] : inscription, connexion et rotation des jetons
 //!   (`/auth/signup|login|refresh`).
-//! - [`admin`] (#208) : administration des utilisateurs (`/admin/users`).
+//! - [`admin`] (#208) : administration des utilisateurs (`/admin/users`) ;
+//!   [`admin_workflows`] (#243) : workflows de tous les comptes
+//!   (`/admin/workflows`, super-admin).
 //! - [`email_verification`] (#231) : vérification de l'adresse email.
 //! - [`erasure`] (#229) : effacement d'un compte et de ses données (RGPD).
 //! - [`invitation`] (#241) : invitation de compte par un administrateur.
@@ -21,6 +23,7 @@
 
 pub mod accounts;
 pub mod admin;
+pub mod admin_workflows;
 pub mod auth;
 pub mod client_ip;
 pub mod cors;

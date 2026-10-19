@@ -62,7 +62,8 @@ pub use webhook::{
     EndpointSecret, InMemoryWebhookEndpointStore, WebhookEndpoint, WebhookEndpointStore,
 };
 pub use workflow::repo::{
-    InMemoryWorkflowRepository, Pagination, WorkflowPage, WorkflowRepository, LEGACY_NAMESPACE,
+    InMemoryWorkflowRepository, Pagination, WorkflowFilter, WorkflowListing, WorkflowListingPage,
+    WorkflowPage, WorkflowRepository, LEGACY_NAMESPACE,
 };
 pub use workflow::{Edge, Node, NodeKind, NodePosition, WorkflowGraph, WorkflowId};
 
