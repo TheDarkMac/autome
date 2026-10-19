@@ -6,7 +6,7 @@
 //! | Méthode | Path            | Body                    | Succès                      |
 //! |---------|-----------------|-------------------------|-----------------------------|
 //! | POST    | `/auth/signup`  | `{ email, password }`   | 201 + [`TokenResponse`], ou 202 (email à vérifier) |
-//! | POST    | `/auth/login`   | `{ email, password }`   | 200 + [`TokenResponse`]     |
+//! | POST    | `/auth/login`   | `{ email, password }`   | 200 + [`TokenResponse`], ou 202 + [`MfaChallenge`] (second facteur, cf. [`crate::mfa`]) |
 //! | POST    | `/auth/refresh` | `{ refresh_token }`     | 200 + [`TokenResponse`]     |
 //! | POST    | `/auth/logout`  | `{ refresh_token }`     | 204                         |
 //! | POST    | `/auth/logout-all` | — (Bearer requis)    | 204                         |
@@ -107,6 +107,12 @@
 //!   même chemin que la réinitialisation : le lien reçu prouve la boîte.
 //!   Les inscriptions publiques peuvent être fermées (`AUTOME_SIGNUP=
 //!   invite_only`) : 403 `signup closed`.
+//! - Un mot de passe **choisi** (inscription, changement, réinitialisation,
+//!   invitation) est refusé s'il est courant ou divulgué (#245, cf.
+//!   [`crate::password_policy`]) : 400 avec un message unique. Jamais à la
+//!   connexion.
+//! - Second facteur (#245, cf. [`crate::mfa`]) : quand il est actif, la
+//!   connexion par mot de passe répond 202 avec un défi, sans session.
 //! - Chaque inscription/connexion/déconnexion/changement ou réinitialisation
 //!   de mot de passe produit un event d'audit `auth.signup` / `auth.login` /
 //!   `auth.logout` / `auth.logout_all` / `auth.password_change` /
@@ -141,6 +147,7 @@ use crate::client_ip::{ClientIpPolicy, IpKeyer};
 use crate::email_verification::{EmailVerification, VerifyTokens};
 use crate::erasure::{erase_account, Erasure};
 use crate::invitation::InviteTokens;
+use crate::mfa::{login_challenge, mfa_router, Mfa, MfaChallenge};
 use crate::password_policy::PasswordPolicy;
 use crate::password_reset::{PasswordReset, ResetTokens};
 
@@ -259,6 +266,9 @@ pub struct AccountsState {
     /// Refus des mots de passe courants ou compromis (#245) ; listes
     /// intégrées par défaut.
     pub password_policy: PasswordPolicy,
+    /// Second facteur TOTP (#245) ; store en mémoire et clé aléatoire par
+    /// défaut (cf. [`with_mfa`](Self::with_mfa)).
+    pub mfa: Mfa,
     /// Hash leurre vérifié quand l'email est inconnu (égalisation du temps).
     dummy_hash: Arc<str>,
 }
@@ -285,6 +295,7 @@ impl AccountsState {
             invitations: None,
             signup_open: true,
             password_policy: PasswordPolicy::default(),
+            mfa: Mfa::in_memory(),
             dummy_hash: dummy_hash.into(),
         })
     }
@@ -336,6 +347,13 @@ impl AccountsState {
     /// l'opérateur et corpus Have I Been Pwned.
     pub fn with_password_policy(mut self, policy: PasswordPolicy) -> Self {
         self.password_policy = policy;
+        self
+    }
+
+    /// Branche le second facteur (#245) sur un store partagé (PostgreSQL) et
+    /// les clés dérivées d'`ENCRYPTION_KEY`.
+    pub fn with_mfa(mut self, mfa: Mfa) -> Self {
+        self.mfa = mfa;
         self
     }
 }
@@ -452,6 +470,8 @@ pub struct MeResponse {
     pub role: String,
     /// Permissions accordées, triées (`*` = toutes).
     pub permissions: Vec<String>,
+    /// Second facteur actif (#245).
+    pub mfa_enabled: bool,
 }
 
 /// Erreurs des handlers de comptes.
@@ -500,12 +520,12 @@ impl IntoResponse for AccountError {
     }
 }
 
-fn internal(e: impl std::fmt::Display) -> AccountError {
+pub(crate) fn internal(e: impl std::fmt::Display) -> AccountError {
     AccountError::Internal(e.to_string())
 }
 
 /// Exécute un calcul Argon2 hors du runtime async.
-async fn blocking<T: Send + 'static>(
+pub(crate) async fn blocking<T: Send + 'static>(
     f: impl FnOnce() -> autome_core::Result<T> + Send + 'static,
 ) -> Result<T, AccountError> {
     tokio::task::spawn_blocking(f)
@@ -524,7 +544,7 @@ async fn audit(state: &AccountsState, actor: &str, action: &str, outcome: AuditO
 
 /// Compteur IP `scope` de la requête : `(clé, quota)`, ou `None` si la
 /// limitation par IP est désactivée (quota 0) ou l'adresse du pair inconnue.
-fn ip_counter(
+pub(crate) fn ip_counter(
     state: &AccountsState,
     scope: &str,
     peer: Option<SocketAddr>,
@@ -555,7 +575,7 @@ fn ip_counter(
 
 /// Réserve une tentative sur le compteur IP ; `Err(429)` si son quota est
 /// atteint. Ne journalise jamais l'adresse.
-async fn check_ip(
+pub(crate) async fn check_ip(
     state: &AccountsState,
     counter: &Option<(String, u32)>,
     action: &str,
@@ -580,7 +600,7 @@ async fn check_ip(
     }
 }
 
-const LOGIN_IP_SCOPE: &str = "login-ip";
+pub(crate) const LOGIN_IP_SCOPE: &str = "login-ip";
 const SIGNUP_IP_SCOPE: &str = "signup-ip";
 const RESET_IP_SCOPE: &str = "reset-ip";
 const VERIFY_IP_SCOPE: &str = "verify-ip";
@@ -595,10 +615,10 @@ fn token_response(access_token: String, refresh_token: String) -> TokenResponse 
 }
 
 /// Message du refus de connexion d'un compte suspendu (#208).
-const ACCOUNT_DISABLED: &str = "account disabled";
+pub(crate) const ACCOUNT_DISABLED: &str = "account disabled";
 /// Message du refus de connexion d'un compte dont l'email n'est pas vérifié
 /// (#231).
-const EMAIL_NOT_VERIFIED: &str = "email not verified";
+pub(crate) const EMAIL_NOT_VERIFIED: &str = "email not verified";
 /// Message du refus d'inscription quand elles sont fermées (#241).
 const SIGNUP_CLOSED: &str = "signup closed";
 
@@ -614,7 +634,7 @@ async fn issue_pair(state: &AccountsState, user_id: &str) -> Result<TokenRespons
 }
 
 /// Émet une paire à la version de session `sv`, lue par l'appelant.
-fn issue_pair_at(
+pub(crate) fn issue_pair_at(
     state: &AccountsState,
     user_id: &str,
     sv: i64,
@@ -630,7 +650,7 @@ fn issue_pair_at(
 
 /// `true` si le compte existe et n'est pas suspendu (#208). À appeler
 /// **après** avoir lu la version de session des jetons à émettre.
-async fn is_enabled(state: &AccountsState, user_id: &str) -> Result<bool, AccountError> {
+pub(crate) async fn is_enabled(state: &AccountsState, user_id: &str) -> Result<bool, AccountError> {
     Ok(state
         .users
         .find_by_id(user_id)
@@ -738,7 +758,9 @@ pub async fn signup(
     Ok((StatusCode::ACCEPTED, Json(pending)).into_response())
 }
 
-/// `POST /auth/login` — échange email + mot de passe contre une paire de jetons.
+/// `POST /auth/login` — échange email + mot de passe contre une paire de
+/// jetons ; si le second facteur est actif (#245), contre un défi (202) à
+/// présenter avec un code à `/auth/mfa/verify`.
 #[utoipa::path(
     post,
     path = "/auth/login",
@@ -746,6 +768,7 @@ pub async fn signup(
     request_body = CredentialsBody,
     responses(
         (status = 200, description = "Connecté", body = TokenResponse),
+        (status = 202, description = "Mot de passe correct, second facteur exigé : défi à présenter avec un code à `/auth/mfa/verify`", body = MfaChallenge),
         (status = 401, description = "Identifiants invalides"),
         (status = 403, description = "Compte suspendu par un administrateur (`account disabled`), ou adresse email pas encore vérifiée (`email not verified`)"),
         (status = 429, description = "Trop d'échecs (compte ou adresse IP) — voir `Retry-After`")
@@ -756,7 +779,7 @@ pub async fn login(
     peer: Option<ConnectInfo<SocketAddr>>,
     headers: HeaderMap,
     Json(body): Json<CredentialsBody>,
-) -> Result<Json<TokenResponse>, AccountError> {
+) -> Result<Response, AccountError> {
     let email = normalize_email(&body.email);
     let email_key = email_throttle_key(&email);
     let now = state.auth.clock.now_unix_seconds();
@@ -824,8 +847,12 @@ pub async fn login(
                 audit(&state, &user.id, "auth.login", AuditOutcome::Denied).await;
                 return Err(AccountError::Forbidden(EMAIL_NOT_VERIFIED));
             }
+            // Second facteur actif (#245) : un défi, pas de session.
+            if let Some(challenge) = login_challenge(&state, &user, sv).await? {
+                return Ok((StatusCode::ACCEPTED, Json(challenge)).into_response());
+            }
             audit(&state, &user.id, "auth.login", AuditOutcome::Success).await;
-            Ok(Json(issue_pair_at(&state, &user.id, sv)?))
+            Ok(Json(issue_pair_at(&state, &user.id, sv)?).into_response())
         }
         _ => {
             audit(&state, &email, "auth.login", AuditOutcome::Failure).await;
@@ -1603,11 +1630,18 @@ pub async fn me(
         .map_err(internal)?;
     let mut permissions: Vec<String> = granted.iter().cloned().collect();
     permissions.sort();
+    let mfa_enabled = state
+        .mfa
+        .active(&account.id)
+        .await
+        .map_err(internal)?
+        .is_some();
     Ok(Json(MeResponse {
         role: role_of(&granted).to_string(),
         id: account.id,
         email: account.email,
         permissions,
+        mfa_enabled,
     }))
 }
 
@@ -1711,6 +1745,11 @@ pub async fn delete_account(
         // Effacé entre-temps (requête concurrente ou administration).
         return Err(AccountError::Unauthorized);
     };
+    // En PostgreSQL, le second facteur est déjà parti avec le compte
+    // (cascade) ; le store en mémoire, lui, ne connaît pas les comptes.
+    if let Err(e) = state.mfa.store.disable(&account.id).await {
+        tracing::warn!(error = %e, "second facteur du compte effacé non supprimé");
+    }
     audit(
         &state,
         &erased.pseudonym,
@@ -1722,11 +1761,12 @@ pub async fn delete_account(
 }
 
 /// Sous-router `/signup`, `/login`, `/refresh`, `/logout`,
-/// `/password/forgot`, `/password/reset`, `/email/verify`, `/email/resend`
-/// (publics), `/logout-all`,
-/// `/password` et `/me` (Bearer) — à imbriquer sous `/auth` avec
+/// `/password/forgot`, `/password/reset`, `/email/verify`, `/email/resend`,
+/// `/mfa/verify` (publics), `/logout-all`, `/password`, `/me` et `/mfa*`
+/// (Bearer, cf. [`crate::mfa`]) — à imbriquer sous `/auth` avec
 /// [`crate::auth::protected_router`].
 pub fn accounts_router(state: AccountsState) -> Router {
+    let mfa = mfa_router(state.clone());
     Router::new()
         .route("/signup", post(signup))
         .route("/login", post(login))
@@ -1741,6 +1781,7 @@ pub fn accounts_router(state: AccountsState) -> Router {
         .route("/invitation/accept", post(accept_invitation))
         .route("/me", get(me).delete(delete_account))
         .with_state(state)
+        .merge(mfa)
 }
 
 #[cfg(test)]

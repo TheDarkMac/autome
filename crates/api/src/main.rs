@@ -9,7 +9,9 @@
 use std::sync::Arc;
 
 use autome_api::accounts::{accounts_router, AccountsState, IpThrottle};
-use autome_api::admin::{admin_router, promote_admin, AdminState, Promotion};
+use autome_api::admin::{
+    admin_router, promote_admin, reset_mfa_by_operator, AdminState, OperatorMfaReset, Promotion,
+};
 use autome_api::admin_workflows::{admin_workflows_router, AdminWorkflowsState};
 use autome_api::auth::protected_router;
 use autome_api::cors::{allowed_origins_from_env, with_cors};
@@ -24,8 +26,10 @@ use autome_api::invitation::{
 };
 use autome_api::mail::MailSettings;
 use autome_api::metrics::{metrics_router, with_metrics, Metrics};
+use autome_api::mfa::Mfa;
 use autome_api::observability::with_request_tracing;
 use autome_api::openapi::openapi_router;
+use autome_api::password_policy::PasswordPolicy;
 use autome_api::password_reset::{PasswordReset, ResetTokens};
 use autome_api::probes::{probes_router, ProbesState};
 use autome_api::runs::{runs_router, RunsState};
@@ -42,7 +46,7 @@ use autome_api::workflows::{
     create_workflow, delete_workflow, get_workflow, list_workflows, update_workflow, WorkflowsState,
 };
 use autome_core::{telemetry, Argon2PasswordHasher, Config};
-use autome_persistence::{connect, PgAuditSink, PgUserStore};
+use autome_persistence::{connect, PgAuditSink, PgMfaStore, PgUserStore};
 use axum::http::HeaderValue;
 use axum::{routing::get, Router};
 
@@ -147,26 +151,36 @@ struct MailFeatures {
     invitation: Option<Invitation>,
 }
 
-/// État de l'administration (#208) : suppression de comptes (#229) et
-/// invitations si un envoi d'email est configuré (#241).
+/// État de l'administration (#208) : suppression de comptes (#229),
+/// second facteur (#245) et invitations si un envoi d'email est configuré
+/// (#241).
 fn admin_state(backends: &Backends, invitation: Option<Invitation>) -> AdminState {
     let admin = AdminState::new(backends.auth.clone(), backends.users.clone())
-        .with_erasure(erasure(backends));
+        .with_erasure(erasure(backends))
+        .with_mfa(backends.mfa.clone());
     match invitation {
         Some(invitation) => admin.with_invitation(invitation),
         None => admin,
     }
 }
 
+/// Réglages des comptes lus dans l'environnement au démarrage.
+struct AccountSettings {
+    ip_throttle: IpThrottle,
+    signup_open: bool,
+    password_policy: PasswordPolicy,
+}
+
 /// État des endpoints de comptes : Argon2id sur les stores de `backends`,
 /// anti-bruteforce par email et par adresse IP (#190), mot de passe oublié,
 /// vérification de l'email et acceptation des invitations si un envoi d'email
-/// est configuré (#204, #231, #241), inscriptions ouvertes ou non (#241).
+/// est configuré (#204, #231, #241), inscriptions ouvertes ou non (#241),
+/// refus des mots de passe compromis et second facteur (#245).
 fn accounts_state(
     backends: &Backends,
-    ip_throttle: IpThrottle,
+    config: &Config,
+    settings: AccountSettings,
     mail: MailFeatures,
-    signup_open: bool,
 ) -> autome_core::Result<AccountsState> {
     let accounts = AccountsState::new(
         backends.auth.clone(),
@@ -174,9 +188,11 @@ fn accounts_state(
         Arc::new(Argon2PasswordHasher::new()),
     )?
     .with_throttle(backends.login_throttle.clone())
-    .with_ip_throttle(ip_throttle)
+    .with_ip_throttle(settings.ip_throttle)
     .with_erasure(erasure(backends))
-    .with_signup_open(signup_open);
+    .with_signup_open(settings.signup_open)
+    .with_password_policy(settings.password_policy)
+    .with_mfa(Mfa::from_config(backends.mfa.clone(), config));
     let accounts = match mail.invitation {
         Some(invitation) => accounts.with_invitations(invitation.tokens),
         None => accounts,
@@ -290,6 +306,35 @@ async fn invite_command(
     }
 }
 
+/// `autome-api reset-mfa <email>` (#245) : supprime le second facteur du
+/// compte dans la base `DATABASE_URL`, puis s'arrête — dernier administrateur
+/// qui a perdu son téléphone et ses codes de secours. Exige l'accès à
+/// l'infrastructure.
+async fn reset_mfa_command(config: &Config, email: &str) -> Result<(), Box<dyn std::error::Error>> {
+    if PersistenceMode::from_env()? != PersistenceMode::Postgres {
+        return Err("reset-mfa requiert AUTOME_PERSISTENCE=postgres (les comptes en mémoire ne survivent pas au processus)".into());
+    }
+    let pool = connect(&config.database_url)?;
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_millis() as i64;
+    match reset_mfa_by_operator(
+        &PgUserStore::new(pool.clone()),
+        &PgMfaStore::new(pool.clone()),
+        &PgAuditSink::new(pool),
+        email,
+        now_ms,
+    )
+    .await?
+    {
+        OperatorMfaReset::Reset { user_id, had_mfa } => {
+            tracing::info!(%user_id, had_mfa, "second facteur réinitialisé");
+            Ok(())
+        }
+        OperatorMfaReset::UnknownEmail => Err(format!("aucun compte pour {email}").into()),
+    }
+}
+
 /// `autome-api verify-email <email>` (#231) : marque vérifiée l'adresse d'un
 /// compte existant dans la base `DATABASE_URL`, puis s'arrête (envoi d'emails
 /// en panne, tests de bout en bout). Exige l'accès à l'infrastructure.
@@ -379,6 +424,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
             return verify_email_command(&config, email).await;
         }
+        Some("reset-mfa") => {
+            let [_, email] = args.as_slice() else {
+                return Err("usage : autome-api reset-mfa <email>".into());
+            };
+            return reset_mfa_command(&config, email).await;
+        }
         Some("invite") => {
             return match args.as_slice() {
                 [_, email] => invite_command(&config, email, None).await,
@@ -389,7 +440,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(other) => {
             return Err(format!(
                 "commande inconnue « {other} » (promote-admin <email>, verify-email <email>, \
-                 invite <email> [role])"
+                 invite <email> [role], reset-mfa <email>)"
             )
             .into())
         }
@@ -476,9 +527,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         verify_max = ip_throttle.verify_max,
         "limitation des tentatives par adresse IP"
     );
+    // Mots de passe compromis (#245) : configuration invalide ou liste
+    // illisible ⇒ refus de démarrer.
+    let password_policy = PasswordPolicy::from_env()?;
+    tracing::info!(
+        local_entries = password_policy.local_entries(),
+        breached_corpus = password_policy.checks_breaches(),
+        "refus des mots de passe courants ou compromis"
+    );
     let mail = mail_features(&config)?;
     let admin = admin_state(&backends, mail.invitation.clone());
-    let accounts = accounts_state(&backends, ip_throttle, mail, signup_open()?)?;
+    let settings = AccountSettings {
+        ip_throttle,
+        signup_open: signup_open()?,
+        password_policy,
+    };
+    let accounts = accounts_state(&backends, &config, settings, mail)?;
     // Webhooks (#202) : quota invalide ⇒ refus de démarrer.
     let webhook_max = max_per_window_from_env()?;
     tracing::info!(
@@ -558,8 +622,13 @@ mod tests {
             "dev sans SMTP : liens journalisés"
         );
         let admin = admin_state(&backends, features.invitation.clone());
+        let settings = AccountSettings {
+            ip_throttle,
+            signup_open: true,
+            password_policy: PasswordPolicy::default(),
+        };
         let accounts =
-            accounts_state(&backends, ip_throttle, features, true).expect("état comptes");
+            accounts_state(&backends, &config, settings, features).expect("état comptes");
         let probes = ProbesState::new(vec![]);
         let webhooks = webhooks_state(&backends, &config, 10);
         build_router(
