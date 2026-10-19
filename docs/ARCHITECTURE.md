@@ -109,6 +109,14 @@ flowchart TB
   rôle (transaction), les suspend (`users.disabled_at`, migration `0017`, plus
   fermeture des sessions par version) et ferme leurs sessions. Le premier
   administrateur naît hors HTTP : `autome-api promote-admin <email>`.
+- **Invitations** (#241) : `api::invitation` crée le compte au rôle choisi
+  avec un hash **inutilisable** (préfixe `!`, `core::unusable_password_hash`) :
+  « invitation en attente » n'est qu'une vue du hash, sans colonne. Le lien
+  `#invite=` est un jeton `api::signed_link` sous sa propre clé, lié à ce hash :
+  l'acceptation (`/auth/invitation/accept`) le remplace par écriture
+  conditionnelle, un renvoi en tire un nouveau ; les deux invalident les liens
+  en circulation. `AUTOME_SIGNUP=invite_only` ferme `/auth/signup` ;
+  `autome-api invite` amorce une instance fermée.
 - **Suppression de compte** (#229, RGPD) : `core::AccountEraser` efface le
   compte et ce qui lui est rattaché (workflows et leurs cascades, runs,
   tokens de connecteurs, permissions) et pseudonymise l'audit ; en PostgreSQL,
