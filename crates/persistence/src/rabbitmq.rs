@@ -57,6 +57,11 @@ use tokio::sync::{Mutex, RwLock};
 /// indéfiniment sur un hôte qui ne répond pas).
 pub const OPEN_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Délai maximal d'une publication, confirmation du broker comprise : un
+/// broker figé (sans couper la connexion) ne bloque pas l'appelant. Le message
+/// d'un run est alors republié par le relais de l'outbox (#239).
+pub const PUBLISH_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Messages non acquittés que le broker confie d'avance à un consommateur
 /// (`basic_qos`), faute de [`RabbitMqQueue::with_prefetch`].
 pub const DEFAULT_PREFETCH: u16 = 1;
@@ -427,9 +432,9 @@ impl Settle {
     }
 }
 
-#[async_trait]
-impl Queue for RabbitMqQueue {
-    async fn publish(&self, name: &str, msg: Message) -> autome_core::Result<()> {
+impl RabbitMqQueue {
+    /// Publication confirmée par le broker (sans borne de durée).
+    async fn publish_confirmed(&self, name: &str, msg: Message) -> autome_core::Result<()> {
         let session = self.session().await?;
         let wire = WireMessage {
             headers: msg.headers,
@@ -472,6 +477,23 @@ impl Queue for RabbitMqQueue {
             "publish",
             "message non routé (queue introuvable)",
         ))
+    }
+}
+
+#[async_trait]
+impl Queue for RabbitMqQueue {
+    async fn publish(&self, name: &str, msg: Message) -> autome_core::Result<()> {
+        tokio::time::timeout(PUBLISH_TIMEOUT, self.publish_confirmed(name, msg))
+            .await
+            .map_err(|_| {
+                storage_err(
+                    "publish",
+                    format!(
+                        "pas de confirmation du broker en {} s",
+                        PUBLISH_TIMEOUT.as_secs()
+                    ),
+                )
+            })?
     }
 
     async fn poll(&self, name: &str) -> autome_core::Result<Option<Delivery>> {
