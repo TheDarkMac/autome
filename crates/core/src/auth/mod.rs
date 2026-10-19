@@ -31,6 +31,7 @@ pub use throttle::{
     LOGIN_WINDOW_SECONDS, MAX_LOGIN_FAILURES,
 };
 pub use users::{
-    normalize_email, validate_email, validate_password, CreateUser, InMemoryUserStore, UserPage,
-    UserRecord, UserStore, UserSummary,
+    has_usable_password, normalize_email, unusable_password_hash, validate_email,
+    validate_password, CreateUser, InMemoryUserStore, UserPage, UserRecord, UserStore, UserSummary,
+    UNUSABLE_PASSWORD_PREFIX,
 };

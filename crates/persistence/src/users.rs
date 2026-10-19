@@ -2,7 +2,8 @@
 //!
 //! Schéma : migrations `0001_users.sql`, `0007_rbac_permissions.sql` et
 //! `0017_user_admin.sql` (suspension, index de pagination) et
-//! `0020_email_verification.sql` (#231). Le compte et ses
+//! `0020_email_verification.sql` (#231). Une invitation en attente (#241)
+//! n'est qu'un hash inutilisable : aucune colonne dédiée. Le compte et ses
 //! permissions sont écrits dans **une seule transaction** : un crash entre les
 //! deux ne laisse ni compte sans droits ni droits orphelins. Il en va de même
 //! du remplacement des permissions par l'administration (#208).
@@ -35,11 +36,13 @@ fn record(r: &Row) -> UserRecord {
 
 /// Colonnes d'un [`UserSummary`], dans l'ordre lu par [`summary`] : les
 /// permissions de chaque ligne en sous-requête (clé primaire de
-/// `user_permissions`), évaluée pour les seules lignes de la page.
+/// `user_permissions`), évaluée pour les seules lignes de la page. Le
+/// préfixe `!` est [`autome_core::UNUSABLE_PASSWORD_PREFIX`] (hash d'un
+/// compte invité, #241).
 const SUMMARY_COLUMNS: &str = "u.id::text, u.email, u.disabled_at IS NOT NULL, \
      (extract(epoch FROM u.created_at) * 1000)::bigint, \
      ARRAY(SELECT p.permission FROM user_permissions p WHERE p.user_id = u.id::text), \
-     u.email_verified_at IS NOT NULL";
+     u.email_verified_at IS NOT NULL, NOT starts_with(u.password_hash, '!')";
 
 fn summary(r: &Row) -> UserSummary {
     UserSummary {
@@ -49,6 +52,7 @@ fn summary(r: &Row) -> UserSummary {
         created_at_ms: r.get(3),
         permissions: r.get::<_, Vec<String>>(4).into_iter().collect(),
         email_verified: r.get(5),
+        password_set: r.get(6),
     }
 }
 
@@ -327,7 +331,16 @@ pub(crate) fn is_uuid(s: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{contains_pattern, is_uuid};
+    use super::{contains_pattern, is_uuid, SUMMARY_COLUMNS};
+
+    #[test]
+    fn invitation_prefix_matches_the_core_constant() {
+        let expected = format!(
+            "NOT starts_with(u.password_hash, '{}')",
+            autome_core::UNUSABLE_PASSWORD_PREFIX
+        );
+        assert!(SUMMARY_COLUMNS.ends_with(&expected));
+    }
 
     #[test]
     fn like_metacharacters_are_escaped() {
