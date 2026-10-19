@@ -380,12 +380,25 @@ where
                 .find_map(|s| s.error.clone())
                 .or_else(|| Some("run en échec".into()));
         }
-        if let Err(e) = self.store.checkpoint(&checkpoint).await {
-            // L'état final n'a pas pu être persisté. Le run reste `Running` en
-            // base : la redélivrance ne le rejouera pas (déjà réclamé), et le
-            // balayage des orphelins le clora en échec.
-            error!(error = %e, verdict = "retry", "état final du run non persisté");
-            return HandlerVerdict::Retry;
+        match self.store.finish(&checkpoint).await {
+            Ok(true) => {}
+            // Run effacé pendant son exécution (suppression du compte de son
+            // propriétaire, #229) : rien n'est réécrit, la livraison est
+            // acquittée.
+            Ok(false) => {
+                info!(
+                    verdict = "ack",
+                    "run effacé pendant son exécution, état final abandonné"
+                );
+                return HandlerVerdict::Ok;
+            }
+            Err(e) => {
+                // L'état final n'a pas pu être persisté. Le run reste `Running`
+                // en base : la redélivrance ne le rejouera pas (déjà réclamé),
+                // et le balayage des orphelins le clora en échec.
+                error!(error = %e, verdict = "retry", "état final du run non persisté");
+                return HandlerVerdict::Retry;
+            }
         }
 
         let duration_ms = now_ms().saturating_sub(started_ms);
@@ -981,6 +994,44 @@ mod tests {
             from_port: None,
         });
         wf
+    }
+
+    /// Transport qui efface les runs d'`owner` pendant l'appel : le compte du
+    /// propriétaire est supprimé alors que son run s'exécute (#229).
+    #[derive(Clone)]
+    struct ErasingHttp {
+        store: Arc<InMemoryRunStateStore>,
+        owner: &'static str,
+    }
+
+    impl HttpClient for ErasingHttp {
+        fn send(&self, _req: &HttpRequest) -> Result<HttpResponse, String> {
+            self.store.remove_owner(self.owner).unwrap();
+            Ok(HttpResponse {
+                status: 200,
+                body: json!({ "ok": true }),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn a_run_erased_during_execution_is_not_recreated() {
+        let repo = Arc::new(InMemoryWorkflowRepository::new());
+        let store = Arc::new(InMemoryRunStateStore::new());
+        seed_owned(&repo, &store, http_workflow("wf-e"), "run-e", Some("alice")).await;
+        let http = ErasingHttp {
+            store: Arc::clone(&store),
+            owner: "alice",
+        };
+        let exec = RunExecutor::with_http(repo, Arc::clone(&store) as Arc<_>, resolver(), http);
+
+        let verdict = exec.handle(&delivery("run-e", "wf-e")).await;
+        assert_eq!(verdict, HandlerVerdict::Ok, "acquitté, pas de rejeu");
+        assert_eq!(
+            store.load("run-e").await.unwrap(),
+            None,
+            "ni le run ni ses sorties ne sont réécrits"
+        );
     }
 
     /// Pool d'un consommateur avec un run « long » en file, démarré et
