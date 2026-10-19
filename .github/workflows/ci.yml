@@ -3,10 +3,15 @@
 # Reproduit la « definition of done » appliquée à chaque feature :
 #   - backend  : fmt + clippy (zéro warning) + schéma (migrations + seed)
 #                + tests workspace, y compris contre un vrai PostgreSQL et un
-#                vrai RabbitMQ (services du job) + build
-#   - frontend : typecheck + lint + tests Vitest
+#                vrai RabbitMQ (services du job), avec couverture chiffrée et
+#                plancher (cargo llvm-cov, #247) + build
+#   - frontend : typecheck + lint + tests Vitest avec couverture et plancher
+#                (v8, #247)
 #   - smoke    : images réelles api + worker sur PostgreSQL et RabbitMQ
 #                (Docker Compose), un run de bout en bout (#216)
+#
+# Couverture : tableau dans le résumé de chaque job, rapports (lcov, JSON)
+# en artefacts `coverage-backend` / `coverage-frontend`, aucun service tiers.
 #
 # Les tests backend sont surtout in-process / in-memory (api : reqwest sur
 # serveur local ; worker : queue/stores in-memory) ; ceux qui ciblent les
@@ -72,13 +77,21 @@ jobs:
       - uses: actions/checkout@v4
 
       # Toolchain ≥ 1.85 (edition2024) ; on pin 1.90 comme les Dockerfiles.
+      # `llvm-tools-preview` : instrumentation de la couverture (#247).
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@1.90
         with:
-          components: rustfmt, clippy
+          components: rustfmt, clippy, llvm-tools-preview
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
+
+      # Binaire précompilé (somme de contrôle vérifiée par l'action), version
+      # pinnée : pas de `cargo install` à chaque run.
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov@0.9.1
 
       - name: Format
         run: cargo fmt --all --check
@@ -91,16 +104,19 @@ jobs:
       - name: Schema (migrations + seed)
         run: scripts/check-migrations.sh
 
+      # Tests instrumentés (#247) : `cargo llvm-cov` lance `cargo test` une
+      # seule fois (profil de test, `target/llvm-cov-target`) ; les rapports
+      # sont produits plus bas à partir des profils collectés (`--no-report`).
       # `--nocapture` : le message de saut des tests réels reste visible, ce
       # qui permet à l'étape suivante de vérifier qu'aucun n'a été sauté.
       # Sans couleur : `CARGO_TERM_COLOR=always` (posé par la toolchain) glisse
       # des codes ANSI dans « Running … » et casserait le grep du garde-fou.
-      - name: Tests
+      - name: Tests (coverage)
         env:
           CARGO_TERM_COLOR: never
         run: |
           set -o pipefail
-          cargo test --workspace --locked -- --nocapture 2>&1 | tee "$RUNNER_TEMP/cargo-test.log"
+          cargo llvm-cov --no-report --workspace --locked -- --nocapture 2>&1 | tee "$RUNNER_TEMP/cargo-test.log"
 
       # Garde-fou : un test réel qui passe sans avoir rien exécuté (variable
       # renommée, retirée de `env:`…) ferait passer la CI au vert à tort.
@@ -112,6 +128,28 @@ jobs:
           fi
           echo "Binaires de tests réels exécutés :"
           grep -E 'Running .*(pg_[a-z_]+|rabbitmq)\.rs' "$RUNNER_TEMP/cargo-test.log"
+
+      # Chiffres dans le résumé du job, rapports en artefact — y compris quand
+      # le plancher ci-dessous échoue, pour voir ce qui a baissé.
+      - name: Coverage report
+        run: |
+          mkdir -p "$RUNNER_TEMP/coverage"
+          cargo llvm-cov report --lcov --output-path "$RUNNER_TEMP/coverage/lcov.info"
+          cargo llvm-cov report --json --summary-only --output-path "$RUNNER_TEMP/coverage/coverage.json"
+          scripts/coverage-summary.sh rust "$RUNNER_TEMP/coverage/coverage.json" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-backend
+          path: ${{ runner.temp }}/coverage/
+          retention-days: 14
+
+      # Plancher bloquant, juste sous la mesure du 2026-10-20 (lignes
+      # 95,0 %, fonctions 88,8 %) : à remonter avec elle, jamais à baisser
+      # pour faire passer une PR.
+      - name: Coverage threshold
+        run: cargo llvm-cov report --fail-under-lines 94 --fail-under-functions 87
 
       - name: Build (release)
         run: cargo build --workspace --release --locked
@@ -146,8 +184,23 @@ jobs:
       - name: Lint
         run: pnpm run lint
 
-      - name: Tests
-        run: pnpm run test
+      # Couverture v8 (#247) ; planchers dans `vite.config.ts` (`thresholds`),
+      # l'étape échoue s'ils ne sont pas atteints.
+      - name: Tests (coverage)
+        run: pnpm run test:coverage
+
+      # Même quand le plancher échoue, pour voir ce qui a baissé.
+      - name: Coverage report
+        if: ${{ !cancelled() && hashFiles('frontend/coverage/coverage-summary.json') != '' }}
+        run: ../scripts/coverage-summary.sh vitest coverage/coverage-summary.json | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload coverage report
+        if: ${{ !cancelled() && hashFiles('frontend/coverage/coverage-summary.json') != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-frontend
+          path: frontend/coverage/
+          retention-days: 14
 
   smoke:
     name: Smoke e2e (Docker Compose)
