@@ -303,6 +303,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    // Proxys sortants ignorés par le client filtré anti-SSRF (#233).
+    let proxies = autome_connectors::proxy_vars_set(|k| std::env::var(k).ok());
+    if !proxies.is_empty() {
+        tracing::warn!(
+            variables = ?proxies,
+            "proxy sortant ignoré par les requêtes HTTP filtrées (OAuth) : la sortie se fait \
+             en direct ; passer par une passerelle transparente si le réseau l'impose"
+        );
+    }
+
     // Backend de persistance (dette #107) : `AUTOME_PERSISTENCE=postgres` adosse
     // les stores d'auth à PostgreSQL ; défaut `memory` (dev/tests/single-node).
     // Le secret JWT vient toujours de `config.jwt_secret` (constat 1).

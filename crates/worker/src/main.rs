@@ -48,7 +48,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use autome_connectors::oauth::{OAuthClient, OAuthRegistry};
-use autome_connectors::{EgressPolicy, ReqwestHttpClient};
+use autome_connectors::{proxy_vars_set, EgressPolicy, ReqwestHttpClient};
 use autome_core::{telemetry, Config, QueueRunDispatcher};
 use autome_persistence::selectors::{
     build_connector_token_store, build_health_checks, build_queue, build_run_state_store,
@@ -120,6 +120,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let concurrency = concurrency_from_env();
     let run_timeout_ms = run_timeout_ms_from_env();
     let credentials_mode = ConnectorCredentialsMode::from_env()?;
+    // Proxys sortants ignorés par le client filtré anti-SSRF (#233).
+    let proxies = proxy_vars_set(|k| std::env::var(k).ok());
+    if !proxies.is_empty() {
+        tracing::warn!(
+            variables = ?proxies,
+            "proxy sortant ignoré par les requêtes HTTP filtrées (http_request, polls, OAuth) : \
+             la sortie se fait en direct ; passer par une passerelle transparente si le réseau l'impose"
+        );
+    }
 
     // Backends sélectionnés par l'environnement (partagés avec l'API).
     let queue = build_queue(&config, queue_mode).await?;
