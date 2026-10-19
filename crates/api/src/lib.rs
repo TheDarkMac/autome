@@ -13,6 +13,8 @@
 //! - [`email_verification`] (#231) : vérification de l'adresse email.
 //! - [`erasure`] (#229) : effacement d'un compte et de ses données (RGPD).
 //! - [`invitation`] (#241) : invitation de compte par un administrateur.
+//! - [`password_policy`] (#245) : refus des mots de passe courants ou
+//!   compromis.
 //! - [`mail`] et [`password_reset`] (#204) : envoi d'emails (SMTP) et jetons
 //!   de réinitialisation du mot de passe ; [`signed_link`] : jetons sans état
 //!   des liens envoyés par email.
@@ -35,6 +37,7 @@ pub mod mail;
 pub mod metrics;
 pub mod observability;
 pub mod openapi;
+pub mod password_policy;
 pub mod password_reset;
 pub mod probes;
 pub mod runs;

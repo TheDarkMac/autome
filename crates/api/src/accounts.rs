@@ -122,7 +122,8 @@ use std::sync::Arc;
 use autome_core::{
     email_throttle_key, has_usable_password, normalize_email, role_of, validate_email,
     validate_password, AuditEvent, AuditOutcome, Config, CreateUser, InMemoryLoginThrottle,
-    LoginAttempt, LoginThrottleStore, PasswordHasher, Role, TokenKind, UserStore, PERM_WILDCARD,
+    LoginAttempt, LoginThrottleStore, PasswordHasher, Role, TokenKind, UserStore,
+    COMPROMISED_PASSWORD_MESSAGE, PERM_WILDCARD,
 };
 pub use autome_core::{LOGIN_WINDOW_SECONDS, MAX_LOGIN_FAILURES};
 use axum::{
@@ -140,6 +141,7 @@ use crate::client_ip::{ClientIpPolicy, IpKeyer};
 use crate::email_verification::{EmailVerification, VerifyTokens};
 use crate::erasure::{erase_account, Erasure};
 use crate::invitation::InviteTokens;
+use crate::password_policy::PasswordPolicy;
 use crate::password_reset::{PasswordReset, ResetTokens};
 
 /// Durée de vie d'un access token (15 min).
@@ -254,6 +256,9 @@ pub struct AccountsState {
     /// Inscriptions publiques ouvertes (`AUTOME_SIGNUP`, #241) ; fermées, les
     /// comptes ne naissent que par invitation.
     pub signup_open: bool,
+    /// Refus des mots de passe courants ou compromis (#245) ; listes
+    /// intégrées par défaut.
+    pub password_policy: PasswordPolicy,
     /// Hash leurre vérifié quand l'email est inconnu (égalisation du temps).
     dummy_hash: Arc<str>,
 }
@@ -279,6 +284,7 @@ impl AccountsState {
             email_verification: None,
             invitations: None,
             signup_open: true,
+            password_policy: PasswordPolicy::default(),
             dummy_hash: dummy_hash.into(),
         })
     }
@@ -323,6 +329,13 @@ impl AccountsState {
     /// Ouvre (`true`, défaut) ou ferme les inscriptions publiques (#241).
     pub fn with_signup_open(mut self, open: bool) -> Self {
         self.signup_open = open;
+        self
+    }
+
+    /// Remplace le contrôle des mots de passe choisis (#245), ex. fichier de
+    /// l'opérateur et corpus Have I Been Pwned.
+    pub fn with_password_policy(mut self, policy: PasswordPolicy) -> Self {
+        self.password_policy = policy;
         self
     }
 }
@@ -626,6 +639,28 @@ async fn is_enabled(state: &AccountsState, user_id: &str) -> Result<bool, Accoun
         .is_some_and(|u| !u.disabled))
 }
 
+/// Refuse (400) un mot de passe choisi courant ou compromis pour le compte
+/// `email` (#245). La raison est journalisée, jamais le mot de passe ; le
+/// client reçoit un message unique.
+async fn screen_password(
+    state: &AccountsState,
+    password: &str,
+    email: &str,
+) -> Result<(), AccountError> {
+    match state.password_policy.weakness(password, Some(email)).await {
+        None => Ok(()),
+        Some(weakness) => {
+            tracing::info!(
+                ?weakness,
+                "mot de passe choisi refusé : courant ou compromis"
+            );
+            Err(AccountError::BadRequest(
+                COMPROMISED_PASSWORD_MESSAGE.into(),
+            ))
+        }
+    }
+}
+
 /// `POST /auth/signup` — crée un compte (rôle `editor`) et le connecte ; si
 /// la vérification de l'email est exigée (#231), il reste non vérifié, un
 /// lien lui est envoyé et la réponse (202) ne porte aucun jeton.
@@ -637,7 +672,7 @@ async fn is_enabled(state: &AccountsState, user_id: &str) -> Result<bool, Accoun
     responses(
         (status = 201, description = "Compte créé et connecté (vérification de l'email désactivée)", body = TokenResponse),
         (status = 202, description = "Compte créé, email de vérification envoyé : connexion possible après vérification", body = SignupPending),
-        (status = 400, description = "Email ou mot de passe invalide"),
+        (status = 400, description = "Email ou mot de passe invalide, ou mot de passe courant ou divulgué dans une fuite"),
         (status = 403, description = "Inscriptions fermées (`signup closed`) : comptes créés par invitation seulement"),
         (status = 409, description = "Email déjà enregistré"),
         (status = 429, description = "Trop d'inscriptions depuis cette adresse — voir `Retry-After`")
@@ -661,6 +696,9 @@ pub async fn signup(
     let ip = ip_counter(&state, SIGNUP_IP_SCOPE, peer.map(|c| c.0), &headers);
     let now = state.auth.clock.now_unix_seconds();
     check_ip(&state, &ip, "auth.signup", &email, now).await?;
+    // Après le quota IP : un anonyme ne déclenche pas d'appels au corpus
+    // distant à volonté.
+    screen_password(&state, &body.password, &email).await?;
 
     let hasher = Arc::clone(&state.hasher);
     let password = body.password;
@@ -933,7 +971,7 @@ pub async fn logout_all(
     request_body = ChangePasswordBody,
     responses(
         (status = 200, description = "Mot de passe changé ; autres sessions fermées", body = TokenResponse),
-        (status = 400, description = "Nouveau mot de passe invalide ou identique à l'actuel"),
+        (status = 400, description = "Nouveau mot de passe invalide, identique à l'actuel, courant ou divulgué dans une fuite"),
         (status = 401, description = "Access token absent, invalide ou révoqué"),
         (status = 403, description = "Mot de passe actuel incorrect"),
         (status = 409, description = "Mot de passe changé entre-temps (requête concurrente)"),
@@ -996,6 +1034,14 @@ pub async fn change_password(
         )
         .await;
         return Err(AccountError::Forbidden("current password is incorrect"));
+    }
+    // Mot de passe actuel prouvé : un nouveau mot de passe refusé ne compte
+    // pas comme un essai (le titulaire ne doit pas se bloquer en cherchant).
+    if let Err(e) = screen_password(&state, &body.new_password, &account.email).await {
+        if let Err(refund) = state.throttle.refund(&key).await {
+            tracing::warn!(error = %refund, "remboursement du compteur de mot de passe impossible");
+        }
+        return Err(e);
     }
 
     let hasher = Arc::clone(&state.hasher);
@@ -1180,7 +1226,7 @@ async fn send_reset_link(state: &AccountsState, reset: &PasswordReset, email: &s
     request_body = ResetPasswordBody,
     responses(
         (status = 204, description = "Mot de passe remplacé ; sessions fermées"),
-        (status = 400, description = "Lien invalide, expiré ou déjà utilisé, ou nouveau mot de passe invalide"),
+        (status = 400, description = "Lien invalide, expiré ou déjà utilisé, ou nouveau mot de passe invalide, courant ou divulgué"),
         (status = 503, description = "Réinitialisation indisponible : aucun envoi d'email configuré")
     )
 )]
@@ -1214,6 +1260,8 @@ pub async fn reset_password(
         .await;
         return Err(invalid());
     };
+    // Après le jeton : un lien valide est exigé avant d'interroger le corpus.
+    screen_password(&state, &body.new_password, &account.email).await?;
 
     let hasher = Arc::clone(&state.hasher);
     let new_password = body.new_password;
@@ -1446,7 +1494,7 @@ const INVALID_INVITE_TOKEN: &str = "invalid or expired invitation link";
     request_body = AcceptInvitationBody,
     responses(
         (status = 200, description = "Invitation acceptée, connecté", body = TokenResponse),
-        (status = 400, description = "Lien invalide, expiré, déjà utilisé ou remplacé par un renvoi, ou mot de passe invalide"),
+        (status = 400, description = "Lien invalide, expiré, déjà utilisé ou remplacé par un renvoi, ou mot de passe invalide, courant ou divulgué"),
         (status = 403, description = "Compte suspendu par un administrateur (`account disabled`)"),
         (status = 503, description = "Invitations indisponibles : aucun envoi d'email configuré")
     )
@@ -1482,6 +1530,7 @@ pub async fn accept_invitation(
         audit(&state, &account.id, ACTION, AuditOutcome::Denied).await;
         return Err(AccountError::Forbidden(ACCOUNT_DISABLED));
     }
+    screen_password(&state, &body.password, &account.email).await?;
 
     let hasher = Arc::clone(&state.hasher);
     let password = body.password;
@@ -1988,11 +2037,26 @@ mod tests {
     #[tokio::test]
     async fn signup_rejects_duplicate_email_case_insensitively() {
         let h = harness();
-        post(&h.app, "/signup", creds("bob@example.io", "password-1")).await;
-        let resp = post(&h.app, "/signup", creds("BOB@example.io", "password-2")).await;
+        post(
+            &h.app,
+            "/signup",
+            creds("bob@example.io", "bob-first-secret"),
+        )
+        .await;
+        let resp = post(
+            &h.app,
+            "/signup",
+            creds("BOB@example.io", "bob-second-secret"),
+        )
+        .await;
         assert_eq!(resp.status(), StatusCode::CONFLICT);
         // Le premier mot de passe reste le bon.
-        let ok = post(&h.app, "/login", creds("bob@example.io", "password-1")).await;
+        let ok = post(
+            &h.app,
+            "/login",
+            creds("bob@example.io", "bob-first-secret"),
+        )
+        .await;
         assert_eq!(ok.status(), StatusCode::OK);
     }
 
@@ -3111,7 +3175,9 @@ mod tests {
 
         // Jeton signé par une autre clé, ou falsifié, ou absurde.
         let foreign = ResetTokens::new(b"other-key").issue(&user.id, &user.password_hash, START);
-        let tampered = format!("{}0", &token[..token.len() - 1]);
+        // Dernier chiffre du MAC toujours modifié (`0` ⇒ `1`, sinon `0`).
+        let last = if token.ends_with('0') { '1' } else { '0' };
+        let tampered = format!("{}{last}", &token[..token.len() - 1]);
         for bad in [foreign.as_str(), tampered.as_str(), "", "x.y.z"] {
             let r = post(&h.app, "/password/reset", reset_body(bad, "new-password")).await;
             assert_eq!(r.status(), StatusCode::BAD_REQUEST, "{bad:?}");
@@ -4151,5 +4217,155 @@ mod tests {
         )
         .await;
         assert_eq!(r.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    // ───── Mots de passe courants ou compromis (#245) ─────
+
+    #[tokio::test]
+    async fn signup_refuses_common_and_contextual_passwords() {
+        let h = harness();
+        for weak in [
+            "Password123!",
+            "azertyuiop",
+            "zoe.martin2026",
+            "Autome2026!",
+        ] {
+            let r = post(&h.app, "/signup", creds("zoe.martin@example.io", weak)).await;
+            assert_eq!(r.status(), StatusCode::BAD_REQUEST, "{weak}");
+            assert_eq!(text(r).await, COMPROMISED_PASSWORD_MESSAGE);
+        }
+        assert!(h
+            .users
+            .find_by_email("zoe.martin@example.io")
+            .await
+            .unwrap()
+            .is_none());
+        let r = post(
+            &h.app,
+            "/signup",
+            creds("zoe.martin@example.io", "vélo rouge sous la pluie"),
+        )
+        .await;
+        assert_eq!(r.status(), StatusCode::CREATED);
+    }
+
+    #[tokio::test]
+    async fn a_refused_new_password_does_not_count_as_a_guess() {
+        let h = harness();
+        let pair = tokens(
+            post(
+                &h.app,
+                "/signup",
+                creds("tom@example.io", "tom-real-secret"),
+            )
+            .await,
+        )
+        .await;
+        // Le titulaire cherche un mot de passe accepté : jamais bloqué.
+        for _ in 0..=MAX_LOGIN_FAILURES {
+            let r = post_bearer(
+                &h.app,
+                "/password",
+                &pair.access_token,
+                pw("tom-real-secret", "Qwerty2024!"),
+            )
+            .await;
+            assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+            assert_eq!(text(r).await, COMPROMISED_PASSWORD_MESSAGE);
+        }
+        // Rien n'a changé : la session est intacte, l'ancien mot de passe aussi.
+        assert_eq!(
+            whoami_status(&h.app, &pair.access_token).await,
+            StatusCode::OK
+        );
+        let r = post_bearer(
+            &h.app,
+            "/password",
+            &pair.access_token,
+            pw("tom-real-secret", "tom-new-long-secret"),
+        )
+        .await;
+        assert_eq!(r.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn reset_and_invitation_refuse_compromised_passwords_and_keep_the_link() {
+        let h = harness();
+        let token = reset_token_for(&h, "una@example.io", "una-old-secret").await;
+        let r = post(&h.app, "/password/reset", reset_body(&token, "iloveyou2")).await;
+        assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(text(r).await, COMPROMISED_PASSWORD_MESSAGE);
+        // Le lien n'a pas été consommé.
+        let r = post(
+            &h.app,
+            "/password/reset",
+            reset_body(&token, "una-new-long-secret"),
+        )
+        .await;
+        assert_eq!(r.status(), StatusCode::NO_CONTENT);
+
+        let (id, hash) = invited(&h, "ivo@example.io").await;
+        let token = invite_tokens().issue(&id, &hash, START);
+        let r = post(
+            &h.app,
+            "/invitation/accept",
+            accept_body(&token, "12345678"),
+        )
+        .await;
+        assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(text(r).await, COMPROMISED_PASSWORD_MESSAGE);
+        let r = post(
+            &h.app,
+            "/invitation/accept",
+            accept_body(&token, "ivo-chosen-secret"),
+        )
+        .await;
+        assert_eq!(r.status(), StatusCode::OK);
+    }
+
+    /// Corpus distant factice : un seul mot de passe divulgué.
+    struct OneLeak(&'static str);
+
+    #[async_trait::async_trait]
+    impl autome_core::BreachedPasswordSource for OneLeak {
+        async fn is_breached(&self, password: &str) -> autome_core::Result<bool> {
+            Ok(password == self.0)
+        }
+    }
+
+    #[tokio::test]
+    async fn the_breach_corpus_applies_when_choosing_never_when_logging_in() {
+        let perms = Arc::new(InMemoryPermissionStore::new());
+        let auth = AuthState::new(
+            TokenService::new(SECRET),
+            Arc::new(InMemoryRevocationStore::new()),
+            perms.clone(),
+            Arc::new(InMemoryAuditSink::new()),
+        );
+        let users = Arc::new(InMemoryUserStore::new(perms));
+        let leaked = "a long but leaked phrase";
+        let state = AccountsState::new(auth, users.clone(), Arc::new(PlainHasher))
+            .unwrap()
+            .with_password_policy(
+                PasswordPolicy::default().with_breached_source(Arc::new(OneLeak(leaked))),
+            );
+        let app = accounts_router(state);
+        let r = post(&app, "/signup", creds("leo@example.io", leaked)).await;
+        assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(text(r).await, COMPROMISED_PASSWORD_MESSAGE);
+
+        // Un compte existant dont le mot de passe vient d'apparaître dans une
+        // fuite se connecte toujours : seul un nouveau choix est contrôlé.
+        users
+            .create(
+                "old@example.io",
+                &format!("plain:{leaked}"),
+                &Role::editor().permissions,
+                true,
+            )
+            .await
+            .unwrap();
+        let r = post(&app, "/login", creds("old@example.io", leaked)).await;
+        assert_eq!(r.status(), StatusCode::OK);
     }
 }
