@@ -18,6 +18,11 @@
 //!
 //! Exception explicite : les hôtes listés par l'opérateur dans
 //! [`ALLOWLIST_ENV`] (intranet légitime, IdP interne…) ne sont pas filtrés.
+//!
+//! Les proxys sortants de l'environnement ([`PROXY_ENV_VARS`]) sont ignorés
+//! par le client filtré (#233) : le proxy résoudrait lui-même l'hôte cible,
+//! hors de portée du résolveur. [`proxy_vars_set`] permet de le signaler au
+//! démarrage.
 
 use std::collections::HashSet;
 use std::fmt;
@@ -28,6 +33,25 @@ use reqwest::Url;
 /// Variable d'environnement : hôtes internes autorisés malgré le filtre,
 /// séparés par virgules/espaces (ex. `keycloak.internal,10.0.0.12`).
 pub const ALLOWLIST_ENV: &str = "AUTOME_EGRESS_ALLOWLIST";
+
+/// Variables de proxy que les clients HTTP suivent d'habitude et que le
+/// client filtré ignore.
+pub const PROXY_ENV_VARS: [&str; 6] = [
+    "HTTP_PROXY",
+    "http_proxy",
+    "HTTPS_PROXY",
+    "https_proxy",
+    "ALL_PROXY",
+    "all_proxy",
+];
+
+/// Variables de [`PROXY_ENV_VARS`] définies (non vides) dans `src`.
+pub fn proxy_vars_set(src: impl Fn(&str) -> Option<String>) -> Vec<&'static str> {
+    PROXY_ENV_VARS
+        .into_iter()
+        .filter(|k| src(k).is_some_and(|v| !v.trim().is_empty()))
+        .collect()
+}
 
 /// Refus d'une destination sortante.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -369,5 +393,17 @@ mod tests {
             EgressPolicy::from_source(|_| Some(" , ".into())),
             EgressPolicy::strict()
         );
+    }
+
+    #[test]
+    fn proxy_vars_set_lists_non_empty_proxy_variables() {
+        assert!(proxy_vars_set(|_| None).is_empty());
+        let set = proxy_vars_set(|k| match k {
+            "HTTPS_PROXY" => Some("http://proxy.internal:3128".into()),
+            "all_proxy" => Some("socks5://10.0.0.9:1080".into()),
+            "HTTP_PROXY" => Some("  ".into()),
+            _ => None,
+        });
+        assert_eq!(set, ["HTTPS_PROXY", "all_proxy"]);
     }
 }

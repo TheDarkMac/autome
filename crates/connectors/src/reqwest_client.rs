@@ -18,6 +18,9 @@
 //! un résolveur dédié (la connexion part vers les adresses validées : pas de
 //! DNS rebinding), redirections revérifiées. Délais et taille de réponse
 //! bornés ([`REQUEST_TIMEOUT`], [`CONNECT_TIMEOUT`], [`MAX_RESPONSE_BYTES`]).
+//! Les proxys de l'environnement (`HTTP(S)_PROXY`, `ALL_PROXY`) sont
+//! **ignorés** (#233) : derrière un proxy, seul le nom du proxy passerait par
+//! le résolveur filtré et l'hôte cible ne serait plus contrôlé.
 
 use std::io::Read;
 use std::net::SocketAddr;
@@ -97,6 +100,8 @@ impl ReqwestHttpClient {
                 }
             });
             reqwest::blocking::Client::builder()
+                // Pas de proxy : la cible doit passer par `GuardedResolver`.
+                .no_proxy()
                 .dns_resolver(Arc::new(GuardedResolver {
                     policy: Arc::clone(&self.policy),
                 }))
