@@ -122,6 +122,22 @@ flowchart TB
   conditionnelle, un renvoi en tire un nouveau ; les deux invalident les liens
   en circulation. `AUTOME_SIGNUP=invite_only` ferme `/auth/signup` ;
   `autome-api invite` amorce une instance fermée.
+- **Mots de passe compromis** (#245) : `core::CommonPasswords` (liste
+  intégrée, mots de base après retrait des chiffres et du *leet speak*,
+  contexte email/service, fichier de l'opérateur) et la source distante
+  `core::BreachedPasswordSource`, implémentée par `api::password_policy::HibpRange`
+  (Have I Been Pwned en k-anonymat, sur option, repli sur les listes locales).
+  `api::password_policy::PasswordPolicy` est appliquée aux quatre chemins où
+  un mot de passe est choisi, jamais à la connexion.
+- **Double authentification** (#245) : `api::mfa` (TOTP RFC 6238, codes de
+  secours, défi de connexion) sur `core::MfaStore` (`PgMfaStore`, migration
+  `0022` : `user_mfa` + `mfa_recovery_codes`, cascade sur `users`). Le secret
+  est scellé par `EnvelopeCipher` (clé dérivée d'`ENCRYPTION_KEY` sous son
+  domaine), les codes de secours stockés en HMAC ; l'anti-rejeu et l'usage
+  unique sont des écritures conditionnelles. `/auth/login` répond 202 avec un
+  défi `api::signed_link` lié à la version de session et au hash du mot de
+  passe ; `/auth/mfa/verify` l'échange avec un code contre une paire.
+  Réinitialisation par `DELETE /admin/users/{id}/mfa` ou `autome-api reset-mfa`.
 - **Suppression de compte** (#229, RGPD) : `core::AccountEraser` efface le
   compte et ce qui lui est rattaché (workflows et leurs cascades, runs,
   tokens de connecteurs, permissions) et pseudonymise l'audit ; en PostgreSQL,

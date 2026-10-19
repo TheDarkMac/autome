@@ -45,6 +45,12 @@ data:
   # Inscriptions publiques (#241) : `open` ou `invite_only` (comptes créés par
   # invitation ; premier admin : `autome-api invite <email> admin`).
   AUTOME_SIGNUP: "open"
+  # Mots de passe compromis (#245) : `hibp` compare aussi au corpus Have I Been
+  # Pwned en k-anonymat (sortie HTTPS vers api.pwnedpasswords.com, ou miroir
+  # via AUTOME_PWNED_PASSWORDS_URL) ; `off` = listes locales seules.
+  AUTOME_PWNED_PASSWORDS: "off"
+  # Double authentification (#245) : nom affiché par les applications TOTP.
+  AUTOME_MFA_ISSUER: "Autome"
   # URL publique du frontend (base des liens envoyés par email) et
   # expéditeur. Sans AUTOME_SMTP_URL (Secret), le mot de passe oublié et les
   # invitations répondent 503 et les comptes sont créés vérifiés.
