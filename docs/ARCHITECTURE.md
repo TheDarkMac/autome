@@ -317,6 +317,11 @@ erDiagram
 - Broker : reconnexion à la demande après perte de RabbitMQ, `DeliveryId` lié à
   la génération du canal (un `ack` périmé est ignoré), publisher confirms
   réels ; backoff du worker pendant une panne (#180).
+- Consommation **poussée** : le worker s'abonne à la queue (`basic_consume`,
+  prefetch = concurrence du process) au lieu de sonder par `basic_get` ; les
+  queues ne sont déclarées qu'une fois par connexion, publication `mandatory`
+  (un message non routé est republié après redéclaration) ; à l'arrêt, les
+  messages reçus d'avance sont rendus au broker (#237).
 
 **Sécurité**
 - TLS côté API (rustls, *all-or-nothing*) ; TLS d'ingress = cible (F6.4).
