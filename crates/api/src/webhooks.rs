@@ -753,7 +753,14 @@ mod tests {
                 Arc::clone(&queue) as Arc<dyn Queue + Send + Sync>,
                 Arc::clone(&runs) as Arc<dyn RunStateStore + Send + Sync>,
             )
-            .with_id_generator(|| "hook-run".to_string()),
+            // `hook-run`, puis `hook-run-2`… : un id ne sert qu'une fois.
+            .with_id_generator({
+                let n = std::sync::atomic::AtomicUsize::new(0);
+                move || match n.fetch_add(1, std::sync::atomic::Ordering::SeqCst) {
+                    0 => "hook-run".to_string(),
+                    i => format!("hook-run-{}", i + 1),
+                }
+            }),
         );
         let auth = AuthState::new(
             TokenService::new(SECRET),
