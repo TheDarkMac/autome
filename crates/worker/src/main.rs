@@ -10,9 +10,13 @@
 //! - `AUTOME_WORKER_CONCURRENCY` : nombre de tâches consommatrices (défaut 4),
 //!   aussi le prefetch du consommateur RabbitMQ (messages poussés d'avance).
 //! - `AUTOME_RUN_TIMEOUT_SECS` : au-delà, un run toujours `running` est
-//!   considéré interrompu et clos en `failed` (défaut 3600, plancher 60). Un
-//!   run n'étant jamais rejoué (#174), c'est ce qui solde les runs d'un worker
-//!   tué en cours d'exécution.
+//!   clos en `failed` (défaut 3600, plancher 60) : borne la durée d'une
+//!   tentative, et solde les runs pris par un worker antérieur à #239 (sans
+//!   battement).
+//! - `AUTOME_RUN_LEASE_SECS` : bail d'un run en cours (défaut 60, plancher
+//!   10, #239). Le worker bat tous les quarts de bail ; un run sans battement
+//!   depuis le bail (worker tué) est remis en file et repris par un autre
+//!   worker à son point de reprise.
 //! - `AUTOME_CONNECTOR_CREDENTIALS` : `per_user` (défaut) — chaque action de
 //!   connecteur utilise le token OAuth **du propriétaire du run**, lu dans le
 //!   store chiffré (`connector_tokens`, déchiffré avec `ENCRYPTION_KEY`, qui
@@ -41,10 +45,15 @@
 //!   chacune. Les polls passent par le client HTTP filtré anti-SSRF
 //!   (`AUTOME_EGRESS_ALLOWLIST`). Sans PostgreSQL, rien n'est planifié.
 //!
+//! Outbox (#239) : toutes les 5 s, chaque réplique publie les messages de run
+//! restés en attente (publication du dispatcher perdue) et remet en file les
+//! runs sans battement.
+//!
 //! Arrêt **borné** : sur `SIGINT`/`SIGTERM`, le pool cesse de consommer,
-//! `/readyz` passe à 503 et les runs en cours ont le délai d'arrêt pour se
-//! terminer ; au-delà, ils sont clos en `failed` (« worker arrêté pendant
-//! l'exécution ») au lieu de rester `running` jusqu'au balayage des orphelins.
+//! `/readyz` passe à 503 et chaque run en cours s'arrête au prochain nœud et
+//! est remis en file (repris ailleurs sans rien rejouer) ; un nœud long a le
+//! délai d'arrêt pour se terminer, au-delà son run est remis en file et le
+//! worker qui le reprend décide si le nœud interrompu peut être rejoué.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -58,12 +67,13 @@ use autome_persistence::selectors::{
     build_trigger_schedule_store, build_workflow_repository, ensure_durable_backends,
     PersistenceMode, QueueMode,
 };
+use autome_worker::outbox::{lease_from_env, relay_outbox, requeue_stale, MAINTENANCE_INTERVAL};
 use autome_worker::probe::{self, ProbeState};
 use autome_worker::shutdown::shutdown_timeout_from_env;
 use autome_worker::triggers::tick_period_from_env;
 use autome_worker::{
     drain, reap_orphans, ConnectorCredentialsMode, DrainOutcome, Handler, IdempotencyStore,
-    InMemoryIdempotencyStore, RunExecutor, TriggerLoop, WorkerMetrics, WorkerPool,
+    InMemoryIdempotencyStore, RequeueReason, RunExecutor, TriggerLoop, WorkerMetrics, WorkerPool,
 };
 
 /// Queue des runs (alignée sur `QueueRunDispatcher::queue_name` par défaut).
@@ -122,6 +132,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     ensure_durable_backends(config.profile, persistence, queue_mode)?;
     let concurrency = concurrency_from_env();
     let run_timeout_ms = run_timeout_ms_from_env();
+    let lease = lease_from_env()?;
     let credentials_mode = ConnectorCredentialsMode::from_env()?;
     // Proxys sortants ignorés par le client filtré anti-SSRF (#233).
     let proxies = proxy_vars_set(|k| std::env::var(k).ok());
@@ -180,6 +191,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
+    // Outbox (#239) : messages de run restés en attente, runs sans battement.
+    let maintenance_queue = queue.clone();
+    let maintenance_store = Arc::clone(&store);
+    let maintenance_metrics = Arc::clone(&metrics);
+    let lease_ms = lease.as_millis() as i64;
+    let maintenance = tokio::spawn(async move {
+        let mut tick = tokio::time::interval(MAINTENANCE_INTERVAL);
+        loop {
+            tick.tick().await;
+            let (queue, store) = (maintenance_queue.as_ref(), maintenance_store.as_ref());
+            match relay_outbox(queue, store, now_ms()).await {
+                Ok(0) => {}
+                Ok(n) => maintenance_metrics.outbox_relayed(n as u64),
+                Err(e) => {
+                    maintenance_metrics.outbox_error();
+                    tracing::warn!(error = %e, "relais de l'outbox en échec");
+                }
+            }
+            match requeue_stale(queue, store, now_ms(), lease_ms).await {
+                Ok(0) => {}
+                Ok(n) => maintenance_metrics.runs_requeued(RequeueReason::Stale, n as u64),
+                Err(e) => {
+                    maintenance_metrics.outbox_error();
+                    tracing::error!(error = %e, "remise en file des runs sans battement impossible");
+                }
+            }
+        }
+    });
+
     // Déclencheurs planifiés (#227) : runs publiés sur la même file, comme
     // ceux de l'API.
     let scheduler_period = tick_period_from_env()?;
@@ -201,8 +241,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    let executor =
-        RunExecutor::new(repo, Arc::clone(&store), resolver).with_metrics(Arc::clone(&metrics));
+    let executor = RunExecutor::new(repo, Arc::clone(&store), resolver)
+        .with_metrics(Arc::clone(&metrics))
+        .with_lease(lease)
+        .with_queue(queue.clone());
     // Runs en cours, pour clore ceux qu'un arrêt interromprait (#200).
     let in_flight = executor.in_flight();
     let handler: Arc<dyn Handler + Send + Sync> = Arc::new(executor);
@@ -216,13 +258,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         credentials = ?credentials_mode,
         concurrency,
         run_timeout_s = run_timeout_ms / 1_000,
+        run_lease_s = lease.as_secs(),
         scheduler_tick_s = scheduler_period.map(|p| p.as_secs()),
         runs_queue = RUNS_QUEUE,
         log_format = ?log_format,
         "autome-worker démarré"
     );
 
-    let pool = WorkerPool::new(queue, handler, idempotency, RUNS_QUEUE, concurrency)
+    let pool = WorkerPool::new(queue.clone(), handler, idempotency, RUNS_QUEUE, concurrency)
         .with_metrics(Arc::clone(&metrics));
 
     // Arrêt borné (#200) : délai laissé aux runs en cours ; `/readyz` à 503
@@ -261,10 +304,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!(
         timeout_s = shutdown_timeout.as_secs(),
         runs_en_cours = in_flight.snapshot().len(),
-        "signal d'arrêt reçu : plus de nouveaux runs, drain des runs en cours"
+        "signal d'arrêt reçu : plus de nouveaux runs, runs en cours arrêtés au prochain nœud"
     );
-    let outcome = drain(running, &in_flight, store.as_ref(), shutdown_timeout).await;
+    let outcome = drain(
+        running,
+        &in_flight,
+        store.as_ref(),
+        queue.as_ref(),
+        shutdown_timeout,
+    )
+    .await;
     reaper.abort();
+    maintenance.abort();
     if let Some(probes) = probes {
         probes.abort();
     }
@@ -273,11 +324,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             tracing::info!("autome-worker arrêté proprement");
             Ok(())
         }
-        DrainOutcome::Interrupted { failed } => {
+        DrainOutcome::Interrupted { requeued, failed } => {
+            metrics.runs_requeued(RequeueReason::Shutdown, requeued.len() as u64);
             tracing::warn!(
-                runs = failed.len(),
-                run_ids = ?failed,
-                "délai d'arrêt dépassé : runs interrompus clos en échec"
+                requeued = ?requeued,
+                failed = ?failed,
+                "délai d'arrêt dépassé : runs interrompus en plein nœud remis en file \
+                 (ceux sans message dans l'outbox clos en échec)"
             );
             // Le runtime attendrait sinon, à sa destruction, la fin des
             // threads bloquants du moteur — c'est-à-dire des runs qu'on vient

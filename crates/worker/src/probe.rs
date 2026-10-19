@@ -337,7 +337,7 @@ mod tests {
 
         metrics.delivery(DeliveryOutcome::Ack);
         metrics.run_finished(RunOutcome::Succeeded, Duration::from_millis(300));
-        let _running = in_flight.track("run-1");
+        let _running = in_flight.track("run-1", 1);
         let res = request(addr, "GET /metrics HTTP/1.1\r\nHost: x\r\n\r\n").await;
         let (head, body) = res.split_once("\r\n\r\n").unwrap();
         assert!(head.starts_with("HTTP/1.1 200 OK\r\n"), "{head}");
