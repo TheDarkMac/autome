@@ -213,6 +213,21 @@ impl InMemoryUserStore {
             .map_err(|_| Error::Invalid("users lock empoisonné".into()))
     }
 
+    /// Supprime le compte `id` et ses permissions (suppression de compte,
+    /// #229) ; renvoie l'enregistrement supprimé, `None` si inconnu.
+    pub fn remove(&self, id: &str) -> Result<Option<UserRecord>> {
+        let mut users = self.lock()?;
+        let Some(email) = users
+            .iter()
+            .find(|(_, u)| u.record.id == id)
+            .map(|(email, _)| email.clone())
+        else {
+            return Ok(None);
+        };
+        self.permissions.replace(id, &HashSet::new())?;
+        Ok(users.remove(&email).map(|u| u.record))
+    }
+
     /// Complète des comptes de leurs permissions (verrou des comptes relâché).
     async fn summaries(&self, users: Vec<(UserRecord, i64)>) -> Result<Vec<UserSummary>> {
         let mut out = Vec::with_capacity(users.len());
@@ -584,5 +599,26 @@ mod tests {
             .update_password("inconnu", "hash-v2", "hash-x")
             .await
             .unwrap());
+    }
+
+    #[tokio::test]
+    async fn remove_deletes_the_account_and_its_permissions() {
+        let (users, perms) = store();
+        let alice = created(&users, "alice@example.io").await;
+        let bob = created(&users, "bob@example.io").await;
+        assert_eq!(users.remove(&alice.id).unwrap(), Some(alice.clone()));
+        assert_eq!(users.find_by_id(&alice.id).await.unwrap(), None);
+        assert_eq!(users.find_by_email("alice@example.io").await.unwrap(), None);
+        assert!(perms.permissions_for(&alice.id).await.unwrap().is_empty());
+        assert_eq!(users.remove(&alice.id).unwrap(), None);
+        assert!(users.find_by_id(&bob.id).await.unwrap().is_some());
+        // L'email redevient libre.
+        assert!(matches!(
+            users
+                .create("alice@example.io", "h", &HashSet::new())
+                .await
+                .unwrap(),
+            CreateUser::Created(_)
+        ));
     }
 }
