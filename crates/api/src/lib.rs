@@ -8,6 +8,7 @@
 //! - [`accounts`] : inscription, connexion et rotation des jetons
 //!   (`/auth/signup|login|refresh`).
 //! - [`admin`] (#208) : administration des utilisateurs (`/admin/users`).
+//! - [`erasure`] (#229) : effacement d'un compte et de ses données (RGPD).
 //! - [`mail`] et [`password_reset`] (#204) : envoi d'emails (SMTP) et jetons
 //!   de réinitialisation du mot de passe.
 //! - [`auth`] (F6.1.c) : extractor axum `AuthenticatedUser` qui consomme
@@ -21,6 +22,7 @@ pub mod auth;
 pub mod client_ip;
 pub mod cors;
 pub mod credentials;
+pub mod erasure;
 pub mod mail;
 pub mod metrics;
 pub mod observability;

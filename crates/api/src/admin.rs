@@ -10,6 +10,7 @@
 //! | POST    | `/admin/users/{id}/disable`      | —            | 200 + [`AdminUser`]  |
 //! | POST    | `/admin/users/{id}/enable`       | —            | 200 + [`AdminUser`]  |
 //! | POST    | `/admin/users/{id}/logout-all`   | —            | 204                  |
+//! | DELETE  | `/admin/users/{id}`              | —            | 204                  |
 //!
 //! Règles :
 //! - le **rôle** (`admin`, `editor`, `viewer`) n'est qu'une vue des
@@ -29,10 +30,17 @@
 //!   l'incrément de version, et la connexion relit le drapeau *après* avoir
 //!   lu la version (cf. [`crate::accounts`]) : une connexion concurrente de la
 //!   suspension est soit refusée, soit émise à une version aussitôt périmée ;
+//! - la **suppression** (#229, RGPD) est définitive : le compte et toutes
+//!   ses données sont effacés (cf. [`crate::erasure`]), par exemple sur une
+//!   demande reçue hors de l'application. Mêmes garde-fous (`*` pour un
+//!   compte super-admin, 409 sur son propre compte : passer par
+//!   `DELETE /auth/me`) ; l'audit désigne ensuite le compte par son
+//!   pseudonyme ;
 //! - compte inconnu : 404 ; chaque appel produit un event d'audit
 //!   `admin.users_list` / `admin.user_get` / `admin.user_role` /
-//!   `admin.user_disable` / `admin.user_enable` / `admin.user_logout_all`
-//!   (ressource = compte visé).
+//!   `admin.user_disable` / `admin.user_enable` / `admin.user_logout_all` /
+//!   `admin.user_delete` (ressource = compte visé, ou son pseudonyme une fois
+//!   effacé).
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -53,6 +61,7 @@ use serde_json::{json, Value};
 use utoipa::{IntoParams, ToSchema};
 
 use crate::auth::{AuthError, AuthState, AuthenticatedUser, OwnerScope};
+use crate::erasure::{erase_account, Erasure};
 
 /// Taille de page par défaut de la liste.
 pub const DEFAULT_PAGE_SIZE: usize = 50;
@@ -66,12 +75,24 @@ pub struct AdminState {
     pub auth: AuthState,
     /// Comptes utilisateurs.
     pub users: Arc<dyn UserStore + Send + Sync>,
+    /// Suppression de compte (#229) ; `None` = indisponible (503).
+    pub erasure: Option<Erasure>,
 }
 
 impl AdminState {
     /// Construit l'état.
     pub fn new(auth: AuthState, users: Arc<dyn UserStore + Send + Sync>) -> Self {
-        Self { auth, users }
+        Self {
+            auth,
+            users,
+            erasure: None,
+        }
+    }
+
+    /// Active la suppression de comptes (#229).
+    pub fn with_erasure(mut self, erasure: Erasure) -> Self {
+        self.erasure = Some(erasure);
+        self
     }
 }
 
@@ -158,6 +179,8 @@ pub enum AdminError {
     BadRequest(String),
     /// Action refusée sur son propre compte.
     Conflict(&'static str),
+    /// Fonction non configurée sur ce déploiement.
+    Unavailable(&'static str),
     /// Erreur interne (store).
     Internal(String),
 }
@@ -175,6 +198,7 @@ impl IntoResponse for AdminError {
             AdminError::NotFound => (StatusCode::NOT_FOUND, "user not found").into_response(),
             AdminError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg).into_response(),
             AdminError::Conflict(msg) => (StatusCode::CONFLICT, msg).into_response(),
+            AdminError::Unavailable(msg) => (StatusCode::SERVICE_UNAVAILABLE, msg).into_response(),
             AdminError::Internal(msg) => {
                 tracing::error!(error = %msg, "erreur interne de l'administration");
                 (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response()
@@ -571,6 +595,69 @@ pub async fn logout_user(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// `DELETE /admin/users/{id}` — efface définitivement le compte et toutes
+/// ses données (RGPD, droit à l'effacement) ; ses sessions sont fermées.
+#[utoipa::path(
+    delete,
+    path = "/admin/users/{id}",
+    tag = "admin",
+    params(("id" = String, Path, description = "Identifiant du compte")),
+    responses(
+        (status = 204, description = "Compte et données effacés"),
+        (status = 401, description = "Token absent ou invalide"),
+        (status = 403, description = "Manque `users.admin`, ou `*` pour un compte super-admin"),
+        (status = 404, description = "Compte inconnu"),
+        (status = 409, description = "Son propre compte (passer par `DELETE /auth/me`)"),
+        (status = 503, description = "Suppression indisponible sur ce déploiement")
+    ),
+    security(("bearer" = []))
+)]
+pub async fn delete_user(
+    user: AuthenticatedUser,
+    State(state): State<AdminState>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, AdminError> {
+    const ACTION: &str = "admin.user_delete";
+    state
+        .auth
+        .require_permission(&user, PERM_USERS_ADMIN)
+        .await?;
+    let Some(erasure) = state.erasure.clone() else {
+        return Err(AdminError::Unavailable(
+            "account deletion is not configured",
+        ));
+    };
+    if id == user.user_id() {
+        return Err(
+            refuse_self(&state, &user, ACTION, "cannot delete your own account here").await,
+        );
+    }
+    target_for_change(&state, &user, &id, ACTION).await?;
+    let Some(account) = state.users.find_by_id(&id).await.map_err(internal)? else {
+        return Err(AdminError::NotFound);
+    };
+    let Some(erased) = erase_account(&state.auth, &erasure, &account)
+        .await
+        .map_err(internal)?
+    else {
+        return Err(AdminError::NotFound);
+    };
+    audit(
+        &state,
+        user.user_id(),
+        ACTION,
+        &erased.pseudonym,
+        AuditOutcome::Success,
+        json!({
+            "workflows": erased.report.workflows,
+            "runs": erased.report.runs,
+            "connector_tokens": erased.report.connector_tokens,
+        }),
+    )
+    .await;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 /// Issue de [`promote_admin`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Promotion {
@@ -626,7 +713,7 @@ pub async fn promote_admin(
 pub fn admin_router(state: AdminState) -> Router {
     Router::new()
         .route("/admin/users", get(list_users))
-        .route("/admin/users/:id", get(get_user))
+        .route("/admin/users/:id", get(get_user).delete(delete_user))
         .route("/admin/users/:id/role", put(set_role))
         .route("/admin/users/:id/disable", post(disable_user))
         .route("/admin/users/:id/enable", post(enable_user))
@@ -637,10 +724,15 @@ pub fn admin_router(state: AdminState) -> Router {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::erasure::InMemoryAccountEraser;
+    use autome_connectors::oauth::InMemoryConnectorTokenStore;
     use autome_core::{
-        AuditSink, CreateUser, InMemoryAuditSink, InMemoryPermissionStore, InMemoryRevocationStore,
-        InMemoryUserStore, PermissionStore, RevocationStore, TokenService, ROLE_EDITOR,
-        ROLE_VIEWER,
+        AuditSink, CreateUser, EnvelopeCipher, InMemoryAuditSink, InMemoryKeyProvider,
+        InMemoryLoginThrottle, InMemoryPermissionStore, InMemoryRevocationStore,
+        InMemoryRunStateStore, InMemoryTriggerScheduleStore, InMemoryUserStore,
+        InMemoryWebhookEndpointStore, InMemoryWorkflowRepository, Pagination, PermissionStore,
+        RevocationStore, TokenService, WorkflowGraph, WorkflowId, WorkflowRepository,
+        ERASED_PREFIX, ROLE_EDITOR, ROLE_VIEWER,
     };
     use axum::body::Body;
     use axum::http::Request;
@@ -663,6 +755,7 @@ mod tests {
         perms: Arc<InMemoryPermissionStore>,
         revocation: Arc<InMemoryRevocationStore>,
         audit: Arc<InMemoryAuditSink>,
+        workflows: Arc<InMemoryWorkflowRepository>,
     }
 
     impl Fixture {
@@ -678,16 +771,30 @@ mod tests {
                 Arc::clone(&audit) as Arc<dyn AuditSink + Send + Sync>,
             )
             .with_clock(Arc::new(FixedClock));
-            let app = admin_router(AdminState::new(
-                auth,
-                Arc::clone(&users) as Arc<dyn UserStore + Send + Sync>,
-            ));
+            let workflows = Arc::new(InMemoryWorkflowRepository::new());
+            let eraser = InMemoryAccountEraser::new(
+                Arc::clone(&users),
+                workflows.clone(),
+                Arc::new(InMemoryRunStateStore::new()),
+                Arc::new(InMemoryConnectorTokenStore::new(EnvelopeCipher::new(
+                    InMemoryKeyProvider::with_key("v1", [4u8; 32]),
+                ))),
+                Arc::new(InMemoryWebhookEndpointStore::new()),
+                Arc::new(InMemoryTriggerScheduleStore::new()),
+                Some(Arc::clone(&audit)),
+            );
+            let erasure = Erasure::new(Arc::new(eraser), Arc::new(InMemoryLoginThrottle::new()));
+            let app = admin_router(
+                AdminState::new(auth, Arc::clone(&users) as Arc<dyn UserStore + Send + Sync>)
+                    .with_erasure(erasure),
+            );
             Self {
                 app,
                 users,
                 perms,
                 revocation,
                 audit,
+                workflows,
             }
         }
 
@@ -779,6 +886,7 @@ mod tests {
             ("POST", format!("/admin/users/{other}/disable"), None),
             ("POST", format!("/admin/users/{other}/enable"), None),
             ("POST", format!("/admin/users/{other}/logout-all"), None),
+            ("DELETE", format!("/admin/users/{other}"), None),
         ] {
             let res = fx.call(method, &uri, &editor, body).await;
             assert_eq!(res.status(), StatusCode::FORBIDDEN, "{method} {uri}");
@@ -1133,5 +1241,94 @@ mod tests {
                 AuditOutcome::Success
             )]
         );
+    }
+
+    // ───── Suppression (#229) ─────
+
+    #[tokio::test]
+    async fn an_admin_erases_an_account_and_its_data() {
+        let fx = Fixture::new();
+        let admin = fx.account("root@example.io", users_admin_only()).await;
+        let alice = fx.account("alice@example.io", Role::editor()).await;
+        fx.workflows
+            .create(
+                &alice,
+                WorkflowGraph {
+                    id: WorkflowId::new("wf"),
+                    name: "wf".into(),
+                    nodes: vec![],
+                    edges: vec![],
+                },
+            )
+            .await
+            .unwrap();
+        // Une action d'administration antérieure qui vise alice.
+        fx.call("GET", &format!("/admin/users/{alice}"), &admin, None)
+            .await;
+
+        let res = fx
+            .call("DELETE", &format!("/admin/users/{alice}"), &admin, None)
+            .await;
+        assert_eq!(res.status(), StatusCode::NO_CONTENT);
+        assert_eq!(fx.users.find_by_id(&alice).await.unwrap(), None);
+        assert_eq!(
+            fx.workflows
+                .list(&alice, Pagination::default_paging())
+                .await
+                .unwrap()
+                .total,
+            0
+        );
+        assert!(
+            fx.revocation.session_version(&alice).await.unwrap() > 0,
+            "sessions fermées"
+        );
+
+        let actions = fx.actions().await;
+        assert!(actions.iter().all(|(_, resource, _)| resource != &alice));
+        let (_, pseudonym, outcome) = actions
+            .iter()
+            .find(|(action, _, _)| action == "admin.user_delete")
+            .expect("suppression auditée");
+        assert_eq!(*outcome, AuditOutcome::Success);
+        assert!(pseudonym.starts_with(ERASED_PREFIX));
+        assert!(
+            actions
+                .iter()
+                .any(|(action, resource, _)| action == "admin.user_get" && resource == pseudonym),
+            "action antérieure rattachée au pseudonyme"
+        );
+
+        let again = fx
+            .call("DELETE", &format!("/admin/users/{alice}"), &admin, None)
+            .await;
+        assert_eq!(again.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn deletion_keeps_the_self_and_super_admin_guards() {
+        let fx = Fixture::new();
+        let admin = fx.account("admin@example.io", users_admin_only()).await;
+        let root = fx.account("root@example.io", Role::super_admin()).await;
+
+        let own = fx
+            .call("DELETE", &format!("/admin/users/{admin}"), &admin, None)
+            .await;
+        assert_eq!(own.status(), StatusCode::CONFLICT);
+        let super_admin = fx
+            .call("DELETE", &format!("/admin/users/{root}"), &admin, None)
+            .await;
+        assert_eq!(super_admin.status(), StatusCode::FORBIDDEN);
+        assert!(fx.users.find_by_id(&admin).await.unwrap().is_some());
+        assert!(fx.users.find_by_id(&root).await.unwrap().is_some());
+
+        // Un super-admin peut effacer un autre super-admin (il en reste un).
+        let other_root = fx.account("root2@example.io", Role::super_admin()).await;
+        let res = fx
+            .call("DELETE", &format!("/admin/users/{other_root}"), &root, None)
+            .await;
+        assert_eq!(res.status(), StatusCode::NO_CONTENT);
+        let unknown = fx.call("DELETE", "/admin/users/inconnu", &root, None).await;
+        assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
     }
 }

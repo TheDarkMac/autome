@@ -14,6 +14,7 @@
 //! | POST    | `/auth/password/forgot` | `{ email }`      | 202                         |
 //! | POST    | `/auth/password/reset`  | `{ token, new_password }` | 204               |
 //! | GET     | `/auth/me`      | — (Bearer requis)       | 200 + [`MeResponse`]        |
+//! | DELETE  | `/auth/me`      | `{ current_password }` (Bearer) | 204                 |
 //!
 //! Contrat aligné sur le frontend (`frontend/src/auth.ts`) : 400 saisie
 //! invalide, 401 identifiants/jeton refusés, 403 compte suspendu (connexion
@@ -76,10 +77,17 @@
 //!   drapeau puis incrémente la version, si bien qu'une paire émise sans voir
 //!   le drapeau porte une version déjà périmée. Le changement de mot de passe
 //!   suit le même ordre.
+//! - La suppression du compte (#229, RGPD) exige le mot de passe **actuel**,
+//!   comme son changement (mêmes essais limités, 403 s'il est faux) ; elle
+//!   ferme toutes les sessions puis efface le compte et ses données (cf.
+//!   [`crate::erasure`]). Un compte qui détient `*` est refusé (409) : un
+//!   autre administrateur doit d'abord lui retirer ce rôle, si bien que
+//!   l'instance n'est jamais laissée sans administrateur par ce chemin.
 //! - Chaque inscription/connexion/déconnexion/changement ou réinitialisation
 //!   de mot de passe produit un event d'audit `auth.signup` / `auth.login` /
 //!   `auth.logout` / `auth.logout_all` / `auth.password_change` /
-//!   `auth.password_reset_request` / `auth.password_reset`.
+//!   `auth.password_reset_request` / `auth.password_reset` ; la suppression,
+//!   `auth.account_delete` sous le pseudonyme du compte effacé.
 
 use std::collections::HashSet;
 use std::net::SocketAddr;
@@ -88,7 +96,7 @@ use std::sync::Arc;
 use autome_core::{
     email_throttle_key, normalize_email, role_of, validate_email, validate_password, AuditEvent,
     AuditOutcome, Config, CreateUser, InMemoryLoginThrottle, LoginAttempt, LoginThrottleStore,
-    PasswordHasher, Role, TokenKind, UserStore,
+    PasswordHasher, Role, TokenKind, UserStore, PERM_WILDCARD,
 };
 pub use autome_core::{LOGIN_WINDOW_SECONDS, MAX_LOGIN_FAILURES};
 use axum::{
@@ -103,6 +111,7 @@ use utoipa::ToSchema;
 
 use crate::auth::{bearer_token, AuthState, AuthenticatedUser};
 use crate::client_ip::{ClientIpPolicy, IpKeyer};
+use crate::erasure::{erase_account, Erasure};
 use crate::password_reset::{PasswordReset, ResetTokens};
 
 /// Durée de vie d'un access token (15 min).
@@ -197,6 +206,8 @@ pub struct AccountsState {
     /// Mot de passe oublié (#204) ; `None` = indisponible (503), faute
     /// d'envoi d'email configuré.
     pub password_reset: Option<PasswordReset>,
+    /// Suppression de compte (#229) ; `None` = indisponible (503).
+    pub erasure: Option<Erasure>,
     /// Hash leurre vérifié quand l'email est inconnu (égalisation du temps).
     dummy_hash: Arc<str>,
 }
@@ -218,6 +229,7 @@ impl AccountsState {
             ip_throttle: None,
             signup_permissions: Role::editor().permissions,
             password_reset: None,
+            erasure: None,
             dummy_hash: dummy_hash.into(),
         })
     }
@@ -238,6 +250,12 @@ impl AccountsState {
     /// Active la réinitialisation du mot de passe par email (#204).
     pub fn with_password_reset(mut self, password_reset: PasswordReset) -> Self {
         self.password_reset = Some(password_reset);
+        self
+    }
+
+    /// Active la suppression de compte en libre-service (#229).
+    pub fn with_erasure(mut self, erasure: Erasure) -> Self {
+        self.erasure = Some(erasure);
         self
     }
 }
@@ -272,6 +290,13 @@ pub struct ChangePasswordBody {
     pub current_password: String,
     /// Nouveau mot de passe (8 à 1024 caractères, différent de l'actuel).
     pub new_password: String,
+}
+
+/// Body de `DELETE /auth/me`.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct DeleteAccountBody {
+    /// Mot de passe actuel (confirmation de la suppression).
+    pub current_password: String,
 }
 
 /// Body de `/auth/password/forgot`.
@@ -1139,9 +1164,119 @@ pub async fn me(
     }))
 }
 
+/// Refus de la suppression d'un compte administrateur (#229).
+const ADMIN_CANNOT_DELETE: &str =
+    "an administrator account cannot be deleted: another administrator must first remove its role";
+
+/// `DELETE /auth/me` — efface le compte de l'utilisateur authentifié et tout
+/// ce qui lui est rattaché (RGPD, droit à l'effacement), après vérification
+/// du mot de passe actuel. Toutes ses sessions sont fermées.
+#[utoipa::path(
+    delete,
+    path = "/auth/me",
+    tag = "auth",
+    request_body = DeleteAccountBody,
+    responses(
+        (status = 204, description = "Compte et données effacés ; sessions fermées"),
+        (status = 401, description = "Access token absent, invalide, révoqué, ou compte suspendu"),
+        (status = 403, description = "Mot de passe actuel incorrect"),
+        (status = 409, description = "Compte administrateur (`*`) : un autre administrateur doit d'abord retirer son rôle"),
+        (status = 429, description = "Trop d'essais — voir `Retry-After`"),
+        (status = 503, description = "Suppression indisponible sur ce déploiement")
+    ),
+    security(("bearer" = []))
+)]
+pub async fn delete_account(
+    user: AuthenticatedUser,
+    State(state): State<AccountsState>,
+    Json(body): Json<DeleteAccountBody>,
+) -> Result<StatusCode, AccountError> {
+    let Some(erasure) = state.erasure.clone() else {
+        return Err(AccountError::Unavailable(
+            "account deletion is not configured",
+        ));
+    };
+    let user_id = user.user_id().to_string();
+    // Même compteur que le changement de mot de passe : un jeton volé ne
+    // permet pas de deviner le mot de passe en tentant des suppressions.
+    let key = format!("password:{user_id}");
+    let now = state.auth.clock.now_unix_seconds();
+    if let LoginAttempt::Blocked { retry_after_secs } = state
+        .throttle
+        .begin_attempt(&key, MAX_LOGIN_FAILURES, now)
+        .await
+        .map_err(internal)?
+    {
+        audit(
+            &state,
+            &user_id,
+            "auth.account_delete",
+            AuditOutcome::Denied,
+        )
+        .await;
+        return Err(AccountError::TooManyAttempts(retry_after_secs));
+    }
+    let Some(account) = state
+        .users
+        .find_by_id(&user_id)
+        .await
+        .map_err(internal)?
+        .filter(|a| !a.disabled)
+    else {
+        return Err(AccountError::Unauthorized);
+    };
+    if state
+        .auth
+        .permissions
+        .permissions_for(&user_id)
+        .await
+        .map_err(internal)?
+        .contains(PERM_WILDCARD)
+    {
+        audit(
+            &state,
+            &user_id,
+            "auth.account_delete",
+            AuditOutcome::Denied,
+        )
+        .await;
+        return Err(AccountError::Conflict(ADMIN_CANNOT_DELETE));
+    }
+
+    let hasher = Arc::clone(&state.hasher);
+    let (current, phc) = (body.current_password, account.password_hash.clone());
+    let matches = blocking(move || Ok(hasher.verify(&current, &phc).unwrap_or(false))).await?;
+    if !matches {
+        audit(
+            &state,
+            &user_id,
+            "auth.account_delete",
+            AuditOutcome::Failure,
+        )
+        .await;
+        return Err(AccountError::Forbidden("current password is incorrect"));
+    }
+
+    let Some(erased) = erase_account(&state.auth, &erasure, &account)
+        .await
+        .map_err(internal)?
+    else {
+        // Effacé entre-temps (requête concurrente ou administration).
+        return Err(AccountError::Unauthorized);
+    };
+    audit(
+        &state,
+        &erased.pseudonym,
+        "auth.account_delete",
+        AuditOutcome::Success,
+    )
+    .await;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 /// Sous-router `/signup`, `/login`, `/refresh`, `/logout`,
-/// `/password/forgot`, `/password/reset` (publics), `/logout-all` et
-/// `/password` (Bearer) — à imbriquer sous `/auth` avec
+/// `/password/forgot`, `/password/reset` (publics), `/logout-all`,
+/// `/password` et `/me` (Bearer) — à imbriquer sous `/auth` avec
 /// [`crate::auth::protected_router`].
 pub fn accounts_router(state: AccountsState) -> Router {
     Router::new()
@@ -1153,7 +1288,7 @@ pub fn accounts_router(state: AccountsState) -> Router {
         .route("/password", post(change_password))
         .route("/password/forgot", post(forgot_password))
         .route("/password/reset", post(reset_password))
-        .route("/me", get(me))
+        .route("/me", get(me).delete(delete_account))
         .with_state(state)
 }
 
@@ -1161,11 +1296,16 @@ pub fn accounts_router(state: AccountsState) -> Router {
 mod tests {
     use super::*;
     use crate::auth::{protected_router, Clock};
+    use crate::erasure::InMemoryAccountEraser;
     use crate::mail::{MailSettings, MemoryMailer, OutgoingMail};
     use crate::password_reset::RESET_TTL_SECONDS;
+    use autome_connectors::oauth::InMemoryConnectorTokenStore;
     use autome_core::{
-        Argon2PasswordHasher, AuditSink, InMemoryAuditSink, InMemoryPermissionStore,
-        InMemoryRevocationStore, InMemoryUserStore, PermissionStore, TokenKind, TokenService,
+        Argon2PasswordHasher, AuditSink, EnvelopeCipher, InMemoryAuditSink, InMemoryKeyProvider,
+        InMemoryPermissionStore, InMemoryRevocationStore, InMemoryRunStateStore,
+        InMemoryTriggerScheduleStore, InMemoryUserStore, InMemoryWebhookEndpointStore,
+        InMemoryWorkflowRepository, Pagination, PermissionStore, RunCheckpoint, RunStateStore,
+        TokenKind, TokenService, WorkflowGraph, WorkflowId, WorkflowRepository, ERASED_PREFIX,
     };
     use axum::body::Body;
     use axum::http::Request;
@@ -1211,6 +1351,8 @@ mod tests {
         users: Arc<InMemoryUserStore>,
         audit: Arc<InMemoryAuditSink>,
         mailer: MemoryMailer,
+        workflows: Arc<InMemoryWorkflowRepository>,
+        runs: Arc<InMemoryRunStateStore>,
     }
 
     fn harness_with(hasher: Arc<dyn PasswordHasher + Send + Sync>) -> Harness {
@@ -1246,6 +1388,21 @@ mod tests {
         if let Some(ip) = ip_throttle {
             accounts = accounts.with_ip_throttle(ip);
         }
+        let workflows = Arc::new(InMemoryWorkflowRepository::new());
+        let runs = Arc::new(InMemoryRunStateStore::new());
+        let eraser = InMemoryAccountEraser::new(
+            users.clone(),
+            workflows.clone(),
+            runs.clone(),
+            Arc::new(InMemoryConnectorTokenStore::new(EnvelopeCipher::new(
+                InMemoryKeyProvider::with_key("v1", [9u8; 32]),
+            ))),
+            Arc::new(InMemoryWebhookEndpointStore::new()),
+            Arc::new(InMemoryTriggerScheduleStore::new()),
+            Some(audit.clone()),
+        );
+        let erasure = Erasure::new(Arc::new(eraser), accounts.throttle.clone());
+        let accounts = accounts.with_erasure(erasure);
         let app = protected_router(auth).merge(accounts_router(accounts));
         Harness {
             app,
@@ -1254,6 +1411,8 @@ mod tests {
             users,
             audit,
             mailer,
+            workflows,
+            runs,
         }
     }
 
@@ -1315,6 +1474,21 @@ mod tests {
                     .header("content-type", "application/json")
                     .header("Authorization", format!("Bearer {bearer}"))
                     .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    async fn delete_me(app: &Router, bearer: &str, password: &str) -> Response {
+        app.clone()
+            .oneshot(
+                Request::delete("/me")
+                    .header("content-type", "application/json")
+                    .header("Authorization", format!("Bearer {bearer}"))
+                    .body(Body::from(
+                        json!({ "current_password": password }).to_string(),
+                    ))
                     .unwrap(),
             )
             .await
@@ -2805,6 +2979,180 @@ mod tests {
         assert_eq!(r.status(), StatusCode::ACCEPTED, "réponse inchangée");
         wait_audit(&h, "auth.password_reset_request", AuditOutcome::Denied).await;
         assert!(h.mailer.sent().is_empty());
+    }
+
+    // ───── Suppression de compte (#229) ─────
+
+    /// Inscrit `email` avec un workflow et un run ; renvoie `(id, paire)`.
+    async fn account_with_data(h: &Harness, email: &str) -> (String, TokenResponse) {
+        let pair = tokens(post(&h.app, "/signup", creds(email, "the-password")).await).await;
+        let id = h.users.find_by_email(email).await.unwrap().unwrap().id;
+        h.workflows
+            .create(
+                &id,
+                WorkflowGraph {
+                    id: WorkflowId::new("wf-1"),
+                    name: "wf".into(),
+                    nodes: vec![],
+                    edges: vec![],
+                },
+            )
+            .await
+            .unwrap();
+        h.runs
+            .checkpoint(
+                &RunCheckpoint::queued(format!("run-{email}"), "wf-1", 1, "manual", 1)
+                    .with_owner(Some(id.clone())),
+            )
+            .await
+            .unwrap();
+        (id, pair)
+    }
+
+    async fn workflow_count(h: &Harness, owner: &str) -> usize {
+        h.workflows
+            .list(owner, Pagination::default_paging())
+            .await
+            .unwrap()
+            .total
+    }
+
+    #[tokio::test]
+    async fn deleting_the_account_erases_its_data_and_closes_every_session() {
+        let h = harness();
+        let (sam, laptop) = account_with_data(&h, "sam@example.io").await;
+        let phone =
+            tokens(post(&h.app, "/login", creds("sam@example.io", "the-password")).await).await;
+        // Un échec de connexion journalisé sous l'email.
+        post(&h.app, "/login", creds("sam@example.io", "wrong-password")).await;
+        let (bob, _) = account_with_data(&h, "bob@example.io").await;
+
+        let r = delete_me(&h.app, &laptop.access_token, "the-password").await;
+        assert_eq!(r.status(), StatusCode::NO_CONTENT);
+        // Audit lu tout de suite : les requêtes suivantes en ajoutent.
+        let events = h.audit.list().await.unwrap();
+
+        // Plus aucune session, plus de compte.
+        for pair in [&laptop, &phone] {
+            assert_eq!(
+                whoami_status(&h.app, &pair.access_token).await,
+                StatusCode::UNAUTHORIZED
+            );
+            assert_eq!(
+                refresh_status(&h.app, &pair.refresh_token).await,
+                StatusCode::UNAUTHORIZED
+            );
+        }
+        let login = post(&h.app, "/login", creds("sam@example.io", "the-password")).await;
+        assert_eq!(login.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(h.users.find_by_id(&sam).await.unwrap(), None);
+        assert!(h.perms.permissions_for(&sam).await.unwrap().is_empty());
+        assert_eq!(workflow_count(&h, &sam).await, 0);
+        assert!(h.runs.load("run-sam@example.io").await.unwrap().is_none());
+
+        // Audit : ni id ni email, l'effacement tracé sous un pseudonyme.
+        assert!(events.iter().all(|e| e.actor != sam
+            && e.actor != "sam@example.io"
+            && e.resource.as_deref() != Some(sam.as_str())));
+        let deleted = events
+            .iter()
+            .find(|e| e.action == "auth.account_delete")
+            .expect("effacement audité");
+        assert_eq!(deleted.outcome, AuditOutcome::Success);
+        assert!(deleted.actor.starts_with(ERASED_PREFIX));
+        assert!(
+            events.iter().filter(|e| e.actor == deleted.actor).count() > 1,
+            "événements du compte regroupés sous le pseudonyme"
+        );
+
+        // Bob intact ; l'email de sam redevient libre.
+        assert!(h.users.find_by_id(&bob).await.unwrap().is_some());
+        assert_eq!(workflow_count(&h, &bob).await, 1);
+        assert!(h.runs.load("run-bob@example.io").await.unwrap().is_some());
+        let again = post(&h.app, "/signup", creds("sam@example.io", "new-password")).await;
+        assert_eq!(again.status(), StatusCode::CREATED);
+    }
+
+    #[tokio::test]
+    async fn a_wrong_password_keeps_the_account_and_attempts_are_limited() {
+        let h = harness();
+        let (sam, pair) = account_with_data(&h, "sam@example.io").await;
+        for _ in 0..MAX_LOGIN_FAILURES {
+            let r = delete_me(&h.app, &pair.access_token, "wrong-password").await;
+            assert_eq!(r.status(), StatusCode::FORBIDDEN);
+        }
+        let r = delete_me(&h.app, &pair.access_token, "the-password").await;
+        assert_eq!(r.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(r.headers().contains_key(header::RETRY_AFTER));
+        assert!(h.users.find_by_id(&sam).await.unwrap().is_some());
+        assert_eq!(workflow_count(&h, &sam).await, 1);
+        assert_eq!(
+            whoami_status(&h.app, &pair.access_token).await,
+            StatusCode::OK,
+            "session intacte"
+        );
+        let failures = h
+            .audit
+            .list()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.action == "auth.account_delete" && e.actor == sam)
+            .count();
+        assert_eq!(failures, MAX_LOGIN_FAILURES as usize + 1);
+    }
+
+    #[tokio::test]
+    async fn an_administrator_cannot_delete_its_own_account() {
+        let h = harness();
+        let (root, pair) = account_with_data(&h, "root@example.io").await;
+        h.perms
+            .replace(&root, &Role::super_admin().permissions)
+            .unwrap();
+        let r = delete_me(&h.app, &pair.access_token, "the-password").await;
+        assert_eq!(r.status(), StatusCode::CONFLICT);
+        assert_eq!(text(r).await, ADMIN_CANNOT_DELETE);
+        assert!(h.users.find_by_id(&root).await.unwrap().is_some());
+        assert_eq!(workflow_count(&h, &root).await, 1);
+    }
+
+    #[tokio::test]
+    async fn a_suspended_or_vanished_account_cannot_delete_itself() {
+        let h = harness();
+        let pair = disabled_account(&h, "eve@example.io", "the-password").await;
+        let r = delete_me(&h.app, &pair.access_token, "the-password").await;
+        assert_eq!(r.status(), StatusCode::UNAUTHORIZED);
+        assert!(h
+            .users
+            .find_by_email("eve@example.io")
+            .await
+            .unwrap()
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn without_an_eraser_deletion_answers_503() {
+        let h = harness();
+        let pair =
+            tokens(post(&h.app, "/signup", creds("sam@example.io", "the-password")).await).await;
+        let auth = AuthState::new(
+            TokenService::new(SECRET),
+            Arc::new(InMemoryRevocationStore::new()),
+            h.perms.clone(),
+            h.audit.clone(),
+        )
+        .with_clock(h.clock.clone());
+        let accounts =
+            AccountsState::new(auth.clone(), h.users.clone(), Arc::new(PlainHasher)).unwrap();
+        let app = protected_router(auth).merge(accounts_router(accounts));
+        let r = delete_me(&app, &pair.access_token, "the-password").await;
+        assert_eq!(r.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(h
+            .users
+            .find_by_email("sam@example.io")
+            .await
+            .unwrap()
+            .is_some());
     }
 
     #[tokio::test]
