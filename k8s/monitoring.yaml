@@ -2,7 +2,7 @@
 #
 # Source unique de configuration : les ConfigMaps ci-dessous reprennent à
 # l'identique les fichiers de `monitoring/` utilisés par docker-compose
-# (F10.6.b). Les cibles (`api:8080`, `prometheus:9090`) résolvent dans le
+# (F10.6.b). Les cibles (`api:8080`, `worker`, `prometheus:9090`) résolvent dans le
 # namespace `autome`. ConfigMaps inline (et non `configMapGenerator` sur
 # `../monitoring`) pour que `kubectl kustomize k8s/` rende sans assouplir le
 # load-restrictor.
@@ -21,9 +21,10 @@ data:
   prometheus.yml: |
     # Configuration Prometheus — monitoring Autome (F10.6.b).
     #
-    # Scrape l'endpoint /metrics de l'API (registre F10.6.a). En dev (compose),
-    # la cible est le nom de service Docker `api:8080` ; en k8s, un ConfigMap
-    # équivalent cible le Service `api` (cf. k8s/monitoring.yaml).
+    # Scrape l'endpoint /metrics de l'API (registre F10.6.a) et du worker (#235).
+    # En dev (compose), les cibles sont les noms de services Docker (`api:8080`,
+    # `worker`) ; en k8s, un ConfigMap identique cible les Services `api` et
+    # `worker` (cf. k8s/monitoring.yaml).
     global:
       scrape_interval: 15s
       evaluation_interval: 15s
@@ -41,6 +42,21 @@ data:
           - targets: ["api:8080"]
             labels:
               service: api
+
+      # Worker(s) : livraisons, runs et leur durée, déclencheurs (#235). Servi par
+      # le serveur de sondes (port 9091). Découverte DNS : le nom `worker` résout
+      # vers chaque réplique (DNS de Docker ; Service headless `worker` en k8s),
+      # une cible par instance plutôt qu'une réplique au hasard.
+      - job_name: autome-worker
+        metrics_path: /metrics
+        dns_sd_configs:
+          - names: ["worker"]
+            type: A
+            port: 9091
+            refresh_interval: 30s
+        relabel_configs:
+          - target_label: service
+            replacement: worker
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -306,6 +322,159 @@ data:
               "expr": "autome_http_requests_in_flight",
               "legendFormat": "in-flight",
               "refId": "A"
+            }
+          ]
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "fieldConfig": {
+            "defaults": {
+              "color": { "mode": "palette-classic" },
+              "custom": { "drawStyle": "line", "fillOpacity": 10, "lineWidth": 1 },
+              "unit": "short"
+            },
+            "overrides": []
+          },
+          "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 },
+          "id": 5,
+          "options": {
+            "legend": { "calcs": [], "displayMode": "list", "placement": "bottom", "showLegend": true },
+            "tooltip": { "mode": "multi", "sort": "desc" }
+          },
+          "title": "Worker — runs finished (runs/s) by status",
+          "type": "timeseries",
+          "targets": [
+            {
+              "datasource": { "type": "prometheus", "uid": "${datasource}" },
+              "expr": "sum by (status) (rate(autome_worker_runs_total[5m]))",
+              "legendFormat": "{{status}}",
+              "refId": "A"
+            }
+          ]
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "fieldConfig": {
+            "defaults": {
+              "color": { "mode": "palette-classic" },
+              "custom": { "drawStyle": "line", "fillOpacity": 10, "lineWidth": 1 },
+              "unit": "s"
+            },
+            "overrides": []
+          },
+          "gridPos": { "h": 8, "w": 12, "x": 12, "y": 16 },
+          "id": 6,
+          "options": {
+            "legend": { "calcs": [], "displayMode": "list", "placement": "bottom", "showLegend": true },
+            "tooltip": { "mode": "multi", "sort": "desc" }
+          },
+          "title": "Worker — run duration p95 (s) by status",
+          "type": "timeseries",
+          "targets": [
+            {
+              "datasource": { "type": "prometheus", "uid": "${datasource}" },
+              "expr": "histogram_quantile(0.95, sum by (le, status) (rate(autome_worker_run_duration_seconds_bucket[5m])))",
+              "legendFormat": "{{status}}",
+              "refId": "A"
+            }
+          ]
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "fieldConfig": {
+            "defaults": {
+              "color": { "mode": "palette-classic" },
+              "custom": { "drawStyle": "line", "fillOpacity": 10, "lineWidth": 1 },
+              "unit": "short"
+            },
+            "overrides": []
+          },
+          "gridPos": { "h": 8, "w": 12, "x": 0, "y": 24 },
+          "id": 7,
+          "options": {
+            "legend": { "calcs": [], "displayMode": "list", "placement": "bottom", "showLegend": true },
+            "tooltip": { "mode": "multi", "sort": "desc" }
+          },
+          "title": "Worker — queue deliveries (msg/s) by outcome",
+          "type": "timeseries",
+          "targets": [
+            {
+              "datasource": { "type": "prometheus", "uid": "${datasource}" },
+              "expr": "sum by (outcome) (rate(autome_worker_deliveries_total[5m]))",
+              "legendFormat": "{{outcome}}",
+              "refId": "A"
+            },
+            {
+              "datasource": { "type": "prometheus", "uid": "${datasource}" },
+              "expr": "sum(rate(autome_worker_queue_errors_total[5m]))",
+              "legendFormat": "queue errors",
+              "refId": "B"
+            }
+          ]
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "fieldConfig": {
+            "defaults": {
+              "color": { "mode": "palette-classic" },
+              "custom": { "drawStyle": "line", "fillOpacity": 10, "lineWidth": 1 },
+              "unit": "short"
+            },
+            "overrides": []
+          },
+          "gridPos": { "h": 8, "w": 12, "x": 12, "y": 24 },
+          "id": 8,
+          "options": {
+            "legend": { "calcs": [], "displayMode": "list", "placement": "bottom", "showLegend": true },
+            "tooltip": { "mode": "single", "sort": "none" }
+          },
+          "title": "Worker — runs in flight by instance",
+          "type": "timeseries",
+          "targets": [
+            {
+              "datasource": { "type": "prometheus", "uid": "${datasource}" },
+              "expr": "autome_worker_runs_in_flight",
+              "legendFormat": "{{instance}}",
+              "refId": "A"
+            }
+          ]
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "fieldConfig": {
+            "defaults": {
+              "color": { "mode": "palette-classic" },
+              "custom": { "drawStyle": "line", "fillOpacity": 10, "lineWidth": 1 },
+              "unit": "short"
+            },
+            "overrides": []
+          },
+          "gridPos": { "h": 8, "w": 24, "x": 0, "y": 32 },
+          "id": 9,
+          "options": {
+            "legend": { "calcs": [], "displayMode": "list", "placement": "bottom", "showLegend": true },
+            "tooltip": { "mode": "multi", "sort": "desc" }
+          },
+          "title": "Worker — scheduled triggers (runs/s)",
+          "type": "timeseries",
+          "targets": [
+            {
+              "datasource": { "type": "prometheus", "uid": "${datasource}" },
+              "expr": "sum by (kind, result) (rate(autome_worker_trigger_runs_total[5m]))",
+              "legendFormat": "{{kind}} {{result}}",
+              "refId": "A"
+            },
+            {
+              "datasource": { "type": "prometheus", "uid": "${datasource}" },
+              "expr": "sum(rate(autome_worker_trigger_missed_total[5m]))",
+              "legendFormat": "missed",
+              "refId": "B"
+            },
+            {
+              "datasource": { "type": "prometheus", "uid": "${datasource}" },
+              "expr": "sum(rate(autome_worker_trigger_poll_errors_total[5m]))",
+              "legendFormat": "poll errors",
+              "refId": "C"
             }
           ]
         }

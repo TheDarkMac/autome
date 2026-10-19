@@ -9,7 +9,7 @@
 #   - api      : backend HTTP (http://localhost:8080)
 #   - worker   : exécuteur de runs (stateless)
 #   - frontend : SPA servie par nginx (http://localhost:8081)
-#   - prometheus : scrape /metrics de l'api (http://localhost:9090) — F10.6
+#   - prometheus : scrape /metrics de l'api et du worker (http://localhost:9090) — F10.6, #235
 #   - grafana    : dashboards provisionnés (http://localhost:3000, admin/admin)
 #
 # Les hôtes inter-services sont les NOMS de services Docker (`db`, `queue`).
