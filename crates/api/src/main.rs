@@ -42,13 +42,11 @@ use autome_api::shutdown::{
 };
 use autome_api::tls::load_rustls_config;
 use autome_api::webhooks::{max_per_window_from_env, webhooks_router, WebhookKeys, WebhooksState};
-use autome_api::workflows::{
-    create_workflow, delete_workflow, get_workflow, list_workflows, update_workflow, WorkflowsState,
-};
+use autome_api::workflows::{workflows_router, WorkflowsState};
 use autome_core::{telemetry, Argon2PasswordHasher, Config};
 use autome_persistence::{connect, PgAuditSink, PgMfaStore, PgUserStore};
 use axum::http::HeaderValue;
-use axum::{routing::get, Router};
+use axum::Router;
 
 /// Période de la purge des entrées d'authentification expirées.
 const MAINTENANCE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(600);
@@ -93,16 +91,6 @@ fn build_router(
         backends.dispatcher.clone(),
     );
 
-    let workflows_routes = Router::new()
-        .route("/workflows", get(list_workflows).post(create_workflow))
-        .route(
-            "/workflows/:id",
-            get(get_workflow)
-                .put(update_workflow)
-                .delete(delete_workflow),
-        )
-        .with_state(wf_state);
-
     let credentials_state =
         CredentialsState::new(backends.auth.clone(), backends.credentials.clone());
 
@@ -119,7 +107,7 @@ fn build_router(
             workflows: backends.workflows.clone(),
             users: backends.users.clone(),
         }))
-        .merge(workflows_routes)
+        .merge(workflows_router(wf_state))
         .merge(runs_router(runs_state))
         .merge(webhooks_router(webhooks))
         .merge(credentials_router(credentials_state))
