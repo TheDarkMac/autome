@@ -39,7 +39,8 @@ documentation et les exemples de workflows. Détail dans la
   configuration, visualisation de l'exécution.
 - **Observabilité** : métriques **Prometheus** (`/metrics`) + dashboards
   **Grafana** provisionnés ; logs structurés `tracing` (JSON en prod) corrélés
-  par `x-request-id` côté API et par `run_id` côté worker.
+  par `x-request-id` côté API et par `run_id` côté worker ; traces
+  **OpenTelemetry** (OTLP) d'une requête jusqu'aux nœuds du run qu'elle lance.
 
 ---
 
@@ -51,7 +52,7 @@ documentation et les exemples de workflows. Détail dans la
 | Frontend | React, TypeScript, TailwindCSS, Vite |
 | Base de données | PostgreSQL (migrations SQL versionnées) |
 | File de messages | RabbitMQ |
-| Observabilité | Prometheus, Grafana |
+| Observabilité | Prometheus, Grafana, OpenTelemetry (Jaeger en dev) |
 | Déploiement | Docker (multi-stage), Kubernetes (kustomize) |
 | CI/CD | GitHub Actions (build / lint / test + build-push images + deploy) |
 
@@ -76,6 +77,7 @@ docker compose up --build
 | Frontend | http://localhost:8081 | SPA (éditeur visuel) |
 | Grafana | http://localhost:3000 | `admin` / `admin` (dashboard *Autome — Overview*) |
 | Prometheus | http://localhost:9090 | scrape de l'API et du worker |
+| Jaeger | http://localhost:16686 | traces de l'API et du worker |
 | RabbitMQ | http://localhost:15672 | UI de management (`guest` / `guest`) |
 
 > Profil `dev` avec des secrets de développement — **ne pas utiliser tel quel
@@ -155,6 +157,8 @@ flowchart LR
   WK --> DB
   API --> PROM["Prometheus → Grafana"]
   WK --> PROM
+  API -. "OTLP" .-> TR["Jaeger / collecteur OTLP"]
+  WK -. "OTLP" .-> TR
 ```
 
 Principes clés : **séparation API / exécution**, **workers stateless** (tout

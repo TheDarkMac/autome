@@ -53,6 +53,8 @@ cp .env.example .env
 | `AUTOME_EGRESS_ALLOWLIST` | Hôtes internes autorisés en sortie HTTP (anti-SSRF), séparés par virgule | *(vide : public uniquement)* | selon besoin |
 | `AUTOME_LOG_FORMAT` | Format des logs (API + worker) : `json` ou `text` | `text` | `json` (défaut en `prod`) |
 | `RUST_LOG` | Niveau des logs, syntaxe `EnvFilter` (ex. `info,autome_worker=debug`) | `info` | `info` |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | Traces (#249) : base OTLP/HTTP du collecteur (`/v1/traces` ajouté) ; `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` pour une URL complète. Vide = aucun export | *(non défini)* ; `http://jaeger:4318` en compose | selon collecteur |
+| `OTEL_TRACES_SAMPLER` / `OTEL_TRACES_SAMPLER_ARG` | Échantillonnage standard OpenTelemetry (ex. `parentbased_traceidratio` + `0.1`) | `parentbased_always_on` | `parentbased_traceidratio`, `0.1` |
 | `AUTOME_WORKER_CONCURRENCY` | Worker : tâches consommatrices par process ; aussi le *prefetch* RabbitMQ (messages poussés d'avance au process) | `4` | selon charge |
 | `AUTOME_RUN_TIMEOUT_SECS` | Worker : au-delà, une tentative encore `running` est close en `failed` (min. 60) | `3600` | > durée du plus long run |
 | `AUTOME_RUN_LEASE_SECS` | Worker : bail d'un run en cours (min. 10) ; sans battement depuis ce délai (worker tué), le run est remis en file et repris par un autre worker | `60` | `60` |
@@ -232,8 +234,8 @@ définir un seul provoque une erreur au démarrage). Sinon, HTTP en clair.
 
 ## Voie A — Docker Compose
 
-La stack complète (base, file, API, worker, frontend, **Prometheus + Grafana**)
-démarre en une commande :
+La stack complète (base, file, API, worker, frontend, **Prometheus + Grafana**,
+**Jaeger**) démarre en une commande :
 
 ```bash
 docker compose up --build
@@ -255,6 +257,7 @@ démarrage (`AUTOME_MIGRATE=true`). Les données survivent à un
 | Frontend | http://localhost:8081 | — |
 | Grafana | http://localhost:3000 | `admin` / `admin` |
 | Prometheus | http://localhost:9090 | — |
+| Jaeger (traces, #249) | http://localhost:16686 | — |
 | RabbitMQ (UI) | http://localhost:15672 | `guest` / `guest` |
 | PostgreSQL | `localhost:5432` | `postgres` / `postgres` |
 
@@ -546,8 +549,57 @@ CloudWatch…). Champs utiles :
 - `span.run_id` / `span.workflow_id` (worker) : tous les logs d'un run, y
   compris ceux des connecteurs.
 
+- `span.trace_id` (API et worker, export des traces actif) : identifiant de la
+  trace OpenTelemetry de la requête ou du run — de la ligne de log à la trace.
+
 Le chemin est journalisé sans la query string. Pour diagnostiquer, monter le
 niveau d'un module sans redéployer l'image : `RUST_LOG=info,autome_worker=debug`.
+
+**Traces (#249)** : avec `OTEL_EXPORTER_OTLP_ENDPOINT`, l'API et le worker
+exportent leurs spans en **OTLP HTTP/protobuf** (port 4318 d'un collecteur :
+OpenTelemetry Collector, Jaeger, Grafana Tempo…), par lots depuis un thread
+dédié. Sans endpoint, rien n'est exporté ni ajouté. Une requête qui lance un
+run donne **une seule trace** de bout en bout :
+
+```
+autome-api     POST /workflows/:id/runs           span serveur, nommé d'après la route
+autome-api       └─ run dispatch                  mise en file (contexte W3C dans le message)
+autome-worker        └─ run                       exécution, statut d'erreur si le run échoue
+autome-worker            ├─ node trigger           un span par nœud (type, action, statut)
+autome-worker            └─ node slack.send
+autome-worker                └─ POST               appel HTTP sortant : méthode, hôte, statut
+```
+
+- Le `traceparent` voyage dans les en-têtes du message de run, donc aussi dans
+  l'outbox : un run republié par le relais ou remis en file reste dans sa
+  trace. Les déclencheurs planifiés ouvrent la leur au `run dispatch`.
+- **Ce qui n'entre pas dans une trace** : paramètres et sorties des nœuds,
+  chemins et query strings des appels sortants (une URL de webhook ou une clé
+  d'API y figurent parfois), identifiants d'utilisateur, adresses IP. Les
+  événements de log émis pendant un span lui sont attachés, avec les mêmes
+  champs que dans les logs. Aucun `traceparent` n'est envoyé aux services
+  tiers.
+- Le `traceparent` d'une requête entrante n'est repris **que d'un proxy de
+  confiance** (`AUTOME_TRUSTED_PROXIES`, comme `X-Forwarded-For`) : un client
+  direct ne choisit ni l'id de sa trace ni son échantillonnage.
+- Sondes (`/livez`, `/health`, `/readyz`) et `/metrics` ne sont pas tracées ;
+  les 404 non plus (elles restent dans les logs).
+- Variables standard lues par le SDK : `OTEL_SERVICE_NAME` (défaut
+  `autome-api` / `autome-worker`), `OTEL_RESOURCE_ATTRIBUTES`
+  (`deployment.environment=prod`…), `OTEL_EXPORTER_OTLP_HEADERS` (jeton du
+  collecteur — dans un secret), `OTEL_EXPORTER_OTLP_TIMEOUT` (ms, défaut
+  10 000), `OTEL_BSP_*` (lots). `OTEL_SDK_DISABLED=true` ou
+  `OTEL_TRACES_EXPORTER=none` coupe l'export. Seul `http/protobuf` est pris en
+  charge : `OTEL_EXPORTER_OTLP_PROTOCOL=grpc` refuse le démarrage plutôt que
+  d'envoyer dans le vide.
+- Collecteur injoignable : l'API et le worker continuent, les spans sont
+  perdus et une seule ligne `WARN` « export des traces impossible » est
+  journalisée, puis « export des traces rétabli ». À l'arrêt, les spans en
+  attente sont envoyés (5 s au plus).
+- En compose, Jaeger reçoit les traces (UI http://localhost:16686, aussi en
+  source de données dans Grafana) et `scripts/compose-smoke.sh` vérifie qu'un
+  run y forme une trace complète API → worker. En k8s, renseigner
+  `OTEL_EXPORTER_OTLP_ENDPOINT` dans `k8s/config.yaml` (vide par défaut).
 
 ---
 
