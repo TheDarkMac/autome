@@ -212,10 +212,11 @@ jobs:
   smoke:
     name: Smoke e2e (Docker Compose)
     runs-on: ubuntu-latest
-    # Deux builds Rust release en parallèle : ≈ 25 min sur 4 cœurs à froid
-    # (dépendances comprises), ≈ 6 min mesurées en local quand seul le code
-    # du workspace change (couche cargo-chef en cache, #219) ; + démarrage
-    # de la pile (≈ 45 s).
+    # Un build Rust release pour les deux binaires (#263) ; à froid,
+    # dépendances comprises, c'était ≈ 25 min sur 4 cœurs pour deux builds
+    # en parallèle. Quand seul le code du workspace change, la couche
+    # cargo-chef vient du cache (#219) ; un commit hors du contexte de build
+    # (doc, frontend, k8s) ne recompile rien. + démarrage de la pile (≈ 45 s).
     # Borné pour ne pas occuper un runner sur un conteneur bloqué.
     timeout-minutes: 45
     env:
@@ -227,10 +228,14 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      # Mêmes Dockerfiles que la CD, lus depuis le compose. Cache par couches
-      # partagé avec la CD (scopes `api` / `worker`, `mode=max` pour garder les
-      # étages intermédiaires) : dépendances compilées (cargo-chef, #219)
-      # réutilisées tant que Cargo.toml / Cargo.lock ne changent pas.
+      # Même Dockerfile que la CD, lu depuis le compose : les deux cibles
+      # partagent l'étage builder, construit une fois par bake (#263). Cache
+      # par couches dans un seul scope `backend` partagé avec la CD
+      # (`mode=max` pour garder les étages intermédiaires) : dépendances
+      # compilées (cargo-chef, #219) réutilisées tant que Cargo.toml /
+      # Cargo.lock ne changent pas. Seul `api` l'écrit : deux exports dans le
+      # même scope s'écraseraient, et l'export d'`api` contient déjà tout
+      # sauf la dernière couche du worker (copie du binaire).
       - name: Build images (api, worker)
         uses: docker/bake-action@v5
         with:
@@ -240,10 +245,8 @@ jobs:
           targets: api,worker
           load: true
           set: |
-            api.cache-from=type=gha,scope=api
-            api.cache-to=type=gha,mode=max,scope=api
-            worker.cache-from=type=gha,scope=worker
-            worker.cache-to=type=gha,mode=max,scope=worker
+            *.cache-from=type=gha,scope=backend
+            api.cache-to=type=gha,mode=max,scope=backend
 
       # db + queue (+ jaeger, #249) démarrés comme dépendances ; `--wait`
       # attend les healthchecks (api : `/readyz` = migrations appliquées, base

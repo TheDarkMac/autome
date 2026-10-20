@@ -60,7 +60,8 @@ services:
   api:
     build:
       context: .
-      dockerfile: docker/api.Dockerfile
+      dockerfile: docker/backend.Dockerfile
+      target: api
     environment:
       APP_PROFILE: dev
       APP_HTTP_ADDR: 0.0.0.0:8080
@@ -100,7 +101,8 @@ services:
   worker:
     build:
       context: .
-      dockerfile: docker/worker.Dockerfile
+      dockerfile: docker/backend.Dockerfile
+      target: worker
     environment:
       APP_PROFILE: dev
       DATABASE_URL: postgres://postgres:postgres@db:5432/autome
