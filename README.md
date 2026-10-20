@@ -34,9 +34,11 @@ documentation et les exemples de workflows. Détail dans la
 - **Sécurité** : auth JWT, OAuth2 (Authorization Code + PKCE), chiffrement des
   credentials au repos (AES-256-GCM), TLS, RBAC, journal d'audit.
 - **API REST** : CRUD workflows, déclenchement manuel, gestion des
-  credentials, spec **OpenAPI** générée (`GET /openapi.json`).
-- **Éditeur visuel** : canvas drag-and-drop (React), palette de nodes,
-  configuration, visualisation de l'exécution.
+  credentials, catalogue des actions de connecteur (`GET /connectors/actions`),
+  spec **OpenAPI** générée (`GET /openapi.json`).
+- **Éditeur visuel** : canvas drag-and-drop (React), palette de nodes (actions
+  de connecteur lues sur l'API, depuis les schémas du SDK), configuration,
+  visualisation de l'exécution.
 - **Observabilité** : métriques **Prometheus** (`/metrics`) + dashboards
   **Grafana** provisionnés ; logs structurés `tracing` (JSON en prod) corrélés
   par `x-request-id` côté API et par `run_id` côté worker ; traces

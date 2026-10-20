@@ -44,8 +44,9 @@ Tout connecteur suit la même structure (voir `template.rs`) :
    qui valide les `params`, construit une `HttpRequest` via `headers_for`, puis
    délègue à `interpret`.
 4. **Connector** — un struct `*Connector` qui implémente `Connector` : il publie
-   le `provider()` et la liste des `ActionSchema` (consommée par la palette du
-   frontend et l'API).
+   le `provider()` et la liste des `ActionSchema`. Enregistré dans
+   `catalog::connectors()`, il est servi par `GET /connectors/actions`, d'où le
+   frontend tire la palette de nodes et le formulaire de chaque action (§7).
 
 ---
 
@@ -213,12 +214,30 @@ pub struct ActionSchema {
     pub params: Vec<ParamSpec>,
 }
 
-pub enum ParamKind { String, Integer, Boolean, Object, Array { inner: Box<ParamKind> }, Enum { variants: Vec<&'static str> } }
+pub enum ParamKind { String, Text, Integer, Boolean, Object, Array { inner: Box<ParamKind> }, Enum { variants: Vec<&'static str> } }
 ```
 
 Helpers `const` pour les cas courants : `ParamSpec::req_str`, `opt_str`,
-`opt_int`, `opt_obj`. Pour les autres types (`Boolean`, `Array`, `Enum`),
-construisez `ParamSpec { key, label, kind, required, description }` directement.
+`req_text`, `opt_text`, `req_int`, `opt_int`, `req_obj`, `opt_obj`. Pour les
+autres types (`Boolean`, `Array`, `Enum`), construisez
+`ParamSpec { key, label, kind, required, description }` directement.
+
+Rendu dans le panneau de configuration de l'éditeur :
+
+| `ParamKind` | Champ | Valeur envoyée dans `params` |
+|---|---|---|
+| `String` | ligne de texte | chaîne |
+| `Text` | zone multiligne (corps de message, description) | chaîne |
+| `Integer` | nombre | nombre |
+| `Boolean` | case à cocher | booléen |
+| `Enum` | liste déroulante des `variants` | chaîne |
+| `Object`, `Array` | zone JSON (objet ou tableau, ou expression `{{ … }}`) | objet / tableau |
+
+`description` devient l'aide affichée sous le champ. `required` doit refléter
+ce que l'action **exige** : le formulaire bloque un node incomplet, et le test
+`every_catalog_action_runs_with_exactly_its_required_params` du worker vérifie
+que l'action s'exécute avec ses seuls paramètres requis et échoue dès qu'il en
+manque un.
 
 > ⚠️ Le `kind` de l'`ActionSchema` **doit** être identique à celui renvoyé par
 > `Action::kind()` : c'est la clé qui relie le schéma (UI/API) à l'exécution.
@@ -313,6 +332,12 @@ Connecteurs réels à étudier, par ordre de complexité :
 4. Pour l'exécuter dans les workflows, l'ajouter au dispatch du worker
    (`crates/worker/src/dispatch.rs` : `is_connector_action` + bras de
    `dispatch_action`).
+5. Pour le proposer dans l'éditeur, ajouter son `*Connector` à
+   `catalog::connectors()` (`crates/connectors/src/catalog.rs`). L'API le sert
+   aussitôt (`GET /connectors/actions`, public, décrit dans `/openapi.json`) et
+   la palette du frontend l'affiche, avec un formulaire tiré de ses
+   `ParamSpec` : rien à recopier côté frontend. Le test du worker cité au §4
+   échoue si une action du catalogue n'est pas dispatchée.
 
 ### Token injecté à l'exécution
 
@@ -344,13 +369,6 @@ Le worker ne construit jamais l'`*Auth` à partir d'un secret global : le
   du mode mono-tenant `AUTOME_CONNECTOR_CREDENTIALS=single_tenant`
   (cf. [INSTALLATION.md](INSTALLATION.md#tokens-des-connecteurs-par-utilisateur)).
 
-> ℹ️ **État actuel** : le moteur d'exécution et l'API ne consomment pas encore
-> automatiquement le registre de connecteurs (les `action_schemas` ne sont pas
-> branchés sur la palette live de l'API/engine — intégration en cours, cf.
-> [dette #107](https://github.com/TheDarkMac/autome/issues/107)). Le contrat du
-> connecteur (auth → requête → interprétation, + schémas + tests) est lui
-> complet et stable : c'est ce que ce guide couvre.
-
 ---
 
 ## ✅ Checklist
@@ -358,7 +376,8 @@ Le worker ne construit jamais l'`*Auth` à partir d'un secret global : le
 - [ ] Enum `*Auth` + `impl Credentials`.
 - [ ] `*Interpreter` + `impl ResponseInterpreter` (avec `extract_error`).
 - [ ] Une ou plusieurs `Action<C: HttpClient>` (`kind` == schéma).
-- [ ] `*Connector` publiant les `ActionSchema`.
+- [ ] `*Connector` publiant les `ActionSchema` (`required` = ce que l'action exige).
+- [ ] Connecteur ajouté à `catalog::connectors()` et au dispatch du worker.
 - [ ] Tests `RecordingClient` : succès, paramètre manquant, erreur HTTP.
 - [ ] Module déclaré + ré-exporté dans `lib.rs`.
 - [ ] `cargo fmt --check`, `cargo clippy -D warnings`, `cargo test -p autome-connectors` verts.
