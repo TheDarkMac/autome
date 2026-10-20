@@ -39,6 +39,8 @@ export interface ConnectorsPanelProps {
   storage?: Storage;
   /** Appelé après traitement du callback (pour nettoyer l'URL). */
   onCallbackHandled?: () => void;
+  /** Appelé après une déconnexion (l'en-tête relit les credentials, #265). */
+  onCredentialsChange?: () => void;
 }
 
 type Load =
@@ -53,6 +55,7 @@ export function ConnectorsPanel({
   callbackSearch = typeof window !== "undefined" ? window.location.search : "",
   storage = typeof sessionStorage !== "undefined" ? sessionStorage : undefined,
   onCallbackHandled,
+  onCredentialsChange,
 }: ConnectorsPanelProps): JSX.Element {
   const [load, setLoad] = useState<Load>({ kind: "loading" });
   const [busy, setBusy] = useState<string | null>(null);
@@ -126,6 +129,7 @@ export function ConnectorsPanel({
       try {
         await revokeCredential(provider, accessToken, fetchImpl);
         await reload();
+        onCredentialsChange?.();
         setNotice(`${provider} déconnecté.`);
       } catch (e) {
         setNotice(`Échec de la déconnexion : ${(e as Error).message}`);
@@ -133,7 +137,7 @@ export function ConnectorsPanel({
         setBusy(null);
       }
     },
-    [accessToken, fetchImpl, reload],
+    [accessToken, fetchImpl, reload, onCredentialsChange],
   );
 
   return (

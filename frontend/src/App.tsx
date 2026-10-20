@@ -20,6 +20,7 @@ import {
   verifyEmail as apiVerifyEmail,
 } from "./auth";
 import { ConnectorsPanel } from "./ConnectorsPanel";
+import { loadChallenge, parseCallbackParams } from "./connectors";
 import type { CanvasNode, WireGraph } from "./graph";
 import { LoginPage } from "./LoginPage";
 import {
@@ -41,6 +42,7 @@ import {
   type NodeExecStatus,
   type RunCheckpoint,
 } from "./runs";
+import { useReconnectNeeded } from "./useReconnectNeeded";
 import { useRunPolling } from "./useRunPolling";
 import { useSession, type UseSessionOptions } from "./useSession";
 import { VerifyEmailPage } from "./VerifyEmailPage";
@@ -58,6 +60,23 @@ type Status =
   | { kind: "error"; message: string };
 
 type View = "edit" | "runs" | "connectors" | "account" | "admin";
+
+/** Fragment qui ouvre l'onglet Connecteurs (lien de l'email #265). */
+const CONNECTORS_FRAGMENT = "#connecteurs";
+
+/**
+ * Onglet au chargement : Connecteurs pour le lien de l'email (#265) et au
+ * retour du provider OAuth (`?code&state` d'un flow lancé ici), où le panneau
+ * finalise la connexion.
+ */
+function initialView(): View {
+  const oauthReturn =
+    parseCallbackParams(window.location.search) !== null &&
+    loadChallenge() !== null;
+  return window.location.hash === CONNECTORS_FRAGMENT || oauthReturn
+    ? "connectors"
+    : "edit";
+}
 
 export interface AppProps {
   /** Options de session (store/impls injectables pour les tests). */
@@ -242,7 +261,39 @@ export function App({
   const [catalogLoading, setCatalogLoading] = useState(true);
   const [selectedNode, setSelectedNode] = useState<CanvasNode | null>(null);
   const [controller, setController] = useState<NodeCanvasController | null>(null);
-  const [view, setView] = useState<View>("edit");
+  const [view, setView] = useState<View>(initialView);
+  // Lien de l'email collé dans un onglet déjà ouvert (#265) ; le fragment
+  // est retiré de la barre d'adresse.
+  useEffect(() => {
+    const open = (): void => {
+      if (window.location.hash !== CONNECTORS_FRAGMENT) return;
+      setView("connectors");
+      window.history.replaceState(
+        null,
+        "",
+        window.location.pathname + window.location.search,
+      );
+    };
+    open();
+    window.addEventListener("hashchange", open);
+    return () => window.removeEventListener("hashchange", open);
+  }, []);
+  // Connecteurs à reconnecter (#265), relus à chaque changement d'onglet, de
+  // statut du run suivi et après une (re)connexion dans le panneau.
+  const [credentialsRevision, setCredentialsRevision] = useState(0);
+  const onCredentialsChange = useCallback(
+    () => setCredentialsRevision((n) => n + 1),
+    [],
+  );
+  // Retour du provider OAuth traité : `?code&state` retiré de l'URL.
+  const onCallbackHandled = useCallback(() => {
+    window.history.replaceState(
+      null,
+      "",
+      window.location.pathname + window.location.hash,
+    );
+    onCredentialsChange();
+  }, [onCredentialsChange]);
   const graph = editor.graph;
   const [selectedRunId, setSelectedRunId] = useState<string | null>(null);
   // Autre workflow ouvert : sa sélection et son run ne valent plus.
@@ -263,6 +314,10 @@ export function App({
   const { checkpoint, error: pollError } = useRunPolling(
     view === "runs" ? selectedRunId : null,
     { fetchImpl: api.getRun },
+  );
+  const reconnect = useReconnectNeeded(
+    userId ? api.listCredentials : null,
+    `${userId}:${view}:${checkpoint?.status ?? ""}:${credentialsRevision}`,
   );
 
   useEffect(() => {
@@ -377,6 +432,18 @@ export function App({
           </p>
         </div>
         <div className="flex items-center gap-3 text-sm">
+          {reconnect.length > 0 && (
+            <button
+              type="button"
+              onClick={() => setView("connectors")}
+              data-testid="reconnect-indicator"
+              className="rounded-md border border-amber-300 bg-amber-50 px-3 py-1.5 font-medium text-amber-900 hover:bg-amber-100"
+            >
+              {reconnect.length === 1
+                ? `Connecteur à reconnecter : ${reconnect[0]}`
+                : `${reconnect.length} connecteurs à reconnecter : ${reconnect.join(", ")}`}
+            </button>
+          )}
           <span className="text-neutral-500" data-testid="current-user">
             {me?.email ?? session.userId}
           </span>
@@ -415,7 +482,12 @@ export function App({
         <BackendStatus status={status} />
       </section>
 
-      <ViewTabs view={view} onChange={setView} showAdmin={isAdmin} />
+      <ViewTabs
+        view={view}
+        onChange={setView}
+        showAdmin={isAdmin}
+        reconnectCount={reconnect.length}
+      />
 
       {view === "admin" && me && isAdmin ? (
         <div className="min-h-0 flex-1 overflow-y-auto">
@@ -436,7 +508,11 @@ export function App({
         </div>
       ) : view === "connectors" ? (
         <div className="min-h-0 flex-1 overflow-y-auto">
-          <ConnectorsPanel accessToken={session.accessToken} />
+          <ConnectorsPanel
+            accessToken={session.accessToken}
+            onCallbackHandled={onCallbackHandled}
+            onCredentialsChange={onCredentialsChange}
+          />
         </div>
       ) : (
         <>
@@ -521,10 +597,13 @@ function ViewTabs({
   view,
   onChange,
   showAdmin,
+  reconnectCount,
 }: {
   view: View;
   onChange: (v: View) => void;
   showAdmin: boolean;
+  /** Connecteurs à reconnecter : pastille sur l'onglet (#265). */
+  reconnectCount: number;
 }): JSX.Element {
   return (
     <nav
@@ -545,6 +624,11 @@ function ViewTabs({
       <ViewTab
         active={view === "connectors"}
         label="Connecteurs"
+        badge={
+          reconnectCount > 0
+            ? { count: reconnectCount, label: `${reconnectCount} à reconnecter` }
+            : undefined
+        }
         onClick={() => onChange("connectors")}
       />
       <ViewTab
@@ -566,10 +650,13 @@ function ViewTabs({
 function ViewTab({
   active,
   label,
+  badge,
   onClick,
 }: {
   active: boolean;
   label: string;
+  /** Compteur affiché après le libellé, `label` pour les lecteurs d'écran. */
+  badge?: { count: number; label: string } | undefined;
   onClick: () => void;
 }): JSX.Element {
   return (
@@ -585,6 +672,17 @@ function ViewTab({
       }`}
     >
       {label}
+      {badge && (
+        <>
+          <span
+            aria-hidden="true"
+            className="ml-1.5 rounded-full bg-amber-100 px-1.5 py-0.5 text-[10px] font-medium text-amber-900"
+          >
+            {badge.count}
+          </span>
+          <span className="sr-only"> ({badge.label})</span>
+        </>
+      )}
     </button>
   );
 }

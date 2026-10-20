@@ -302,6 +302,132 @@ describe("<App />", () => {
     expect(await screen.findByTestId("connector-slack")).toBeInTheDocument();
   });
 
+  /** Backend dont `GET /credentials` renvoie `credentials()` à chaque appel. */
+  function credentialsBackend(credentials: () => unknown): typeof fetch {
+    return vi.fn(async (input, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : (input as Request).url;
+      const method = init?.method ?? "GET";
+      if (url.includes("/openapi.json")) return jsonResponse(sampleSpec);
+      if (url.endsWith("/credentials/providers")) {
+        return jsonResponse({
+          items: [
+            { provider_id: "github", scopes: [] },
+            { provider_id: "slack", scopes: [] },
+          ],
+        });
+      }
+      if (method === "POST" && url.endsWith("/credentials/slack/callback")) {
+        return jsonResponse({ provider_id: "slack", has_refresh_token: true });
+      }
+      if (url.endsWith("/credentials")) return jsonResponse(credentials());
+      return new Response("", { status: 404 });
+    }) as typeof fetch;
+  }
+
+  const revokedSlack = (): unknown => ({
+    items: [
+      { provider_id: "slack", has_refresh_token: true, needs_reconnect: true },
+      { provider_id: "github", has_refresh_token: true, needs_reconnect: false },
+    ],
+  });
+
+  it("signale dans l'en-tête un connecteur à reconnecter et mène à l'onglet (#265)", async () => {
+    globalThis.fetch = credentialsBackend(revokedSlack);
+    render(<App sessionOptions={authedSession()} />);
+
+    const indicator = await screen.findByTestId("reconnect-indicator");
+    expect(indicator).toHaveTextContent("Connecteur à reconnecter : slack");
+    expect(
+      screen.getByRole("tab", { name: "Connecteurs (1 à reconnecter)" }),
+    ).toBeInTheDocument();
+
+    fireEvent.click(indicator);
+    const row = await screen.findByTestId("connector-slack");
+    expect(row).toHaveTextContent("À reconnecter");
+  });
+
+  it("aucun indicateur quand tout est connecté ou que la lecture échoue (#265)", async () => {
+    globalThis.fetch = credentialsBackend(() => ({
+      items: [{ provider_id: "slack", has_refresh_token: true, needs_reconnect: false }],
+    }));
+    const { unmount } = render(<App sessionOptions={authedSession()} />);
+    await waitFor(() => expect(globalThis.fetch).toHaveBeenCalledWith(
+      expect.stringMatching(/\/credentials$/),
+      expect.anything(),
+    ));
+    await act(async () => undefined);
+    expect(screen.queryByTestId("reconnect-indicator")).toBeNull();
+    expect(screen.getByRole("tab", { name: "Connecteurs" })).toBeInTheDocument();
+    unmount();
+
+    globalThis.fetch = vi.fn().mockRejectedValue(new Error("ECONNREFUSED")) as typeof fetch;
+    render(<App sessionOptions={authedSession()} />);
+    await act(async () => undefined);
+    expect(screen.queryByTestId("reconnect-indicator")).toBeNull();
+  });
+
+  it("plusieurs connecteurs à reconnecter : compteur et liste (#265)", async () => {
+    globalThis.fetch = credentialsBackend(() => ({
+      items: [
+        { provider_id: "slack", needs_reconnect: true },
+        { provider_id: "github", needs_reconnect: true },
+      ],
+    }));
+    render(<App sessionOptions={authedSession()} />);
+    expect(await screen.findByTestId("reconnect-indicator")).toHaveTextContent(
+      "2 connecteurs à reconnecter : github, slack",
+    );
+  });
+
+  it("le lien #connecteurs de l'email ouvre l'onglet Connecteurs (#265)", async () => {
+    window.history.replaceState(null, "", "/#connecteurs");
+    globalThis.fetch = credentialsBackend(revokedSlack);
+    render(<App sessionOptions={authedSession()} />);
+    expect(await screen.findByTestId("connectors-panel")).toBeInTheDocument();
+    expect(window.location.hash).toBe("");
+
+    // Lien recollé dans l'onglet déjà ouvert.
+    fireEvent.click(screen.getByRole("tab", { name: "Compte" }));
+    expect(screen.queryByTestId("connectors-panel")).toBeNull();
+    await act(async () => {
+      window.history.replaceState(null, "", "/#connecteurs");
+      window.dispatchEvent(new HashChangeEvent("hashchange"));
+    });
+    expect(screen.getByTestId("connectors-panel")).toBeInTheDocument();
+    expect(window.location.hash).toBe("");
+  });
+
+  it("au retour du provider OAuth, finalise la reconnexion et retire l'indicateur (#265)", async () => {
+    let revoked = true;
+    globalThis.fetch = credentialsBackend(() =>
+      revoked
+        ? revokedSlack()
+        : { items: [{ provider_id: "slack", has_refresh_token: true }] },
+    );
+    window.sessionStorage.setItem(
+      "autome.oauth.challenge",
+      JSON.stringify({
+        provider: "slack",
+        authorizeUrl: "https://x",
+        state: "st-1",
+        codeVerifier: "ver-1",
+      }),
+    );
+    window.history.replaceState(null, "", "/?code=c-1&state=st-1");
+    // Le provider a accepté : la marque est effacée côté serveur.
+    revoked = false;
+    try {
+      render(<App sessionOptions={authedSession()} />);
+      expect(await screen.findByText(/slack connecté/i)).toBeInTheDocument();
+      expect(window.location.search).toBe("");
+      await act(async () => undefined);
+      expect(screen.queryByTestId("reconnect-indicator")).toBeNull();
+    } finally {
+      window.sessionStorage.clear();
+      window.history.replaceState(null, "", "/");
+    }
+  });
+
   it("se déconnecte et revient à la page de login", async () => {
     globalThis.fetch = vi.fn().mockResolvedValue(jsonResponse(sampleSpec)) as typeof fetch;
     render(<App sessionOptions={authedSession()} />);

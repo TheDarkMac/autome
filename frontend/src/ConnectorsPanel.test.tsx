@@ -185,15 +185,25 @@ describe("<ConnectorsPanel />", () => {
       ],
     ]);
 
+    const onCredentialsChange = vi.fn();
     render(
-      <ConnectorsPanel accessToken="t" fetchImpl={fetchImpl} callbackSearch="" />,
+      <ConnectorsPanel
+        accessToken="t"
+        fetchImpl={fetchImpl}
+        callbackSearch=""
+        onCredentialsChange={onCredentialsChange}
+      />,
     );
 
-    fireEvent.click(await screen.findByRole("button", { name: "Déconnecter" }));
+    await screen.findByRole("button", { name: "Déconnecter" });
+    expect(onCredentialsChange).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Déconnecter" }));
 
     await waitFor(() =>
       expect(screen.getByText(/slack déconnecté/i)).toBeInTheDocument(),
     );
+    // L'en-tête relit les credentials (#265).
+    expect(onCredentialsChange).toHaveBeenCalledTimes(1);
     const slackRow = screen.getByTestId("connector-slack");
     expect(
       within(slackRow).getByRole("button", { name: "Connecter" }),
