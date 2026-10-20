@@ -75,6 +75,11 @@ jobs:
       # service injoignable ⇒ ces tests échouent (pas de saut).
       TEST_DATABASE_URL: postgres://postgres:pg@localhost:5432/postgres
       TEST_AMQP_URL: amqp://guest:guest@localhost:5672/%2f
+      # Test réseau de `ReqwestHttpClient` (connectors, #263) : politique
+      # stricte, vrai DNS, TLS rustls et certificats racine. Il refuse les
+      # adresses non publiques, d'où une cible HTTPS publique plutôt qu'un
+      # service du job ; github.com est joignable depuis tout runner.
+      TEST_HTTP_URL: https://github.com/robots.txt
     steps:
       - uses: actions/checkout@v4
 
@@ -124,8 +129,8 @@ jobs:
       # renommée, retirée de `env:`…) ferait passer la CI au vert à tort.
       - name: Real-service tests were not skipped
         run: |
-          if grep -E 'absent → test (PostgreSQL|RabbitMQ) sauté' "$RUNNER_TEMP/cargo-test.log"; then
-            echo "::error::Tests PostgreSQL/RabbitMQ sautés malgré les services du job"
+          if grep -E 'absent → test (PostgreSQL|RabbitMQ|réseau) sauté' "$RUNNER_TEMP/cargo-test.log"; then
+            echo "::error::Tests PostgreSQL/RabbitMQ/réseau sautés malgré l'environnement du job"
             exit 1
           fi
           echo "Binaires de tests réels exécutés :"
