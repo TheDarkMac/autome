@@ -28,3 +28,5 @@ reqwest = { workspace = true }
 tokio = { workspace = true, features = ["net"] }
 # Span `http_client` des appels sortants, exporté en trace (#249).
 tracing = { workspace = true }
+# Schémas d'actions décrits dans la spec OpenAPI de l'API (#257).
+utoipa = { workspace = true }

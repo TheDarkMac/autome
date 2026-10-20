@@ -632,6 +632,56 @@ mod tests {
         assert!(err.contains("non supportée"), "msg: {err}");
     }
 
+    /// Valeur factice du type qu'attend un paramètre de schéma.
+    fn sample(kind: &autome_connectors::ParamKind) -> Value {
+        use autome_connectors::ParamKind;
+        match kind {
+            ParamKind::String | ParamKind::Text => json!("x"),
+            ParamKind::Integer => json!(1),
+            ParamKind::Boolean => json!(true),
+            ParamKind::Object => json!({ "k": "v" }),
+            ParamKind::Array { inner } => json!([sample(inner)]),
+            ParamKind::Enum { variants } => json!(variants[0]),
+        }
+    }
+
+    /// Le catalogue servi à l'interface (#257) et le dispatch ne divergent
+    /// pas : chaque action du catalogue s'exécute avec ses seuls paramètres
+    /// requis, et échoue dès qu'il en manque un (le schéma ne déclare pas
+    /// requis un paramètre dont l'action se passe).
+    #[test]
+    fn every_catalog_action_runs_with_exactly_its_required_params() {
+        for schema in autome_connectors::catalog::action_schemas() {
+            let required: serde_json::Map<String, Value> = schema
+                .params
+                .iter()
+                .filter(|p| p.required)
+                .map(|p| (p.key.to_string(), sample(&p.kind)))
+                .collect();
+            let run = |params: serde_json::Map<String, Value>| {
+                let http = SharedMock::ok(json!({ "ok": true }));
+                dispatch_action(
+                    schema.kind,
+                    &Value::Object(params),
+                    &http,
+                    &resolver("t"),
+                    Some("alice"),
+                )
+            };
+            let res = run(required.clone());
+            assert!(res.is_ok(), "{} : {res:?}", schema.kind);
+            for key in required.keys() {
+                let mut missing = required.clone();
+                missing.remove(key);
+                assert!(
+                    run(missing).is_err(),
+                    "{} : `{key}` déclaré requis, mais l'action s'en passe",
+                    schema.kind
+                );
+            }
+        }
+    }
+
     #[test]
     fn is_connector_action_recognizes_known_providers() {
         assert!(is_connector_action("slack.send_message"));

@@ -76,7 +76,7 @@ pub fn send_message_schema() -> ActionSchema {
         description: "Publie un message dans un canal Slack via `chat.postMessage`.",
         params: vec![
             ParamSpec::req_str("channel", "Canal"),
-            ParamSpec::req_str("text", "Texte"),
+            ParamSpec::req_text("text", "Texte"),
             ParamSpec::opt_str("thread_ts", "Thread (parent ts)"),
             ParamSpec {
                 key: "blocks",
