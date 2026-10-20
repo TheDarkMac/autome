@@ -1,0 +1,10 @@
+# Traces de l'api et du worker (#249) : Jaeger du compose, consultable aussi
+# dans Grafana (Explore → Jaeger).
+apiVersion: 1
+
+datasources:
+  - name: Jaeger
+    type: jaeger
+    access: proxy
+    url: http://jaeger:16686
+    editable: false

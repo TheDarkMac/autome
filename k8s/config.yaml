@@ -59,6 +59,15 @@ data:
   # CORS (#225) : origine(s) du frontend, servi sur un autre hôte que l'API
   # (cf. ingress). Sans elle, le navigateur bloque tous les appels du frontend.
   AUTOME_CORS_ORIGINS: "https://autome.example.com"
+  # Traces OpenTelemetry (#249) : base OTLP/HTTP du collecteur (ex.
+  # "http://otel-collector.observability:4318", `/v1/traces` ajouté). Vide =
+  # aucun export. `service.name` vaut `autome-api` / `autome-worker` ; en-têtes
+  # d'authentification du collecteur dans le Secret (OTEL_EXPORTER_OTLP_HEADERS).
+  # Échantillonnage conseillé en production, à décommenter :
+  #   OTEL_TRACES_SAMPLER: "parentbased_traceidratio"
+  #   OTEL_TRACES_SAMPLER_ARG: "0.1"
+  # Le `traceparent` entrant n'est repris que des AUTOME_TRUSTED_PROXIES.
+  OTEL_EXPORTER_OTLP_ENDPOINT: ""
 ---
 # Secrets (F10.3) — VALEURS DE DÉMONSTRATION, à remplacer impérativement
 # avant tout usage réel (SealedSecrets / External Secrets / Vault…).

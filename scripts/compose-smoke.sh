@@ -16,12 +16,18 @@
 # par la commande d'exploitation `autome-api verify-email` dans le conteneur
 # de l'API (`SMOKE_VERIFY_CMD` pour une autre pile).
 #
+# Traces (#249) : si Jaeger répond (`SMOKE_JAEGER`, défaut
+# http://localhost:16686), le run doit y apparaître dans une seule trace
+# couvrant l'API (requête, mise en file) et le worker (run, nœud).
+# `SMOKE_REQUIRE_TRACES=1` (CI) fait échouer le smoke si Jaeger est absent.
+#
 # Crée un compte jetable (email unique) et un workflow trigger-only — aucun
 # effet de bord externe.
 set -euo pipefail
 
 API="${AUTOME_API:-http://localhost:8080}"
 TIMEOUT_S="${SMOKE_TIMEOUT_S:-60}"
+JAEGER="${SMOKE_JAEGER:-http://localhost:16686}"
 SUFFIX="$(date +%s)-$$"
 EMAIL="smoke-${SUFFIX}@autome.local"
 PASSWORD="smoke-password-${SUFFIX}"
@@ -76,9 +82,56 @@ STATUS=""
 for _ in $(seq 1 "$TIMEOUT_S"); do
   STATUS="$(curl -fsS "${AUTH[@]}" "$API/runs/$RUN_ID" | json_field status | tr '[:upper:]' '[:lower:]')"
   case "$STATUS" in
-    succeeded) echo "OK : run $RUN_ID exécuté par le worker (succeeded)"; exit 0 ;;
+    succeeded) echo "OK : run $RUN_ID exécuté par le worker (succeeded)"; break ;;
     failed) fail "run $RUN_ID en échec : $(curl -fsS "${AUTH[@]}" "$API/runs/$RUN_ID")" ;;
   esac
   sleep 1
 done
-fail "run $RUN_ID toujours « $STATUS » après ${TIMEOUT_S} s — le worker ne consomme pas la file de l'API ?"
+[ "$STATUS" = succeeded ] \
+  || fail "run $RUN_ID toujours « $STATUS » après ${TIMEOUT_S} s — le worker ne consomme pas la file de l'API ?"
+
+if ! curl -fsS "$JAEGER/api/v3/services" >/dev/null 2>&1; then
+  [ "${SMOKE_REQUIRE_TRACES:-0}" = 1 ] && fail "Jaeger injoignable sur $JAEGER"
+  echo "  (Jaeger injoignable sur $JAEGER : traces non vérifiées)"
+  exit 0
+fi
+# Les spans partent par lots toutes les 5 s (OTEL_BSP_SCHEDULE_DELAY). API v3
+# de Jaeger 2 : traces au format OTLP JSON.
+echo "→ attente de la trace du run dans Jaeger (≤ ${TIMEOUT_S} s)…"
+QUERY="$(python3 -c '
+import datetime, json, sys, urllib.parse
+now = datetime.datetime.now(datetime.timezone.utc)
+fmt = lambda t: t.strftime("%Y-%m-%dT%H:%M:%SZ")
+print(urllib.parse.urlencode({
+    "query.service_name": "autome-worker",
+    "query.attributes": json.dumps({"run_id": sys.argv[1]}),
+    "query.start_time_min": fmt(now - datetime.timedelta(minutes=15)),
+    "query.start_time_max": fmt(now + datetime.timedelta(minutes=5)),
+}))' "$RUN_ID")"
+VERDICT=""
+for _ in $(seq 1 "$TIMEOUT_S"); do
+  VERDICT="$(curl -sS "$JAEGER/api/v3/traces?$QUERY" | python3 -c '
+import json, sys
+spans = {}
+for rs in (json.load(sys.stdin).get("result") or {}).get("resourceSpans", []):
+    svc = next(a["value"]["stringValue"] for a in rs["resource"]["attributes"] if a["key"] == "service.name")
+    for ss in rs["scopeSpans"]:
+        for s in ss["spans"]:
+            spans[s["spanId"]] = (svc, s["name"], s.get("parentSpanId"), s["traceId"])
+def parent(span_id, svc, name):
+    p = spans.get(spans.get(span_id, (None, None, None, None))[2])
+    return p is not None and p[0] == svc and p[1].startswith(name)
+runs = [i for i, s in spans.items() if s[:2] == ("autome-worker", "run")]
+ok = [i for i in runs
+      if parent(i, "autome-api", "run dispatch")
+      and parent(spans[i][2], "autome-api", "POST /workflows/:id/runs")
+      and any(s[2] == i and s[1].startswith("node ") for s in spans.values())]
+print("ok " + spans[ok[0]][3] if ok else "partielle : " + repr(sorted({s[:2] for s in spans.values()})))
+' 2>/dev/null)" || VERDICT="illisible"
+  case "$VERDICT" in ok\ *) break ;; esac
+  sleep 1
+done
+case "$VERDICT" in
+  ok\ *) echo "OK : trace ${VERDICT#ok } — requête API → mise en file → run du worker" ;;
+  *) fail "trace du run $RUN_ID incomplète dans Jaeger ($VERDICT)" ;;
+esac
