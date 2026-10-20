@@ -26,3 +26,5 @@ reqwest = { workspace = true }
 # Résolution DNS async du résolveur anti-SSRF (exécuté dans le runtime interne
 # de reqwest) — backlog post-audit.
 tokio = { workspace = true, features = ["net"] }
+# Span `http_client` des appels sortants, exporté en trace (#249).
+tracing = { workspace = true }

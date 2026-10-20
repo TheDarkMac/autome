@@ -136,6 +136,42 @@ impl HttpClient for ReqwestHttpClient {
             .map_err(|e| format!("méthode HTTP invalide `{}` : {e}", req.method))?;
         let url = reqwest::Url::parse(&req.url)
             .map_err(|e| format!("URL invalide `{}` : {e}", req.url))?;
+        // Span de trace (#249) : méthode et hôte seulement — le chemin et la
+        // query portent parfois un secret (URL de webhook, clé d'API). Aucun
+        // `traceparent` n'est transmis au service tiers.
+        let span = tracing::info_span!(
+            autome_core::telemetry::HTTP_CLIENT_SPAN,
+            otel.name = %format!("{method}"),
+            otel.kind = "client",
+            otel.status_code = tracing::field::Empty,
+            http.request.method = %method,
+            server.address = url.host_str().unwrap_or(""),
+            http.response.status_code = tracing::field::Empty,
+        );
+        let _entered = span.enter();
+        let result = self.execute(method, url, req);
+        match &result {
+            Ok(resp) => {
+                span.record("http.response.status_code", resp.status);
+                if resp.status >= 400 {
+                    span.record("otel.status_code", "error");
+                }
+            }
+            Err(_) => {
+                span.record("otel.status_code", "error");
+            }
+        }
+        result
+    }
+}
+
+impl ReqwestHttpClient {
+    fn execute(
+        &self,
+        method: reqwest::Method,
+        url: reqwest::Url,
+        req: &HttpRequest,
+    ) -> std::result::Result<HttpResponse, String> {
         self.policy.check_url(&url).map_err(|e| e.to_string())?;
         let mut rb = self.client().request(method, url);
         for (k, v) in &req.headers {

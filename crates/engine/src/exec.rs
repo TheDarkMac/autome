@@ -396,7 +396,10 @@ fn run_once(
         None => runner.run(node, ctx),
         Some(ms) => thread::scope(|s| {
             let (tx, rx) = mpsc::channel();
+            // Le span du nœud n'est pas hérité par le thread (#249).
+            let span = tracing::Span::current();
             s.spawn(move || {
+                let _entered = span.enter();
                 let _ = tx.send(runner.run(node, ctx));
             });
             match rx.recv_timeout(Duration::from_millis(ms)) {
@@ -429,8 +432,58 @@ fn run_with_policy(
     Err(last)
 }
 
-/// Évalue un node selon son type (commun séquentiel/parallèle).
+/// Évalue un node dans son span de trace (#249) : identifiant, type, action
+/// et statut final — jamais les paramètres ni la sortie, qui portent les
+/// données du workflow.
 fn evaluate_node(node: &Node, ctx: &mut RunContext, runner: &(dyn NodeRunner + Sync)) -> NodeEval {
+    // Nom d'opération par type d'action (`node slack.send`, `node if`) :
+    // borné, contrairement aux ids de nœuds de tous les workflows.
+    let (kind, action_type) = match &node.kind {
+        NodeKind::Action { action_type } => ("action", Some(action_type.as_str())),
+        other => (node_kind_label(other), None),
+    };
+    let span = tracing::info_span!(
+        autome_core::telemetry::NODE_SPAN,
+        otel.name = %format!("node {}", action_type.unwrap_or(kind)),
+        node_id = %node.id.0,
+        node_kind = kind,
+        action_type,
+        status = tracing::field::Empty,
+        otel.status_code = tracing::field::Empty,
+    );
+    let eval = span.in_scope(|| evaluate_node_kind(node, ctx, runner));
+    span.record(
+        "status",
+        match eval.status {
+            StepStatus::Succeeded => "succeeded",
+            StepStatus::Failed => "failed",
+            StepStatus::Skipped => "skipped",
+        },
+    );
+    if eval.status == StepStatus::Failed {
+        span.record("otel.status_code", "error");
+    }
+    eval
+}
+
+/// Type du nœud tel qu'affiché dans la trace.
+fn node_kind_label(kind: &NodeKind) -> &'static str {
+    match kind {
+        NodeKind::Trigger { .. } => "trigger",
+        NodeKind::Action { .. } => "action",
+        NodeKind::If => "if",
+        NodeKind::Switch => "switch",
+        NodeKind::Loop => "loop",
+        NodeKind::While => "while",
+    }
+}
+
+/// Évalue un node selon son type (commun séquentiel/parallèle).
+fn evaluate_node_kind(
+    node: &Node,
+    ctx: &mut RunContext,
+    runner: &(dyn NodeRunner + Sync),
+) -> NodeEval {
     match &node.kind {
         // Les nodes de contrôle évaluent eux-mêmes leurs expressions brutes.
         NodeKind::If => from_control(eval_if(node, ctx)),

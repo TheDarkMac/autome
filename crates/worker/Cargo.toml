@@ -28,3 +28,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "tim
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "sync"] }
+# Exporteur en mémoire des tests de traces (#249).
+opentelemetry = { workspace = true }
+opentelemetry_sdk = { workspace = true, features = ["testing"] }
+tracing-subscriber = { workspace = true }

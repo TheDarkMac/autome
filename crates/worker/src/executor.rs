@@ -60,8 +60,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use async_trait::async_trait;
 use autome_connectors::{EgressPolicy, HttpAction, HttpClient, ReqwestHttpClient};
 use autome_core::{
-    Action, Delivery, Node, NodeId, NodeKind, Queue, RunCheckpoint, RunProgress, RunStateStore,
-    RunStatus, WorkflowId, WorkflowRepository, LEGACY_NAMESPACE,
+    telemetry, Action, Delivery, Node, NodeId, NodeKind, Queue, RunCheckpoint, RunProgress,
+    RunStateStore, RunStatus, WorkflowId, WorkflowRepository, LEGACY_NAMESPACE,
 };
 use autome_engine::{
     rerunnable, resume_sequential, Control, Cursor, Dag, Execution, RunContext, RunObserver,
@@ -297,8 +297,20 @@ where
             return HandlerVerdict::DeadLetter;
         };
         // Tous les logs du run (y compris ceux du moteur et des connecteurs)
-        // portent `run_id` / `workflow_id`.
-        let span = tracing::info_span!("run", run_id, workflow_id);
+        // portent `run_id` / `workflow_id`. En trace (#249), le run est
+        // l'enfant de sa mise en file (`traceparent` du message, conservé
+        // par l'outbox et les remises en file) et ses logs portent
+        // `trace_id`.
+        let span = tracing::info_span!(
+            "run",
+            otel.kind = "consumer",
+            otel.status_code = tracing::field::Empty,
+            run_id,
+            workflow_id,
+            trace_id = tracing::field::Empty,
+        );
+        telemetry::set_parent(&span, &delivery.message.headers);
+        telemetry::record_trace_id(&span);
         let payload = body["payload"].clone();
         self.execute(run_id, workflow_id, payload)
             .instrument(span)
@@ -419,9 +431,13 @@ where
             lost: Arc::clone(&lost),
             unsaved: Mutex::new(None),
         };
-        // Le span n'est pas propagé automatiquement au thread bloquant.
+        // Le span n'est pas propagé automatiquement au thread bloquant, ni le
+        // subscriber s'il n'est pas global (tests) : les spans des nœuds en
+        // dépendent (#249).
         let span = tracing::Span::current();
+        let dispatch = tracing::dispatcher::get_default(Clone::clone);
         let execution = tokio::task::spawn_blocking(move || {
+            let _subscriber = tracing::dispatcher::set_default(&dispatch);
             let _entered = span.enter();
             let runner = move |node: &Node, ctx: &RunContext| {
                 run_node(
@@ -524,6 +540,7 @@ where
                 HandlerVerdict::Ok
             }
             status => {
+                tracing::Span::current().record("otel.status_code", "error");
                 warn!(
                     status = ?status,
                     duration_ms,
@@ -972,6 +989,64 @@ mod tests {
         assert_eq!(cp.status, RunStatus::Succeeded);
         assert!(cp.started_at_ms.is_some());
         assert!(cp.finished_at_ms.is_some());
+    }
+
+    #[tokio::test]
+    async fn the_run_continues_the_trace_of_its_dispatch() {
+        use autome_core::telemetry::{subscriber, LogFormat};
+        use opentelemetry::trace::{SpanId, Status, TracerProvider as _};
+        use opentelemetry_sdk::trace::{InMemorySpanExporter, SdkTracerProvider};
+
+        const TRACE_ID: &str = "4bf92f3577b34da6a3ce929d0e0e4736";
+        const PARENT_ID: &str = "00f067aa0ba902b7";
+        let exporter = InMemorySpanExporter::default();
+        let provider = SdkTracerProvider::builder()
+            .with_simple_exporter(exporter.clone())
+            .build();
+        let _default = tracing::subscriber::set_default(subscriber(
+            LogFormat::Json,
+            tracing_subscriber::EnvFilter::new("info"),
+            std::io::sink,
+            Some(provider.tracer("test")),
+        ));
+        let repo = Arc::new(InMemoryWorkflowRepository::new());
+        let store = Arc::new(InMemoryRunStateStore::new());
+        seed(&repo, &store, unsupported_action("wf-traced"), "run-traced").await;
+        let exec = RunExecutor::new(repo, Arc::clone(&store) as Arc<_>, resolver());
+        let mut delivery = delivery("run-traced", "wf-traced");
+        delivery.message.headers.insert(
+            "traceparent".into(),
+            format!("00-{TRACE_ID}-{PARENT_ID}-01"),
+        );
+
+        assert_eq!(exec.handle(&delivery).await, HandlerVerdict::DeadLetter);
+
+        let spans = exporter.get_finished_spans().unwrap();
+        let find = |name: &str| {
+            spans
+                .iter()
+                .find(|s| s.name == name)
+                .unwrap_or_else(|| panic!("span `{name}` absent : {spans:?}"))
+        };
+        let run = find("run");
+        assert_eq!(run.span_context.trace_id().to_string(), TRACE_ID);
+        assert_eq!(run.parent_span_id.to_string(), PARENT_ID);
+        assert!(
+            matches!(run.status, Status::Error { .. }),
+            "{:?}",
+            run.status
+        );
+        // Les nœuds, exécutés sur le thread bloquant du moteur, sont ses
+        // enfants.
+        for node in ["node trigger", "node slack_send"] {
+            let node = find(node);
+            assert_eq!(node.parent_span_id, run.span_context.span_id());
+            assert_ne!(node.parent_span_id, SpanId::INVALID);
+        }
+        assert!(matches!(
+            find("node slack_send").status,
+            Status::Error { .. }
+        ));
     }
 
     #[tokio::test]

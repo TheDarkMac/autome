@@ -78,6 +78,16 @@ reqwest = { version = "0.12", default-features = false, features = ["blocking", 
 # (filtre `RUST_LOG`, sortie JSON ou texte) initialisé par les binaires.
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+# Export des traces (#249) : couche `tracing-opentelemetry` sur le subscriber,
+# SDK OpenTelemetry et exporteur OTLP HTTP/protobuf. Le transport est le
+# `reqwest` bloquant du workspace (le client intégré de l'exporteur tirerait
+# reqwest 0.13 en double) ; pas de gRPC/tonic. Désactivé tant qu'aucun endpoint
+# n'est configuré.
+opentelemetry = { version = "0.33", default-features = false, features = ["trace"] }
+opentelemetry_sdk = { version = "0.33", default-features = false, features = ["trace"] }
+opentelemetry-otlp = { version = "0.33", default-features = false, features = ["http-proto", "trace"] }
+opentelemetry-http = { version = "0.33", default-features = false }
+tracing-opentelemetry = { version = "0.34", default-features = false }
 
 # Lints partagés (F1.3.g) : appliqués via `[lints] workspace = true` dans
 # chaque crate. `clippy -- -D warnings` en CI (cf. CONVENTIONS §4/§5).

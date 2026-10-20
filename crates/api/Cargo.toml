@@ -59,3 +59,8 @@ http-body-util = "0.1"
 rcgen = "0.13"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 tempfile = "3"
+# Exporteur en mémoire des tests de traces (#249).
+opentelemetry = { workspace = true }
+opentelemetry_sdk = { workspace = true, features = ["testing"] }
+tracing-subscriber = { workspace = true }
+serde_json = { workspace = true }

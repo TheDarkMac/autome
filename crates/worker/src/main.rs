@@ -125,7 +125,8 @@ fn now_ms() -> i64 {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = Config::from_env()?;
-    let log_format = telemetry::init(config.profile)?;
+    // Gardée jusqu'à la fin de `main` : son relâchement vide les traces (#249).
+    let telemetry = telemetry::init(config.profile, "autome-worker")?;
     let persistence = PersistenceMode::from_env()?;
     let queue_mode = QueueMode::from_env()?;
     // Garde prod (#172) : un worker in-memory ne verrait aucun run publié par l'API.
@@ -261,7 +262,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         run_lease_s = lease.as_secs(),
         scheduler_tick_s = scheduler_period.map(|p| p.as_secs()),
         runs_queue = RUNS_QUEUE,
-        log_format = ?log_format,
+        log_format = ?telemetry.log_format(),
+        traces = telemetry.exports_traces(),
         "autome-worker démarré"
     );
 
@@ -334,7 +336,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
             // Le runtime attendrait sinon, à sa destruction, la fin des
             // threads bloquants du moteur — c'est-à-dire des runs qu'on vient
-            // de clore.
+            // de clore. `exit` ne relâche rien : traces vidées d'abord.
+            telemetry.shutdown();
             std::process::exit(0)
         }
     }
