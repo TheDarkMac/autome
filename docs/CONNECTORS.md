@@ -228,7 +228,7 @@ Rendu dans le panneau de configuration de l'éditeur :
 |---|---|---|
 | `String` | ligne de texte | chaîne |
 | `Text` | zone multiligne (corps de message, description) | chaîne |
-| `Integer` | nombre | nombre |
+| `Integer` | nombre, ou expression `{{ nœud.champ }}` occupant tout le champ (remplacée à l'exécution, type compris) | nombre / chaîne `{{ … }}` |
 | `Boolean` | case à cocher | booléen |
 | `Enum` | liste déroulante des `variants` | chaîne |
 | `Object`, `Array` | zone JSON (objet ou tableau, ou expression `{{ … }}`) | objet / tableau |

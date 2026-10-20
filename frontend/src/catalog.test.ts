@@ -129,6 +129,9 @@ describe("actions de connecteur (#257)", () => {
     expect(params.find((p) => p.name === "issue_number")).toMatchObject({
       type: "number",
       required: true,
+      expression: true,
+      placeholder: "42 ou {{ nœud.champ }}",
+      help: "Nombre, ou expression {{ nœud.champ }} remplacée à l'exécution.",
     });
     expect(params.find((p) => p.name === "state_reason")).toEqual({
       name: "state_reason",
