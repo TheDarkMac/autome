@@ -389,6 +389,20 @@ erDiagram
   (`request_id`, méthode, chemin sans query string) + ligne d'accès, en-tête
   `x-request-id` repris ou généré puis renvoyé. Worker : span `run` (`run_id`,
   `workflow_id`) propagé au thread bloquant du moteur, ligne de fin de run.
+- **Traces OpenTelemetry** (#249) : couche `tracing-opentelemetry` ajoutée au
+  subscriber de `autome_core::telemetry` quand `OTEL_EXPORTER_OTLP_ENDPOINT`
+  est défini ; export OTLP HTTP/protobuf par lots (thread du SDK, transport =
+  le `reqwest` bloquant du workspace). Spans : `http_server` (API, nommé
+  `{méthode} {route}`, couche de route), `run_dispatch` (producteur), `run`
+  (consommateur, worker), `node` (moteur), `http_client` (connecteurs :
+  méthode, hôte, statut). Contexte W3C `traceparent` injecté dans les en-têtes
+  du message de run — conservé par l'outbox, le relais et la remise en file —
+  et relu par le worker ; repris d'une requête entrante seulement depuis un
+  proxy de confiance. Deux familles de spans sont séparées : `http_request`
+  reste dans les logs seulement (il précède le routage), les spans imbriqués
+  du run (`node`, `http_client`, …) restent dans la trace seulement — sans
+  quoi une ligne JSON émise dans un nœud perdrait `run_id`. `trace_id` est
+  ajouté aux spans `http_request` et `run` pour aller du log à la trace.
 - **CI** GitHub Actions (fmt + clippy `-D warnings` + tests workspace + build ;
   typecheck/lint/test frontend) — F10.4.
 - **CD** : build & push des images sur GHCR + déploiement Kubernetes gardé

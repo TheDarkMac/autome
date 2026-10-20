@@ -17,7 +17,7 @@ Déclenchée sur **push** et **pull request** vers `main`. Reproduit la
 |---|---|
 | **Backend (Rust)** | services `postgres:16-alpine` + `rabbitmq:3-management-alpine` (healthchecks) · toolchain pinnée + cache · `cargo fmt --all --check` · `cargo clippy --workspace --all-targets -- -D warnings` · `scripts/check-migrations.sh` (migrations + seed + invariants) · `cargo llvm-cov --no-report --workspace --locked -- --nocapture` (tests instrumentés) avec `TEST_DATABASE_URL` / `TEST_AMQP_URL` · garde-fou « aucun test réel sauté » · rapport de couverture (résumé du job + artefact `coverage-backend`) · plancher `--fail-under-lines` / `--fail-under-functions` · `cargo build --workspace --release --locked` |
 | **Frontend (Node)** | Corepack/pnpm · `pnpm install --frozen-lockfile` · `pnpm run typecheck` · `pnpm run lint` · `pnpm run test:coverage` (Vitest, couverture v8 et planchers de `vite.config.ts`) · rapport de couverture (résumé du job + artefact `coverage-frontend`) |
-| **Smoke e2e (Docker Compose)** | `docker/bake-action` construit les images `api` / `worker` depuis le compose (surcharge `docker/compose.ci.yml`, cache `gha` partagé avec la CD) · `docker compose up --no-build --wait api worker` (PostgreSQL + RabbitMQ, healthchecks) · `scripts/compose-smoke.sh` · journaux des conteneurs si échec · `down --volumes` toujours — #216 |
+| **Smoke e2e (Docker Compose)** | `docker/bake-action` construit les images `api` / `worker` depuis le compose (surcharge `docker/compose.ci.yml`, cache `gha` partagé avec la CD) · `docker compose up --no-build --wait api worker` (PostgreSQL + RabbitMQ + Jaeger, healthchecks) · `scripts/compose-smoke.sh` (`SMOKE_REQUIRE_TRACES=1` : trace du run exigée dans Jaeger, #249) · journaux des conteneurs si échec · `down --volumes` toujours — #216 |
 
 - `concurrency` avec `cancel-in-progress` (annule les runs obsolètes).
 - `permissions: contents: read` (moindre privilège).
@@ -51,8 +51,9 @@ Déclenchée sur **push** et **pull request** vers `main`. Reproduit la
   (`postgres:16-alpine`, surchargeable par `PGIMAGE`) : schéma vierge, toutes
   les migrations dans l'ordre + seed de dev, puis invariants (tables, contraintes).
 - Job `smoke` : images réelles sur la stack Compose. Inscription, connexion, workflow,
-  run déclenché via l'API puis exécuté par le worker jusqu'à `succeeded` —
-  couvre le câblage (env, migrations au démarrage, Dockerfiles, healthchecks,
+  run déclenché via l'API puis exécuté par le worker jusqu'à `succeeded`, puis
+  retrouvé dans Jaeger en une seule trace (requête API, mise en file, run et
+  nœud côté worker — #249) — couvre le câblage (env, migrations au démarrage, Dockerfiles, healthchecks,
   sélecteurs de backend). Borné à 45 min : compilation Rust complète des deux
   images à froid (≈ 25 min), seulement les crates du workspace quand
   `Cargo.toml` / `Cargo.lock` n'ont pas changé (≈ 6 min, cargo-chef — #219).
