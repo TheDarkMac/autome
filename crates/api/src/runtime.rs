@@ -12,7 +12,7 @@
 use std::sync::Arc;
 
 use autome_connectors::oauth::{
-    ConnectorTokenStore, InMemoryConnectorTokenStore, OAuthClient, OAuthRegistry,
+    ConnectorTokenStore, InMemoryConnectorTokenStore, OAuthClient, OAuthRegistry, ReconnectNotices,
 };
 use autome_connectors::{
     CredentialService, EgressPolicy, OAuthCredentialService, ReqwestHttpClient,
@@ -88,6 +88,9 @@ pub struct Backends {
     /// Second facteur des comptes (#245), partagé par les comptes et
     /// l'administration.
     pub mfa: Arc<dyn MfaStore>,
+    /// Invalidations de credentials à signaler par email (#265) : le store
+    /// de tokens du service de credentials.
+    pub reconnect_notices: Arc<dyn ReconnectNotices + Send + Sync>,
 }
 
 /// Assemble les backends. En `Postgres`, **un seul pool** est partagé par tous
@@ -113,8 +116,7 @@ pub fn build_backends(
             );
             let workflows: Arc<dyn WorkflowRepository + Send + Sync> =
                 Arc::new(InMemoryWorkflowRepository::new());
-            let tokens: Arc<dyn ConnectorTokenStore + Send + Sync> =
-                Arc::new(InMemoryConnectorTokenStore::new(connector_cipher(config)));
+            let tokens = Arc::new(InMemoryConnectorTokenStore::new(connector_cipher(config)));
             let users = Arc::new(InMemoryUserStore::new(permissions));
             let webhooks: Arc<dyn WebhookEndpointStore> =
                 Arc::new(InMemoryWebhookEndpointStore::new());
@@ -135,7 +137,8 @@ pub fn build_backends(
                 workflows,
                 runs,
                 dispatcher,
-                credentials: build_credential_service(tokens)?,
+                credentials: build_credential_service(tokens.clone())?,
+                reconnect_notices: tokens,
                 users,
                 login_throttle: Arc::new(InMemoryLoginThrottle::new()),
                 webhooks,
@@ -156,15 +159,17 @@ pub fn build_backends(
                 Arc::new(PgRunStateStore::new(pool.clone()));
             let dispatcher: Arc<dyn RunDispatcher + Send + Sync> =
                 Arc::new(QueueRunDispatcher::new(queue, runs.clone()));
+            let tokens = Arc::new(PgConnectorTokenStore::new(
+                pool.clone(),
+                connector_cipher(config),
+            ));
             Ok(Backends {
                 auth,
                 workflows: Arc::new(PgWorkflowRepository::new(pool.clone())),
                 runs,
                 dispatcher,
-                credentials: build_credential_service(Arc::new(PgConnectorTokenStore::new(
-                    pool.clone(),
-                    connector_cipher(config),
-                )))?,
+                credentials: build_credential_service(tokens.clone())?,
+                reconnect_notices: tokens,
                 login_throttle: Arc::new(PgLoginThrottle::new(pool.clone())),
                 webhooks: Arc::new(PgWebhookEndpointStore::new(pool.clone())),
                 schedules: Arc::new(PgTriggerScheduleStore::new(pool.clone())),
