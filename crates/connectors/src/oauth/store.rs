@@ -12,6 +12,10 @@
 //! lecture et réécriture sous **verrou exclusif** par `(user_id, provider_id)`
 //! — entre processus pour PostgreSQL — afin qu'un refresh token ne soit
 //! présenté qu'une fois au provider, même avec plusieurs répliques du worker.
+//!
+//! [`ReconnectNotices`] (#265) : file des invalidations à signaler par email
+//! au propriétaire, chacune réclamée **une fois** même avec plusieurs
+//! répliques de l'API.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -147,10 +151,38 @@ pub trait ConnectorTokenStore {
     fn load_all_by_user(&self, user_id: &str) -> Result<Vec<(String, StoredCredential)>>;
 }
 
+/// Invalidation à signaler au propriétaire de la credential (#265). L'ordre
+/// est celui de la réclamation : la plus ancienne d'abord.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ReconnectNotice {
+    /// Horodatage de l'invalidation (Unix ms) : une notification par valeur.
+    pub invalidated_at_ms: i64,
+    /// Propriétaire de la credential (`claims.sub`).
+    pub user_id: String,
+    /// Provider à reconnecter.
+    pub provider_id: String,
+}
+
+/// Invalidations pas encore signalées à leur propriétaire (#265).
+///
+/// Une invalidation est identifiée par sa date : la réclamer mémorise cette
+/// date comme notifiée. Une reconnexion suivie d'une nouvelle révocation porte
+/// une autre date, donc une nouvelle notification.
+pub trait ReconnectNotices {
+    /// Réclame au plus `limit` invalidations non notifiées, les plus anciennes
+    /// d'abord, et les marque notifiées dans la même opération : deux appels
+    /// concurrents — deux répliques — ne renvoient jamais la même. Envoi
+    /// **au plus une fois** : une notification réclamée puis non envoyée
+    /// n'est pas retentée.
+    fn claim_reconnect_notices(&self, limit: usize) -> Result<Vec<ReconnectNotice>>;
+}
+
 /// Entrée de [`InMemoryConnectorTokenStore`] : enveloppe chiffrée + marque.
 struct Entry {
     envelope: String,
     invalidated: Option<CredentialInvalidation>,
+    /// Date de la dernière invalidation réclamée par [`ReconnectNotices`].
+    notified_at_ms: Option<i64>,
 }
 
 /// Impl in-process : HashMap sous Mutex, valeurs chiffrées via `EnvelopeCipher`.
@@ -199,6 +231,7 @@ impl<K: KeyProvider> ConnectorTokenStore for InMemoryConnectorTokenStore<K> {
                 Entry {
                     envelope,
                     invalidated: None,
+                    notified_at_ms: None,
                 },
             );
         Ok(())
@@ -245,6 +278,7 @@ impl<K: KeyProvider> ConnectorTokenStore for InMemoryConnectorTokenStore<K> {
                 *entry = Entry {
                     envelope: seal_tokens(&self.cipher, &tokens)?,
                     invalidated: None,
+                    notified_at_ms: None,
                 };
             }
             CredentialUpdate::Invalidate(invalidation) => entry.invalidated = Some(invalidation),
@@ -294,6 +328,35 @@ impl<K: KeyProvider> ConnectorTokenStore for InMemoryConnectorTokenStore<K> {
             .collect::<Result<Vec<_>>>()?;
         credentials.sort_by(|(a, _), (b, _)| a.cmp(b));
         Ok(credentials)
+    }
+}
+
+impl<K: KeyProvider> ReconnectNotices for InMemoryConnectorTokenStore<K> {
+    fn claim_reconnect_notices(&self, limit: usize) -> Result<Vec<ReconnectNotice>> {
+        let mut map = self
+            .inner
+            .lock()
+            .map_err(|_| Error::Invalid("token store lock empoisonné".into()))?;
+        let mut pending: Vec<ReconnectNotice> = map
+            .iter()
+            .filter_map(|((user_id, provider_id), entry)| {
+                let at_ms = entry.invalidated.as_ref()?.at_ms;
+                (entry.notified_at_ms != Some(at_ms)).then(|| ReconnectNotice {
+                    user_id: user_id.clone(),
+                    provider_id: provider_id.clone(),
+                    invalidated_at_ms: at_ms,
+                })
+            })
+            .collect();
+        pending.sort();
+        pending.truncate(limit);
+        for notice in &pending {
+            if let Some(entry) = map.get_mut(&(notice.user_id.clone(), notice.provider_id.clone()))
+            {
+                entry.notified_at_ms = Some(notice.invalidated_at_ms);
+            }
+        }
+        Ok(pending)
     }
 }
 
@@ -553,5 +616,69 @@ mod tests {
         locked(&store, CredentialUpdate::Replace(sample_tokens()));
         locked(&store, CredentialUpdate::Invalidate(invalidation()));
         assert!(store.is_empty());
+    }
+
+    fn invalidate(
+        store: &InMemoryConnectorTokenStore<InMemoryKeyProvider>,
+        user: &str,
+        provider: &str,
+        at_ms: i64,
+    ) {
+        store
+            .update_locked(user, provider, &mut |_| {
+                CredentialUpdate::Invalidate(CredentialInvalidation {
+                    at_ms,
+                    reason: "invalid_grant".into(),
+                })
+            })
+            .unwrap();
+    }
+
+    fn notice(user: &str, provider: &str, at_ms: i64) -> ReconnectNotice {
+        ReconnectNotice {
+            user_id: user.into(),
+            provider_id: provider.into(),
+            invalidated_at_ms: at_ms,
+        }
+    }
+
+    #[test]
+    fn reconnect_notices_are_claimed_once_oldest_first() {
+        let store = make_store();
+        for (user, provider) in [("alice", "slack"), ("alice", "github"), ("bob", "notion")] {
+            store.store(user, provider, &sample_tokens()).unwrap();
+        }
+        store.store("carol", "gmail", &sample_tokens()).unwrap();
+        invalidate(&store, "alice", "slack", 300);
+        invalidate(&store, "alice", "github", 100);
+        invalidate(&store, "bob", "notion", 200);
+
+        assert_eq!(
+            store.claim_reconnect_notices(2).unwrap(),
+            vec![notice("alice", "github", 100), notice("bob", "notion", 200)]
+        );
+        assert_eq!(
+            store.claim_reconnect_notices(10).unwrap(),
+            vec![notice("alice", "slack", 300)],
+            "credential saine (carol) jamais réclamée"
+        );
+        assert!(store.claim_reconnect_notices(10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_new_invalidation_after_reconnect_is_notified_again() {
+        let store = make_store();
+        store.store("alice", "slack", &sample_tokens()).unwrap();
+        invalidate(&store, "alice", "slack", 100);
+        assert_eq!(store.claim_reconnect_notices(10).unwrap().len(), 1);
+
+        // Reconnexion puis nouvelle révocation : nouvelle notification.
+        store.store("alice", "slack", &sample_tokens()).unwrap();
+        assert!(store.claim_reconnect_notices(10).unwrap().is_empty());
+        invalidate(&store, "alice", "slack", 500);
+        assert_eq!(
+            store.claim_reconnect_notices(10).unwrap(),
+            vec![notice("alice", "slack", 500)]
+        );
     }
 }
