@@ -212,44 +212,15 @@ pub async fn migrate(config: &Config) -> Result<usize> {
     run_migrations(&pool).await
 }
 
-/// Construit l'[`AuthState`] selon le `mode` :
-/// - `Memory` : [`AuthState::from_config`] (in-memory) ;
-/// - `Postgres` : pool partagé + stores PG. Le pool n'ouvre pas de connexion à
-///   la construction (deadpool connecte à la demande) — les erreurs DB
-///   remontent au premier usage.
-pub fn build_auth_state(config: &Config, mode: PersistenceMode) -> Result<AuthState> {
-    match mode {
-        PersistenceMode::Memory => Ok(AuthState::from_config(config)),
-        PersistenceMode::Postgres => {
-            let pool = connect(&config.database_url)?;
-            Ok(AuthState::new(
-                token_service_from_config(config),
-                Arc::new(PgRevocationStore::new(pool.clone())),
-                Arc::new(PgPermissionStore::new(pool.clone())),
-                // Audit persistant en base ; passer à NoopAuditSink si l'on
-                // veut explicitement désactiver l'audit en prod.
-                Arc::new(PgAuditSink::new(pool)),
-            ))
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn memory_mode_builds_in_memory_auth_state() {
-        let config = Config::load(|_| None).expect("config dev");
-        // Ne doit pas toucher au réseau ni échouer.
-        let _state = build_auth_state(&config, PersistenceMode::Memory).unwrap();
-    }
-
-    #[test]
     fn postgres_mode_builds_without_connecting() {
         // `build_unchecked` ⇒ la construction n'ouvre pas de connexion ; on peut
-        // bâtir l'état avec un DSN qui ne répond pas (les erreurs viendraient au
-        // premier usage, pas ici).
+        // bâtir les backends avec un DSN qui ne répond pas (les erreurs
+        // viendraient au premier usage, pas ici).
         let config = Config::load(|k| match k {
             "APP_PROFILE" => Some("prod".into()),
             "DATABASE_URL" => Some("postgres://u:p@127.0.0.1:1/none".into()),
@@ -258,7 +229,10 @@ mod tests {
             _ => None,
         })
         .expect("config prod");
-        let _state = build_auth_state(&config, PersistenceMode::Postgres).unwrap();
+        let queue = Arc::new(autome_core::InMemoryQueue::new());
+        build_backends(&config, PersistenceMode::Postgres, queue)
+            .map(drop)
+            .unwrap();
     }
 
     #[tokio::test]
