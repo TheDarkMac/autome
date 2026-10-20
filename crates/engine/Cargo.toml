@@ -20,6 +20,8 @@ serde_json = { workspace = true }
 # Empreinte du graphe portée par le point de reprise (#239).
 sha2 = { workspace = true }
 hex = { workspace = true }
+# Span `node` exporté en trace (#249).
+tracing = { workspace = true }
 
 [dev-dependencies]
 # Décodage du `raw` base64url de Gmail dans l'exemple e2e (F12.1).

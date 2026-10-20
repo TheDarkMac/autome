@@ -53,6 +53,12 @@ impl ClientIpPolicy {
         Ok(Self { trusted })
     }
 
+    /// `true` si `peer` est un proxy de confiance : ses en-têtes de
+    /// transfert (`X-Forwarded-For`, `traceparent` — #249) sont repris.
+    pub fn trusts(&self, peer: IpAddr) -> bool {
+        self.is_trusted(peer)
+    }
+
     fn is_trusted(&self, ip: IpAddr) -> bool {
         let ip = canonical(ip);
         self.trusted.iter().any(|net| net.contains(&ip))

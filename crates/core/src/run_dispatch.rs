@@ -19,7 +19,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde_json::{json, Value};
-use tracing::warn;
+use tracing::{warn, Instrument};
 
 use crate::queue::{Message, Queue};
 use crate::run_state::{outbox_idempotency_key, OutboxMessage, RunCheckpoint, RunStateStore};
@@ -109,6 +109,22 @@ impl QueueRunDispatcher {
 impl RunDispatcher for QueueRunDispatcher {
     async fn dispatch(&self, req: DispatchRequest) -> Result<DispatchOutcome> {
         let run_id = (self.id_gen)();
+        // Span producteur (#249) : son contexte voyage dans les en-têtes du
+        // message, le span `run` du worker en sera l'enfant.
+        let span = tracing::info_span!(
+            crate::telemetry::DISPATCH_SPAN,
+            otel.name = "run dispatch",
+            otel.kind = "producer",
+            run_id = %run_id,
+            workflow_id = %req.workflow_id,
+            trigger_type = %req.trigger_type,
+        );
+        self.dispatch_as(run_id, req).instrument(span).await
+    }
+}
+
+impl QueueRunDispatcher {
+    async fn dispatch_as(&self, run_id: String, req: DispatchRequest) -> Result<DispatchOutcome> {
         let checkpoint = RunCheckpoint::queued(
             &run_id,
             &req.workflow_id,
@@ -124,9 +140,12 @@ impl RunDispatcher for QueueRunDispatcher {
             "trigger_type": &req.trigger_type,
             "payload": req.payload,
         });
-        let message = Message::new(body)
+        let mut message = Message::new(body)
             .with_header("idempotency-key", outbox_idempotency_key(&run_id, 0))
             .with_header("trigger-source", &req.trigger_type);
+        // Conservé par l'outbox : un message republié (relais, remise en
+        // file) garde la trace d'origine.
+        crate::telemetry::inject_context(&mut message.headers);
         let outbox = OutboxMessage {
             run_id: run_id.clone(),
             queue: self.queue_name.clone(),
@@ -256,6 +275,71 @@ mod tests {
                 .map(String::as_str),
             Some("manual")
         );
+    }
+
+    #[tokio::test]
+    async fn traced_dispatch_carries_the_trace_context_into_the_outbox_message() {
+        use crate::telemetry::{subscriber, LogFormat};
+        use opentelemetry::trace::TracerProvider as _;
+        use opentelemetry_sdk::trace::{InMemorySpanExporter, SdkTracerProvider};
+
+        let exporter = InMemorySpanExporter::default();
+        let provider = SdkTracerProvider::builder()
+            .with_simple_exporter(exporter.clone())
+            .build();
+        let _default = tracing::subscriber::set_default(subscriber(
+            LogFormat::Json,
+            tracing_subscriber::EnvFilter::new("info"),
+            std::io::sink,
+            Some(provider.tracer("test")),
+        ));
+        let (d, queue, _) = make_dispatcher();
+        d.dispatch(sample_request()).await.unwrap();
+        // Broker coupé : le message reste dans l'outbox, que republient le
+        // relais et les remises en file.
+        let store: Arc<InMemoryRunStateStore> = Arc::new(InMemoryRunStateStore::new());
+        QueueRunDispatcher::new(
+            Arc::new(DownQueue),
+            Arc::clone(&store) as Arc<dyn RunStateStore + Send + Sync>,
+        )
+        .dispatch(sample_request())
+        .await
+        .unwrap();
+
+        let dispatch = exporter
+            .get_finished_spans()
+            .unwrap()
+            .into_iter()
+            .find(|s| {
+                s.name == "run dispatch"
+                    && s.attributes
+                        .iter()
+                        .any(|kv| kv.value.as_str() == "fixed-run-id")
+            })
+            .expect("span de mise en file exporté");
+        assert_eq!(dispatch.span_kind, opentelemetry::trace::SpanKind::Producer);
+        let expected = format!(
+            "00-{}-{}-01",
+            dispatch.span_context.trace_id(),
+            dispatch.span_context.span_id()
+        );
+        let delivery = queue.poll("runs").await.unwrap().expect("message");
+        assert_eq!(delivery.message.headers.get("traceparent"), Some(&expected));
+        let pending = store.pending_outbox(i64::MAX, 10).await.unwrap();
+        assert_eq!(pending.len(), 1);
+        let traceparent = pending[0].message.headers.get("traceparent");
+        assert!(
+            traceparent.is_some_and(|t| t.starts_with("00-") && t != &expected),
+            "contexte de sa propre mise en file : {traceparent:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn untraced_dispatch_adds_no_trace_header() {
+        let (d, queue, _) = make_dispatcher();
+        d.dispatch(sample_request()).await.unwrap();
+        let delivery = queue.poll("runs").await.unwrap().expect("message");
+        assert!(!delivery.message.headers.contains_key("traceparent"));
     }
 
     #[tokio::test]

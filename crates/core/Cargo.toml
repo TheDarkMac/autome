@@ -30,7 +30,15 @@ base64 = { workspace = true }
 # Logs structurés (#176)
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+opentelemetry = { workspace = true }
+opentelemetry_sdk = { workspace = true }
+opentelemetry-otlp = { workspace = true }
+opentelemetry-http = { workspace = true }
+reqwest = { workspace = true }
+tracing-opentelemetry = { workspace = true }
 
 [dev-dependencies]
 # Exécuteur pour les tests des stores asynchrones.
 tokio = { workspace = true, features = ["macros", "rt"] }
+# Exporteur en mémoire des tests de traces (#249).
+opentelemetry_sdk = { workspace = true, features = ["testing"] }

@@ -76,6 +76,13 @@ fn build_router(
     metrics: Arc<Metrics>,
     cors: Vec<HeaderValue>,
 ) -> Router {
+    // `traceparent` entrant repris des seuls proxys de confiance (#249), les
+    // mêmes que pour `X-Forwarded-For`.
+    let proxies = accounts
+        .ip_throttle
+        .as_ref()
+        .map(|ip| ip.policy.clone())
+        .unwrap_or_default();
     let wf_state = WorkflowsState::new(backends.auth.clone(), backends.workflows.clone())
         .with_webhooks(backends.webhooks.clone())
         .with_schedules(backends.schedules.clone());
@@ -119,7 +126,7 @@ fn build_router(
         .merge(metrics_router(metrics.clone()));
     // Traçage en couche externe (toutes les requêtes, 404 et préflights
     // compris), CORS ensuite, métriques par route à l'intérieur.
-    with_request_tracing(with_cors(with_metrics(router, metrics), cors))
+    with_request_tracing(with_cors(with_metrics(router, metrics), cors), proxies)
 }
 
 /// État des webhooks (#202) : clé dérivée d'`ENCRYPTION_KEY`, quota par
@@ -406,8 +413,13 @@ async fn promote_admin_command(
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = Config::from_env()?;
-    let log_format = telemetry::init(config.profile)?;
-    tracing::debug!(log_format = ?log_format, "logs initialisés");
+    // Gardée jusqu'à la fin de `main` : son relâchement vide les traces (#249).
+    let telemetry = telemetry::init(config.profile, "autome-api")?;
+    tracing::debug!(
+        log_format = ?telemetry.log_format(),
+        traces = telemetry.exports_traces(),
+        "logs initialisés"
+    );
 
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
