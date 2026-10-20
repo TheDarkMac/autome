@@ -81,6 +81,8 @@ use utoipa::{
         crate::webhooks::receive,
         crate::webhooks::list_webhooks,
         crate::webhooks::rotate_webhook,
+        // catalogue des actions de connecteur (#257)
+        crate::connector_actions::list_actions,
         // credentials (F7.3)
         crate::credentials::list_providers,
         crate::credentials::start_authorize,
@@ -125,6 +127,7 @@ use utoipa::{
         crate::webhooks::WebhookAccepted,
         crate::webhooks::WebhookInfo,
         crate::webhooks::WebhookList,
+        crate::connector_actions::ConnectorActionsResponse,
         crate::credentials::ProviderDto,
         crate::credentials::ListProvidersResponse,
         crate::credentials::AuthorizeResponse,
@@ -139,6 +142,7 @@ use utoipa::{
         (name = "workflows", description = "CRUD des workflows."),
         (name = "runs", description = "Déclenchement et suivi des runs."),
         (name = "webhooks", description = "Déclencheurs webhook : URL secrètes publiques et leur gestion."),
+        (name = "connectors", description = "Catalogue des actions de connecteur (public)."),
         (name = "credentials", description = "OAuth2 connecteurs tiers."),
     ),
     modifiers(&SecurityAddon),
@@ -234,6 +238,24 @@ mod tests {
         assert!(paths.contains_key("/credentials/{provider}"));
         assert!(paths.contains_key("/credentials/{provider}/authorize"));
         assert!(paths.contains_key("/credentials/{provider}/callback"));
+        // #257 — catalogue des actions de connecteur
+        assert!(paths.contains_key("/connectors/actions"));
+    }
+
+    #[tokio::test]
+    async fn openapi_describes_the_connector_action_schemas() {
+        let spec = fetch_spec().await;
+        let op = &spec["paths"]["/connectors/actions"]["get"];
+        assert!(op["security"].is_null(), "catalogue public : pas de bearer");
+        let schemas = &spec["components"]["schemas"];
+        for name in [
+            "ConnectorActionsResponse",
+            "ActionSchema",
+            "ParamSpec",
+            "ParamKind",
+        ] {
+            assert!(schemas[name].is_object(), "schéma {name} attendu");
+        }
     }
 
     #[tokio::test]
