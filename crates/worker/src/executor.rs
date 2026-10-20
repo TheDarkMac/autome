@@ -991,63 +991,8 @@ mod tests {
         assert!(cp.finished_at_ms.is_some());
     }
 
-    #[tokio::test]
-    async fn the_run_continues_the_trace_of_its_dispatch() {
-        use autome_core::telemetry::{subscriber, LogFormat};
-        use opentelemetry::trace::{SpanId, Status, TracerProvider as _};
-        use opentelemetry_sdk::trace::{InMemorySpanExporter, SdkTracerProvider};
-
-        const TRACE_ID: &str = "4bf92f3577b34da6a3ce929d0e0e4736";
-        const PARENT_ID: &str = "00f067aa0ba902b7";
-        let exporter = InMemorySpanExporter::default();
-        let provider = SdkTracerProvider::builder()
-            .with_simple_exporter(exporter.clone())
-            .build();
-        let _default = tracing::subscriber::set_default(subscriber(
-            LogFormat::Json,
-            tracing_subscriber::EnvFilter::new("info"),
-            std::io::sink,
-            Some(provider.tracer("test")),
-        ));
-        let repo = Arc::new(InMemoryWorkflowRepository::new());
-        let store = Arc::new(InMemoryRunStateStore::new());
-        seed(&repo, &store, unsupported_action("wf-traced"), "run-traced").await;
-        let exec = RunExecutor::new(repo, Arc::clone(&store) as Arc<_>, resolver());
-        let mut delivery = delivery("run-traced", "wf-traced");
-        delivery.message.headers.insert(
-            "traceparent".into(),
-            format!("00-{TRACE_ID}-{PARENT_ID}-01"),
-        );
-
-        assert_eq!(exec.handle(&delivery).await, HandlerVerdict::DeadLetter);
-
-        let spans = exporter.get_finished_spans().unwrap();
-        let find = |name: &str| {
-            spans
-                .iter()
-                .find(|s| s.name == name)
-                .unwrap_or_else(|| panic!("span `{name}` absent : {spans:?}"))
-        };
-        let run = find("run");
-        assert_eq!(run.span_context.trace_id().to_string(), TRACE_ID);
-        assert_eq!(run.parent_span_id.to_string(), PARENT_ID);
-        assert!(
-            matches!(run.status, Status::Error { .. }),
-            "{:?}",
-            run.status
-        );
-        // Les nœuds, exécutés sur le thread bloquant du moteur, sont ses
-        // enfants.
-        for node in ["node trigger", "node slack_send"] {
-            let node = find(node);
-            assert_eq!(node.parent_span_id, run.span_context.span_id());
-            assert_ne!(node.parent_span_id, SpanId::INVALID);
-        }
-        assert!(matches!(
-            find("node slack_send").status,
-            Status::Error { .. }
-        ));
-    }
+    // `the_run_continues_the_trace_of_its_dispatch` vit dans
+    // `tests/run_trace.rs`, seul dans son binaire (#259).
 
     #[tokio::test]
     async fn unsupported_action_fails_and_dead_letters() {
