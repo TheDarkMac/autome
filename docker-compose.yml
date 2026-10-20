@@ -21,9 +21,12 @@
 # Vérification de bout en bout : scripts/compose-smoke.sh.
 # Profil `dev` (secrets de dev tolérés) — ne PAS utiliser tel quel en production.
 
+# Images tierces de la pile pinnées par digest (#263), comme les services du
+# job `backend` de la CI et k8s/ : tag lisible avant `@`, rafraîchir avec
+#   docker buildx imagetools inspect <tag>
 services:
   db:
-    image: postgres:16-alpine
+    image: postgres:16-alpine@sha256:721873c34ceb9f8d8fc265984940dc982404c105f19ad51be9fdc5970a6080ea
     environment:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
@@ -39,7 +42,7 @@ services:
       retries: 10
 
   queue:
-    image: rabbitmq:3-management-alpine
+    image: rabbitmq:3-management-alpine@sha256:606d8c0d6b3c18d1da9afc53bc7cdb2a8d5486df91b5a9830e9e07626c9ae281
     environment:
       RABBITMQ_DEFAULT_USER: guest
       RABBITMQ_DEFAULT_PASS: guest

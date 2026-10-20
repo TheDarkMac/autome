@@ -10,9 +10,10 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 MIG_DIR="$ROOT/migrations"
 CONTAINER="autome-migcheck-$$"
-# Même version majeure que docker-compose.yml et k8s/postgres.yaml ;
-# surchargeable (PGIMAGE=postgres:17-alpine scripts/check-migrations.sh).
-PGIMAGE="${PGIMAGE:-postgres:16-alpine}"
+# Même image (digest compris, #263) que docker-compose.yml, k8s/postgres.yaml
+# et le service du job `backend` ; surchargeable
+# (PGIMAGE=postgres:17-alpine scripts/check-migrations.sh).
+PGIMAGE="${PGIMAGE:-postgres:16-alpine@sha256:721873c34ceb9f8d8fc265984940dc982404c105f19ad51be9fdc5970a6080ea}"
 PGPASS="check"
 PGDB="autome_check"
 
