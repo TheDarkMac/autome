@@ -59,7 +59,7 @@ cp .env.example .env
 | `AUTOME_RUN_TIMEOUT_SECS` | Worker : au-delà, une tentative encore `running` est close en `failed` (min. 60) | `3600` | > durée du plus long run |
 | `AUTOME_RUN_LEASE_SECS` | Worker : bail d'un run en cours (min. 10) ; sans battement depuis ce délai (worker tué), le run est remis en file et repris par un autre worker | `60` | `60` |
 | `AUTOME_SCHEDULER_TICK_SECS` | Worker : période de la boucle des déclencheurs `schedule` / `polling` (s, `0` = désactivée) | `10` | `10` |
-| `AUTOME_SMTP_URL` | Relais SMTP des emails (mot de passe oublié, vérification de l'adresse, invitations) : `smtps://user:pass@hôte` (TLS, 465) ou `smtp://hôte:587?tls=required` (STARTTLS). Contient un mot de passe : à mettre dans un secret | *(non défini : liens journalisés en `dev`)* | **requis pour le mot de passe oublié et les invitations** (sinon 503) et la vérification de l'email (sinon comptes créés vérifiés) |
+| `AUTOME_SMTP_URL` | Relais SMTP des emails (mot de passe oublié, vérification de l'adresse, invitations, connecteurs à reconnecter) : `smtps://user:pass@hôte` (TLS, 465) ou `smtp://hôte:587?tls=required` (STARTTLS). Contient un mot de passe : à mettre dans un secret | *(non défini : liens journalisés en `dev`)* | **requis pour le mot de passe oublié et les invitations** (sinon 503) et la vérification de l'email (sinon comptes créés vérifiés) |
 | `AUTOME_EMAIL_VERIFICATION` | `required` : un compte inscrit ne se connecte qu'après avoir ouvert le lien reçu par email (dès qu'un envoi d'email est possible) ; `off` : comptes créés vérifiés (#231) | `required` | `required` |
 | `AUTOME_SIGNUP` | `open` : inscriptions publiques (`/auth/signup`) ; `invite_only` : comptes créés par invitation d'un administrateur seulement, `/auth/signup` répond 403 `signup closed` (#241). Autre valeur : refus de démarrer | `open` | selon l'instance (`invite_only` pour une équipe fermée) |
 | `AUTOME_PASSWORD_BLOCKLIST_FILE` | Fichier de mots de passe refusés en plus de la liste intégrée (un par ligne, `#` = commentaire, comparaison sans casse) — ex. fuites internes, nom de l'entreprise (#245). Illisible : refus de démarrer | *(non défini)* | facultatif |
@@ -197,9 +197,18 @@ relit au moment du run. Le `provider_id` OAuth doit être le préfixe de l'actio
   la credential est marquée invalide (`invalidated_at_ms`, `invalid_reason`,
   migration `0018`) et les runs suivants échouent **sans rappeler le
   provider** ; `GET /credentials` l'expose (`needs_reconnect`,
-  `invalidated_at_ms` — le motif brut reste en base) et l'onglet Connecteurs
-  affiche le badge « À reconnecter » ; reconnecter le compte
-  (`/credentials/<provider>/authorize`) efface la marque. Une erreur transitoire (réseau, 5xx) ne marque rien : le run
+  `invalidated_at_ms` — le motif brut reste en base) : l'onglet Connecteurs
+  affiche le badge « À reconnecter », l'en-tête de l'application un
+  indicateur qui y mène (relu au changement d'onglet, à la fin d'un run et
+  toutes les 5 min), et l'API envoie au propriétaire un email
+  (`AUTOME_PUBLIC_URL/#connecteurs`, sans le motif du provider) — une fois par
+  invalidation, même avec plusieurs répliques (tâche périodique de 60 s qui
+  réclame la ligne, colonne `reconnect_notified_at_ms`, migration `0024`).
+  Pas d'email vers un compte suspendu ou à l'adresse non vérifiée ; un échec
+  SMTP est journalisé (`email « à reconnecter » non envoyé`) sans nouvel
+  essai ; sans SMTP en `prod`, aucun email. Reconnecter le compte
+  (`/credentials/<provider>/authorize`) efface la marque ; une révocation
+  ultérieure envoie un nouvel email. Une erreur transitoire (réseau, 5xx) ne marque rien : le run
   suivant retente.
 - **Mode mono-tenant (opt-in)** : `AUTOME_CONNECTOR_CREDENTIALS=single_tenant`
   sur le worker rétablit le repli sur un token **global** par provider
