@@ -15,9 +15,9 @@ Déclenchée sur **push** et **pull request** vers `main`. Reproduit la
 
 | Job | Étapes |
 |---|---|
-| **Backend (Rust)** | services `postgres:16-alpine` + `rabbitmq:3-management-alpine` (healthchecks) · toolchain pinnée + cache · `cargo fmt --all --check` · `cargo clippy --workspace --all-targets -- -D warnings` · `scripts/check-migrations.sh` (migrations + seed + invariants) · `cargo llvm-cov --no-report --workspace --locked -- --nocapture` (tests instrumentés) avec `TEST_DATABASE_URL` / `TEST_AMQP_URL` · garde-fou « aucun test réel sauté » · rapport de couverture (résumé du job + artefact `coverage-backend`) · plancher `--fail-under-lines` / `--fail-under-functions` · `cargo build --workspace --release --locked` |
+| **Backend (Rust)** | services `postgres:16-alpine` + `rabbitmq:3-management-alpine` pinnés par digest (healthchecks, #263) · toolchain pinnée + cache · `cargo fmt --all --check` · `cargo clippy --workspace --all-targets -- -D warnings` · `scripts/check-migrations.sh` (migrations + seed + invariants) · `cargo llvm-cov --no-report --workspace --locked -- --nocapture` (tests instrumentés) avec `TEST_DATABASE_URL` / `TEST_AMQP_URL` / `TEST_HTTP_URL` · garde-fou « aucun test réel sauté » (PostgreSQL, RabbitMQ, réseau) · rapport de couverture (résumé du job + artefact `coverage-backend`) · plancher `--fail-under-lines` / `--fail-under-functions` · `cargo build --workspace --release --locked` |
 | **Frontend (Node)** | Corepack/pnpm · `pnpm install --frozen-lockfile` · `pnpm run typecheck` · `pnpm run lint` · `pnpm run test:coverage` (Vitest, couverture v8 et planchers de `vite.config.ts`) · rapport de couverture (résumé du job + artefact `coverage-frontend`) |
-| **Smoke e2e (Docker Compose)** | `docker/bake-action` construit les images `api` / `worker` depuis le compose (surcharge `docker/compose.ci.yml`, cache `gha` partagé avec la CD) · `docker compose up --no-build --wait api worker` (PostgreSQL + RabbitMQ + Jaeger, healthchecks) · `scripts/compose-smoke.sh` (`SMOKE_REQUIRE_TRACES=1` : trace du run exigée dans Jaeger, #249) · journaux des conteneurs si échec · `down --volumes` toujours — #216 |
+| **Smoke e2e (Docker Compose)** | `docker/bake-action` construit les images `api` / `worker` depuis le compose (surcharge `docker/compose.ci.yml`), deux cibles de `docker/backend.Dockerfile` dont l'étage builder est construit une fois (cache `gha`, scope `backend` partagé avec la CD, #263) · `docker compose up --no-build --wait api worker` (PostgreSQL + RabbitMQ + Jaeger, healthchecks) · `scripts/compose-smoke.sh` (`SMOKE_REQUIRE_TRACES=1` : trace du run exigée dans Jaeger, #249) · journaux des conteneurs si échec · `down --volumes` toujours — #216 |
 
 - `concurrency` avec `cancel-in-progress` (annule les runs obsolètes).
 - `permissions: contents: read` (moindre privilège).
@@ -65,7 +65,7 @@ Déclenchée **après une CI verte** (`workflow_run` sur `main`), sur les **tags
 
 | Job | Rôle |
 |---|---|
-| **build-push** | matrice `api` / `worker` / `frontend` → `docker/build-push-action`, publication sur **GHCR** (`ghcr.io/<owner>/autome-*`) via `GITHUB_TOKEN` (`packages: write`), tags via `metadata-action`, cache `gha` |
+| **build-push** | matrice `api` / `worker` / `frontend` → `docker/build-push-action`, publication sur **GHCR** (`ghcr.io/<owner>/autome-*`) via `GITHUB_TOKEN` (`packages: write`), tags via `metadata-action`, cache `gha` (scope `backend` de la CI pour `api` / `worker`, écrit par `api` seulement ; `frontend`) |
 | **deploy** | `environment: production`, épingle l'image (`sha-<court>`) dans `k8s/`, `kubectl kustomize` (validation systématique), puis `kubectl apply -k` **uniquement si** le secret `KUBE_CONFIG` est présent (sinon dry-run documenté) |
 
 Garde-fous : `build-push` ne s'exécute pas si la CI déclenchante a échoué ;
@@ -79,12 +79,13 @@ protégé + secret optionnel.
 | Aspect | État | Référence |
 |---|---|---|
 | Lockfile Rust | `Cargo.lock` **versionné** | racine du dépôt |
-| Builds Rust verrouillés | `--locked` en CI (`clippy`, `llvm-cov`, `build`) **et** dans les Dockerfiles | `ci.yml`, `docker/*.Dockerfile` |
+| Builds Rust verrouillés | `--locked` en CI (`clippy`, `llvm-cov`, `build`) **et** dans les Dockerfiles | `ci.yml`, `docker/backend.Dockerfile` |
 | Lockfile frontend | `pnpm-lock.yaml` **versionné** + `pnpm install --frozen-lockfile` (CI + Docker) | `frontend/`, `ci.yml`, `frontend/Dockerfile` |
 | Toolchain Rust | **pinnée 1.90** (CI `dtolnay/rust-toolchain@1.90` + images `rust:1.90-bookworm`) | `ci.yml`, `docker/*` |
 | MSRV | `rust-version = "1.85"` (plancher edition2024) | `Cargo.toml` |
 | Node / pnpm | Node **20** (CI `setup-node@v4` + image `node:20-…`) ; pnpm via Corepack (`packageManager` pinné) | `ci.yml`, `frontend/` |
-| Images de base | pinnées par **digest `@sha256:`** (tag lisible en commentaire) | `docker/*.Dockerfile`, `frontend/Dockerfile` |
+| Images de base | pinnées par **digest `@sha256:`** (tag lisible en commentaire) | `docker/backend.Dockerfile`, `frontend/Dockerfile` |
+| Images tierces de la pile | `postgres`, `rabbitmq` pinnées par **digest** (#263) | `ci.yml` (services), `docker-compose.yml`, `k8s/`, `scripts/check-migrations.sh` |
 
 > La cohérence toolchain CI ↔ images (1.90) garantit que « vert en CI » ⇒
 > « build identique en conteneur ».
@@ -102,8 +103,34 @@ protégé + secret optionnel.
   puis `COPY . .` et `cargo build --release --locked`). Modifier un `.rs` ne
   change pas la recette : la couche des dépendances compilées est reprise du
   cache (local ou `gha`, `mode=max`) et seuls les crates du workspace sont
-  recompilés. Rafraîchir cargo-chef : changer la version dans les deux
-  Dockerfiles (`docker/api.Dockerfile`, `docker/worker.Dockerfile`).
+  recompilés. Rafraîchir cargo-chef : changer la version dans
+  `docker/backend.Dockerfile`.
+- **Un Dockerfile, deux cibles** (#263) : `docker/backend.Dockerfile` cuit et
+  compile `autome-api` et `autome-worker` dans un même étage `builder` ; les
+  cibles `api` et `worker` n'en copient que leur binaire. Dépendances et
+  crates du workspace sont compilés une fois pour les deux, `bake` ne
+  construit le builder qu'une fois, et un seul scope de cache (`backend`)
+  sert la CI et la CD.
+- **Contexte de build en liste blanche** (`.dockerignore`, #263) :
+  `Cargo.toml`, `Cargo.lock`, `crates/`, `migrations/`. Un commit de doc, de
+  frontend ou de manifests ne change pas le contexte, donc ne recompile pas
+  les binaires (avant : 254 s de rebuild pour un commit de ROADMAP).
+- **Profil release sans LTO entre crates** (#263, `Cargo.toml`) : l'édition
+  des liens en `lto = "thin"` dominait chaque rebuild. Même profil pour la CI
+  et la prod (le smoke teste le binaire livré). Mesure locale, 4 cœurs,
+  `cargo build --release -p autome-api -p autome-worker` :
+
+  | Profil | À froid | `core` modifié | `worker` modifié | api / worker |
+  |---|---|---|---|---|
+  | `lto = "thin"`, `codegen-units = 1` (avant) | 1591 s | 485 s | 167 s | 14,1 / 10,0 Mo |
+  | `lto = "thin"`, `codegen-units = 16` | 1426 s | 690 s | 240 s | 17,7 / 12,0 Mo |
+  | **sans LTO, `codegen-units = 1`** (retenu) | **784 s** | **207 s** | **20 s** | **13,5 / 9,7 Mo** |
+  | sans LTO, `codegen-units = 16` | 680 s | 198 s | 25 s | 17,1 / 11,8 Mo |
+
+  Pas de benchmark d'exécution dans le dépôt : le coût est jugé faible pour
+  un service surtout en attente réseau / base, dont le code chaud (argon2,
+  ring, serde) est optimisé dans son propre crate. À remesurer si un
+  chemin CPU apparaît.
 - **Bases pinnées par digest `@sha256:`** (#162) : `rust:1.90-bookworm`,
   `debian:bookworm-slim`, `node:20-bookworm-slim`, `nginx:1.27-alpine` — le tag
   lisible reste en commentaire. Rafraîchir un digest :
@@ -140,6 +167,7 @@ protégé + secret optionnel.
 - [x] CI déclenchée sur push **et** PR vers `main`.
 - [x] Smoke de bout en bout sur la stack Compose (images réelles, PostgreSQL, RabbitMQ) — #216.
 - [x] Tests PostgreSQL/RabbitMQ réels (`TEST_DATABASE_URL` / `TEST_AMQP_URL`) exécutés en CI, avec garde-fou contre le saut silencieux — #218.
+- [x] Test réseau de `ReqwestHttpClient` (`TEST_HTTP_URL`, cible HTTPS publique) exécuté en CI, sous le même garde-fou — #263.
 - [x] Migrations + seed validés sur un PostgreSQL vierge en CI (`scripts/check-migrations.sh`) — #218.
 
 **Livraison (CD)**
@@ -155,6 +183,8 @@ protégé + secret optionnel.
 - [x] Frontend : lockfile `pnpm-lock.yaml` versionné + `pnpm install --frozen-lockfile` (CI + Dockerfile) — #162.
 - [x] Images de base pinnées par **digest** `@sha256:` (CI/Docker) — #162.
 - [x] Dépendances Cargo compilées dans une couche Docker réutilisée tant que `Cargo.toml` / `Cargo.lock` ne changent pas (cargo-chef pinné) — #219.
+- [x] Images des services de la CI, de compose et de `k8s/` pinnées par digest — #263.
+- [x] Une compilation Rust pour les deux images, un seul scope de cache, contexte de build réduit à ce que lit `cargo` — #263.
 
 ---
 
@@ -167,7 +197,8 @@ protégé + secret optionnel.
 | 3 | `cargo fmt`/`clippy` sans `--locked` | ✅ **Résolu (#162)** : `--locked` ajouté à l'étape `clippy` (la CI échoue désormais si `Cargo.lock` n'est pas en phase dès le lint). |
 | 4 | **Branchement runtime** (PostgreSQL/RabbitMQ) non câblé dans les binaires | ✅ Résolu — [dette #107](https://github.com/TheDarkMac/autome/issues/107) close (API + worker branchés sur PG/RabbitMQ via `AUTOME_PERSISTENCE`/`AUTOME_QUEUE`). |
 | 5 | **Aucun smoke de bout en bout en CI** : `scripts/compose-smoke.sh` n'était lancé qu'à la main | ✅ **Résolu (#216)** : job `smoke` (images construites, `compose up --wait`, smoke, journaux si échec). La compilation des dépendances, refaite à chaque changement de source (`COPY . .` invalidait le cache), est isolée dans un étage cargo-chef réutilisé par le cache `gha` de la CI et de la CD (#219) : rebuild après modification d'un `.rs` mesuré à 386 s au lieu de 1918 s en local (4 cœurs). |
-| 6 | **Tests PostgreSQL/RabbitMQ réels jamais exécutés en CI** : gatés par `TEST_DATABASE_URL` / `TEST_AMQP_URL`, ils passaient « au vert » sans rien exécuter ; `scripts/check-migrations.sh` (deux fois réparé après coup, #186 et #208) n'était lancé qu'à la main | ✅ **Résolu (#218)** : services du job `backend`, variables au niveau du job, garde-fou sur la sortie des tests, script de migrations en CI. Reste : images des services par tag (comme `docker-compose.yml` et `k8s/`), test réseau `TEST_HTTP_URL` (connectors) toujours sauté en CI. |
+| 6 | **Tests PostgreSQL/RabbitMQ réels jamais exécutés en CI** : gatés par `TEST_DATABASE_URL` / `TEST_AMQP_URL`, ils passaient « au vert » sans rien exécuter ; `scripts/check-migrations.sh` (deux fois réparé après coup, #186 et #208) n'était lancé qu'à la main | ✅ **Résolu (#218)** : services du job `backend`, variables au niveau du job, garde-fou sur la sortie des tests, script de migrations en CI. Les restes (images des services par tag, test réseau `TEST_HTTP_URL` sauté) sont soldés par #263. |
+| 7 | **Rebuild des images coûteux** (#219 l'avait ramené à 386 s) : un scope de cache `gha` par image, donc dépendances et crates du workspace compilés deux fois ; contexte de build ouvert (`.dockerignore` n'excluait `*.md` qu'à la racine) ; édition des liens en LTO thin | ✅ **Résolu (#263)** : `docker/backend.Dockerfile` à deux cibles et un scope `backend`, `.dockerignore` en liste blanche, profil release sans LTO entre crates (§3). |
 
 ---
 
