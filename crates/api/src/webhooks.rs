@@ -126,7 +126,7 @@ impl WebhookKeys {
             Hmac::<Sha256>::new_from_slice(&self.key).expect("HMAC accepte toute longueur");
         mac.update(label);
         mac.update(salt);
-        hex(&mac.finalize().into_bytes())
+        hex::encode(mac.finalize().into_bytes())
     }
 
     /// Token de l'URL `/hooks/{token}` de l'endpoint de sel `salt`.
@@ -146,10 +146,6 @@ impl WebhookKeys {
         let token_hash = token_hash(&self.token(&salt));
         EndpointSecret { salt, token_hash }
     }
-}
-
-fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// Clé de résolution d'un token : son SHA-256.
@@ -452,7 +448,7 @@ pub async fn receive(
         .ok_or(WebhookError::NotFound)?;
 
     // Quota avant tout travail : lecture du workflow, vérification HMAC.
-    let throttle_key = format!("webhook:{}", hex(&hash));
+    let throttle_key = format!("webhook:{}", hex::encode(&hash));
     if let LoginAttempt::Blocked { retry_after_secs } = state
         .throttle
         .begin_attempt(&throttle_key, state.max_per_window, state.now())
@@ -870,7 +866,7 @@ mod tests {
     fn github_signature(secret: &str, body: &[u8]) -> String {
         let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).unwrap();
         mac.update(body);
-        format!("sha256={}", hex(&mac.finalize().into_bytes()))
+        format!("sha256={}", hex::encode(mac.finalize().into_bytes()))
     }
 
     #[tokio::test]

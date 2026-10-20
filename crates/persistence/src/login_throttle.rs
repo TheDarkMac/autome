@@ -20,10 +20,7 @@ fn storage_err(context: &str, e: impl std::fmt::Display) -> Error {
 
 /// Clé de la ligne : SHA-256 (hex) de la clé du compteur.
 fn key_hash(key: &str) -> String {
-    Sha256::digest(key.as_bytes())
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect()
+    hex::encode(Sha256::digest(key.as_bytes()))
 }
 
 /// Compteurs de tentatives persistés dans PostgreSQL.

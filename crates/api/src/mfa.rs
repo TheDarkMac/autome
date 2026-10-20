@@ -77,7 +77,7 @@ use crate::accounts::{
     AccountsState, TokenResponse, ACCOUNT_DISABLED, EMAIL_NOT_VERIFIED, LOGIN_IP_SCOPE,
 };
 use crate::auth::AuthenticatedUser;
-use crate::signed_link::{hex, LinkTokens, ParsedLinkToken};
+use crate::signed_link::{LinkTokens, ParsedLinkToken};
 
 /// Durée d'un pas TOTP (secondes).
 pub const TOTP_PERIOD: i64 = 30;
@@ -346,7 +346,7 @@ impl Mfa {
         let mut mac = Hmac::<Sha256>::new_from_slice(&self.keys.recovery)
             .expect("HMAC accepte toute longueur");
         mac.update(normalized.as_bytes());
-        hex(&mac.finalize().into_bytes())
+        hex::encode(mac.finalize().into_bytes())
     }
 
     fn recovery_hashes(&self, codes: &[String]) -> Vec<String> {

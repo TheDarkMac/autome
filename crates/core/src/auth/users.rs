@@ -57,8 +57,7 @@ pub const UNUSABLE_PASSWORD_PREFIX: &str = "!";
 pub fn unusable_password_hash() -> String {
     let mut b = [0u8; 16];
     rand::thread_rng().fill_bytes(&mut b);
-    let hex: String = b.iter().map(|x| format!("{x:02x}")).collect();
-    format!("{UNUSABLE_PASSWORD_PREFIX}invited${hex}")
+    format!("{UNUSABLE_PASSWORD_PREFIX}invited${}", hex::encode(b))
 }
 
 /// `false` pour un hash inutilisable ([`unusable_password_hash`]) : le compte
@@ -221,7 +220,7 @@ fn fresh_user_id() -> String {
     rand::thread_rng().fill_bytes(&mut b);
     b[6] = (b[6] & 0x0f) | 0x40;
     b[8] = (b[8] & 0x3f) | 0x80;
-    let hex: String = b.iter().map(|x| format!("{x:02x}")).collect();
+    let hex = hex::encode(b);
     format!(
         "{}-{}-{}-{}-{}",
         &hex[0..8],

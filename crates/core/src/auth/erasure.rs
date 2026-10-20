@@ -29,8 +29,7 @@ pub const ERASED_PREFIX: &str = "erased:";
 pub fn erasure_pseudonym() -> String {
     let mut b = [0u8; 8];
     rand::thread_rng().fill_bytes(&mut b);
-    let hex: String = b.iter().map(|x| format!("{x:02x}")).collect();
-    format!("{ERASED_PREFIX}{hex}")
+    format!("{ERASED_PREFIX}{}", hex::encode(b))
 }
 
 /// Bilan d'un effacement : ce qui a été supprimé ou pseudonymisé.

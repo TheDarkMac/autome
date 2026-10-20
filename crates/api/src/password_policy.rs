@@ -178,7 +178,7 @@ impl HibpRange {
 /// `(préfixe de 5, suffixe de 35)`.
 fn sha1_range(password: &str) -> (String, String) {
     let digest = Sha1::digest(password.as_bytes());
-    let hex: String = digest.iter().map(|b| format!("{b:02X}")).collect();
+    let hex = hex::encode_upper(digest);
     let (prefix, suffix) = hex.split_at(5);
     (prefix.to_string(), suffix.to_string())
 }

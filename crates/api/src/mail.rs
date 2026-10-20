@@ -108,8 +108,7 @@ impl Mailer for SmtpMailer {
 fn message_id(domain: &str) -> String {
     let mut bytes = [0u8; 16];
     rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut bytes);
-    let id: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
-    format!("<{id}@{domain}>")
+    format!("<{}@{domain}>", hex::encode(bytes))
 }
 
 /// Profil `dev` sans SMTP : le message (lien compris) est écrit dans les
