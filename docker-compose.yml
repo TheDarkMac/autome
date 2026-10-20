@@ -11,6 +11,7 @@
 #   - frontend : SPA servie par nginx (http://localhost:8081)
 #   - prometheus : scrape /metrics de l'api et du worker (http://localhost:9090) — F10.6, #235
 #   - grafana    : dashboards provisionnés (http://localhost:3000, admin/admin)
+#   - jaeger     : traces OpenTelemetry de l'api et du worker (http://localhost:16686) — #249
 #
 # Les hôtes inter-services sont les NOMS de services Docker (`db`, `queue`).
 # L'API et le worker partagent PostgreSQL (stores : workflows, runs, comptes,
@@ -71,6 +72,8 @@ services:
       # Le frontend (:8081) et Vite (:5173) appellent l'API depuis une autre
       # origine : sans CORS, le navigateur bloque tout (#225).
       AUTOME_CORS_ORIGINS: http://localhost:8081,http://localhost:5173
+      # Traces OTLP/HTTP vers Jaeger (#249) ; retirer la variable coupe l'export.
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4318
     ports:
       - "8080:8080"
     # Arrêt gracieux (#194) : retrait (5 s) + drain (≤ 20 s) avant SIGKILL.
@@ -87,6 +90,9 @@ services:
         condition: service_healthy
       queue:
         condition: service_healthy
+      # Démarré, sans plus : l'API tourne même si le collecteur est absent.
+      jaeger:
+        condition: service_started
 
   worker:
     build:
@@ -100,6 +106,9 @@ services:
       AUTOME_QUEUE: rabbitmq
       # Même clé que l'API : le worker déchiffre les tokens OAuth des connecteurs.
       ENCRYPTION_KEY: dev-insecure-encryption-key
+      # Traces OTLP/HTTP vers Jaeger (#249) : le run prolonge la trace de la
+      # requête qui l'a déclenché.
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4318
     # Arrêt borné (#200) : 25 s pour finir les runs en cours, puis clôture.
     stop_grace_period: 35s
     healthcheck:
@@ -116,6 +125,8 @@ services:
       # prête, pas seulement lancée (#192).
       api:
         condition: service_healthy
+      jaeger:
+        condition: service_started
 
   frontend:
     build:
@@ -159,6 +170,15 @@ services:
       - "3000:3000"
     depends_on:
       - prometheus
+
+  # Traces (#249) : Jaeger tout-en-un, stockage en mémoire (perdu au
+  # redémarrage). Reçoit l'OTLP/HTTP de l'api et du worker sur 4318 (publié
+  # pour un binaire lancé hors compose), UI et API de recherche sur 16686.
+  jaeger:
+    image: jaegertracing/jaeger:2.22.0
+    ports:
+      - "16686:16686"  # UI
+      - "4318:4318"    # OTLP/HTTP
 
 volumes:
   pgdata:

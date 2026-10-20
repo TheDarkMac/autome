@@ -238,13 +238,17 @@ jobs:
             worker.cache-from=type=gha,scope=worker
             worker.cache-to=type=gha,mode=max,scope=worker
 
-      # db + queue démarrés comme dépendances ; `--wait` attend les healthchecks
-      # (api : `/readyz` = migrations appliquées, base et broker joignables).
+      # db + queue (+ jaeger, #249) démarrés comme dépendances ; `--wait`
+      # attend les healthchecks (api : `/readyz` = migrations appliquées, base
+      # et broker joignables).
       - name: Start stack
         run: docker compose up --no-build --wait --wait-timeout 180 api worker
 
-      # Un run déclenché via l'API doit être exécuté par le worker (`succeeded`).
+      # Un run déclenché via l'API doit être exécuté par le worker (`succeeded`)
+      # et former dans Jaeger une trace complète API → worker (#249).
       - name: Smoke
+        env:
+          SMOKE_REQUIRE_TRACES: "1"
         run: scripts/compose-smoke.sh
 
       - name: Container logs
