@@ -1,32 +1,21 @@
-# Contexte de build minimal (F10.1) — on n'envoie au daemon que les
-# sources nécessaires à `cargo build`. Les artefacts et dépendances
-# volumineux sont reconstruits dans l'étape builder.
+# Contexte de build du backend Rust (`docker/backend.Dockerfile`, F10.1).
+#
+# Liste blanche (#263) : on n'envoie au daemon que ce que lit `cargo build`.
+# Tout fichier en plus entre dans `COPY . .` et invalide la couche du
+# workspace : un commit de doc, de frontend ou de manifests k8s
+# reconstruisait les deux binaires. Un crate qui lit un fichier hors de
+# `crates/` à la compilation (`include_str!`…) doit l'ajouter ici.
+# Le frontend a son propre contexte (`frontend/`, `frontend/.dockerignore`).
 
-# Artefacts de compilation Rust
-/target
+*
+
+# Workspace Cargo
+!Cargo.toml
+!Cargo.lock
+!crates/
+
+# Migrations SQL embarquées (`crates/persistence/src/migrations.rs`)
+!migrations/
+
+# Artefacts de compilation locaux (un `target/` par crate éventuel)
 **/target
-
-# Frontend : node_modules + build (le frontend a son propre Dockerfile)
-/frontend/node_modules
-/frontend/dist
-
-# Git & métadonnées
-.git
-.gitignore
-.github
-
-# DevOps (pas nécessaire à la compilation des binaires)
-/docker
-docker-compose*.yml
-**/Dockerfile
-.dockerignore
-
-# Éditeurs / OS
-.vscode
-.idea
-**/*.swp
-.DS_Store
-
-# Docs & divers
-*.md
-LICENSE
