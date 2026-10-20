@@ -2,14 +2,15 @@
 //! PostgreSQL. Gaté par `TEST_DATABASE_URL` (skip-pass sinon). Cf.
 //! `pg_revocation.rs` pour lancer un conteneur jetable.
 //!
-//! Le schéma est créé à partir des migrations **réelles** `0011` et `0018`
-//! (embarquées dans [`MIGRATIONS`]) : le test valide aussi le DDL.
+//! Le schéma est créé à partir des migrations **réelles** `0011`, `0018` et
+//! `0024` (embarquées dans [`MIGRATIONS`]) : le test valide aussi le DDL.
 //!
 //! Runtime **multi-thread** : le trait est synchrone et ponte vers l'async via
 //! `block_in_place` (cf. module `connector_tokens`).
 
 use autome_connectors::oauth::{
-    ConnectorTokenStore, CredentialInvalidation, CredentialUpdate, StoredCredential, TokenSet,
+    ConnectorTokenStore, CredentialInvalidation, CredentialUpdate, ReconnectNotice,
+    ReconnectNotices, StoredCredential, TokenSet,
 };
 use autome_core::{EnvelopeCipher, InMemoryKeyProvider};
 use autome_persistence::{connect, PgConnectorTokenStore, PgPool, MIGRATIONS};
@@ -34,14 +35,15 @@ async fn setup() -> Option<PgPool> {
                     [
                         "0011_connector_tokens.sql",
                         "0018_connector_token_invalidation.sql",
+                        "0024_connector_token_reconnect_notice.sql",
                     ]
                     .contains(name)
                 })
                 .map(|(_, sql)| *sql)
                 .collect();
             assert!(
-                ddl.contains("invalidated_at_ms"),
-                "migration 0018 embarquée"
+                ddl.contains("reconnect_notified_at_ms"),
+                "migration 0024 embarquée"
             );
             let client = pool.get().await.expect("connexion");
             client
@@ -331,4 +333,125 @@ async fn load_all_by_user_reads_tokens_and_marks_in_one_pass() {
     let hugo = store.load_all_by_user("hugo").unwrap();
     assert_eq!(hugo[0].1.invalidated, None);
     assert_eq!(hugo[0].1.tokens, tokens("ya29-new"));
+}
+
+fn invalidate(store: &PgConnectorTokenStore<InMemoryKeyProvider>, user: &str, at_ms: i64) {
+    store
+        .update_locked(user, "slack", &mut |_| {
+            CredentialUpdate::Invalidate(CredentialInvalidation {
+                at_ms,
+                reason: "invalid_grant".into(),
+            })
+        })
+        .unwrap();
+}
+
+/// La réclamation porte sur toute la table : les tests qui réclament passent
+/// l'un après l'autre.
+static CLAIMS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Réclamations de ce test seulement : les autres tests du binaire posent
+/// aussi des marques (plus récentes, `1_700_000_000_000`).
+fn claimed_among(notices: Vec<ReconnectNotice>, users: &[&str]) -> Vec<(String, i64)> {
+    notices
+        .into_iter()
+        .filter(|n| users.contains(&n.user_id.as_str()))
+        .map(|n| (n.user_id, n.invalidated_at_ms))
+        .collect()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn reconnect_notices_are_claimed_once_and_again_after_a_new_invalidation() {
+    let Some(pool) = setup().await else {
+        eprintln!("TEST_DATABASE_URL absent → test PostgreSQL sauté");
+        return;
+    };
+    let _claims = CLAIMS.lock().await;
+    let store = PgConnectorTokenStore::new(pool, cipher(6));
+    let users = ["jade", "karl", "lea"];
+    for user in users {
+        store.store(user, "slack", &tokens("xoxb")).unwrap();
+    }
+    // Dates minuscules : les plus anciennes de la table, réclamées d'abord.
+    invalidate(&store, "karl", 2);
+    invalidate(&store, "jade", 1);
+
+    let first = store.claim_reconnect_notices(2).unwrap();
+    assert_eq!(
+        first,
+        [
+            ReconnectNotice {
+                invalidated_at_ms: 1,
+                user_id: "jade".into(),
+                provider_id: "slack".into(),
+            },
+            ReconnectNotice {
+                invalidated_at_ms: 2,
+                user_id: "karl".into(),
+                provider_id: "slack".into(),
+            },
+        ]
+    );
+    assert!(
+        claimed_among(store.claim_reconnect_notices(1000).unwrap(), &users).is_empty(),
+        "déjà réclamées ; lea, saine, jamais"
+    );
+
+    // Reconnexion puis nouvelle révocation : nouvelle notification.
+    store.store("jade", "slack", &tokens("xoxb-new")).unwrap();
+    assert!(claimed_among(store.claim_reconnect_notices(1000).unwrap(), &users).is_empty());
+    invalidate(&store, "jade", 3);
+    assert_eq!(
+        claimed_among(store.claim_reconnect_notices(1000).unwrap(), &users),
+        [("jade".to_string(), 3)]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_pools_never_claim_the_same_reconnect_notice() {
+    let Some(pool) = setup().await else {
+        eprintln!("TEST_DATABASE_URL absent → test PostgreSQL sauté");
+        return;
+    };
+    let _claims = CLAIMS.lock().await;
+    let url = std::env::var("TEST_DATABASE_URL").unwrap();
+    let a = std::sync::Arc::new(PgConnectorTokenStore::new(pool, cipher(8)));
+    let b = std::sync::Arc::new(PgConnectorTokenStore::new(
+        connect(&url).unwrap(),
+        cipher(8),
+    ));
+    let users: Vec<String> = (0..20).map(|i| format!("mona-{i:02}")).collect();
+    for user in &users {
+        a.store(user, "slack", &tokens("xoxb")).unwrap();
+        invalidate(&a, user, 10);
+    }
+
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let claim = |store: std::sync::Arc<PgConnectorTokenStore<InMemoryKeyProvider>>,
+                 barrier: std::sync::Arc<std::sync::Barrier>| {
+        tokio::task::spawn_blocking(move || {
+            barrier.wait();
+            let mut claimed = Vec::new();
+            loop {
+                let batch = store.claim_reconnect_notices(3).unwrap();
+                if batch.is_empty() {
+                    return claimed;
+                }
+                claimed.extend(batch);
+            }
+        })
+    };
+    let (ra, rb) = (
+        claim(std::sync::Arc::clone(&a), std::sync::Arc::clone(&barrier)),
+        claim(b, barrier),
+    );
+    let refs: Vec<&str> = users.iter().map(String::as_str).collect();
+    let mut all = claimed_among(ra.await.unwrap(), &refs);
+    all.extend(claimed_among(rb.await.unwrap(), &refs));
+    all.sort();
+    let expected: Vec<(String, i64)> = users.iter().map(|u| (u.clone(), 10)).collect();
+    assert_eq!(
+        all, expected,
+        "chaque invalidation réclamée exactement une fois"
+    );
 }

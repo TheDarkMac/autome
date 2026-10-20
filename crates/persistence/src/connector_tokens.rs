@@ -29,13 +29,21 @@
 //! La connexion et la transaction sont tenues entre plusieurs `block_on`
 //! successifs : la décision (appel HTTP **bloquant** au provider) s'exécute
 //! hors du contexte async, où un client bloquant serait interdit.
+//!
+//! ## Notifications « à reconnecter » (#265)
+//!
+//! [`ReconnectNotices`] réclame les invalidations non notifiées en **une**
+//! requête (`UPDATE … WHERE … IN (SELECT … FOR UPDATE SKIP LOCKED) RETURNING`,
+//! migration `0024`) : deux répliques de l'API ne réclament jamais la même, et
+//! une ligne verrouillée par un rafraîchissement en cours est laissée au tour
+//! suivant au lieu de bloquer.
 
 use std::future::Future;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use autome_connectors::oauth::{
     open_tokens, seal_tokens, ConnectorTokenStore, CredentialInvalidation, CredentialUpdate,
-    StoredCredential, TokenSet,
+    ReconnectNotice, ReconnectNotices, StoredCredential, TokenSet,
 };
 use autome_core::{EnvelopeCipher, Error, KeyProvider, Result};
 use tokio::runtime::Handle;
@@ -253,6 +261,41 @@ impl<K: KeyProvider> ConnectorTokenStore for PgConnectorTokenStore<K> {
                 ))
             })
             .collect()
+    }
+}
+
+impl<K: KeyProvider> ReconnectNotices for PgConnectorTokenStore<K> {
+    fn claim_reconnect_notices(&self, limit: usize) -> Result<Vec<ReconnectNotice>> {
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let rows = block_on(async {
+            let client = self.pool.get().await.map_err(|e| storage_err("pool", e))?;
+            client
+                .query(
+                    "UPDATE connector_tokens AS t \
+                     SET reconnect_notified_at_ms = t.invalidated_at_ms \
+                     FROM (SELECT user_id, provider_id FROM connector_tokens \
+                           WHERE invalidated_at_ms IS NOT NULL \
+                             AND reconnect_notified_at_ms IS DISTINCT FROM invalidated_at_ms \
+                           ORDER BY invalidated_at_ms, user_id, provider_id \
+                           LIMIT $1 FOR UPDATE SKIP LOCKED) AS pending \
+                     WHERE t.user_id = pending.user_id AND t.provider_id = pending.provider_id \
+                     RETURNING t.user_id, t.provider_id, t.invalidated_at_ms",
+                    &[&limit],
+                )
+                .await
+                .map_err(|e| storage_err("connector_tokens.claim_reconnect_notices", e))
+        })?;
+        let mut notices: Vec<ReconnectNotice> = rows
+            .iter()
+            .map(|r| ReconnectNotice {
+                user_id: r.get(0),
+                provider_id: r.get(1),
+                invalidated_at_ms: r.get(2),
+            })
+            .collect();
+        // `RETURNING` ne garantit aucun ordre.
+        notices.sort();
+        Ok(notices)
     }
 }
 
