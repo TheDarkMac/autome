@@ -34,5 +34,5 @@ pub use refresh::{
 };
 pub use store::{
     open_tokens, seal_tokens, ConnectorTokenStore, CredentialInvalidation, CredentialUpdate,
-    InMemoryConnectorTokenStore, StoredCredential,
+    InMemoryConnectorTokenStore, ReconnectNotice, ReconnectNotices, StoredCredential,
 };
