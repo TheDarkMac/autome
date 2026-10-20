@@ -1395,6 +1395,27 @@
         }
       }
     },
+    "/connectors/actions": {
+      "get": {
+        "tags": [
+          "connectors"
+        ],
+        "summary": "`GET /connectors/actions` — actions de connecteur exécutables par le\nworker, avec leurs paramètres.",
+        "operationId": "list_actions",
+        "responses": {
+          "200": {
+            "description": "Actions des connecteurs livrés et leurs paramètres",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConnectorActionsResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/credentials": {
       "get": {
         "tags": [
@@ -2347,6 +2368,42 @@
           }
         }
       },
+      "ActionSchema": {
+        "type": "object",
+        "description": "Schéma complet d'une action connecteur.",
+        "required": [
+          "provider",
+          "kind",
+          "label",
+          "description",
+          "params"
+        ],
+        "properties": {
+          "description": {
+            "type": "string",
+            "description": "Description longue (UI)."
+          },
+          "kind": {
+            "type": "string",
+            "description": "Identifiant stable de l'action (égal à `Action::kind()`)."
+          },
+          "label": {
+            "type": "string",
+            "description": "Libellé court (UI)."
+          },
+          "params": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ParamSpec"
+            },
+            "description": "Paramètres acceptés par l'action."
+          },
+          "provider": {
+            "type": "string",
+            "description": "Provider (`\"slack\"`, `\"github\"`, …)."
+          }
+        }
+      },
       "AdminUser": {
         "type": "object",
         "description": "Compte vu par l'administration — jamais le hash du mot de passe.",
@@ -2535,6 +2592,22 @@
           "new_password": {
             "type": "string",
             "description": "Nouveau mot de passe (8 à 1024 caractères, différent de l'actuel)."
+          }
+        }
+      },
+      "ConnectorActionsResponse": {
+        "type": "object",
+        "description": "Réponse de `GET /connectors/actions`.",
+        "required": [
+          "actions"
+        ],
+        "properties": {
+          "actions": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ActionSchema"
+            },
+            "description": "Actions des connecteurs livrés, connecteur par connecteur."
           }
         }
       },
@@ -2992,6 +3065,164 @@
           }
         }
       },
+      "ParamKind": {
+        "oneOf": [
+          {
+            "type": "object",
+            "description": "Chaîne libre.",
+            "required": [
+              "type"
+            ],
+            "properties": {
+              "type": {
+                "type": "string",
+                "enum": [
+                  "string"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "Chaîne longue (corps de message, description) : zone multiligne\ncôté UI, même valeur JSON qu'une [`ParamKind::String`].",
+            "required": [
+              "type"
+            ],
+            "properties": {
+              "type": {
+                "type": "string",
+                "enum": [
+                  "text"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "Entier (non signé ou signé).",
+            "required": [
+              "type"
+            ],
+            "properties": {
+              "type": {
+                "type": "string",
+                "enum": [
+                  "integer"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "Booléen.",
+            "required": [
+              "type"
+            ],
+            "properties": {
+              "type": {
+                "type": "string",
+                "enum": [
+                  "boolean"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "Objet JSON arbitraire (pas de validation interne).",
+            "required": [
+              "type"
+            ],
+            "properties": {
+              "type": {
+                "type": "string",
+                "enum": [
+                  "object"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "Tableau de `inner`.",
+            "required": [
+              "inner",
+              "type"
+            ],
+            "properties": {
+              "inner": {
+                "$ref": "#/components/schemas/ParamKind",
+                "description": "Type des éléments."
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "array"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "Énumération de valeurs admises (strings).",
+            "required": [
+              "variants",
+              "type"
+            ],
+            "properties": {
+              "type": {
+                "type": "string",
+                "enum": [
+                  "enum"
+                ]
+              },
+              "variants": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "Valeurs permises."
+              }
+            }
+          }
+        ],
+        "description": "Type principal d'un paramètre."
+      },
+      "ParamSpec": {
+        "type": "object",
+        "description": "Spec d'un paramètre.",
+        "required": [
+          "key",
+          "label",
+          "kind",
+          "required"
+        ],
+        "properties": {
+          "description": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Description courte (UI)."
+          },
+          "key": {
+            "type": "string",
+            "description": "Clé JSON dans les `params` du node."
+          },
+          "kind": {
+            "$ref": "#/components/schemas/ParamKind",
+            "description": "Type du paramètre."
+          },
+          "label": {
+            "type": "string",
+            "description": "Libellé affiché côté UI."
+          },
+          "required": {
+            "type": "boolean",
+            "description": "`true` si la clé doit être présente."
+          }
+        }
+      },
       "ProviderDto": {
         "type": "object",
         "description": "Description publique d'un provider — pas de `client_secret`.",
@@ -3312,6 +3543,10 @@
     {
       "name": "webhooks",
       "description": "Déclencheurs webhook : URL secrètes publiques et leur gestion."
+    },
+    {
+      "name": "connectors",
+      "description": "Catalogue des actions de connecteur (public)."
     },
     {
       "name": "credentials",

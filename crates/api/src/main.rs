@@ -14,6 +14,7 @@ use autome_api::admin::{
 };
 use autome_api::admin_workflows::{admin_workflows_router, AdminWorkflowsState};
 use autome_api::auth::protected_router;
+use autome_api::connector_actions::connector_actions_router;
 use autome_api::cors::{allowed_origins_from_env, with_cors};
 use autome_api::credentials::{credentials_router, CredentialsState};
 use autome_api::email_verification::{
@@ -52,7 +53,8 @@ use axum::Router;
 const MAINTENANCE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(600);
 
 /// Construit le routeur racine : sondes (`/livez`, `/readyz`, `/health`),
-/// `/metrics` et la spec `/openapi.json` publics,
+/// `/metrics`, la spec `/openapi.json` et le catalogue `/connectors/actions`
+/// (#257) publics,
 /// `/auth/signup|login|refresh` publics (émission des jetons), `/auth/whoami|admin`
 /// protégés par JWT, l'administration des utilisateurs (`/admin/users`, #208),
 /// le CRUD `workflows` + `runs` (domaine 7) et les webhooks
@@ -111,6 +113,7 @@ fn build_router(
         .merge(runs_router(runs_state))
         .merge(webhooks_router(webhooks))
         .merge(credentials_router(credentials_state))
+        .merge(connector_actions_router())
         .merge(metrics_router(metrics.clone()));
     // Traçage en couche externe (toutes les requêtes, 404 et préflights
     // compris), CORS ensuite, métriques par route à l'intérieur.
@@ -692,6 +695,25 @@ mod tests {
             serde_json::from_slice(&bytes).expect("spec OpenAPI = JSON valide");
         assert!(spec["openapi"].as_str().unwrap_or("").starts_with("3."));
         assert!(spec["paths"]["/workflows"].is_object());
+    }
+
+    #[tokio::test]
+    async fn connector_actions_are_served_publicly_by_the_full_router() {
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode};
+        use tower::ServiceExt;
+
+        // #257 : la palette lit ce catalogue sans jeton.
+        let response = dev_router()
+            .oneshot(
+                Request::builder()
+                    .uri("/connectors/actions")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[tokio::test]

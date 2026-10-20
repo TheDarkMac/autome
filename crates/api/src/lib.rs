@@ -29,6 +29,7 @@ pub mod admin;
 pub mod admin_workflows;
 pub mod auth;
 pub mod client_ip;
+pub mod connector_actions;
 pub mod cors;
 pub mod credentials;
 pub mod email_verification;

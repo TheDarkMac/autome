@@ -589,6 +589,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/connectors/actions": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * `GET /connectors/actions` — actions de connecteur exécutables par le
+         *     worker, avec leurs paramètres.
+         */
+        get: operations["list_actions"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/credentials": {
         parameters: {
             query?: never;
@@ -854,6 +874,19 @@ export interface components {
             /** @description Jeton reçu par email (fragment `#invite=` du lien). */
             token: string;
         };
+        /** @description Schéma complet d'une action connecteur. */
+        ActionSchema: {
+            /** @description Description longue (UI). */
+            description: string;
+            /** @description Identifiant stable de l'action (égal à `Action::kind()`). */
+            kind: string;
+            /** @description Libellé court (UI). */
+            label: string;
+            /** @description Paramètres acceptés par l'action. */
+            params: components["schemas"]["ParamSpec"][];
+            /** @description Provider (`"slack"`, `"github"`, …). */
+            provider: string;
+        };
         /** @description Compte vu par l'administration — jamais le hash du mot de passe. */
         AdminUser: {
             /**
@@ -935,6 +968,11 @@ export interface components {
             current_password: string;
             /** @description Nouveau mot de passe (8 à 1024 caractères, différent de l'actuel). */
             new_password: string;
+        };
+        /** @description Réponse de `GET /connectors/actions`. */
+        ConnectorActionsResponse: {
+            /** @description Actions des connecteurs livrés, connecteur par connecteur. */
+            actions: components["schemas"]["ActionSchema"][];
         };
         /** @description Body JSON du POST. `payload` est libre (transmis tel quel au worker). */
         CreateRunBody: {
@@ -1127,6 +1165,46 @@ export interface components {
             code: string;
             /** @description Jeton de défi reçu de `/auth/login`. */
             mfa_token: string;
+        };
+        /** @description Type principal d'un paramètre. */
+        ParamKind: {
+            /** @enum {string} */
+            type: "string";
+        } | {
+            /** @enum {string} */
+            type: "text";
+        } | {
+            /** @enum {string} */
+            type: "integer";
+        } | {
+            /** @enum {string} */
+            type: "boolean";
+        } | {
+            /** @enum {string} */
+            type: "object";
+        } | {
+            /** @description Type des éléments. */
+            inner: components["schemas"]["ParamKind"];
+            /** @enum {string} */
+            type: "array";
+        } | {
+            /** @enum {string} */
+            type: "enum";
+            /** @description Valeurs permises. */
+            variants: string[];
+        };
+        /** @description Spec d'un paramètre. */
+        ParamSpec: {
+            /** @description Description courte (UI). */
+            description?: string | null;
+            /** @description Clé JSON dans les `params` du node. */
+            key: string;
+            /** @description Type du paramètre. */
+            kind: components["schemas"]["ParamKind"];
+            /** @description Libellé affiché côté UI. */
+            label: string;
+            /** @description `true` si la clé doit être présente. */
+            required: boolean;
         };
         /** @description Description publique d'un provider — pas de `client_secret`. */
         ProviderDto: {
@@ -2684,6 +2762,26 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content?: never;
+            };
+        };
+    };
+    list_actions: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Actions des connecteurs livrés et leurs paramètres */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ConnectorActionsResponse"];
+                };
             };
         };
     };
