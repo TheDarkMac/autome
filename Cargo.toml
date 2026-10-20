@@ -99,7 +99,14 @@ unsafe_code = "forbid"
 missing_docs = "warn"
 
 # Profil de release : binaires fins, optimisés.
+#
+# Pas de LTO entre crates (#263) : `lto = "thin"` doublait le build et
+# dominait chaque rebuild pour un service surtout en attente réseau / base,
+# dont le code chaud (argon2, ring, serde) est optimisé dans son propre crate.
+# Mesure locale (4 cœurs, `-p autome-api -p autome-worker`), thin → sans :
+# à froid 1591 → 784 s, `core` modifié 485 → 207 s, `worker` modifié
+# 167 → 20 s ; binaires 14,1 → 13,5 Mo (api), 10,0 → 9,7 Mo (worker).
+# `codegen-units = 1` gardé : à 16, binaires +25 % pour un rebuild égal.
 [profile.release]
-lto = "thin"
 codegen-units = 1
 strip = true
