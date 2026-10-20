@@ -1,0 +1,11 @@
+-- Suppression de la table `credentials` (#251).
+--
+-- Créée par `0004_credentials.sql` (et indexée par `0005`), elle n'a jamais
+-- été câblée : les tokens de connecteurs vivent dans `connector_tokens`
+-- (0011), chiffrés par enveloppe. Aucun code ne la lit ni ne l'écrit.
+--
+-- `0004` et `0005` restent en place : le runner identifie une migration par
+-- son nom, une base existante les a déjà appliquées. `idx_credentials_owner`
+-- part avec la table. `IF EXISTS` : une base dont la table aurait été retirée
+-- à la main se migre quand même.
+DROP TABLE IF EXISTS credentials;

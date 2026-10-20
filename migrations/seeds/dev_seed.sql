@@ -58,13 +58,4 @@ VALUES
     ('run-demo', 'trigger', '{"body": {"hello": "world"}}'::jsonb),
     ('run-demo', 'act', '{"status": 200}'::jsonb);
 
-INSERT INTO credentials (owner_id, provider, name, secret_enc)
-VALUES (
-    '00000000-0000-0000-0000-000000000001',
-    'slack',
-    'workspace-dev',
-    -- Placeholder chiffré (le chiffrement réel AES-GCM/KMS = F6.3).
-    '\x00'::bytea
-);
-
 COMMIT;

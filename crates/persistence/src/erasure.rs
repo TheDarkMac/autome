@@ -5,8 +5,8 @@
 //! runs du propriétaire (`run_steps` en cascade), workflows de son espace
 //! (`workflow_versions`, `webhook_endpoints`, `trigger_schedules` en
 //! cascade), tokens de connecteurs, permissions, pseudonymisation de
-//! l'audit, puis le compte lui-même (la table morte `credentials`, 0004, suit
-//! par cascade). Une erreur à n'importe quelle étape annule tout.
+//! l'audit, puis le compte lui-même. Une erreur à n'importe quelle étape
+//! annule tout.
 //!
 //! `runs.owner_id`, `connector_tokens.user_id` et `user_permissions.user_id`
 //! sont des `TEXT` sans clé étrangère vers `users` (identité = `claims.sub`,
