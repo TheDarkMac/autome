@@ -66,7 +66,7 @@ impl LinkTokens {
     pub fn issue(&self, user_id: &str, bound: &str, now: i64) -> String {
         let expires_at = now.saturating_add(self.ttl_seconds);
         let mac = self.mac(user_id, expires_at, bound).finalize().into_bytes();
-        format!("{user_id}.{expires_at}.{}", hex(&mac))
+        format!("{user_id}.{expires_at}.{}", hex::encode(mac))
     }
 
     /// Découpe `token` sans le vérifier ; `None` s'il est mal formé.
@@ -101,19 +101,12 @@ impl LinkTokens {
     }
 }
 
-/// Octets en hexadécimal minuscule.
-pub(crate) fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
-}
-
+/// MAC hexadécimal d'un jeton : exactement 32 octets (HMAC-SHA-256).
 fn unhex(s: &str) -> Option<Vec<u8>> {
-    if s.len() != 64 || !s.is_ascii() {
+    if s.len() != 64 {
         return None;
     }
-    (0..s.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok())
-        .collect()
+    hex::decode(s).ok()
 }
 
 #[cfg(test)]

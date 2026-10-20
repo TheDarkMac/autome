@@ -69,11 +69,7 @@ pub struct Claims {
 fn fresh_jti() -> String {
     let mut bytes = [0u8; 16];
     rand::thread_rng().fill_bytes(&mut bytes);
-    let mut out = String::with_capacity(32);
-    for b in &bytes {
-        out.push_str(&format!("{b:02x}"));
-    }
-    out
+    hex::encode(bytes)
 }
 
 /// Service d'émission/vérification de tokens.

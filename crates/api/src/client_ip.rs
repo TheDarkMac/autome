@@ -142,8 +142,7 @@ impl IpKeyer {
             IpAddr::V6(v6) => mac.update(&v6.octets()[..8]),
         }
         let digest = mac.finalize().into_bytes();
-        let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
-        format!("{scope}:{hex}")
+        format!("{scope}:{}", hex::encode(digest))
     }
 }
 

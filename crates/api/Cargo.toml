@@ -51,6 +51,8 @@ tower-http = { version = "0.6", features = ["cors"] }
 sha1 = "0.10"
 qrcode = { version = "0.14", default-features = false, features = ["svg"] }
 reqwest = { workspace = true }
+# Encodage hexadécimal (MAC, empreintes, identifiants) (#253)
+hex = { workspace = true }
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
