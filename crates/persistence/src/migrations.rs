@@ -111,6 +111,10 @@ pub const MIGRATIONS: &[(&str, &str)] = &[
         "0022_user_mfa.sql",
         include_str!("../../../migrations/0022_user_mfa.sql"),
     ),
+    (
+        "0023_drop_credentials.sql",
+        include_str!("../../../migrations/0023_drop_credentials.sql"),
+    ),
 ];
 
 fn storage_err(context: &str, e: impl std::fmt::Display) -> Error {

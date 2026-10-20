@@ -55,6 +55,12 @@ async fn applies_all_then_is_idempotent() {
             .get(0);
         assert!(exists, "table absente après migration : {table}");
     }
+    let credentials: bool = client
+        .query_one("SELECT to_regclass('credentials') IS NOT NULL", &[])
+        .await
+        .unwrap()
+        .get(0);
+    assert!(!credentials, "table morte `credentials` encore présente");
 
     // Reprise par 0020 (#231) : un compte créé avant la migration est tenu
     // pour vérifié à sa date de création — personne n'est mis à la porte.
@@ -77,4 +83,32 @@ async fn applies_all_then_is_idempotent() {
         .unwrap()
         .get(0);
     assert!(backfilled, "compte antérieur vérifié à sa date de création");
+
+    // 0023 (#251) sur une base antérieure : la table `credentials` de 0004,
+    // indexée par 0005 et seedée, disparaît avec son index.
+    client
+        .batch_execute(include_str!("../../../migrations/0004_credentials.sql"))
+        .await
+        .unwrap();
+    client
+        .batch_execute(
+            "CREATE INDEX idx_credentials_owner ON credentials (owner_id); \
+             INSERT INTO credentials (owner_id, provider, name, secret_enc) \
+             SELECT id, 'slack', 'workspace-dev', '\\x00'::bytea FROM users \
+             WHERE email = 'legacy@example.io'; \
+             DELETE FROM schema_migrations WHERE name = '0023_drop_credentials.sql';",
+        )
+        .await
+        .unwrap();
+    assert_eq!(run_migrations(&pool).await.expect("run 4"), 1);
+    let leftovers: i64 = client
+        .query_one(
+            "SELECT count(*) FROM pg_class \
+             WHERE relname IN ('credentials', 'idx_credentials_owner')",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(leftovers, 0, "table `credentials` ou son index restant");
 }
