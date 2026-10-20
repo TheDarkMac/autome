@@ -34,9 +34,16 @@ export interface ParamSchema {
   readonly help?: string;
   /** Pattern regex (string source) pour `type: "string"` ou `"text"`. */
   readonly pattern?: string;
-  /** Bornes pour `type: "number"`. */
+  /** Bornes pour `type: "number"` (appliquées aux seuls nombres). */
   readonly min?: number;
   readonly max?: number;
+  /**
+   * Pour `type: "number"` : accepte aussi une expression `{{ … }}` occupant
+   * toute la valeur, que le moteur remplace en gardant le type de la valeur
+   * référencée (#261). Réservé aux actions de connecteur : les nombres des
+   * nodes intégrés ne passent pas par ce templating.
+   */
+  readonly expression?: boolean;
   /** Pour `type: "json"` : forme attendue (#257). */
   readonly jsonShape?: "object" | "array";
 }
@@ -277,6 +284,10 @@ export function validateParams(
         break;
       }
       case "number": {
+        if (p.expression && typeof v === "string") {
+          if (!isSoleExpression(v)) errors[p.name] = "Nombre ou expression {{ … }} attendu.";
+          break;
+        }
         const n = typeof v === "number" ? v : Number(v);
         if (!Number.isFinite(n)) {
           errors[p.name] = "Doit être un nombre.";
@@ -339,6 +350,31 @@ export function extractReferences(value: unknown): ExpressionReference[] {
     });
   }
   return out;
+}
+
+/**
+ * `true` si `s` est une seule expression `{{ … }}` : le moteur la remplace
+ * alors par la valeur référencée, type compris (`sole_expression`,
+ * `crates/engine/src/mapping.rs`). Mêlée à du texte, elle donnerait une
+ * chaîne, refusée par un paramètre entier.
+ */
+export function isSoleExpression(s: string): boolean {
+  const t = s.trim();
+  if (!t.startsWith("{{") || !t.endsWith("}}") || t.length < 4) return false;
+  const inner = t.slice(2, -2);
+  return inner.trim().length > 0 && !inner.includes("{{") && !inner.includes("}}");
+}
+
+/**
+ * Valeur d'un champ nombre qui accepte une expression (#261) : un nombre si
+ * la saisie en est un, sinon le texte tel quel (expression, ou saisie à
+ * corriger que la validation signale).
+ */
+export function parseNumberOrExpression(raw: string): ParamValue {
+  const t = raw.trim();
+  if (t.length === 0) return null;
+  const n = Number(t);
+  return Number.isFinite(n) ? n : raw;
 }
 
 /** Coerce une string de champ number vers `number | null` (pour onChange). */

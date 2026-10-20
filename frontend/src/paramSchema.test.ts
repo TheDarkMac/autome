@@ -6,8 +6,10 @@ import {
   defaultParams,
   extractReferences,
   findNodeSchema,
+  isSoleExpression,
   jsonDraft,
   parseJsonInput,
+  parseNumberOrExpression,
   validateParams,
 } from "./paramSchema";
 import { SAMPLE_CATALOG } from "./testCatalog";
@@ -146,6 +148,53 @@ describe("validateParams", () => {
     expect(validateParams(slack, { channel: "#g", text: "hi", blocks: {} })["blocks"]).toBe(
       "Tableau JSON attendu.",
     );
+  });
+});
+
+describe("nombre ou expression (#261)", () => {
+  const github = findNodeSchema("action", "github.close_issue", CONNECTORS)!;
+  const base = { owner: "o", repo: "r" };
+
+  it("isSoleExpression : une seule expression occupant toute la valeur", () => {
+    expect(isSoleExpression("{{ hook.body.issue.number }}")).toBe(true);
+    expect(isSoleExpression("  {{x}}  ")).toBe(true);
+    expect(isSoleExpression("#{{ x }}")).toBe(false);
+    expect(isSoleExpression("{{ a }} {{ b }}")).toBe(false);
+    expect(isSoleExpression("{{  }}")).toBe(false);
+    expect(isSoleExpression("{{}}")).toBe(false);
+    expect(isSoleExpression("42")).toBe(false);
+  });
+
+  it("parseNumberOrExpression : nombre si la saisie en est un, texte sinon", () => {
+    expect(parseNumberOrExpression("42")).toBe(42);
+    expect(parseNumberOrExpression(" 7 ")).toBe(7);
+    expect(parseNumberOrExpression("{{ x.n }}")).toBe("{{ x.n }}");
+    expect(parseNumberOrExpression("abc")).toBe("abc");
+    expect(parseNumberOrExpression("   ")).toBeNull();
+  });
+
+  it("un entier de connecteur accepte une expression seule, pas du texte", () => {
+    expect(validateParams(github, { ...base, issue_number: 12 })).toEqual({});
+    expect(
+      validateParams(github, { ...base, issue_number: "{{ hook.body.issue.number }}" }),
+    ).toEqual({});
+    expect(validateParams(github, { ...base, issue_number: "abc" })["issue_number"]).toBe(
+      "Nombre ou expression {{ … }} attendu.",
+    );
+    expect(
+      validateParams(github, { ...base, issue_number: "#{{ x.n }}" })["issue_number"],
+    ).toBe("Nombre ou expression {{ … }} attendu.");
+    expect(validateParams(github, base)["issue_number"]).toBe("Champ requis.");
+  });
+
+  it("les nombres des nodes intégrés restent des nombres", () => {
+    const polling = findNodeSchema("trigger", "polling")!;
+    expect(polling.params.some((p) => p.expression)).toBe(false);
+    expect(
+      validateParams(polling, { url: "https://x", interval_seconds: "{{ x.n }}" })[
+        "interval_seconds"
+      ],
+    ).toMatch(/Doit être un nombre/);
   });
 });
 

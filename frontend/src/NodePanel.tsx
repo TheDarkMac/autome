@@ -40,6 +40,7 @@ import {
   findNodeSchema,
   jsonDraft,
   parseJsonInput,
+  parseNumberOrExpression,
   validateParams,
 } from "./paramSchema";
 
@@ -264,7 +265,10 @@ function ParamField({ schema, value, error, onChange }: ParamFieldProps): JSX.El
   const errCls = error ? "border-rose-400" : "border-neutral-200";
   const cls = `${baseInputCls} ${errCls}`;
   const refs =
-    schema.type === "string" || schema.type === "text" || schema.type === "json"
+    schema.type === "string" ||
+    schema.type === "text" ||
+    schema.type === "json" ||
+    schema.expression
       ? extractReferences(value)
       : [];
 
@@ -297,7 +301,16 @@ function ParamField({ schema, value, error, onChange }: ParamFieldProps): JSX.El
       );
       break;
     case "number":
-      input = (
+      input = schema.expression ? (
+        <NumberOrExpressionInput
+          id={id}
+          value={value}
+          placeholder={schema.placeholder ?? ""}
+          onChange={onChange}
+          className={cls}
+          invalid={error !== undefined}
+        />
+      ) : (
         <input
           id={id}
           type="number"
@@ -377,6 +390,45 @@ function ParamField({ schema, value, error, onChange }: ParamFieldProps): JSX.El
       ) : null}
       {refs.length > 0 ? <ReferenceChips refs={refs} /> : null}
     </div>
+  );
+}
+
+/**
+ * Nombre ou expression `{{ … }}` (#261) : champ texte, la saisie reste telle
+ * quelle à l'écran ; la valeur transmise est un nombre quand le texte en est
+ * un (cf. `parseNumberOrExpression`).
+ */
+function NumberOrExpressionInput({
+  id,
+  value,
+  placeholder,
+  onChange,
+  className,
+  invalid,
+}: {
+  id: string;
+  value: ParamValue;
+  placeholder: string;
+  onChange: (v: ParamValue) => void;
+  className: string;
+  invalid: boolean;
+}): JSX.Element {
+  const [draft, setDraft] = useState(() =>
+    typeof value === "number" || typeof value === "string" ? String(value) : "",
+  );
+  return (
+    <input
+      id={id}
+      type="text"
+      value={draft}
+      placeholder={placeholder}
+      onChange={(e) => {
+        setDraft(e.target.value);
+        onChange(parseNumberOrExpression(e.target.value));
+      }}
+      className={className}
+      aria-invalid={invalid ? "true" : undefined}
+    />
   );
 }
 

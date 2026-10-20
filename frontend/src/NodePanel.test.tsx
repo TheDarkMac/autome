@@ -223,6 +223,81 @@ describe("<NodePanel /> — actions de connecteur (#257)", () => {
   });
 });
 
+describe("<NodePanel /> — entier de connecteur : nombre ou expression (#261)", () => {
+  const schemas = SAMPLE_CATALOG.schemas;
+  const field = (): HTMLInputElement =>
+    screen.getByTestId("field-issue_number").querySelector("input") as HTMLInputElement;
+
+  it("accepte une expression et la transmet telle quelle", () => {
+    const node = buildCanvasNode({
+      id: "g-1",
+      kind: "action",
+      subtype: "github.close_issue",
+      params: { owner: "o", repo: "r" },
+    });
+    const onChange = vi.fn();
+    render(<NodePanel node={node} onChange={onChange} onClose={noop} schemas={schemas} fetchCredentialsImpl={emptyCreds} />);
+    expect(field().type).toBe("text");
+    fireEvent.change(field(), { target: { value: "{{ hook.body.issue.number }}" } });
+    expect(onChange).toHaveBeenLastCalledWith("g-1", {
+      owner: "o",
+      repo: "r",
+      issue_number: "{{ hook.body.issue.number }}",
+    });
+    expect(screen.getByTestId("panel-status")).toHaveTextContent(/valide/);
+  });
+
+  it("transmet un nombre, signale un texte et garde la saisie à l'écran", () => {
+    const node = buildCanvasNode({
+      id: "g-1",
+      kind: "action",
+      subtype: "github.close_issue",
+      params: { owner: "o", repo: "r" },
+    });
+    const onChange = vi.fn();
+    render(<NodePanel node={node} onChange={onChange} onClose={noop} schemas={schemas} fetchCredentialsImpl={emptyCreds} />);
+    fireEvent.change(field(), { target: { value: "12" } });
+    expect(onChange).toHaveBeenLastCalledWith("g-1", { owner: "o", repo: "r", issue_number: 12 });
+    fireEvent.change(field(), { target: { value: "douze" } });
+    expect(field().value).toBe("douze");
+    expect(screen.getByTestId("error-issue_number")).toHaveTextContent(
+      "Nombre ou expression {{ … }} attendu.",
+    );
+    fireEvent.change(field(), { target: { value: "" } });
+    expect(onChange).toHaveBeenLastCalledWith("g-1", { owner: "o", repo: "r" });
+  });
+
+  it("réaffiche une valeur enregistrée, nombre ou expression", () => {
+    const withNumber = buildCanvasNode({
+      id: "g-1",
+      kind: "action",
+      subtype: "github.close_issue",
+      params: { owner: "o", repo: "r", issue_number: 7 },
+    });
+    const { unmount } = render(<NodePanel node={withNumber} onChange={noop} onClose={noop} schemas={schemas} fetchCredentialsImpl={emptyCreds} />);
+    expect(field().value).toBe("7");
+    unmount();
+    const withExpr = buildCanvasNode({
+      id: "g-2",
+      kind: "action",
+      subtype: "github.close_issue",
+      params: { owner: "o", repo: "r", issue_number: "{{ $node('hook').issue }}" },
+    });
+    render(<NodePanel node={withExpr} onChange={noop} onClose={noop} schemas={schemas} fetchCredentialsImpl={emptyCreds} />);
+    expect(field().value).toBe("{{ $node('hook').issue }}");
+    expect(screen.getByTestId("field-issue_number")).toHaveTextContent("hook.issue");
+  });
+
+  it("les nombres des nodes intégrés gardent un champ numérique", () => {
+    const node = buildCanvasNode({ id: "w-1", kind: "while" });
+    render(<NodePanel node={node} onChange={noop} onClose={noop} fetchCredentialsImpl={emptyCreds} />);
+    const input = screen
+      .getByTestId("field-max_iterations")
+      .querySelector("input") as HTMLInputElement;
+    expect(input.type).toBe("number");
+  });
+});
+
 describe("<NodePanel /> — bouton fermer", () => {
   it("appelle onClose au clic sur ×", () => {
     const node = buildCanvasNode({ id: "t-1", kind: "trigger", subtype: "webhook" });

@@ -209,7 +209,15 @@ function paramFromSpec(spec: ParamSpec): ParamSchema {
     case "text":
       return { ...base, type: "text", ...(help ? { help } : {}) };
     case "integer":
-      return { ...base, type: "number", ...(help ? { help } : {}) };
+      // Souvent tiré d'un node précédent (numéro d'issue d'un webhook…) :
+      // nombre ou expression (#261).
+      return {
+        ...base,
+        type: "number",
+        expression: true,
+        placeholder: "42 ou {{ nœud.champ }}",
+        help: help ?? "Nombre, ou expression {{ nœud.champ }} remplacée à l'exécution.",
+      };
     case "boolean":
       return { ...base, type: "boolean", ...(help ? { help } : {}) };
     case "enum":
