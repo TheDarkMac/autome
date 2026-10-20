@@ -64,7 +64,7 @@ flowchart TB
 
   subgraph Infra
     Q[("File de messages<br/>RabbitMQ (ADR 0003)")]
-    DB[("PostgreSQL<br/>workflows · runs · credentials · users")]
+    DB[("PostgreSQL<br/>workflows · runs · tokens de connecteurs · users")]
     SEC[("Chiffrement enveloppe<br/>KeyProvider versionné · AES-256-GCM<br/>(KMS = cible production)")]
     OBS["Prometheus + Grafana"]
     SMTP["Relais SMTP<br/>(emails de réinitialisation)"]
