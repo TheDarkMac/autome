@@ -1447,12 +1447,40 @@ mod tests {
 
     // ───── Arrêt borné (#200) ─────
 
-    /// Transport qui met la durée donnée à répondre : un run « long ».
+    /// Signal « l'appel HTTP a commencé » (#259). Un run réclamé n'a pas
+    /// forcément commencé son premier nœud : sous charge, le thread bloquant
+    /// du moteur démarre plus tard, et un drain lancé trop tôt arrête le run
+    /// avant `entry`. Les tests de drain attendent donc ce signal, qui prouve
+    /// qu'un nœud est en cours.
+    #[derive(Clone, Default)]
+    struct CallStarted(Arc<tokio::sync::Notify>);
+
+    impl CallStarted {
+        /// Appelé par le transport, sur le thread bloquant du moteur. Le
+        /// permis est gardé si le test n'attend pas encore.
+        fn signal(&self) {
+            self.0.notify_one();
+        }
+
+        /// Attend le début de l'appel ; borne large, simple filet contre un
+        /// test bloqué (ce n'est pas elle qui synchronise).
+        async fn wait(&self) {
+            tokio::time::timeout(std::time::Duration::from_secs(30), self.0.notified())
+                .await
+                .expect("l'appel HTTP n'a jamais commencé");
+        }
+    }
+
+    /// Transport qui met `delay` à répondre : un run « long ».
     #[derive(Clone)]
-    struct SlowHttp(std::time::Duration);
+    struct SlowHttp {
+        delay: std::time::Duration,
+        started: CallStarted,
+    }
     impl HttpClient for SlowHttp {
         fn send(&self, _req: &HttpRequest) -> Result<HttpResponse, String> {
-            std::thread::sleep(self.0);
+            self.started.signal();
+            std::thread::sleep(self.delay);
             Ok(HttpResponse {
                 status: 200,
                 body: json!({ "ok": true }),
@@ -1518,7 +1546,7 @@ mod tests {
     }
 
     /// Pool d'un consommateur avec un run « long » en file, démarré et
-    /// attendu jusqu'à ce que le run soit réclamé.
+    /// attendu jusqu'à ce que le run soit dans son appel lent.
     async fn running_pool_with_slow_run(
         delay: std::time::Duration,
     ) -> (
@@ -1535,11 +1563,15 @@ mod tests {
             .publish("runs", delivery("run-slow", "wf-slow").message)
             .await
             .unwrap();
+        let started = CallStarted::default();
         let exec = RunExecutor::with_http(
             repo,
             Arc::clone(&store) as Arc<_>,
             resolver(),
-            SlowHttp(delay),
+            SlowHttp {
+                delay,
+                started: started.clone(),
+            },
         );
         let in_flight = exec.in_flight();
         let handler: Arc<dyn Handler + Send + Sync> = Arc::new(exec);
@@ -1548,12 +1580,7 @@ mod tests {
         let running = crate::WorkerPool::new(queue, handler, idem, "runs", 1)
             .with_idle_sleep(std::time::Duration::from_millis(10))
             .start();
-        for _ in 0..200 {
-            if !in_flight.snapshot().is_empty() {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        }
+        started.wait().await;
         assert_eq!(in_flight.snapshot(), vec!["run-slow"], "run réclamé");
         (running, in_flight, store)
     }
@@ -1698,17 +1725,20 @@ mod tests {
         store.mark_published(run_id, 0, NOW).await.unwrap();
     }
 
-    /// Transport qui enregistre les URL appelées, lent sur `/first`.
+    /// Transport qui enregistre les URL appelées, lent sur `/first` (dont
+    /// il signale le début).
     #[derive(Clone, Default)]
     struct CountingHttp {
         urls: Arc<Mutex<Vec<String>>>,
         first_delay: std::time::Duration,
+        first_started: CallStarted,
     }
 
     impl HttpClient for CountingHttp {
         fn send(&self, req: &HttpRequest) -> Result<HttpResponse, String> {
             self.urls.lock().unwrap().push(req.url.clone());
             if req.url.ends_with("/first") {
+                self.first_started.signal();
                 std::thread::sleep(self.first_delay);
             }
             Ok(HttpResponse {
@@ -1829,12 +1859,8 @@ mod tests {
         )
         .with_idle_sleep(std::time::Duration::from_millis(10))
         .start();
-        for _ in 0..200 {
-            if !in_flight.is_empty() {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        }
+        // Drain pendant `first`, pas seulement une fois le run réclamé.
+        http_a.first_started.wait().await;
         let outcome = crate::drain(
             running,
             &in_flight,
@@ -1911,7 +1937,7 @@ mod tests {
             Arc::clone(&repo) as Arc<_>,
             Arc::clone(&store) as Arc<_>,
             resolver(),
-            http_a,
+            http_a.clone(),
         );
         let in_flight = exec_a.in_flight();
         let handler: Arc<dyn Handler + Send + Sync> = Arc::new(exec_a);
@@ -1924,14 +1950,9 @@ mod tests {
         )
         .with_idle_sleep(std::time::Duration::from_millis(10))
         .start();
-        // Attendre que `first` soit marqué en cours.
-        for _ in 0..200 {
-            let cp = store.load("run-t").await.unwrap().unwrap();
-            if cp.next_node.as_deref() == Some("first") {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        }
+        // Attendre que l'appel de `first` soit en cours (marqué en cours
+        // avant l'appel).
+        http_a.first_started.wait().await;
         let outcome = crate::drain(
             running,
             &in_flight,
