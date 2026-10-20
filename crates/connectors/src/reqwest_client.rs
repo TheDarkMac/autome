@@ -334,9 +334,10 @@ mod tests {
         assert!(err.contains("trop volumineuse"), "{err}");
     }
 
-    /// Test d'intégration **réseau**, gaté par `TEST_HTTP_URL` (skip sinon).
-    /// Ex. : `TEST_HTTP_URL=https://httpbin.org/post cargo test -p autome-connectors --test ...`
-    /// Ici on vérifie surtout que l'aller-retour ne panique pas hors runtime.
+    /// Test d'intégration **réseau**, gaté par `TEST_HTTP_URL` (skip sinon),
+    /// fourni par la CI (#263). Politique stricte : l'URL doit être publique.
+    /// Ex. : `TEST_HTTP_URL=https://github.com/robots.txt cargo test -p autome-connectors real_get`
+    /// Vérifie l'aller-retour hors runtime : vrai DNS, TLS rustls, certificats racine.
     #[test]
     fn real_get_when_url_provided() {
         let Some(url) = std::env::var("TEST_HTTP_URL").ok() else {
