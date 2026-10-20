@@ -543,12 +543,13 @@ pub async fn delete_workflow(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// Construit le sous-router `/workflows/*`. Composable via `Router::nest`.
+/// Construit le router `/workflows` et `/workflows/:id`, monté tel quel par
+/// `main` (`Router::merge`).
 pub fn workflows_router(state: WorkflowsState) -> Router {
     Router::new()
-        .route("/", get(list_workflows).post(create_workflow))
+        .route("/workflows", get(list_workflows).post(create_workflow))
         .route(
-            "/:id",
+            "/workflows/:id",
             get(get_workflow)
                 .put(update_workflow)
                 .delete(delete_workflow),
@@ -666,7 +667,7 @@ mod tests {
         let token = svc.issue_access("alice", 900, FIXED_NOW).unwrap();
         let app = workflows_router(state);
         let response = app
-            .oneshot(auth_req("GET", "/", &token, None))
+            .oneshot(auth_req("GET", "/workflows", &token, None))
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
@@ -683,7 +684,7 @@ mod tests {
         let app = workflows_router(state);
         let payload = sample_workflow_json("wf-1").to_string();
         let response = app
-            .oneshot(auth_req("POST", "/", &token, Some(&payload)))
+            .oneshot(auth_req("POST", "/workflows", &token, Some(&payload)))
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::CREATED);
@@ -703,7 +704,7 @@ mod tests {
         let token = svc.issue_access("alice", 900, FIXED_NOW).unwrap();
         let app = workflows_router(state);
         let response = app
-            .oneshot(auth_req("GET", "/wf-1", &token, None))
+            .oneshot(auth_req("GET", "/workflows/wf-1", &token, None))
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
@@ -718,7 +719,7 @@ mod tests {
         let token = svc.issue_access("alice", 900, FIXED_NOW).unwrap();
         let app = workflows_router(state);
         let response = app
-            .oneshot(auth_req("GET", "/missing", &token, None))
+            .oneshot(auth_req("GET", "/workflows/missing", &token, None))
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
@@ -736,7 +737,7 @@ mod tests {
         let response = app
             .oneshot(auth_req(
                 "PUT",
-                "/wf-1",
+                "/workflows/wf-1",
                 &token,
                 Some(&new_payload.to_string()),
             ))
@@ -761,7 +762,7 @@ mod tests {
         let token = svc.issue_access("alice", 900, FIXED_NOW).unwrap();
         let app = workflows_router(state);
         let response = app
-            .oneshot(auth_req("DELETE", "/wf-1", &token, None))
+            .oneshot(auth_req("DELETE", "/workflows/wf-1", &token, None))
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
@@ -783,7 +784,7 @@ mod tests {
         let app = workflows_router(state);
         let payload = sample_workflow_json("wf-1").to_string();
         let response = app
-            .oneshot(auth_req("POST", "/", &token, Some(&payload)))
+            .oneshot(auth_req("POST", "/workflows", &token, Some(&payload)))
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::CONFLICT);
@@ -797,7 +798,12 @@ mod tests {
         let app = workflows_router(state);
         let payload = sample_workflow_json("missing").to_string();
         let response = app
-            .oneshot(auth_req("PUT", "/missing", &token, Some(&payload)))
+            .oneshot(auth_req(
+                "PUT",
+                "/workflows/missing",
+                &token,
+                Some(&payload),
+            ))
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
@@ -813,7 +819,7 @@ mod tests {
         // body id != path id
         let payload = sample_workflow_json("wf-other").to_string();
         let response = app
-            .oneshot(auth_req("PUT", "/wf-1", &token, Some(&payload)))
+            .oneshot(auth_req("PUT", "/workflows/wf-1", &token, Some(&payload)))
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
@@ -827,7 +833,7 @@ mod tests {
         let token = svc.issue_access("alice", 900, FIXED_NOW).unwrap();
         let app = workflows_router(state);
         let response = app
-            .oneshot(auth_req("DELETE", "/missing", &token, None))
+            .oneshot(auth_req("DELETE", "/workflows/missing", &token, None))
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
@@ -840,7 +846,12 @@ mod tests {
         let (state, _, _, _, _) = make_test_state();
         let app = workflows_router(state);
         let response = app
-            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/workflows")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
@@ -855,7 +866,7 @@ mod tests {
         let app = workflows_router(state);
         let payload = sample_workflow_json("wf-1").to_string();
         let response = app
-            .oneshot(auth_req("POST", "/", &token, Some(&payload)))
+            .oneshot(auth_req("POST", "/workflows", &token, Some(&payload)))
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
@@ -868,7 +879,7 @@ mod tests {
         let token = svc.issue_access("alice", 900, FIXED_NOW).unwrap();
         let app = workflows_router(state);
         let response = app
-            .oneshot(auth_req("GET", "/", &token, None))
+            .oneshot(auth_req("GET", "/workflows", &token, None))
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
@@ -884,7 +895,7 @@ mod tests {
         let app = workflows_router(state);
         let payload = sample_workflow_json("wf-7").to_string();
         let _ = app
-            .oneshot(auth_req("POST", "/", &token, Some(&payload)))
+            .oneshot(auth_req("POST", "/workflows", &token, Some(&payload)))
             .await
             .unwrap();
         let events = audit.list().await.unwrap();
@@ -910,7 +921,7 @@ mod tests {
         let token = svc.issue_access("alice", 900, FIXED_NOW).unwrap();
         let app = workflows_router(state);
         let response = app
-            .oneshot(auth_req("GET", "/?offset=2&limit=2", &token, None))
+            .oneshot(auth_req("GET", "/workflows?offset=2&limit=2", &token, None))
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
@@ -976,7 +987,12 @@ mod tests {
         perms.assign_role("alice", &Role::editor()).unwrap();
         let payload = sample_workflow_json("wf-new").to_string();
         let r = workflows_router(state)
-            .oneshot(auth_req("POST", "/", &token(&svc, "alice"), Some(&payload)))
+            .oneshot(auth_req(
+                "POST",
+                "/workflows",
+                &token(&svc, "alice"),
+                Some(&payload),
+            ))
             .await
             .unwrap();
         assert_eq!(r.status(), StatusCode::CREATED);
@@ -992,7 +1008,7 @@ mod tests {
         let create = |body: String| {
             let (app, t) = (app.clone(), token(&svc, "bob"));
             async move {
-                app.oneshot(auth_req("POST", "/", &t, Some(&body)))
+                app.oneshot(auth_req("POST", "/workflows", &t, Some(&body)))
                     .await
                     .unwrap()
                     .status()
@@ -1003,7 +1019,7 @@ mod tests {
         // Le doublon dans son propre espace reste un conflit.
         assert_eq!(create(mine.to_string()).await, StatusCode::CONFLICT);
 
-        let bob = call(&app, "GET", "/wf-a", "bob", &svc).await;
+        let bob = call(&app, "GET", "/workflows/wf-a", "bob", &svc).await;
         let v: serde_json::Value = serde_json::from_str(&body_string(bob).await).unwrap();
         assert_eq!(v["name"], "wf-a de bob");
         let alice = repo.get("alice", &wid("wf-a")).await.unwrap().unwrap();
@@ -1024,21 +1040,21 @@ mod tests {
             let (app, svc) = (app.clone(), &svc);
             async move { ids(body_string(call(&app, "GET", uri, who, svc).await).await) }
         };
-        assert_eq!(list("/", "bob").await, vec!["wf-b"]);
+        assert_eq!(list("/workflows", "bob").await, vec!["wf-b"]);
         // Le super-admin a lui aussi son propre espace (vide ici)…
-        assert!(list("/", "root").await.is_empty());
+        assert!(list("/workflows", "root").await.is_empty());
         // … et vise celui d'un autre explicitement.
-        assert_eq!(list("/?owner=alice", "root").await, vec!["wf-a"]);
-        assert_eq!(list("/?owner=", "root").await, vec!["wf-legacy"]);
+        assert_eq!(list("/workflows?owner=alice", "root").await, vec!["wf-a"]);
+        assert_eq!(list("/workflows?owner=", "root").await, vec!["wf-legacy"]);
     }
 
     #[tokio::test]
     async fn someone_elses_workflow_does_not_exist_in_my_namespace() {
         let (app, svc, audit, repo) = two_users().await;
-        let r = call(&app, "GET", "/wf-a", "bob", &svc).await;
+        let r = call(&app, "GET", "/workflows/wf-a", "bob", &svc).await;
         assert_eq!(r.status(), StatusCode::NOT_FOUND);
         // Même réponse que pour un id inconnu : l'existence n'est pas révélée.
-        let unknown = call(&app, "GET", "/wf-zzz", "bob", &svc).await;
+        let unknown = call(&app, "GET", "/workflows/wf-zzz", "bob", &svc).await;
         assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
         assert_eq!(
             body_string(r).await.replace("wf-a", "ID"),
@@ -1051,7 +1067,7 @@ mod tests {
             .clone()
             .oneshot(auth_req(
                 "PUT",
-                "/wf-a",
+                "/workflows/wf-a",
                 &token(&svc, "bob"),
                 Some(&hijack.to_string()),
             ))
@@ -1059,7 +1075,7 @@ mod tests {
             .unwrap();
         assert_eq!(put.status(), StatusCode::NOT_FOUND);
         // DELETE idempotent : 204, mais rien n'est supprimé chez alice.
-        let del = call(&app, "DELETE", "/wf-a", "bob", &svc).await;
+        let del = call(&app, "DELETE", "/workflows/wf-a", "bob", &svc).await;
         assert_eq!(del.status(), StatusCode::NO_CONTENT);
         let kept = repo.get("alice", &wid("wf-a")).await.unwrap().unwrap();
         assert_eq!(kept.name, "workflow wf-a");
@@ -1077,17 +1093,17 @@ mod tests {
         let (app, svc, _, _) = two_users().await;
         // 403 que le workflow existe ou non : rien n'est révélé.
         for uri in [
-            "/wf-a?owner=alice",
-            "/wf-zzz?owner=alice",
-            "/?owner=alice",
-            "/wf-legacy?owner=",
+            "/workflows/wf-a?owner=alice",
+            "/workflows/wf-zzz?owner=alice",
+            "/workflows?owner=alice",
+            "/workflows/wf-legacy?owner=",
         ] {
             let r = call(&app, "GET", uri, "bob", &svc).await;
             assert_eq!(r.status(), StatusCode::FORBIDDEN, "{uri}");
         }
         // Viser explicitement son propre espace est permis.
         assert_eq!(
-            call(&app, "GET", "/wf-a?owner=alice", "alice", &svc)
+            call(&app, "GET", "/workflows/wf-a?owner=alice", "alice", &svc)
                 .await
                 .status(),
             StatusCode::OK
@@ -1098,18 +1114,20 @@ mod tests {
     async fn super_admin_reaches_another_namespace_with_owner() {
         let (app, svc, audit, repo) = two_users().await;
         assert_eq!(
-            call(&app, "GET", "/wf-a", "root", &svc).await.status(),
+            call(&app, "GET", "/workflows/wf-a", "root", &svc)
+                .await
+                .status(),
             StatusCode::NOT_FOUND,
             "sans `owner`, root est dans son propre espace"
         );
         assert_eq!(
-            call(&app, "GET", "/wf-a?owner=alice", "root", &svc)
+            call(&app, "GET", "/workflows/wf-a?owner=alice", "root", &svc)
                 .await
                 .status(),
             StatusCode::OK
         );
         assert_eq!(
-            call(&app, "DELETE", "/wf-a?owner=alice", "root", &svc)
+            call(&app, "DELETE", "/workflows/wf-a?owner=alice", "root", &svc)
                 .await
                 .status(),
             StatusCode::NO_CONTENT
@@ -1129,13 +1147,13 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            call(&app, "GET", "/wf-legacy", "alice", &svc)
+            call(&app, "GET", "/workflows/wf-legacy", "alice", &svc)
                 .await
                 .status(),
             StatusCode::NOT_FOUND
         );
         assert_eq!(
-            call(&app, "GET", "/wf-legacy?owner=", "root", &svc)
+            call(&app, "GET", "/workflows/wf-legacy?owner=", "root", &svc)
                 .await
                 .status(),
             StatusCode::OK
@@ -1177,7 +1195,12 @@ mod tests {
         wf["nodes"].as_array_mut().unwrap().pop();
         let r = app
             .clone()
-            .oneshot(auth_req("PUT", "/wf-1", &token, Some(&wf.to_string())))
+            .oneshot(auth_req(
+                "PUT",
+                "/workflows/wf-1",
+                &token,
+                Some(&wf.to_string()),
+            ))
             .await
             .unwrap();
         assert_eq!(r.status(), StatusCode::OK);
@@ -1186,7 +1209,7 @@ mod tests {
 
         // Suppression du workflow : plus aucune URL.
         let r = app
-            .oneshot(auth_req("DELETE", "/wf-1", &token, None))
+            .oneshot(auth_req("DELETE", "/workflows/wf-1", &token, None))
             .await
             .unwrap();
         assert_eq!(r.status(), StatusCode::NO_CONTENT);
@@ -1264,7 +1287,12 @@ mod tests {
         );
         let r = app
             .clone()
-            .oneshot(auth_req("POST", "/", &token, Some(&bad.to_string())))
+            .oneshot(auth_req(
+                "POST",
+                "/workflows",
+                &token,
+                Some(&bad.to_string()),
+            ))
             .await
             .unwrap();
         assert_eq!(r.status(), StatusCode::BAD_REQUEST);
@@ -1283,7 +1311,12 @@ mod tests {
         repo.create("alice", sample_workflow("wf-2")).await.unwrap();
         let bad = with_trigger("wf-2", "polling", serde_json::json!({ "url": "ftp://x" }));
         let r = app
-            .oneshot(auth_req("PUT", "/wf-2", &token, Some(&bad.to_string())))
+            .oneshot(auth_req(
+                "PUT",
+                "/workflows/wf-2",
+                &token,
+                Some(&bad.to_string()),
+            ))
             .await
             .unwrap();
         assert_eq!(r.status(), StatusCode::BAD_REQUEST);
@@ -1305,7 +1338,12 @@ mod tests {
         let wf = with_trigger("wf-1", "schedule", cron.clone());
         let r = app
             .clone()
-            .oneshot(auth_req("POST", "/", &token, Some(&wf.to_string())))
+            .oneshot(auth_req(
+                "POST",
+                "/workflows",
+                &token,
+                Some(&wf.to_string()),
+            ))
             .await
             .unwrap();
         assert_eq!(r.status(), StatusCode::CREATED);
@@ -1319,7 +1357,12 @@ mod tests {
         let hook = with_trigger("wf-1", "webhook", serde_json::json!({}));
         let r = app
             .clone()
-            .oneshot(auth_req("PUT", "/wf-1", &token, Some(&hook.to_string())))
+            .oneshot(auth_req(
+                "PUT",
+                "/workflows/wf-1",
+                &token,
+                Some(&hook.to_string()),
+            ))
             .await
             .unwrap();
         assert_eq!(r.status(), StatusCode::OK);
@@ -1329,7 +1372,12 @@ mod tests {
         let poll = serde_json::json!({ "url": "https://api.example/items" });
         let wf = with_trigger("wf-1", "polling", poll.clone());
         app.clone()
-            .oneshot(auth_req("PUT", "/wf-1", &token, Some(&wf.to_string())))
+            .oneshot(auth_req(
+                "PUT",
+                "/workflows/wf-1",
+                &token,
+                Some(&wf.to_string()),
+            ))
             .await
             .unwrap();
         assert_eq!(
@@ -1337,7 +1385,7 @@ mod tests {
             vec![("wf-1".into(), "entry".into(), poll)]
         );
         let r = app
-            .oneshot(auth_req("DELETE", "/wf-1", &token, None))
+            .oneshot(auth_req("DELETE", "/workflows/wf-1", &token, None))
             .await
             .unwrap();
         assert_eq!(r.status(), StatusCode::NO_CONTENT);
@@ -1360,7 +1408,12 @@ mod tests {
         store.fail.store(true, std::sync::atomic::Ordering::SeqCst);
         let r = app
             .clone()
-            .oneshot(auth_req("POST", "/", &token, Some(&wf.to_string())))
+            .oneshot(auth_req(
+                "POST",
+                "/workflows",
+                &token,
+                Some(&wf.to_string()),
+            ))
             .await
             .unwrap();
         assert_eq!(r.status(), StatusCode::INTERNAL_SERVER_ERROR);
@@ -1374,7 +1427,12 @@ mod tests {
         store.fail.store(false, std::sync::atomic::Ordering::SeqCst);
         let r = app
             .clone()
-            .oneshot(auth_req("POST", "/", &token, Some(&wf.to_string())))
+            .oneshot(auth_req(
+                "POST",
+                "/workflows",
+                &token,
+                Some(&wf.to_string()),
+            ))
             .await
             .unwrap();
         assert_eq!(r.status(), StatusCode::CREATED);
@@ -1387,13 +1445,23 @@ mod tests {
         store.fail.store(true, std::sync::atomic::Ordering::SeqCst);
         let r = app
             .clone()
-            .oneshot(auth_req("PUT", "/wf-1", &token, Some(&changed.to_string())))
+            .oneshot(auth_req(
+                "PUT",
+                "/workflows/wf-1",
+                &token,
+                Some(&changed.to_string()),
+            ))
             .await
             .unwrap();
         assert_eq!(r.status(), StatusCode::INTERNAL_SERVER_ERROR);
         store.fail.store(false, std::sync::atomic::Ordering::SeqCst);
         let r = app
-            .oneshot(auth_req("PUT", "/wf-1", &token, Some(&changed.to_string())))
+            .oneshot(auth_req(
+                "PUT",
+                "/workflows/wf-1",
+                &token,
+                Some(&changed.to_string()),
+            ))
             .await
             .unwrap();
         assert_eq!(r.status(), StatusCode::OK);
