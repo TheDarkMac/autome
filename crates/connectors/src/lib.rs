@@ -6,6 +6,7 @@
 //! [`sdk`] (F4.5) ; un connecteur exemple complet est livré dans
 //! [`template`].
 
+pub mod catalog;
 pub mod credentials;
 pub mod egress;
 pub mod github;

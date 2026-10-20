@@ -480,10 +480,36 @@ pub fn send_email_schema() -> ActionSchema {
                 required: true,
                 description: None,
             },
+            ParamSpec {
+                key: "cc",
+                label: "Cc",
+                kind: ParamKind::Array {
+                    inner: Box::new(ParamKind::String),
+                },
+                required: false,
+                description: None,
+            },
+            ParamSpec {
+                key: "bcc",
+                label: "Cci",
+                kind: ParamKind::Array {
+                    inner: Box::new(ParamKind::String),
+                },
+                required: false,
+                description: None,
+            },
             ParamSpec::opt_str("from", "From"),
             ParamSpec::req_str("subject", "Sujet"),
-            ParamSpec::req_str("body", "Corps"),
-            ParamSpec::opt_obj("attachments", "Pièces jointes"),
+            ParamSpec::req_text("body", "Corps"),
+            ParamSpec {
+                key: "attachments",
+                label: "Pièces jointes",
+                kind: ParamKind::Array {
+                    inner: Box::new(ParamKind::Object),
+                },
+                required: false,
+                description: None,
+            },
             ParamSpec::opt_str("user_id", "User id (défaut: me)"),
         ],
     }

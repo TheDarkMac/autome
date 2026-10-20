@@ -422,7 +422,7 @@ pub fn create_issue_schema() -> ActionSchema {
             ParamSpec::req_str("owner", "Owner"),
             ParamSpec::req_str("repo", "Repo"),
             ParamSpec::req_str("title", "Titre"),
-            ParamSpec::opt_str("body", "Corps"),
+            ParamSpec::opt_text("body", "Corps"),
             ParamSpec {
                 key: "labels",
                 label: "Labels",
@@ -455,8 +455,8 @@ pub fn comment_issue_schema() -> ActionSchema {
         params: vec![
             ParamSpec::req_str("owner", "Owner"),
             ParamSpec::req_str("repo", "Repo"),
-            ParamSpec::opt_int("issue_number", "Issue #"),
-            ParamSpec::req_str("body", "Commentaire"),
+            ParamSpec::req_int("issue_number", "Issue #"),
+            ParamSpec::req_text("body", "Commentaire"),
         ],
     }
 }
@@ -471,7 +471,7 @@ pub fn close_issue_schema() -> ActionSchema {
         params: vec![
             ParamSpec::req_str("owner", "Owner"),
             ParamSpec::req_str("repo", "Repo"),
-            ParamSpec::opt_int("issue_number", "Issue #"),
+            ParamSpec::req_int("issue_number", "Issue #"),
             ParamSpec {
                 key: "state_reason",
                 label: "Raison",
@@ -527,7 +527,7 @@ pub fn create_pull_schema() -> ActionSchema {
             ParamSpec::req_str("title", "Titre"),
             ParamSpec::req_str("head", "Head"),
             ParamSpec::req_str("base", "Base"),
-            ParamSpec::opt_str("body", "Description"),
+            ParamSpec::opt_text("body", "Description"),
         ],
     }
 }
@@ -542,7 +542,7 @@ pub fn merge_pull_schema() -> ActionSchema {
         params: vec![
             ParamSpec::req_str("owner", "Owner"),
             ParamSpec::req_str("repo", "Repo"),
-            ParamSpec::opt_int("pull_number", "PR #"),
+            ParamSpec::req_int("pull_number", "PR #"),
             ParamSpec {
                 key: "merge_method",
                 label: "Méthode",

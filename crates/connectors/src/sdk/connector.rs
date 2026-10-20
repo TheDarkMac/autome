@@ -1,8 +1,9 @@
 //! Trait racine d'un connecteur (F4.5.a).
 //!
 //! Le `Connector` est essentiellement un *registre* : il expose son
-//! identifiant de provider et la liste des actions qu'il propose, dans une
-//! forme consommable par le frontend (palette de nodes) et l'API publique.
+//! identifiant de provider et la liste des actions qu'il propose. Les
+//! connecteurs livrés sont réunis dans [`crate::catalog`], que l'API sert
+//! (`GET /connectors/actions`) et dont le frontend tire sa palette de nodes.
 //! Le cycle de vie d'auth concret est porté par les enums `*Auth` de
 //! chaque provider, qui implémentent [`crate::sdk::Credentials`].
 

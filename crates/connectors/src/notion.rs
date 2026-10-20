@@ -7,8 +7,8 @@ use serde_json::{json, Value};
 
 use crate::http::{HttpClient, HttpRequest};
 use crate::sdk::{
-    headers_for, interpret, percent_encode, ActionSchema, Connector, Credentials, ParamSpec,
-    ResponseInterpreter,
+    headers_for, interpret, percent_encode, ActionSchema, Connector, Credentials, ParamKind,
+    ParamSpec, ResponseInterpreter,
 };
 
 const NOTION_API: &str = "https://api.notion.com/v1";
@@ -291,9 +291,17 @@ pub fn create_page_schema() -> ActionSchema {
         label: "Notion — Créer une page",
         description: "Crée une page via `POST /v1/pages`.",
         params: vec![
-            ParamSpec::opt_obj("parent", "Parent"),
-            ParamSpec::opt_obj("properties", "Properties"),
-            ParamSpec::opt_obj("children", "Children (blocs)"),
+            ParamSpec::req_obj("parent", "Parent"),
+            ParamSpec::req_obj("properties", "Properties"),
+            ParamSpec {
+                key: "children",
+                label: "Children (blocs)",
+                kind: ParamKind::Array {
+                    inner: Box::new(ParamKind::Object),
+                },
+                required: false,
+                description: None,
+            },
             ParamSpec::opt_obj("icon", "Icon"),
             ParamSpec::opt_obj("cover", "Cover"),
         ],
@@ -321,7 +329,15 @@ pub fn query_database_schema() -> ActionSchema {
         params: vec![
             ParamSpec::req_str("database_id", "Database ID"),
             ParamSpec::opt_obj("filter", "Filter"),
-            ParamSpec::opt_obj("sorts", "Sorts"),
+            ParamSpec {
+                key: "sorts",
+                label: "Sorts",
+                kind: ParamKind::Array {
+                    inner: Box::new(ParamKind::Object),
+                },
+                required: false,
+                description: None,
+            },
             ParamSpec::opt_int("page_size", "Page size"),
             ParamSpec::opt_str("start_cursor", "Start cursor"),
         ],
