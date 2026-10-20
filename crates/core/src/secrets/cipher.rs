@@ -34,7 +34,7 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
 use rand::RngCore;
 
-use crate::secrets::keys::{KeyProvider, KEY_LEN};
+use crate::secrets::keys::KeyProvider;
 use crate::{Error, Result};
 
 const FORMAT_VERSION: &str = "v1";
@@ -154,17 +154,18 @@ fn parse_envelope(envelope: &str) -> Result<(&str, &str, &str)> {
     Ok((key_id, nonce_b64, ct_b64))
 }
 
-/// Génère 32 octets aléatoires — utilitaire pour bootstrap d'une clé en dev.
-pub fn random_key() -> [u8; KEY_LEN] {
-    let mut k = [0u8; KEY_LEN];
-    rand::thread_rng().fill_bytes(&mut k);
-    k
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::secrets::keys::KEY_LEN;
     use crate::secrets::InMemoryKeyProvider;
+
+    /// Clé de 32 octets aléatoires, différente à chaque test.
+    fn random_key() -> [u8; KEY_LEN] {
+        let mut k = [0u8; KEY_LEN];
+        rand::thread_rng().fill_bytes(&mut k);
+        k
+    }
 
     fn cipher_with(key: [u8; KEY_LEN]) -> EnvelopeCipher<InMemoryKeyProvider> {
         let provider = InMemoryKeyProvider::with_key("k1", key);
