@@ -49,17 +49,28 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # api & worker : contexte = racine du dépôt, Dockerfile dans docker/.
+          # api & worker : contexte = racine du dépôt, une cible chacun du
+          # Dockerfile backend. Même scope de cache que la CI (#263) : son
+          # smoke a déjà construit le builder pour ce commit. Seul `api`
+          # écrit le scope (deux exports parallèles s'écraseraient).
           - image: api
             context: .
-            dockerfile: docker/api.Dockerfile
+            dockerfile: docker/backend.Dockerfile
+            target: api
+            scope: backend
+            write-cache: true
           - image: worker
             context: .
-            dockerfile: docker/worker.Dockerfile
+            dockerfile: docker/backend.Dockerfile
+            target: worker
+            scope: backend
+            write-cache: false
           # frontend : contexte = frontend/, build Vite statique.
           - image: frontend
             context: frontend
             dockerfile: frontend/Dockerfile
+            scope: frontend
+            write-cache: true
     steps:
       - uses: actions/checkout@v4
 
@@ -91,11 +102,12 @@ jobs:
         with:
           context: ${{ matrix.context }}
           file: ${{ matrix.dockerfile }}
+          target: ${{ matrix.target }}
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha,scope=${{ matrix.image }}
-          cache-to: type=gha,mode=max,scope=${{ matrix.image }}
+          cache-from: type=gha,scope=${{ matrix.scope }}
+          cache-to: ${{ matrix.write-cache && format('type=gha,mode=max,scope={0}', matrix.scope) || '' }}
 
   # ──────────────────────────── Deploy ────────────────────────────
   # Rend les manifests avec l'image taggée (sha-<court>), puis applique sur le
