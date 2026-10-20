@@ -1092,7 +1092,7 @@ RGPD, art. 17 (#229). L'utilisateur supprime son compte depuis l'onglet
 
 | Donnée | Table(s) |
 |---|---|
-| Compte : email, hash du mot de passe | `users` (et `credentials`, 0004, par cascade) |
+| Compte : email, hash du mot de passe | `users` |
 | Permissions | `user_permissions` |
 | Workflows de son espace, toutes versions | `workflows`, `workflow_versions` |
 | URL webhook et échéances planifiées de ces workflows | `webhook_endpoints`, `trigger_schedules` (cascade) |

@@ -16,6 +16,11 @@ GitHub PAT, Notion integration secret, …). Ces données sont **hautement
 sensibles** : un dump SQL exposerait l'accès à toutes les intégrations
 des utilisateurs.
 
+> **Note (#251)** : cette table n'a jamais été câblée. Les tokens sont
+> stockés dans `connector_tokens` (`migrations/0011_connector_tokens.sql`),
+> chiffrés selon cette décision ; `credentials` est supprimée par
+> `migrations/0023_drop_credentials.sql`.
+
 On veut un chiffrement **au repos** qui :
 
 - protège contre une fuite de la base (dump, snapshot, accès lecture
