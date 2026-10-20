@@ -43,6 +43,7 @@ pub mod openapi;
 pub mod password_policy;
 pub mod password_reset;
 pub mod probes;
+pub mod reconnect_notice;
 pub mod runs;
 pub mod runtime;
 pub mod shutdown;

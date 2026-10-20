@@ -33,6 +33,7 @@ use autome_api::openapi::openapi_router;
 use autome_api::password_policy::PasswordPolicy;
 use autome_api::password_reset::{PasswordReset, ResetTokens};
 use autome_api::probes::{probes_router, ProbesState};
+use autome_api::reconnect_notice::{ReconnectNotifier, RECONNECT_NOTICE_INTERVAL};
 use autome_api::runs::{runs_router, RunsState};
 use autome_api::runtime::{
     build_backends, build_health_checks, build_queue, ensure_durable_backends, migrate,
@@ -141,12 +142,14 @@ fn erasure(backends: &Backends) -> Erasure {
 }
 
 /// Fonctions qui envoient des emails : mot de passe oublié (#204),
-/// vérification de l'adresse (#231) et invitations (#241).
+/// vérification de l'adresse (#231), invitations (#241) et connecteurs à
+/// reconnecter (#265).
 #[derive(Debug, Default)]
 struct MailFeatures {
     password_reset: Option<PasswordReset>,
     email_verification: Option<EmailVerification>,
     invitation: Option<Invitation>,
+    reconnect_notices: Option<MailSettings>,
 }
 
 /// État de l'administration (#208) : suppression de comptes (#229),
@@ -225,9 +228,9 @@ fn mail_features(config: &Config) -> Result<MailFeatures, String> {
 fn mail_features_from(config: &Config, mail: Option<MailSettings>, required: bool) -> MailFeatures {
     let Some(mail) = mail else {
         tracing::warn!(
-            "mot de passe oublié, invitations et vérification de l'email désactivés : \
-             AUTOME_SMTP_URL absent (503 sur /auth/password/forgot et /admin/users en POST, \
-             comptes créés vérifiés)"
+            "mot de passe oublié, invitations, vérification de l'email et emails « connecteur \
+             à reconnecter » désactivés : AUTOME_SMTP_URL absent (503 sur \
+             /auth/password/forgot et /admin/users en POST, comptes créés vérifiés)"
         );
         return MailFeatures::default();
     };
@@ -247,8 +250,12 @@ fn mail_features_from(config: &Config, mail: Option<MailSettings>, required: boo
             InviteTokens::from_config(config),
             mail.clone(),
         )),
-        password_reset: Some(PasswordReset::new(ResetTokens::from_config(config), mail)),
+        password_reset: Some(PasswordReset::new(
+            ResetTokens::from_config(config),
+            mail.clone(),
+        )),
         email_verification,
+        reconnect_notices: Some(mail),
     }
 }
 
@@ -539,6 +546,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "refus des mots de passe courants ou compromis"
     );
     let mail = mail_features(&config)?;
+    // Connecteurs à reconnecter (#265) : email au propriétaire, une fois par
+    // invalidation, même sur plusieurs répliques.
+    if let Some(settings) = mail.reconnect_notices.clone() {
+        let notifier = ReconnectNotifier::new(
+            backends.reconnect_notices.clone(),
+            backends.users.clone(),
+            settings,
+        );
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(RECONNECT_NOTICE_INTERVAL);
+            loop {
+                tick.tick().await;
+                match notifier.run_once().await {
+                    Ok(report) if report != Default::default() => {
+                        tracing::info!(
+                            sent = report.sent,
+                            skipped = report.skipped,
+                            failed = report.failed,
+                            "connecteurs à reconnecter signalés par email"
+                        )
+                    }
+                    Ok(_) => {}
+                    Err(e) => tracing::warn!(
+                        error = %e,
+                        "connecteurs à reconnecter : réclamation impossible"
+                    ),
+                }
+            }
+        });
+    }
     let admin = admin_state(&backends, mail.invitation.clone());
     let settings = AccountSettings {
         ip_throttle,
@@ -621,7 +658,8 @@ mod tests {
         assert!(
             features.password_reset.is_some()
                 && features.email_verification.is_some()
-                && features.invitation.is_some(),
+                && features.invitation.is_some()
+                && features.reconnect_notices.is_some(),
             "dev sans SMTP : liens journalisés"
         );
         let admin = admin_state(&backends, features.invitation.clone());
@@ -656,6 +694,7 @@ mod tests {
             none.password_reset.is_none()
                 && none.email_verification.is_none()
                 && none.invitation.is_none()
+                && none.reconnect_notices.is_none()
         );
         // Désactivée explicitement : le mot de passe oublié reste disponible.
         let off = mail_features_from(&config, mail(), false);
