@@ -2,6 +2,9 @@
 //
 // F8.4.a — Le formulaire est généré dynamiquement depuis le `NodeSchema`
 //          du couple (kind, subtype). Aucun composant spécifique par type.
+//          Les actions de connecteur ont le leur dans `schemas` (#257, tiré
+//          de `GET /connectors/actions`) ; leurs paramètres objet ou tableau
+//          se saisissent en JSON.
 // F8.4.b — La validation s'exécute à chaque rendu via `validateParams` ;
 //          les erreurs s'affichent sous chaque champ ; un récap en haut
 //          indique l'état global.
@@ -35,6 +38,8 @@ import {
   defaultParams,
   extractReferences,
   findNodeSchema,
+  jsonDraft,
+  parseJsonInput,
   validateParams,
 } from "./paramSchema";
 
@@ -42,6 +47,8 @@ export interface NodePanelProps {
   node: CanvasNode | null;
   onChange: (nodeId: string, params: ParamValues) => void;
   onClose: () => void;
+  /** Formulaires des actions de connecteur (#257) ; absent = intégrés seuls. */
+  schemas?: readonly NodeSchema[];
   /** Override pour tests. */
   fetchCredentialsImpl?: typeof fetchCredentials;
   /** URL des nœuds webhook du workflow courant (#202) ; absent = non affichées. */
@@ -60,11 +67,12 @@ export function NodePanel({
   node,
   onChange,
   onClose,
+  schemas,
   fetchCredentialsImpl = fetchCredentials,
   webhooks,
 }: NodePanelProps): JSX.Element {
   if (!node) return <EmptyPanel />;
-  const schema = findNodeSchema(node.data.kind, node.data.subtype);
+  const schema = findNodeSchema(node.data.kind, node.data.subtype, schemas);
   if (!schema) {
     return <UnknownSchemaPanel node={node} onClose={onClose} />;
   }
@@ -255,9 +263,10 @@ function ParamField({ schema, value, error, onChange }: ParamFieldProps): JSX.El
     "w-full rounded-md border bg-white px-3 py-1.5 text-sm outline-none transition focus:border-sky-400";
   const errCls = error ? "border-rose-400" : "border-neutral-200";
   const cls = `${baseInputCls} ${errCls}`;
-  const refs = schema.type === "string" || schema.type === "text"
-    ? extractReferences(value)
-    : [];
+  const refs =
+    schema.type === "string" || schema.type === "text" || schema.type === "json"
+      ? extractReferences(value)
+      : [];
 
   let input: JSX.Element;
   switch (schema.type) {
@@ -331,6 +340,18 @@ function ParamField({ schema, value, error, onChange }: ParamFieldProps): JSX.El
         </select>
       );
       break;
+    case "json":
+      input = (
+        <JsonInput
+          id={id}
+          value={value}
+          placeholder={schema.placeholder ?? ""}
+          onChange={onChange}
+          className={`${cls} font-mono`}
+          invalid={error !== undefined}
+        />
+      );
+      break;
   }
 
   return (
@@ -356,6 +377,43 @@ function ParamField({ schema, value, error, onChange }: ParamFieldProps): JSX.El
       ) : null}
       {refs.length > 0 ? <ReferenceChips refs={refs} /> : null}
     </div>
+  );
+}
+
+/**
+ * Zone JSON : le texte saisi reste tel quel à l'écran (pas de reformatage en
+ * cours de frappe) ; la valeur transmise est l'objet ou le tableau quand le
+ * texte en est un, le texte sinon (cf. `parseJsonInput`).
+ */
+function JsonInput({
+  id,
+  value,
+  placeholder,
+  onChange,
+  className,
+  invalid,
+}: {
+  id: string;
+  value: ParamValue;
+  placeholder: string;
+  onChange: (v: ParamValue) => void;
+  className: string;
+  invalid: boolean;
+}): JSX.Element {
+  const [draft, setDraft] = useState(() => jsonDraft(value));
+  return (
+    <textarea
+      id={id}
+      rows={4}
+      value={draft}
+      placeholder={placeholder}
+      onChange={(e) => {
+        setDraft(e.target.value);
+        onChange(parseJsonInput(e.target.value));
+      }}
+      className={className}
+      aria-invalid={invalid ? "true" : undefined}
+    />
   );
 }
 

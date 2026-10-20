@@ -6,7 +6,7 @@ import {
   hasPermission,
   type Schemas,
 } from "./apiClient";
-import { fetchCatalog, STATIC_CATALOG, type CatalogItem } from "./catalog";
+import { BUILTIN_ONLY, fetchCatalog, type Catalog } from "./catalog";
 import { AcceptInvitationPage } from "./AcceptInvitationPage";
 import { AccountPanel } from "./AccountPanel";
 import { AdminPanel } from "./AdminPanel";
@@ -238,7 +238,7 @@ export function App({
     [api, workflowId, persisted, revision],
   );
   const [status, setStatus] = useState<Status>({ kind: "idle" });
-  const [catalog, setCatalog] = useState<readonly CatalogItem[]>(STATIC_CATALOG);
+  const [catalog, setCatalog] = useState<Catalog>(BUILTIN_ONLY);
   const [catalogLoading, setCatalogLoading] = useState(true);
   const [selectedNode, setSelectedNode] = useState<CanvasNode | null>(null);
   const [controller, setController] = useState<NodeCanvasController | null>(null);
@@ -283,9 +283,9 @@ export function App({
   useEffect(() => {
     let cancelled = false;
     setCatalogLoading(true);
-    fetchCatalog().then((items) => {
+    fetchCatalog().then((loaded) => {
       if (cancelled) return;
-      setCatalog(items);
+      setCatalog(loaded);
       setCatalogLoading(false);
     });
     return () => {
@@ -448,7 +448,11 @@ export function App({
           />
           <div className="flex min-h-0 flex-1">
             {view === "edit" ? (
-              <Palette items={catalog} loading={catalogLoading} />
+              <Palette
+                items={catalog.items}
+                loading={catalogLoading}
+                connectorsUnavailable={catalog.connectorsUnavailable}
+              />
             ) : persisted ? (
               <RunsList
                 workflowId={workflowId}
@@ -483,6 +487,7 @@ export function App({
                 node={selectedNode}
                 onChange={handlePanelChange}
                 onClose={() => setSelectedNode(null)}
+                schemas={catalog.schemas}
                 webhooks={webhooks}
               />
             ) : (

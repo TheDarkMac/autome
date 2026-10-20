@@ -1,7 +1,7 @@
 // Palette de nodes — sidebar à gauche du canvas (F8.3.a/b).
 //
 // Le composant est purement présentationnel : il consomme une liste
-// d'`CatalogItem` (fournie par F8.3.c via `fetchCatalog`), groupe par
+// d'`CatalogItem` (fournie par `fetchCatalog`, #257), groupe par
 // catégorie, expose un champ de recherche, et émet le payload d'un drag
 // via `dataTransfer.setData(DND_MIME, ...)`. La cible du drop est gérée
 // par `NodeCanvas`.
@@ -18,9 +18,15 @@ export interface PaletteProps {
   items: readonly CatalogItem[];
   /** État de chargement — affiche un message au lieu de la liste vide. */
   loading?: boolean;
+  /** Actions de connecteur non chargées (#257) : la palette le signale. */
+  connectorsUnavailable?: boolean;
 }
 
-export function Palette({ items, loading = false }: PaletteProps): JSX.Element {
+export function Palette({
+  items,
+  loading = false,
+  connectorsUnavailable = false,
+}: PaletteProps): JSX.Element {
   const [query, setQuery] = useState("");
   const deferredQuery = useDeferredValue(query);
 
@@ -52,6 +58,17 @@ export function Palette({ items, loading = false }: PaletteProps): JSX.Element {
           className="mt-3 w-full rounded-md border border-neutral-200 bg-neutral-50 px-3 py-1.5 text-sm outline-none transition focus:border-sky-400 focus:bg-white"
         />
       </div>
+
+      {connectorsUnavailable && !loading ? (
+        <p
+          className="border-b border-amber-100 bg-amber-50 px-4 py-2 text-xs text-amber-800"
+          role="status"
+          data-testid="palette-connectors-unavailable"
+        >
+          Actions de connecteur indisponibles : l'API ne répond pas. Seuls les
+          nodes intégrés sont listés.
+        </p>
+      ) : null}
 
       <div className="flex-1 overflow-y-auto px-2 py-3" role="list">
         {loading ? (

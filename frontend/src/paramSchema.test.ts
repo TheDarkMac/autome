@@ -6,8 +6,13 @@ import {
   defaultParams,
   extractReferences,
   findNodeSchema,
+  jsonDraft,
+  parseJsonInput,
   validateParams,
 } from "./paramSchema";
+import { SAMPLE_CATALOG } from "./testCatalog";
+
+const CONNECTORS = SAMPLE_CATALOG.schemas;
 
 describe("paramSchema — registre statique", () => {
   it("expose un schéma par couple (kind, subtype) sans doublon", () => {
@@ -33,9 +38,16 @@ describe("paramSchema — registre statique", () => {
     expect(findNodeSchema("action", "inexistant.subtype")).toBeUndefined();
   });
 
-  it("attache un credentialProvider aux actions tierces", () => {
-    expect(findNodeSchema("action", "slack.send")?.credentialProvider).toBe("slack");
-    expect(findNodeSchema("action", "github.create_issue")?.credentialProvider).toBe("github");
+  it("cherche les actions de connecteur dans les schémas chargés (#257)", () => {
+    expect(findNodeSchema("action", "slack.send_message")).toBeUndefined();
+    expect(findNodeSchema("action", "slack.send_message", CONNECTORS)?.credentialProvider).toBe(
+      "slack",
+    );
+    expect(findNodeSchema("action", "github.close_issue", CONNECTORS)?.credentialProvider).toBe(
+      "github",
+    );
+    // Les nodes intégrés restent prioritaires.
+    expect(findNodeSchema("action", "http_request", CONNECTORS)?.label).toBe("HTTP Request");
   });
 
   it("ne déclare pas de credentialProvider pour http_request", () => {
@@ -63,8 +75,8 @@ describe("defaultParams", () => {
 describe("validateParams", () => {
   const webhook = findNodeSchema("trigger", "webhook")!;
   const polling = findNodeSchema("trigger", "polling")!;
-  const slack = findNodeSchema("action", "slack.send")!;
-  const github = findNodeSchema("action", "github.create_issue")!;
+  const slack = findNodeSchema("action", "slack.send_message", CONNECTORS)!;
+  const notion = findNodeSchema("action", "notion.create_page", CONNECTORS)!;
 
   it("flag les champs required manquants", () => {
     const errs = validateParams(polling, {});
@@ -114,18 +126,43 @@ describe("validateParams", () => {
   });
 
   it("ignore les champs optionnels vides", () => {
-    const errs = validateParams(slack, { channel: "#g", message: "hi" });
+    const errs = validateParams(slack, { channel: "#g", text: "hi" });
     expect(errs).toEqual({});
   });
 
-  it("repère le format repo invalide github", () => {
-    const errs = validateParams(github, { repo: "abc", title: "x" });
-    expect(errs["repo"]).toMatch(/Format invalide/);
+  it("champ JSON : objet ou tableau selon le schéma, expression acceptée (#257)", () => {
+    const ok = { parent: { database_id: "db" }, properties: { Name: "x" } };
+    expect(validateParams(notion, ok)).toEqual({});
+    expect(validateParams(notion, { ...ok, parent: ["db"] })["parent"]).toBe(
+      "Objet JSON attendu.",
+    );
+    expect(validateParams(notion, { ...ok, parent: "{ pas du json" })["parent"]).toBe(
+      "JSON invalide.",
+    );
+    expect(validateParams(notion, { ...ok, parent: 3 })["parent"]).toBe("JSON invalide.");
+    expect(validateParams(notion, { ...ok, parent: "{{ trigger.parent }}" })).toEqual({});
+    expect(validateParams(notion, { properties: {} })["parent"]).toBe("Champ requis.");
+    expect(validateParams(slack, { channel: "#g", text: "hi", blocks: [{}] })).toEqual({});
+    expect(validateParams(slack, { channel: "#g", text: "hi", blocks: {} })["blocks"]).toBe(
+      "Tableau JSON attendu.",
+    );
+  });
+});
+
+describe("parseJsonInput / jsonDraft (#257)", () => {
+  it("transmet un objet ou un tableau, sinon le texte tel quel", () => {
+    expect(parseJsonInput('{"a": 1}')).toEqual({ a: 1 });
+    expect(parseJsonInput("[1, 2]")).toEqual([1, 2]);
+    expect(parseJsonInput("{{ x.items }}")).toBe("{{ x.items }}");
+    expect(parseJsonInput('"chaîne"')).toBe('"chaîne"');
+    expect(parseJsonInput("  ")).toBeNull();
   });
 
-  it("est satisfait quand tous les required sont remplis correctement", () => {
-    const errs = validateParams(github, { repo: "TheDarkMac/autome", title: "Bug" });
-    expect(errs).toEqual({});
+  it("affiche le texte saisi, ou la valeur stockée en JSON indenté", () => {
+    expect(jsonDraft("{{ x }}")).toBe("{{ x }}");
+    expect(jsonDraft({ a: 1 })).toBe('{\n  "a": 1\n}');
+    expect(jsonDraft(null)).toBe("");
+    expect(jsonDraft(undefined)).toBe("");
   });
 });
 

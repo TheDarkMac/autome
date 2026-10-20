@@ -4,6 +4,7 @@ import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { NodePanel } from "./NodePanel";
 import { buildCanvasNode } from "./graph";
 import type { Credential } from "./credentials";
+import { SAMPLE_CATALOG } from "./testCatalog";
 
 const noop = (): void => undefined;
 const emptyCreds = async (): Promise<readonly Credential[]> => [];
@@ -127,12 +128,12 @@ describe("<NodePanel /> — F8.4.c : expressions", () => {
 
 describe("<NodePanel /> — F8.4.d : credentials", () => {
   it("affiche la dropdown peuplée par fetchCredentials", async () => {
-    const node = buildCanvasNode({ id: "s-1", kind: "action", subtype: "slack.send" });
+    const node = buildCanvasNode({ id: "s-1", kind: "action", subtype: "slack.send_message" });
     const fetchImpl = vi.fn().mockResolvedValue([
       { id: "c-acme", name: "Workspace Acme", provider: "slack" },
       { id: "c-perso", name: "Perso", provider: "slack" },
     ]);
-    render(<NodePanel node={node} onChange={noop} onClose={noop} fetchCredentialsImpl={fetchImpl as never} />);
+    render(<NodePanel node={node} onChange={noop} onClose={noop} schemas={SAMPLE_CATALOG.schemas} fetchCredentialsImpl={fetchImpl as never} />);
     expect(fetchImpl).toHaveBeenCalledWith("slack");
     await waitFor(() => {
       expect(screen.getByTestId("credential-field").querySelector("select")).not.toBeNull();
@@ -144,8 +145,8 @@ describe("<NodePanel /> — F8.4.d : credentials", () => {
   });
 
   it("affiche un message « aucun credential » quand la liste est vide", async () => {
-    const node = buildCanvasNode({ id: "s-1", kind: "action", subtype: "slack.send" });
-    render(<NodePanel node={node} onChange={noop} onClose={noop} fetchCredentialsImpl={emptyCreds} />);
+    const node = buildCanvasNode({ id: "s-1", kind: "action", subtype: "slack.send_message" });
+    render(<NodePanel node={node} onChange={noop} onClose={noop} schemas={SAMPLE_CATALOG.schemas} fetchCredentialsImpl={emptyCreds} />);
     await waitFor(() => {
       expect(screen.getByTestId("credential-field")).toHaveTextContent(/Aucun credential/);
     });
@@ -158,12 +159,12 @@ describe("<NodePanel /> — F8.4.d : credentials", () => {
   });
 
   it("propage credential_id dans onChange quand l'utilisateur en sélectionne un", async () => {
-    const node = buildCanvasNode({ id: "s-1", kind: "action", subtype: "slack.send" });
+    const node = buildCanvasNode({ id: "s-1", kind: "action", subtype: "slack.send_message" });
     const fetchImpl = vi.fn().mockResolvedValue([
       { id: "c-acme", name: "Workspace Acme", provider: "slack" },
     ]);
     const onChange = vi.fn();
-    render(<NodePanel node={node} onChange={onChange} onClose={noop} fetchCredentialsImpl={fetchImpl as never} />);
+    render(<NodePanel node={node} onChange={onChange} onClose={noop} schemas={SAMPLE_CATALOG.schemas} fetchCredentialsImpl={fetchImpl as never} />);
     await waitFor(() => {
       expect(screen.getByTestId("credential-field").querySelector("select")).not.toBeNull();
     });
@@ -174,6 +175,51 @@ describe("<NodePanel /> — F8.4.d : credentials", () => {
     const lastCall = onChange.mock.calls.at(-1);
     expect(lastCall?.[0]).toBe("s-1");
     expect((lastCall?.[1] as Record<string, unknown>)["credential_id"]).toBe("c-acme");
+  });
+});
+
+describe("<NodePanel /> — actions de connecteur (#257)", () => {
+  const schemas = SAMPLE_CATALOG.schemas;
+
+  it("rend le formulaire tiré du schéma servi par l'API", () => {
+    const node = buildCanvasNode({ id: "s-1", kind: "action", subtype: "slack.send_message" });
+    render(<NodePanel node={node} onChange={noop} onClose={noop} schemas={schemas} fetchCredentialsImpl={emptyCreds} />);
+    expect(screen.getByTestId("field-channel").querySelector("input")).not.toBeNull();
+    expect(screen.getByTestId("field-text").querySelector("textarea")).not.toBeNull();
+    expect(screen.getByTestId("panel-status")).toHaveTextContent(/2 erreurs/);
+  });
+
+  it("sans schémas chargés, une action de connecteur reste sans formulaire", () => {
+    const node = buildCanvasNode({ id: "s-1", kind: "action", subtype: "slack.send_message" });
+    render(<NodePanel node={node} onChange={noop} onClose={noop} fetchCredentialsImpl={emptyCreds} />);
+    expect(screen.getByTestId("node-panel")).toHaveAttribute("data-unknown", "true");
+  });
+
+  it("champ JSON : transmet l'objet saisi et garde le texte en cours de frappe", () => {
+    const node = buildCanvasNode({ id: "n-1", kind: "action", subtype: "notion.create_page" });
+    const onChange = vi.fn();
+    render(<NodePanel node={node} onChange={onChange} onClose={noop} schemas={schemas} fetchCredentialsImpl={emptyCreds} />);
+    const parent = screen.getByTestId("field-parent").querySelector("textarea") as HTMLTextAreaElement;
+    fireEvent.change(parent, { target: { value: '{"database_id": ' } });
+    expect(parent.value).toBe('{"database_id": ');
+    expect(screen.getByTestId("error-parent")).toHaveTextContent("JSON invalide.");
+    fireEvent.change(parent, { target: { value: '{"database_id": "db1"}' } });
+    expect(screen.queryByTestId("error-parent")).toBeNull();
+    expect(onChange).toHaveBeenLastCalledWith("n-1", { parent: { database_id: "db1" } });
+  });
+
+  it("champ JSON : réaffiche une valeur enregistrée et accepte une expression", () => {
+    const node = buildCanvasNode({
+      id: "n-1",
+      kind: "action",
+      subtype: "notion.create_page",
+      params: { parent: { database_id: "db1" }, properties: "{{ $node('t').props }}" },
+    });
+    render(<NodePanel node={node} onChange={noop} onClose={noop} schemas={schemas} fetchCredentialsImpl={emptyCreds} />);
+    const parent = screen.getByTestId("field-parent").querySelector("textarea") as HTMLTextAreaElement;
+    expect(JSON.parse(parent.value)).toEqual({ database_id: "db1" });
+    expect(screen.getByTestId("panel-status")).toHaveTextContent(/valide/);
+    expect(screen.getByTestId("field-properties")).toHaveTextContent("t.props");
   });
 });
 
