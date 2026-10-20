@@ -4,6 +4,7 @@ import { App } from "./App";
 import type { TokenPair } from "./auth";
 import { memorySessionStore } from "./session";
 import type { UseSessionOptions } from "./useSession";
+import { SAMPLE_ACTIONS } from "./testCatalog";
 
 const sampleSpec = {
   openapi: "3.0.3",
@@ -210,15 +211,30 @@ describe("<App />", () => {
   });
 
   it("shows backend ok state with endpoint count", async () => {
-    globalThis.fetch = vi
-      .fn()
-      .mockResolvedValue(jsonResponse(sampleSpec)) as typeof fetch;
+    globalThis.fetch = vi.fn(async (input: RequestInfo | URL) =>
+      String(input).includes("/connectors/actions")
+        ? jsonResponse({ actions: [] })
+        : jsonResponse(sampleSpec),
+    ) as typeof fetch;
     render(<App sessionOptions={authedSession()} />);
     expect(screen.getByRole("heading", { name: "Autome" })).toBeInTheDocument();
     await waitFor(() => {
       expect(screen.getByRole("status")).toHaveTextContent(/Autome API/);
     });
     expect(screen.getByRole("status")).toHaveTextContent(/2 endpoints/);
+  });
+
+  it("liste dans la palette les actions servies par GET /connectors/actions (#257)", async () => {
+    globalThis.fetch = vi.fn(async (input: RequestInfo | URL) =>
+      String(input).includes("/connectors/actions")
+        ? jsonResponse({ actions: SAMPLE_ACTIONS })
+        : jsonResponse(sampleSpec),
+    ) as typeof fetch;
+    render(<App sessionOptions={authedSession()} />);
+    expect(
+      await screen.findByTestId("palette-item-action.slack.send_message"),
+    ).toHaveTextContent("Slack — Envoyer un message");
+    expect(screen.queryByTestId("palette-connectors-unavailable")).toBeNull();
   });
 
   it("shows error state when backend is unreachable", async () => {

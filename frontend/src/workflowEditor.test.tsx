@@ -10,7 +10,7 @@ import { act, fireEvent, render, screen, waitFor, within } from "@testing-librar
 
 import { App } from "./App";
 import type { TokenPair } from "./auth";
-import { DND_MIME, STATIC_CATALOG, type CatalogItem } from "./catalog";
+import { BUILTIN_CATALOG, DND_MIME, type CatalogItem } from "./catalog";
 import type { WireGraph } from "./graph";
 import { memorySessionStore } from "./session";
 import { lastWorkflowKey } from "./useWorkflowEditor";
@@ -143,7 +143,7 @@ function installBackend(opts: {
 }
 
 function dropNode(itemId: string, x = 200, y = 150): void {
-  const item = STATIC_CATALOG.find((i) => i.id === itemId) as CatalogItem;
+  const item = BUILTIN_CATALOG.find((i) => i.id === itemId) as CatalogItem;
   const store = new Map([[DND_MIME, JSON.stringify(item)]]);
   fireEvent.drop(screen.getByTestId("node-canvas"), {
     clientX: x,

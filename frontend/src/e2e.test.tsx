@@ -25,6 +25,7 @@ import type { TokenPair } from "./auth";
 import { memorySessionStore } from "./session";
 import type { RunCheckpoint, RunStatus } from "./runs";
 import type { UseSessionOptions } from "./useSession";
+import { SAMPLE_ACTIONS } from "./testCatalog";
 import { lastWorkflowKey } from "./useWorkflowEditor";
 
 const WORKFLOW_ID = "wf-e2e";
@@ -100,7 +101,7 @@ function installStatefulBackend(): { getRunCalls: () => number; runCreated: () =
     const url = typeof input === "string" ? input : (input as Request).url;
     const method = init?.method ?? "GET";
     if (url.includes("/openapi.json")) return jsonResponse(SAMPLE_SPEC);
-    if (url.includes("/catalog/nodes")) return new Response("", { status: 404 });
+    if (url.includes("/connectors/actions")) return jsonResponse({ actions: SAMPLE_ACTIONS });
     if (url.includes("/workflows?")) {
       return jsonResponse({ items: [WORKFLOW], total: 1, offset: 0, limit: 100 });
     }

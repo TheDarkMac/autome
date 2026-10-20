@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import { act, fireEvent, render, screen } from "@testing-library/react";
 
 import { NodeCanvas, type NodeCanvasController } from "./NodeCanvas";
-import { DND_MIME, STATIC_CATALOG, type CatalogItem } from "./catalog";
+import { BUILTIN_CATALOG, DND_MIME, type CatalogItem } from "./catalog";
 import { buildCanvasNode, type WireGraph } from "./graph";
 
 /** Construit un DataTransfer compatible jsdom pour `fireEvent.drop`. */
@@ -32,7 +32,7 @@ describe("<NodeCanvas />", () => {
 
   it("appends a node when a palette item is dropped on the canvas (F8.3.b)", () => {
     const onChange = vi.fn();
-    const item = STATIC_CATALOG.find((it) => it.id === "trigger.webhook")!;
+    const item = BUILTIN_CATALOG.find((it) => it.id === "trigger.webhook")!;
     render(<NodeCanvas onChange={onChange} />);
     const target = screen.getByTestId("node-canvas");
     fireEvent.drop(target, {
@@ -65,7 +65,7 @@ describe("<NodeCanvas />", () => {
 
   it("generates unique ids when the same kind is dropped repeatedly", () => {
     const onChange = vi.fn();
-    const item = STATIC_CATALOG.find((it) => it.id === "action.slack.send")!;
+    const item = BUILTIN_CATALOG.find((it) => it.id === "action.http_request")!;
     render(<NodeCanvas onChange={onChange} />);
     const target = screen.getByTestId("node-canvas");
     for (let i = 0; i < 3; i += 1) {
@@ -101,7 +101,7 @@ describe("<NodeCanvas />", () => {
 
   it("applique les defaultParams du schéma à l'ajout par drop (F8.4.b)", () => {
     const onChange = vi.fn();
-    const item = STATIC_CATALOG.find((it) => it.id === "trigger.webhook")!;
+    const item = BUILTIN_CATALOG.find((it) => it.id === "trigger.webhook")!;
     render(<NodeCanvas onChange={onChange} />);
     fireEvent.drop(screen.getByTestId("node-canvas"), {
       clientX: 200,

@@ -1,7 +1,9 @@
 // Schémas de paramètres par node (F8.4.a/b/c/d).
 //
 // Chaque node du catalogue (cf. `catalog.ts`) est associé à un `NodeSchema`
-// qui décrit ses champs. Le `NodePanel` rend le formulaire dynamiquement
+// qui décrit ses champs : `NODE_SCHEMAS` pour les nodes intégrés, et, pour
+// les actions de connecteur, les schémas tirés de `GET /connectors/actions`
+// (#257, passés à `findNodeSchema`). Le `NodePanel` rend le formulaire dynamiquement
 // depuis ce schéma — pas de code spécifique par type côté UI.
 //
 // Le schéma porte aussi :
@@ -18,7 +20,7 @@ import type { WireKind } from "./graph";
 
 // ─────────────────────────── types ───────────────────────────
 
-export type ParamType = "string" | "text" | "number" | "boolean" | "enum";
+export type ParamType = "string" | "text" | "number" | "boolean" | "enum" | "json";
 
 export interface ParamSchema {
   readonly name: string;
@@ -35,9 +37,14 @@ export interface ParamSchema {
   /** Bornes pour `type: "number"`. */
   readonly min?: number;
   readonly max?: number;
+  /** Pour `type: "json"` : forme attendue (#257). */
+  readonly jsonShape?: "object" | "array";
 }
 
-export type ParamValue = string | number | boolean | null;
+/** Objet ou tableau JSON, valeur d'un champ `type: "json"` (#257). */
+export type JsonCollection = readonly unknown[] | { readonly [key: string]: unknown };
+
+export type ParamValue = string | number | boolean | null | JsonCollection;
 export type ParamValues = Record<string, ParamValue>;
 
 export interface NodeSchema {
@@ -167,48 +174,6 @@ export const NODE_SCHEMAS: readonly NodeSchema[] = [
       { name: "body", label: "Body", type: "text" },
     ],
   },
-  {
-    kind: "action",
-    subtype: "slack.send",
-    label: "Slack — Send Message",
-    credentialProvider: "slack",
-    params: [
-      { name: "channel", label: "Channel", type: "string", required: true, placeholder: "#general" },
-      { name: "message", label: "Message", type: "text", required: true },
-    ],
-  },
-  {
-    kind: "action",
-    subtype: "gmail.send",
-    label: "Gmail — Send Email",
-    credentialProvider: "gmail",
-    params: [
-      { name: "to", label: "Destinataire", type: "string", required: true },
-      { name: "subject", label: "Sujet", type: "string", required: true },
-      { name: "body", label: "Corps", type: "text", required: true },
-    ],
-  },
-  {
-    kind: "action",
-    subtype: "notion.create_page",
-    label: "Notion — Create Page",
-    credentialProvider: "notion",
-    params: [
-      { name: "database_id", label: "Database ID", type: "string", required: true },
-      { name: "title", label: "Titre", type: "string", required: true },
-    ],
-  },
-  {
-    kind: "action",
-    subtype: "github.create_issue",
-    label: "GitHub — Create Issue",
-    credentialProvider: "github",
-    params: [
-      { name: "repo", label: "Repo (owner/name)", type: "string", required: true, pattern: "^[^/]+/[^/]+$" },
-      { name: "title", label: "Titre", type: "string", required: true },
-      { name: "body", label: "Description", type: "text" },
-    ],
-  },
   // Logique
   {
     kind: "if",
@@ -253,14 +218,18 @@ export const NODE_SCHEMAS: readonly NodeSchema[] = [
   },
 ];
 
-/** Cherche le schéma associé à un node. */
+/**
+ * Cherche le schéma associé à un node : nodes intégrés, puis `extra` (les
+ * actions de connecteur chargées depuis l'API, #257).
+ */
 export function findNodeSchema(
   kind: WireKind,
   subtype?: string,
+  extra: readonly NodeSchema[] = [],
 ): NodeSchema | undefined {
-  return NODE_SCHEMAS.find(
-    (s) => s.kind === kind && (s.subtype ?? undefined) === (subtype ?? undefined),
-  );
+  const matches = (s: NodeSchema): boolean =>
+    s.kind === kind && (s.subtype ?? undefined) === (subtype ?? undefined);
+  return NODE_SCHEMAS.find(matches) ?? extra.find(matches);
 }
 
 // ─────────────────────── defaults (F8.4.b) ───────────────────────
@@ -330,6 +299,11 @@ export function validateParams(
           errors[p.name] = "Valeur non autorisée.";
         }
         break;
+      case "json": {
+        const error = jsonError(v, p.jsonShape);
+        if (error) errors[p.name] = error;
+        break;
+      }
     }
   }
   return Object.keys(errors).length === 0 ? EMPTY : errors;
@@ -372,4 +346,38 @@ export function coerceNumberInput(raw: string): number | null {
   if (raw.trim().length === 0) return null;
   const n = Number(raw);
   return Number.isFinite(n) ? n : null;
+}
+
+// ─────────────────────── champs JSON (#257) ───────────────────────
+
+/**
+ * Valeur d'un champ JSON saisie en texte : objet ou tableau si le texte en
+ * est un, sinon le texte tel quel (une expression `{{ … }}`, que le moteur
+ * remplace par la valeur référencée, ou une saisie à corriger).
+ */
+export function parseJsonInput(raw: string): ParamValue {
+  if (raw.trim().length === 0) return null;
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (typeof parsed === "object" && parsed !== null) return parsed as JsonCollection;
+  } catch {
+    // texte libre : expression ou saisie en cours
+  }
+  return raw;
+}
+
+/** Texte affiché dans un champ JSON pour une valeur stockée. */
+export function jsonDraft(value: ParamValue | undefined): string {
+  if (typeof value === "string") return value;
+  if (typeof value === "object" && value !== null) return JSON.stringify(value, null, 2);
+  return "";
+}
+
+function jsonError(v: ParamValue, shape: "object" | "array" | undefined): string | null {
+  if (typeof v === "string") return v.includes("{{") ? null : "JSON invalide.";
+  if (Array.isArray(v)) return shape === "object" ? "Objet JSON attendu." : null;
+  if (typeof v === "object" && v !== null) {
+    return shape === "array" ? "Tableau JSON attendu." : null;
+  }
+  return "JSON invalide.";
 }
