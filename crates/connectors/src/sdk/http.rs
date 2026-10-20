@@ -19,11 +19,18 @@ pub fn percent_encode(s: &str) -> String {
 }
 
 /// Sérialise une liste `(clé, valeur)` en query string `k=v&k=v…`, chaque
-/// clé et valeur étant [`percent_encode`]-ées. Ordre préservé.
-pub fn to_query(pairs: &[(String, String)]) -> String {
+/// clé et valeur étant [`percent_encode`]-ées. Ordre préservé. Sert aussi
+/// les corps `application/x-www-form-urlencoded` (même encodage).
+pub fn to_query<K: AsRef<str>, V: AsRef<str>>(pairs: &[(K, V)]) -> String {
     pairs
         .iter()
-        .map(|(k, v)| format!("{}={}", percent_encode(k), percent_encode(v)))
+        .map(|(k, v)| {
+            format!(
+                "{}={}",
+                percent_encode(k.as_ref()),
+                percent_encode(v.as_ref())
+            )
+        })
         .collect::<Vec<_>>()
         .join("&")
 }
@@ -53,7 +60,7 @@ mod tests {
 
     #[test]
     fn to_query_keeps_pair_order_and_encodes() {
-        let pairs = vec![
+        let pairs: Vec<(String, String)> = vec![
             ("channel".into(), "C1".into()),
             ("limit".into(), "50".into()),
             ("cursor".into(), "abc=".into()),
@@ -63,6 +70,11 @@ mod tests {
 
     #[test]
     fn to_query_handles_empty() {
-        assert_eq!(to_query(&[]), "");
+        assert_eq!(to_query::<&str, &str>(&[]), "");
+    }
+
+    #[test]
+    fn to_query_accepts_borrowed_pairs() {
+        assert_eq!(to_query(&[("a b", "c&d")]), "a%20b=c%26d");
     }
 }

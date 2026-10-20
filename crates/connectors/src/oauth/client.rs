@@ -22,6 +22,7 @@ use crate::http::{HttpClient, HttpRequest};
 use crate::oauth::pkce::{generate_pkce, generate_state, PkcePair};
 use crate::oauth::provider::{OAuthProviderConfig, OAuthRegistry};
 use crate::oauth::refresh::{is_invalid_grant, RefreshError};
+use crate::sdk::http::to_query;
 
 /// Données à conserver côté serveur après [`OAuthClient::start_authorization`]
 /// jusqu'au callback du provider.
@@ -166,21 +167,6 @@ impl<C: HttpClient> OAuthClient<C> {
 
 // ───────────────────────── helpers internes ─────────────────────────
 
-/// Encodage URL minimal (RFC 3986 « unreserved »). Dupliqué depuis
-/// `sdk::http` pour éviter une dépendance croisée.
-fn percent_encode(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for b in s.bytes() {
-        let c = b as char;
-        if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '~') {
-            out.push(c);
-        } else {
-            out.push_str(&format!("%{b:02X}"));
-        }
-    }
-    out
-}
-
 fn build_authorize_url(provider: &OAuthProviderConfig, pkce: &PkcePair, state: &str) -> String {
     // Ordre fixe pour reproductibilité des tests.
     let scope = provider.scopes.join(" ");
@@ -193,20 +179,11 @@ fn build_authorize_url(provider: &OAuthProviderConfig, pkce: &PkcePair, state: &
         ("code_challenge", pkce.challenge.as_str()),
         ("code_challenge_method", "S256"),
     ];
-    let query = pairs
-        .iter()
-        .map(|(k, v)| format!("{}={}", percent_encode(k), percent_encode(v)))
-        .collect::<Vec<_>>()
-        .join("&");
-    format!("{}?{}", provider.authorize_url, query)
+    format!("{}?{}", provider.authorize_url, to_query(&pairs))
 }
 
 fn build_token_request(token_url: &str, form: &[(&str, &str)]) -> HttpRequest {
-    let body = form
-        .iter()
-        .map(|(k, v)| format!("{}={}", percent_encode(k), percent_encode(v)))
-        .collect::<Vec<_>>()
-        .join("&");
+    let body = to_query(form);
     let mut headers = BTreeMap::new();
     headers.insert(
         "Content-Type".into(),
