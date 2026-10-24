@@ -15,8 +15,8 @@ use autome_core::{
 use sha2::{Digest, Sha256};
 
 use crate::{
-    connect, PgConnectorTokenStore, PgRunStateStore, PgTriggerScheduleStore, PgWorkflowRepository,
-    PostgresCheck, QueueCheck, RabbitMqQueue,
+    connect, wait_for_schema, PgConnectorTokenStore, PgRunStateStore, PgTriggerScheduleStore,
+    PgWorkflowRepository, PostgresCheck, QueueCheck, RabbitMqQueue,
 };
 
 /// Backend de persistance des stores (`AUTOME_PERSISTENCE`).
@@ -143,6 +143,22 @@ pub async fn build_consuming_queue(
     }
 }
 
+/// Attend, en `postgres`, que la base porte toutes les migrations de ce
+/// binaire, au plus `timeout` (#271) ; immédiat en mémoire. Le worker
+/// l'appelle avant de consommer : il ne migre pas, l'API le fait au démarrage.
+pub async fn wait_for_schema_ready(
+    config: &Config,
+    mode: PersistenceMode,
+    timeout: Duration,
+) -> Result<()> {
+    match mode {
+        PersistenceMode::Memory => Ok(()),
+        PersistenceMode::Postgres => {
+            wait_for_schema(&connect(&config.database_url)?, timeout).await
+        }
+    }
+}
+
 /// Vérifications de disponibilité des backends sélectionnés (#192) : la base
 /// en `postgres` (pool dédié, sans connexion avant le premier appel), le
 /// broker en `rabbitmq` (`queue` = la file du process). Aucune en mémoire.
@@ -242,6 +258,18 @@ mod tests {
             PersistenceMode::Postgres
         );
         assert!(PersistenceMode::parse(Some("redis")).is_err());
+    }
+
+    #[tokio::test]
+    async fn schema_wait_in_memory_is_immediate_and_offline() {
+        // DSN injoignable : en mémoire, la base n'est jamais contactée.
+        let config = Config::load(|k| {
+            (k == "DATABASE_URL").then(|| "postgres://nobody@127.0.0.1:1/none".to_string())
+        })
+        .unwrap();
+        wait_for_schema_ready(&config, PersistenceMode::Memory, Duration::from_secs(30))
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

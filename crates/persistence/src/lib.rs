@@ -11,7 +11,8 @@
 //! [`PgConnectorTokenStore`] (tokens OAuth des connecteurs, chiffrés),
 //! [`PgAccountEraser`] (effacement d'un compte, #229), [`PgMfaStore`]
 //! (second facteur, #245) + le
-//! [`run_migrations`] runner. Les backends runs/workflows/queue suivent.
+//! [`run_migrations`] runner (et [`wait_for_schema`], l'attente du worker).
+//! Les backends runs/workflows/queue suivent.
 
 pub mod audit;
 pub mod connector_tokens;
@@ -38,7 +39,7 @@ pub use erasure::PgAccountEraser;
 pub use health::{run_checks, PostgresCheck, QueueCheck, Readiness, CHECK_TIMEOUT};
 pub use login_throttle::PgLoginThrottle;
 pub use mfa::PgMfaStore;
-pub use migrations::{run_migrations, MIGRATIONS};
+pub use migrations::{pending_migrations, run_migrations, wait_for_schema, MIGRATIONS};
 pub use permission::PgPermissionStore;
 pub use pool::{connect, PgPool};
 pub use rabbitmq::RabbitMqQueue;
@@ -47,7 +48,7 @@ pub use run_state::PgRunStateStore;
 pub use selectors::{
     build_connector_token_store, build_consuming_queue, build_health_checks, build_queue,
     build_run_state_store, build_trigger_schedule_store, build_workflow_repository,
-    connector_cipher, ensure_durable_backends, PersistenceMode, QueueMode,
+    connector_cipher, ensure_durable_backends, wait_for_schema_ready, PersistenceMode, QueueMode,
 };
 pub use trigger_schedules::PgTriggerScheduleStore;
 pub use users::PgUserStore;
