@@ -7,7 +7,10 @@
 #
 #   build-push : matrice api / worker / frontend → ghcr.io/<owner>/autome-*
 #   deploy     : rend les manifests avec les images taggées et applique le
-#                déploiement *si* un kubeconfig est fourni (sinon dry-run).
+#                déploiement *si* un kubeconfig est fourni (sinon dry-run) :
+#                l'overlay du cluster (variable de dépôt K8S_OVERLAY, ex.
+#                `clusters/prod`) ou, sans elle, la base `k8s/` ; l'API
+#                d'abord (elle migre la base), le worker ensuite (#271).
 #
 # La CD ne s'exécute qu'après une CI verte : déclenchée par `workflow_run`
 # (CI terminée avec succès sur `main`) et par les tags `v*.*.*` (release).
@@ -126,6 +129,9 @@ jobs:
     # utilisable dans les conditions `if:` des étapes, contrairement à `env`.
     env:
       KUBE_CONFIG: ${{ secrets.KUBE_CONFIG }}
+      # Overlay du cluster (proxys de confiance, NetworkPolicy…, #271) ;
+      # vide = la base k8s/. Il inclut k8s/ : l'épinglage ci-dessous s'y applique.
+      K8S_DIR: ${{ vars.K8S_OVERLAY || 'k8s' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -154,17 +160,23 @@ jobs:
 
       # Toujours valider le rendu (DoD), même sans cluster.
       - name: Render manifests
-        run: kubectl kustomize k8s/ | tee /tmp/rendered.yaml
+        run: kubectl kustomize "$K8S_DIR" | tee /tmp/rendered.yaml
 
       # Déploiement réel uniquement si un kubeconfig est fourni en secret.
+      # En deux temps (#271) : le worker ne migre pas, il exécuterait sinon
+      # ses runs sur un schéma que l'API n'a pas encore migré. 1) tout sauf
+      # le worker (ressources sans label `name` comprises), et l'API prête —
+      # donc migrée (AUTOME_MIGRATE) ; 2) le worker. Il attend de toute façon
+      # le schéma au démarrage, ce qui couvre un `kubectl apply` manuel.
       - name: Deploy to cluster
         if: ${{ env.KUBE_CONFIG != '' }}
         run: |
           mkdir -p "$HOME/.kube"
           printf '%s' "$KUBE_CONFIG" | base64 -d > "$HOME/.kube/config"
-          kubectl apply -k k8s/
-          kubectl -n autome rollout status deployment/api --timeout=120s
-          kubectl -n autome rollout status deployment/worker --timeout=120s
+          kubectl apply -f /tmp/rendered.yaml -l 'app.kubernetes.io/name!=worker'
+          kubectl -n autome rollout status deployment/api --timeout=300s
+          kubectl apply -f /tmp/rendered.yaml -l 'app.kubernetes.io/name=worker'
+          kubectl -n autome rollout status deployment/worker --timeout=300s
           kubectl -n autome rollout status deployment/frontend --timeout=120s
 
       - name: Deploy skipped (no kubeconfig)
