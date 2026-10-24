@@ -111,4 +111,37 @@ async fn applies_all_then_is_idempotent() {
         .unwrap()
         .get(0);
     assert_eq!(leftovers, 0, "table `credentials` ou son index restant");
+
+    // 0025 (#269) sur une base antérieure : un run d'avant 0010
+    // (`owner_id IS NULL`) passe dans l'espace legacy, et la colonne n'admet
+    // plus `NULL`.
+    client
+        .batch_execute(
+            "ALTER TABLE runs ALTER COLUMN owner_id DROP NOT NULL; \
+             INSERT INTO runs (id, workflow_id, version, status, trigger_type, created_at_ms) \
+             VALUES ('run-before-0010', 'wf-old', 1, 'succeeded', 'manual', 1); \
+             INSERT INTO runs (id, workflow_id, version, status, trigger_type, created_at_ms, \
+                               owner_id) \
+             VALUES ('run-owned', 'wf-old', 1, 'succeeded', 'manual', 2, 'alice'); \
+             DELETE FROM schema_migrations WHERE name = '0025_legacy_runs_namespace.sql';",
+        )
+        .await
+        .unwrap();
+    assert_eq!(run_migrations(&pool).await.expect("run 5"), 1);
+    let owners: Vec<String> = client
+        .query("SELECT owner_id FROM runs ORDER BY created_at_ms", &[])
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| r.get(0))
+        .collect();
+    assert_eq!(owners, ["", "alice"]);
+    let refused = client
+        .execute(
+            "INSERT INTO runs (id, workflow_id, version, status, trigger_type, created_at_ms) \
+             VALUES ('run-null', 'wf-old', 1, 'queued', 'manual', 3)",
+            &[],
+        )
+        .await;
+    assert!(refused.is_err(), "owner_id NULL encore accepté");
 }

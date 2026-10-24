@@ -21,7 +21,7 @@ use std::collections::{BTreeMap, HashMap};
 use async_trait::async_trait;
 use autome_core::{
     Error, Message, OutboxMessage, Pagination, RunCheckpoint, RunListPage, RunProgress,
-    RunStateStore, RunStatus,
+    RunStateStore, RunStatus, LEGACY_NAMESPACE,
 };
 use serde_json::Value;
 use tokio_postgres::Row;
@@ -144,7 +144,8 @@ impl PgRunStateStore {
             outputs,
             next_node: run.get("next_node"),
             error: run.get("error"),
-            owner_id: run.get("owner_id"),
+            // Espace legacy (`''`, migration `0025`) = run sans propriétaire.
+            owner_id: Some(run.get::<_, String>("owner_id")).filter(|o| o != LEGACY_NAMESPACE),
             attempt: run.get("attempt"),
             heartbeat_at_ms: run.get("heartbeat_at_ms"),
             resume_state: run.get("resume_state"),
@@ -155,6 +156,12 @@ impl PgRunStateStore {
 const RUN_COLS: &str = "id, workflow_id, version, status, trigger_type, \
                         started_at_ms, finished_at_ms, created_at_ms, next_node, error, owner_id, \
                         attempt, heartbeat_at_ms, resume_state";
+
+/// Valeur de `runs.owner_id` (`NOT NULL`, migration `0025`) : un run sans
+/// propriétaire vit dans l'espace legacy, comme les workflows (`0014`).
+fn owner_column(snapshot: &RunCheckpoint) -> &str {
+    snapshot.owner_id.as_deref().unwrap_or(LEGACY_NAMESPACE)
+}
 
 /// Colonnes d'un message de l'outbox, dans l'ordre de [`row_to_outbox`].
 const OUTBOX_COLS: &str = "run_id, queue, generation, headers, body";
@@ -183,7 +190,7 @@ impl RunStateStore for PgRunStateStore {
             .map_err(|e| storage_err("begin", e))?;
 
         // Upsert de la ligne run (last-write-wins), sauf `owner_id` :
-        // immuable une fois posé (COALESCE garde la valeur existante).
+        // immuable, fixé par la première écriture (`''` sans propriétaire).
         tx.execute(
             "INSERT INTO runs \
              (id, workflow_id, version, status, trigger_type, started_at_ms, \
@@ -197,7 +204,6 @@ impl RunStateStore for PgRunStateStore {
                finished_at_ms = EXCLUDED.finished_at_ms, \
                created_at_ms = EXCLUDED.created_at_ms, \
                next_node = EXCLUDED.next_node, error = EXCLUDED.error, \
-               owner_id = COALESCE(runs.owner_id, EXCLUDED.owner_id), \
                attempt = EXCLUDED.attempt, heartbeat_at_ms = EXCLUDED.heartbeat_at_ms, \
                resume_state = EXCLUDED.resume_state",
             &[
@@ -211,7 +217,7 @@ impl RunStateStore for PgRunStateStore {
                 &snapshot.created_at_ms,
                 &snapshot.next_node,
                 &snapshot.error,
-                &snapshot.owner_id,
+                &owner_column(snapshot),
                 &snapshot.attempt,
                 &snapshot.heartbeat_at_ms,
                 &snapshot.resume_state,
@@ -407,7 +413,7 @@ impl RunStateStore for PgRunStateStore {
                 &snapshot.created_at_ms,
                 &snapshot.next_node,
                 &snapshot.error,
-                &snapshot.owner_id,
+                &owner_column(snapshot),
             ],
         )
         .await

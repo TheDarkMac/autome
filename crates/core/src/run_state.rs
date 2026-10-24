@@ -32,7 +32,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::queue::Message;
-use crate::workflow::repo::Pagination;
+use crate::workflow::repo::{Pagination, LEGACY_NAMESPACE};
 use crate::{Error, Result};
 
 /// État global d'un run.
@@ -86,7 +86,9 @@ pub struct RunCheckpoint {
     /// moment du dispatch). Seul lui — ou un super-admin — peut le lire.
     /// **Immuable** une fois posé : les stores ignorent un changement
     /// ultérieur. `None` = run sans propriétaire (créé avant l'isolation
-    /// par propriétaire), visible des seuls super-admins.
+    /// par propriétaire, migration `0010`), visible des seuls super-admins :
+    /// il appartient à l'espace legacy ([`LEGACY_NAMESPACE`]), au même titre
+    /// que `Some("")`, et les stores le listent dans cet espace (#269).
     #[serde(default)]
     pub owner_id: Option<String>,
     /// Tentative en cours : `0` tant que le run n'a jamais été pris,
@@ -287,7 +289,9 @@ pub trait RunStateStore: Send + Sync {
     ///
     /// `owner = Some(u)` restreint aux runs de `u` : un workflow supprimé puis
     /// recréé sous le même id par un autre utilisateur ne doit pas lui
-    /// exposer les runs de l'ancien propriétaire. `None` = tous (super-admin).
+    /// exposer les runs de l'ancien propriétaire. `Some("")`
+    /// ([`LEGACY_NAMESPACE`]) inclut les runs sans propriétaire. `None` = tous
+    /// (super-admin).
     async fn list_by_workflow(
         &self,
         workflow_id: &str,
@@ -369,12 +373,11 @@ impl RunStateStore for InMemoryRunStateStore {
     async fn checkpoint(&self, snapshot: &RunCheckpoint) -> Result<()> {
         let mut inner = self.lock()?;
         // Propriétaire immuable (même règle que l'impl PostgreSQL) : un
-        // checkpoint ultérieur ne peut ni l'effacer ni le changer.
+        // checkpoint ultérieur ne peut ni l'effacer ni le changer, ni
+        // attribuer à un compte un run de l'espace legacy (`None`).
         let mut snap = snapshot.clone();
         if let Some(existing) = inner.runs.get(&snapshot.run_id) {
-            if existing.owner_id.is_some() {
-                snap.owner_id = existing.owner_id.clone();
-            }
+            snap.owner_id = existing.owner_id.clone();
         }
         inner.runs.insert(snapshot.run_id.clone(), snap);
         Ok(())
@@ -443,9 +446,7 @@ impl RunStateStore for InMemoryRunStateStore {
         }
         let owner = existing.owner_id.clone();
         *existing = snapshot.clone();
-        if owner.is_some() {
-            existing.owner_id = owner;
-        }
+        existing.owner_id = owner;
         inner.outbox.remove(&snapshot.run_id);
         Ok(true)
     }
@@ -597,7 +598,9 @@ impl RunStateStore for InMemoryRunStateStore {
             .runs
             .values()
             .filter(|c| c.workflow_id == workflow_id)
-            .filter(|c| owner.is_none() || c.owner_id.as_deref() == owner)
+            .filter(|c| {
+                owner.is_none() || Some(c.owner_id.as_deref().unwrap_or(LEGACY_NAMESPACE)) == owner
+            })
             .cloned()
             .collect();
         // Tri : created_at_ms desc, puis run_id asc pour stabiliser à
@@ -1025,6 +1028,46 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(all.total, 3, "None = sans filtre (super-admin)");
+    }
+
+    #[tokio::test]
+    async fn a_run_without_owner_lists_in_the_legacy_namespace() {
+        // Runs antérieurs à la migration 0010 (#269) : sans propriétaire, ils
+        // vivent dans l'espace legacy, comme ceux lancés depuis sur un
+        // workflow de cet espace.
+        let store = InMemoryRunStateStore::new();
+        let before_0010 = run_with_created("r-old", "wf", 50);
+        let since = run_with_created("r-new", "wf", 100).with_owner(Some(LEGACY_NAMESPACE.into()));
+        let mine = run_with_created("r-mine", "wf", 200).with_owner(Some("alice".into()));
+        for r in [&before_0010, &since, &mine] {
+            store.checkpoint(r).await.unwrap();
+        }
+        let page = store
+            .list_by_workflow("wf", Some(LEGACY_NAMESPACE), Pagination::default())
+            .await
+            .unwrap();
+        assert_eq!(page.total, 2);
+        let ids: Vec<&str> = page.items.iter().map(|c| c.run_id.as_str()).collect();
+        assert_eq!(ids, ["r-new", "r-old"]);
+    }
+
+    #[tokio::test]
+    async fn a_run_without_owner_keeps_none() {
+        // Sans propriétaire = espace legacy, lui aussi immuable : un checkpoint
+        // ultérieur ne l'attribue pas à un compte.
+        let store = InMemoryRunStateStore::new();
+        store
+            .checkpoint(&run_with_created("r", "wf", 1))
+            .await
+            .unwrap();
+        let mut later = run_with_created("r", "wf", 1).with_owner(Some("mallory".into()));
+        later.status = RunStatus::Running;
+        store.checkpoint(&later).await.unwrap();
+        later.status = RunStatus::Succeeded;
+        assert!(store.finish(&later).await.unwrap());
+        let loaded = store.load("r").await.unwrap().unwrap();
+        assert_eq!(loaded.status, RunStatus::Succeeded);
+        assert_eq!(loaded.owner_id, None);
     }
 
     #[tokio::test]

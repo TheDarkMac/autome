@@ -1,7 +1,7 @@
 //! Test d'intégration de [`PgRunStateStore`] contre un vrai PostgreSQL.
 //! Gaté par `TEST_DATABASE_URL` (skip-pass sinon). Applique les migrations.
 
-use autome_core::{Pagination, RunCheckpoint, RunStateStore, RunStatus};
+use autome_core::{Message, OutboxMessage, Pagination, RunCheckpoint, RunStateStore, RunStatus};
 use autome_persistence::{connect, run_migrations, PgRunStateStore};
 use serde_json::json;
 
@@ -116,6 +116,51 @@ async fn checkpoint_load_orphans_failed_and_list() {
         .await
         .unwrap();
     assert_eq!(all.total, 3);
+}
+
+#[tokio::test]
+async fn a_run_without_owner_lives_in_the_legacy_namespace() {
+    let Some((store, _serial)) = setup().await else {
+        eprintln!("TEST_DATABASE_URL absent → test PostgreSQL sauté");
+        return;
+    };
+    // Écrit sans propriétaire (colonne `NOT NULL` depuis 0025), par checkpoint
+    // comme par l'outbox : relu `None`, listé dans l'espace legacy avec les
+    // runs lancés depuis sur ce workflow.
+    let old = RunCheckpoint::queued("r-old", "wf", 1, "manual", 1_000);
+    store.checkpoint(&old).await.unwrap();
+    assert_eq!(store.load("r-old").await.unwrap().unwrap(), old);
+    let queued = RunCheckpoint::queued("r-queued", "wf", 1, "manual", 1_500);
+    let message = OutboxMessage {
+        run_id: "r-queued".into(),
+        queue: "runs".into(),
+        generation: 0,
+        message: Message::new(json!({ "run_id": "r-queued" })),
+    };
+    store.enqueue(&queued, &message).await.unwrap();
+    let since =
+        RunCheckpoint::queued("r-new", "wf", 1, "manual", 2_000).with_owner(Some(String::new()));
+    store.checkpoint(&since).await.unwrap();
+    let mine =
+        RunCheckpoint::queued("r-mine", "wf", 1, "manual", 3_000).with_owner(Some("alice".into()));
+    store.checkpoint(&mine).await.unwrap();
+
+    let legacy = store
+        .list_by_workflow("wf", Some(""), Pagination::default())
+        .await
+        .unwrap();
+    let ids: Vec<&str> = legacy.items.iter().map(|c| c.run_id.as_str()).collect();
+    assert_eq!(ids, ["r-new", "r-queued", "r-old"]);
+    assert_eq!(legacy.total, 3);
+    assert!(legacy.items.iter().all(|c| c.owner_id.is_none()));
+
+    // Immuable : un checkpoint ultérieur n'attribue pas le run à un compte.
+    let mut later = old.clone().with_owner(Some("mallory".into()));
+    later.status = RunStatus::Running;
+    store.checkpoint(&later).await.unwrap();
+    let got = store.load("r-old").await.unwrap().unwrap();
+    assert_eq!(got.status, RunStatus::Running);
+    assert_eq!(got.owner_id, None);
 }
 
 #[tokio::test(flavor = "multi_thread")]
