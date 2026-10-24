@@ -60,6 +60,7 @@ pub mod liveness;
 pub mod metrics;
 pub mod outbox;
 pub mod probe;
+pub mod schema;
 pub mod shutdown;
 pub mod triggers;
 pub use dispatch::{

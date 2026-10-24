@@ -38,6 +38,10 @@
 //! - `AUTOME_WORKER_SHUTDOWN_TIMEOUT_SECS` : délai laissé aux runs en cours à
 //!   l'arrêt (défaut 25 s, #200).
 //!
+//! - `AUTOME_WORKER_SCHEMA_WAIT_SECS` : en `postgres`, attente au démarrage
+//!   que l'API ait appliqué toutes les migrations du worker (défaut 120 s,
+//!   `0` = une seule vérification, #271) ; au-delà, refus de démarrer.
+//!
 //! - `AUTOME_SCHEDULER_TICK_SECS` : période de la boucle des déclencheurs
 //!   `schedule` (cron / intervalle) et `polling` (défaut 10 s, `0` =
 //!   désactivée, #227). Chaque réplique la fait tourner ; les échéances sont
@@ -65,10 +69,11 @@ use autome_core::{telemetry, Config, QueueRunDispatcher};
 use autome_persistence::selectors::{
     build_connector_token_store, build_consuming_queue, build_health_checks, build_run_state_store,
     build_trigger_schedule_store, build_workflow_repository, ensure_durable_backends,
-    PersistenceMode, QueueMode,
+    wait_for_schema_ready, PersistenceMode, QueueMode,
 };
 use autome_worker::outbox::{lease_from_env, relay_outbox, requeue_stale, MAINTENANCE_INTERVAL};
 use autome_worker::probe::{self, ProbeState};
+use autome_worker::schema::schema_wait_from_env;
 use autome_worker::shutdown::shutdown_timeout_from_env;
 use autome_worker::triggers::tick_period_from_env;
 use autome_worker::{
@@ -135,6 +140,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let run_timeout_ms = run_timeout_ms_from_env();
     let lease = lease_from_env()?;
     let credentials_mode = ConnectorCredentialsMode::from_env()?;
+    let schema_wait = schema_wait_from_env()?;
     // Proxys sortants ignorés par le client filtré anti-SSRF (#233).
     let proxies = proxy_vars_set(|k| std::env::var(k).ok());
     if !proxies.is_empty() {
@@ -144,6 +150,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
              la sortie se fait en direct ; passer par une passerelle transparente si le réseau l'impose"
         );
     }
+
+    // Schéma migré par l'API avant tout run (#271) : un worker plus récent
+    // que la base attend, puis refuse de démarrer.
+    wait_for_schema_ready(&config, persistence, schema_wait).await?;
 
     // Backends sélectionnés par l'environnement (partagés avec l'API).
     // RabbitMQ pousse un message d'avance par tâche consommatrice (#237).
