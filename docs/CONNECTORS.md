@@ -356,13 +356,20 @@ Le worker ne construit jamais l'`*Auth` à partir d'un secret global : le
   le worker via `oauth::TokenRefresher` (`OAuthClient::refresh`) puis
   re-stocké (`merge_refreshed` garde refresh token et scope non renvoyés), sous
   le verrou exclusif du store (`ConnectorTokenStore::update_locked` : verrou de
-  ligne PostgreSQL partagé par les répliques). Un `invalid_grant`
-  (`RefreshError::Revoked`) marque la credential invalide jusqu'à la
+  ligne PostgreSQL partagé par les répliques). Un refus définitif du refresh
+  token (`RefreshError::Revoked`) marque la credential invalide jusqu'à la
   reconnexion (`GET /credentials` renvoie alors `needs_reconnect: true` et
   `invalidated_at_ms`, jamais le motif du provider ; l'onglet Connecteurs
   affiche « À reconnecter », #213, l'en-tête un indicateur et l'API prévient
   le propriétaire par email, #265) ; les autres échecs (`RefreshError::Failed`) sont retentés au run
-  suivant. Un token sans `expires_at_ms` n'est jamais rafraîchi. Un connecteur
+  suivant. Le refus est reconnu même hors du format RFC 6749
+  (`oauth::is_revoked_refresh`, #267) : une réponse est en erreur si son
+  statut n'est pas 2xx, si `ok` vaut `false` (Slack, en HTTP 200) ou si elle
+  porte un `error` sans `access_token` (GitHub) ; elle est définitive si ce
+  code figure dans `REVOKED_REFRESH_CODES` (`invalid_grant`,
+  `invalid_refresh_token`, `token_revoked`, `token_expired`,
+  `bad_refresh_token`), jamais sur un 5xx. Un provider qui refuse avec un
+  autre code l'ajoute à cette liste. Un token sans `expires_at_ms` n'est jamais rafraîchi. Un connecteur
   n'a donc pas à gérer l'expiration lui-même (un access token révoqué côté
   provider avant son expiration reste, lui, une erreur HTTP remontée par
   l'interpreter) ;
