@@ -10,6 +10,7 @@
 //! vient toujours de `config.jwt_secret` (constat 1).
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use autome_connectors::oauth::{
     ConnectorTokenStore, InMemoryConnectorTokenStore, OAuthClient, OAuthRegistry, ReconnectNotices,
@@ -26,9 +27,10 @@ use autome_core::{
     WebhookEndpointStore, WorkflowRepository,
 };
 use autome_persistence::{
-    connect, connector_cipher, run_migrations, PgAccountEraser, PgAuditSink, PgConnectorTokenStore,
-    PgLoginThrottle, PgMfaStore, PgPermissionStore, PgRevocationStore, PgRunStateStore,
-    PgTriggerScheduleStore, PgUserStore, PgWebhookEndpointStore, PgWorkflowRepository,
+    connect, connect_retrying, connector_cipher, run_migrations, PgAccountEraser, PgAuditSink,
+    PgConnectorTokenStore, PgLoginThrottle, PgMfaStore, PgPermissionStore, PgRevocationStore,
+    PgRunStateStore, PgTriggerScheduleStore, PgUserStore, PgWebhookEndpointStore,
+    PgWorkflowRepository,
 };
 
 use crate::auth::{token_service_from_config, AuthState};
@@ -36,7 +38,8 @@ use crate::erasure::InMemoryAccountEraser;
 
 // Sélecteurs de file/stores partagés avec le worker (dette #107).
 pub use autome_persistence::{
-    build_health_checks, build_queue, ensure_durable_backends, PersistenceMode, QueueMode,
+    build_health_checks, build_queue, db_connect_timeout, ensure_durable_backends, PersistenceMode,
+    QueueMode,
 };
 
 /// Construit le service de credentials OAuth (dette #107, constat 3) :
@@ -211,9 +214,11 @@ pub fn migrate_on_boot_requested() -> bool {
 }
 
 /// Applique les migrations sur la base de `config` (mode `postgres`). Renvoie
-/// le nombre de migrations appliquées. Échoue si la base est injoignable.
-pub async fn migrate(config: &Config) -> Result<usize> {
-    let pool = connect(&config.database_url)?;
+/// le nombre de migrations appliquées. Attend jusqu'à `connect_timeout` une
+/// base qui démarre (#273) ; échoue si elle reste injoignable ou refuse la
+/// connexion (identifiants, base inexistante).
+pub async fn migrate(config: &Config, connect_timeout: Duration) -> Result<usize> {
+    let pool = connect_retrying(&config.database_url, connect_timeout).await?;
     run_migrations(&pool).await
 }
 
@@ -238,6 +243,21 @@ mod tests {
         build_backends(&config, PersistenceMode::Postgres, queue)
             .map(drop)
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn migrate_gives_up_on_an_unreachable_database_after_the_timeout() {
+        let config = Config::load(|k| {
+            (k == "DATABASE_URL").then(|| "postgres://u:p@127.0.0.1:1/none".to_string())
+        })
+        .unwrap();
+        let started = std::time::Instant::now();
+        let err = migrate(&config, Duration::from_millis(700))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(started.elapsed() >= Duration::from_millis(450), "retenté");
+        assert!(err.contains("connexion PostgreSQL"), "{err}");
     }
 
     #[tokio::test]
