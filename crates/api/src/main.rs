@@ -36,8 +36,8 @@ use autome_api::probes::{probes_router, ProbesState};
 use autome_api::reconnect_notice::{ReconnectNotifier, RECONNECT_NOTICE_INTERVAL};
 use autome_api::runs::{runs_router, RunsState};
 use autome_api::runtime::{
-    build_backends, build_health_checks, build_queue, ensure_durable_backends, migrate,
-    migrate_on_boot_requested, purge_expired, Backends, PersistenceMode, QueueMode,
+    build_backends, build_health_checks, build_queue, db_connect_timeout, ensure_durable_backends,
+    migrate, migrate_on_boot_requested, purge_expired, Backends, PersistenceMode, QueueMode,
 };
 use autome_api::shutdown::{
     begin_shutdown, serve_tls_until, serve_until, termination_signal, Draining, ShutdownConfig,
@@ -477,9 +477,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Runner de migrations (dette #107) : en mode `postgres` avec
     // `AUTOME_MIGRATE=1`, applique les migrations manquantes au démarrage
-    // (idempotent, sérialisé entre répliques par un verrou applicatif).
+    // (idempotent, sérialisé entre répliques par un verrou applicatif). La
+    // base peut démarrer après l'API : connexion retentée pendant
+    // `AUTOME_DB_CONNECT_TIMEOUT_SECS` (#273), comme le broker.
     if mode == PersistenceMode::Postgres && migrate_on_boot_requested() {
-        let applied = migrate(&config).await?;
+        let applied = migrate(&config, db_connect_timeout()).await?;
         tracing::info!(applied, "migrations appliquées");
     }
 
