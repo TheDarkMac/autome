@@ -29,8 +29,9 @@
 //! échec explicite invitant à reconnecter le compte. Le rafraîchissement se
 //! fait sous le verrou du store ([`ConnectorTokenStore::update_locked`] :
 //! verrou de ligne PostgreSQL, partagé par toutes les répliques), et un refus
-//! définitif (`invalid_grant`) marque la credential invalide : les runs
-//! suivants échouent sans rappeler le provider, jusqu'à la reconnexion.
+//! définitif (`invalid_grant` ou équivalent, `RefreshError::Revoked`) marque
+//! la credential invalide : les runs suivants échouent sans rappeler le
+//! provider, jusqu'à la reconnexion.
 //!
 //! Le token **global** par provider ([`EnvCredentialResolver`],
 //! `AUTOME_CONNECTOR_TOKEN_<PROVIDER>`) n'est consulté qu'en repli, et
@@ -106,7 +107,8 @@ impl CredentialResolver for EnvCredentialResolver {
 /// store : les runs d'une même réplique n'occupent pas chacun une connexion du
 /// pool en attendant le verrou de ligne.
 ///
-/// Refus définitif du provider (`invalid_grant`) : la credential est marquée
+/// Refus définitif du provider (`RefreshError::Revoked` : `invalid_grant`, ou
+/// `ok: false` en HTTP 200 chez Slack) : la credential est marquée
 /// invalide ; tant que l'utilisateur ne l'a pas reconnectée, les runs échouent
 /// sans représenter le refresh token.
 pub struct OwnerCredentialResolver {
@@ -1087,6 +1089,72 @@ mod tests {
         store.store("alice", "gmail", &reconnected).unwrap();
         assert_eq!(gmail_invalidation(&store), None);
         assert_eq!(r.token(Some("alice"), "gmail").unwrap(), "ya29-reconnected");
+    }
+
+    #[test]
+    fn slack_refusal_in_http_200_marks_the_credential() {
+        // Vrai `OAuthClient` : Slack refuse le refresh token en HTTP 200
+        // (`ok: false`), pas en 400 `invalid_grant`.
+        use autome_connectors::oauth::{OAuthClient, OAuthProviderConfig, OAuthRegistry};
+
+        /// Endpoint token de Slack qui refuse tout refresh token.
+        #[derive(Default)]
+        struct SlackRefusing(Mutex<usize>);
+        impl HttpClient for SlackRefusing {
+            fn send(&self, _: &HttpRequest) -> Result<HttpResponse, String> {
+                *self.0.lock().unwrap() += 1;
+                Ok(HttpResponse {
+                    status: 200,
+                    body: json!({ "ok": false, "error": "invalid_refresh_token" }),
+                })
+            }
+        }
+
+        let store = InMemoryConnectorTokenStore::new(EnvelopeCipher::new(
+            InMemoryKeyProvider::with_key("v1", [7u8; 32]),
+        ));
+        let expired = TokenSet {
+            access_token: "xoxe.xoxb-old".into(),
+            refresh_token: Some("xoxe-1-alice".into()),
+            expires_at_ms: Some(NOW - 1),
+            token_type: "bot".into(),
+            scope: None,
+        };
+        store.store("alice", "slack", &expired).unwrap();
+        let store: Arc<dyn ConnectorTokenStore + Send + Sync> = Arc::new(store);
+        let mut registry = OAuthRegistry::new();
+        registry.register(OAuthProviderConfig::new(
+            "slack",
+            "cid",
+            "secret",
+            "https://slack.com/oauth/v2/authorize",
+            "https://slack.com/api/oauth.v2.access",
+            "https://app.autome/oauth/callback/slack",
+        ));
+        let client = Arc::new(OAuthClient::new(registry, SlackRefusing::default()));
+        let r = OwnerCredentialResolver::new(Arc::clone(&store))
+            .with_refresher(Arc::clone(&client) as Arc<dyn TokenRefresher + Send + Sync>)
+            .with_clock(Arc::new(|| NOW));
+
+        let err = r.token(Some("alice"), "slack").unwrap_err();
+        assert!(
+            err.contains("refusé") && err.contains("invalid_refresh_token"),
+            "{err}"
+        );
+        let mut invalidated = None;
+        store
+            .update_locked("alice", "slack", &mut |current| {
+                invalidated = current.and_then(|c| c.invalidated);
+                CredentialUpdate::Keep
+            })
+            .unwrap();
+        let invalidation = invalidated.expect("credential marquée");
+        assert!(invalidation.reason.contains("invalid_refresh_token"));
+
+        // Run suivant : plus d'appel à Slack.
+        let err = r.token(Some("alice"), "slack").unwrap_err();
+        assert!(err.contains("rafraîchissement précédent"), "{err}");
+        assert_eq!(*client.transport().0.lock().unwrap(), 1);
     }
 
     #[test]
