@@ -66,7 +66,7 @@ Déclenchée **après une CI verte** (`workflow_run` sur `main`), sur les **tags
 | Job | Rôle |
 |---|---|
 | **build-push** | matrice `api` / `worker` / `frontend` → `docker/build-push-action`, publication sur **GHCR** (`ghcr.io/<owner>/autome-*`) via `GITHUB_TOKEN` (`packages: write`), tags via `metadata-action`, cache `gha` (scope `backend` de la CI pour `api` / `worker`, écrit par `api` seulement ; `frontend`) |
-| **deploy** | `environment: production`, épingle l'image (`sha-<court>`) dans `k8s/`, `kubectl kustomize` (validation systématique), puis `kubectl apply -k` **uniquement si** le secret `KUBE_CONFIG` est présent (sinon dry-run documenté) |
+| **deploy** | `environment: production`, épingle l'image (`sha-<court>`) dans `k8s/`, `kubectl kustomize` de l'overlay du cluster (variable de dépôt `K8S_OVERLAY`, ex. `clusters/prod` ; vide = `k8s/`) — validation systématique —, puis **uniquement si** le secret `KUBE_CONFIG` est présent (sinon dry-run documenté) : tout sauf le worker, attente de l'API (qui migre la base), puis le worker (#271) |
 
 Garde-fous : `build-push` ne s'exécute pas si la CI déclenchante a échoué ;
 `deploy` dépend de `build-push` ; déploiement réel derrière un *environment*
@@ -139,7 +139,13 @@ protégé + secret optionnel.
   `latest` / semver, et **déploie le tag `sha`** → un déploiement pointe vers un
   artefact précis et traçable (pas le `latest` mouvant).
 - **Manifests** assemblés par `kustomize` (`kubectl kustomize k8s/`) — rendu
-  déterministe, validé en CD avant tout `apply`.
+  déterministe, validé en CD avant tout `apply`. Ce qui dépend du cluster
+  (proxys de confiance, NetworkPolicy de l'API) vit dans un overlay
+  `clusters/<cluster>/` (modèle : `clusters/example/`, #271).
+- **Ordre de déploiement** : l'API migre la base, le worker non ; la CD
+  applique le worker une fois l'API prête, et le worker attend de toute façon
+  que le schéma porte toutes ses migrations (`AUTOME_WORKER_SCHEMA_WAIT_SECS`,
+  #271).
 
 ---
 
@@ -175,6 +181,8 @@ protégé + secret optionnel.
 - [x] Tag d'image **immuable** (`sha-<court>`) déployé (pas `latest`).
 - [x] CD conditionnée à une **CI verte**.
 - [x] Déploiement réel **gardé** (environment + secret kubeconfig).
+- [x] Migrations appliquées (API) **avant** le déploiement du worker ; le worker attend un schéma à jour — #271.
+- [ ] Overlay `clusters/<cluster>/` créé (proxys de confiance au CIDR de l'ingress, NetworkPolicy adaptée) et désigné par `K8S_OVERLAY` — à faire par cluster (#271).
 
 **Reproductibilité**
 - [x] `Cargo.lock` versionné + `--locked` partout (CI + Docker).

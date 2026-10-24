@@ -136,6 +136,7 @@ couverture chiffrée (résumé du job, plancher bloquant — cf.
 ├── docker/                 # Dockerfiles api / worker (frontend : frontend/Dockerfile)
 ├── docker-compose.yml      # Stack de dev complète (db, queue, services, monitoring)
 ├── k8s/                    # Manifests Kubernetes (kustomize)
+├── clusters/               # Overlays kustomize par cluster (modèle : example/)
 ├── monitoring/             # Prometheus + provisioning & dashboards Grafana
 ├── docs/                   # ARCHITECTURE.md + décisions d'architecture (ADR)
 ├── scripts/                # Outils (validation des migrations…)
