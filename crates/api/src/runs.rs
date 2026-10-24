@@ -18,7 +18,8 @@
 //! de l'appelant (#188, cf. [`crate::workflows`]) : démarrer un run vise son
 //! propre workflow `id`, la liste ne contient que ses runs. Lire le run
 //! d'autrui répond 404. Un super-admin (`*`) vise l'espace d'un autre avec
-//! `?owner=<user_id>` et lit tout run par son id.
+//! `?owner=<user_id>` et lit tout run par son id ; `?owner=` vide liste les
+//! runs de l'espace legacy, y compris ceux d'avant la migration `0010` (#269).
 
 use std::sync::Arc;
 
@@ -872,6 +873,50 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(r.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn legacy_runs_list_under_the_empty_owner() {
+        // Runs antérieurs à la migration 0010 (#269) : listés dans l'espace
+        // legacy (`?owner=` vide du super-admin) avec ceux lancés depuis sur
+        // le même workflow ; jamais dans la liste d'un compte ordinaire.
+        let (state, svc, perms, _, _, runs_store) = make_test_state();
+        perms.assign_role("alice", &Role::viewer()).unwrap();
+        perms.assign_role("root", &Role::super_admin()).unwrap();
+        let before_0010 = autome_core::RunCheckpoint::queued("r-old", "wf-1", 1, "manual", 1);
+        let since = autome_core::RunCheckpoint::queued("r-new", "wf-1", 1, "manual", 2)
+            .with_owner(Some(String::new()));
+        let mine = autome_core::RunCheckpoint::queued("r-alice", "wf-1", 1, "manual", 3)
+            .with_owner(Some("alice".into()));
+        for snap in [&before_0010, &since, &mine] {
+            runs_store.checkpoint(snap).await.unwrap();
+        }
+        let app = runs_router(state);
+        let list = |uri: &'static str, token: String| {
+            let app = app.clone();
+            async move {
+                let body = body_string(
+                    app.oneshot(auth_req("GET", uri, &token, None))
+                        .await
+                        .unwrap(),
+                )
+                .await;
+                let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+                body["items"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|r| r["run_id"].as_str().unwrap().to_string())
+                    .collect::<Vec<_>>()
+            }
+        };
+        let root = svc.issue_access("root", 900, FIXED_NOW).unwrap();
+        let alice = svc.issue_access("alice", 900, FIXED_NOW).unwrap();
+        assert_eq!(
+            list("/workflows/wf-1/runs?owner=", root).await,
+            ["r-new", "r-old"]
+        );
+        assert_eq!(list("/workflows/wf-1/runs", alice).await, ["r-alice"]);
     }
 
     #[tokio::test]
