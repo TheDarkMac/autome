@@ -10,8 +10,14 @@
 //! les répliques qui démarreraient ensemble).
 //!
 //! Hypothèse : base **gérée par ce runner** (schéma vierge au départ).
+//!
+//! Seule l'API migre (`AUTOME_MIGRATE`). Le worker, lui, attend avec
+//! [`wait_for_schema`] que le journal contienne toutes ses migrations avant de
+//! consommer un run (#271) : déployé en même temps qu'une API qui migre, il
+//! exécuterait sinon ses runs sur l'ancien schéma.
 
 use std::collections::HashSet;
+use std::time::{Duration, Instant};
 
 use autome_core::{Error, Result};
 
@@ -175,6 +181,74 @@ pub async fn run_migrations(pool: &PgPool) -> Result<usize> {
 
     tx.commit().await.map_err(|e| storage_err("commit", e))?;
     Ok(count)
+}
+
+/// Migrations embarquées absentes du journal de la base, dans l'ordre de
+/// [`MIGRATIONS`] : toutes si le journal n'existe pas encore (base vierge).
+/// Lecture seule : ne crée pas le journal, ne prend pas le verrou de
+/// migration. Une entrée du journal inconnue de ce binaire (base migrée par
+/// une version plus récente) est ignorée.
+pub async fn pending_migrations(pool: &PgPool) -> Result<Vec<&'static str>> {
+    let client = pool.get().await.map_err(|e| storage_err("pool", e))?;
+    let journal: bool = client
+        .query_one("SELECT to_regclass('schema_migrations') IS NOT NULL", &[])
+        .await
+        .map_err(|e| storage_err("journal lookup", e))?
+        .get(0);
+    let applied: HashSet<String> = if journal {
+        client
+            .query("SELECT name FROM schema_migrations", &[])
+            .await
+            .map_err(|e| storage_err("read journal", e))?
+            .iter()
+            .map(|r| r.get::<_, String>(0))
+            .collect()
+    } else {
+        HashSet::new()
+    };
+    Ok(MIGRATIONS
+        .iter()
+        .map(|(name, _)| *name)
+        .filter(|name| !applied.contains(*name))
+        .collect())
+}
+
+/// Premier intervalle entre deux vérifications de [`wait_for_schema`].
+const SCHEMA_POLL_FIRST: Duration = Duration::from_millis(500);
+/// Plafond de l'intervalle (doublé à chaque vérification).
+const SCHEMA_POLL_MAX: Duration = Duration::from_secs(5);
+
+/// Attend que toutes les [`MIGRATIONS`] figurent au journal, au plus
+/// `timeout` (`0` = une seule vérification). Base injoignable et migrations
+/// manquantes sont revérifiées de la même façon, avec un intervalle de
+/// 0,5 s doublé jusqu'à 5 s. Au-delà du délai : erreur listant les migrations
+/// manquantes, ou la dernière erreur d'accès à la base.
+pub async fn wait_for_schema(pool: &PgPool, timeout: Duration) -> Result<()> {
+    let deadline = Instant::now() + timeout;
+    let mut delay = SCHEMA_POLL_FIRST;
+    loop {
+        let outcome = match pending_migrations(pool).await {
+            Ok(pending) if pending.is_empty() => return Ok(()),
+            Ok(pending) => Error::Invalid(format!(
+                "schéma PostgreSQL en retard : {} migration(s) manquante(s) ({}) — \
+                 l'API les applique au démarrage (AUTOME_MIGRATE=true), \
+                 la déployer avant le worker",
+                pending.len(),
+                pending.join(", ")
+            )),
+            Err(e) => e,
+        };
+        if Instant::now() + delay >= deadline {
+            return Err(outcome);
+        }
+        tracing::warn!(
+            retry_in_ms = delay.as_millis() as u64,
+            error = %outcome,
+            "schéma pas encore prêt, nouvelle vérification"
+        );
+        tokio::time::sleep(delay).await;
+        delay = (delay * 2).min(SCHEMA_POLL_MAX);
+    }
 }
 
 #[cfg(test)]
