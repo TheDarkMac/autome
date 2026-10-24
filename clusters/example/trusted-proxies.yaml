@@ -1,0 +1,24 @@
+# Proxys de confiance de ce cluster (#190, #271). L'API ne croit le
+# `X-Forwarded-For` (IP comptée par l'anti-bruteforce) et le `traceparent`
+# que d'un pair situé dans ces plages. La base `k8s/` fait confiance à tous
+# les réseaux privés : n'importe quel pod du cluster peut alors choisir l'IP
+# sous laquelle ses tentatives de login sont comptées.
+#
+# Valeur à mettre, du plus précis au moins précis :
+#   - plage réservée aux pods de l'ingress (pool d'IP dédié au namespace
+#     ingress-nginx : IPPool Calico, multi-pool Cilium…) ;
+#   - contrôleur en hostNetwork : adresses (ou plage) des nœuds qui le portent ;
+#   - sinon, la plage des pods du cluster :
+#       kubectl get nodes -o jsonpath='{.items[*].spec.podCIDR}'
+#     (10.244.0.0/16 par défaut avec kubeadm, kind, k3s : 10.42.0.0/16).
+#     Elle contient encore tous les pods : garder alors api-network-policy.yaml,
+#     qui ne laisse joindre l'API qu'à l'ingress et à Prometheus.
+# Liste vide = aucun proxy de confiance : derrière l'ingress, tous les
+# clients seraient comptés sous l'IP de l'ingress (bloqués ensemble).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: autome-config
+  namespace: autome
+data:
+  AUTOME_TRUSTED_PROXIES: "10.244.0.0/16"

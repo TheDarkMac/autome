@@ -1,0 +1,20 @@
+# Overlay d'un cluster (#271) — modèle à copier en clusters/<cluster>/ puis
+# à ajuster : ce que la base k8s/ ne peut pas connaître d'avance. Hors de
+# k8s/ : kustomize refuse un overlay rangé dans le dossier de sa base.
+#
+#   kubectl kustomize clusters/<cluster>/     # rendu, sans appliquer
+#
+# La CD déploie l'overlay désigné par la variable de dépôt K8S_OVERLAY
+# (ex. `clusters/prod`) ; sans elle, la base `k8s/`. Voir
+# docs/INSTALLATION.md, C.3.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - ../../k8s
+  # API joignable seulement par le contrôleur ingress et Prometheus : ce qui
+  # rend la liste de proxys de confiance sûre (voir trusted-proxies.yaml).
+  - api-network-policy.yaml
+
+patches:
+  - path: trusted-proxies.yaml
