@@ -48,16 +48,21 @@ spec:
               containerPort: 5672
             - name: management
               containerPort: 15672
+          # `rabbitmq-diagnostics` démarre une VM Erlang : ~2 s par appel
+          # (mesuré sur k3s), au-delà du délai par défaut d'une sonde (1 s) —
+          # sans `timeoutSeconds`, le broker est tué en boucle (#271).
           readinessProbe:
             exec:
               command: ["rabbitmq-diagnostics", "-q", "ping"]
             initialDelaySeconds: 15
             periodSeconds: 15
+            timeoutSeconds: 10
           livenessProbe:
             exec:
               command: ["rabbitmq-diagnostics", "-q", "ping"]
             initialDelaySeconds: 30
             periodSeconds: 30
+            timeoutSeconds: 10
           resources:
             requests:
               cpu: 100m
