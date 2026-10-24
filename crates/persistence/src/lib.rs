@@ -41,14 +41,15 @@ pub use login_throttle::PgLoginThrottle;
 pub use mfa::PgMfaStore;
 pub use migrations::{pending_migrations, run_migrations, wait_for_schema, MIGRATIONS};
 pub use permission::PgPermissionStore;
-pub use pool::{connect, PgPool};
+pub use pool::{connect, connect_retrying, PgPool};
 pub use rabbitmq::RabbitMqQueue;
 pub use revocation::PgRevocationStore;
 pub use run_state::PgRunStateStore;
 pub use selectors::{
     build_connector_token_store, build_consuming_queue, build_health_checks, build_queue,
     build_run_state_store, build_trigger_schedule_store, build_workflow_repository,
-    connector_cipher, ensure_durable_backends, wait_for_schema_ready, PersistenceMode, QueueMode,
+    connector_cipher, db_connect_timeout, ensure_durable_backends, wait_for_schema_ready,
+    PersistenceMode, QueueMode,
 };
 pub use trigger_schedules::PgTriggerScheduleStore;
 pub use users::PgUserStore;

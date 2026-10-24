@@ -105,16 +105,28 @@ pub fn ensure_durable_backends(
     )))
 }
 
-/// Délai par défaut pour joindre le broker au démarrage.
-const QUEUE_CONNECT_TIMEOUT: Duration = Duration::from_secs(60);
+/// Délai par défaut pour joindre le broker, ou la base, au démarrage.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Secondes entières lues dans `value` ; absente ou invalide ⇒ `default`.
+fn secs_or(value: Option<&str>, default: Duration) -> Duration {
+    value
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .map(Duration::from_secs)
+        .unwrap_or(default)
+}
 
 /// Lit `AUTOME_QUEUE_CONNECT_TIMEOUT_SECS` (défaut 60 s).
 fn queue_connect_timeout() -> Duration {
-    std::env::var("AUTOME_QUEUE_CONNECT_TIMEOUT_SECS")
-        .ok()
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .map(Duration::from_secs)
-        .unwrap_or(QUEUE_CONNECT_TIMEOUT)
+    let value = std::env::var("AUTOME_QUEUE_CONNECT_TIMEOUT_SECS").ok();
+    secs_or(value.as_deref(), CONNECT_TIMEOUT)
+}
+
+/// Lit `AUTOME_DB_CONNECT_TIMEOUT_SECS` (défaut 60 s) : délai pendant lequel
+/// l'API retente la connexion à PostgreSQL avant de migrer (#273).
+pub fn db_connect_timeout() -> Duration {
+    let value = std::env::var("AUTOME_DB_CONNECT_TIMEOUT_SECS").ok();
+    secs_or(value.as_deref(), CONNECT_TIMEOUT)
 }
 
 /// Construit la file selon le `mode`. En `Rabbitmq`, se connecte au broker
@@ -258,6 +270,16 @@ mod tests {
             PersistenceMode::Postgres
         );
         assert!(PersistenceMode::parse(Some("redis")).is_err());
+    }
+
+    #[test]
+    fn connect_timeouts_read_whole_seconds_with_a_default() {
+        let default = Duration::from_secs(60);
+        assert_eq!(secs_or(None, default), default);
+        assert_eq!(secs_or(Some(" 15 "), default), Duration::from_secs(15));
+        assert_eq!(secs_or(Some("0"), default), Duration::ZERO);
+        assert_eq!(secs_or(Some("1m"), default), default);
+        assert_eq!(secs_or(Some(""), default), default);
     }
 
     #[tokio::test]
