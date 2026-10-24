@@ -99,4 +99,13 @@ assert_count "compte de dev actif" \
 assert_count "compte de dev vérifié" \
   "SELECT count(*) FROM users WHERE email_verified_at IS NOT NULL;" 1
 
+# Runs (#269) : toujours dans un espace de propriétaire (`''` = legacy).
+NULL_OWNER_ERR=$(psql_run -q -c \
+  "INSERT INTO runs(id,workflow_id,version,status,trigger_type,created_at_ms)
+   VALUES('run-null','wf-demo',1,'queued','manual',1);" 2>&1 >/dev/null || true)
+case "$NULL_OWNER_ERR" in
+  *owner_id*) echo "    OK  runs.owner_id NOT NULL" ;;
+  *) echo "ÉCHEC: run sans owner_id accepté ou refusé pour une autre raison [$NULL_OWNER_ERR]"; exit 1 ;;
+esac
+
 echo "==> ✅ Schéma valide : migrations + seed appliqués, invariants OK"
