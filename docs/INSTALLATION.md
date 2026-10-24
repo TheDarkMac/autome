@@ -874,10 +874,11 @@ comptes sont publics ; tout le reste exige `Authorization: Bearer <access_token>
   par défaut ; il vise celui d'un autre compte avec `?owner=<user_id>` sur
   `/workflows`, `/workflows/{id}` et `/workflows/{id}/runs` (et lit tout run
   par son id). `?owner=` vide désigne les workflows antérieurs à la migration
-  `0010`, sans propriétaire. Un utilisateur ordinaire qui vise l'espace d'autrui
-  reçoit 403, que la ressource existe ou non. La vue d'ensemble de tous les
-  espaces est `GET /admin/workflows` (voir « Administration des
-  utilisateurs »).
+  `0010`, sans propriétaire, et tous leurs runs — ceux d'avant `0010` compris,
+  rangés dans cet espace par la migration `0025`. Un utilisateur ordinaire
+  qui vise l'espace d'autrui reçoit 403, que la ressource existe ou non. La
+  vue d'ensemble de tous les espaces est `GET /admin/workflows` (voir
+  « Administration des utilisateurs »).
 
 ```bash
 curl -s -H 'content-type: application/json' \
