@@ -1,0 +1,38 @@
+# Accès réseau à l'API (#271) : seuls le contrôleur ingress-nginx (trafic des
+# clients, webhooks) et Prometheus (`/metrics`) la joignent. Avec une plage
+# de proxys de confiance large (plage des pods), c'est ce qui garantit que le
+# pair qui fournit `X-Forwarded-For` est bien l'ingress.
+#
+# Prérequis : un CNI qui applique les NetworkPolicy (Calico, Cilium…) ;
+# sans lui, la règle est acceptée mais sans effet. Adapter le namespace et
+# les labels au contrôleur installé :
+#   kubectl get pods -A -l app.kubernetes.io/name=ingress-nginx --show-labels
+# Les sondes du kubelet viennent du nœud et ne sont pas filtrées par les CNI
+# courants ; `kubectl port-forward` non plus.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: api-from-ingress
+  namespace: autome
+  labels:
+    app.kubernetes.io/part-of: autome
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: api
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ingress-nginx
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: ingress-nginx
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: prometheus
+      ports:
+        - protocol: TCP
+          port: 8080
