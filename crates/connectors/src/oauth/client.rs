@@ -21,7 +21,7 @@ use serde_json::Value;
 use crate::http::{HttpClient, HttpRequest};
 use crate::oauth::pkce::{generate_pkce, generate_state, PkcePair};
 use crate::oauth::provider::{OAuthProviderConfig, OAuthRegistry};
-use crate::oauth::refresh::{is_invalid_grant, RefreshError};
+use crate::oauth::refresh::{is_revoked_refresh, is_token_error, RefreshError};
 use crate::sdk::http::to_query;
 
 /// Données à conserver côté serveur après [`OAuthClient::start_authorization`]
@@ -114,7 +114,8 @@ impl<C: HttpClient> OAuthClient<C> {
             .transport
             .send(&req)
             .map_err(|e| Error::Invalid(format!("oauth exchange : transport {e}")))?;
-        if !(200..300).contains(&resp.status) {
+        // Slack (`ok: false`) et GitHub signalent une erreur en HTTP 200.
+        if is_token_error(resp.status, &resp.body) {
             return Err(Error::Invalid(format!(
                 "oauth exchange : http {} — {}",
                 resp.status, resp.body
@@ -130,8 +131,9 @@ impl<C: HttpClient> OAuthClient<C> {
     }
 
     /// Comme [`refresh`](Self::refresh), en distinguant le refus définitif du
-    /// refresh token (`invalid_grant` ⇒ [`RefreshError::Revoked`]) des échecs
-    /// transitoires ou de configuration ([`RefreshError::Failed`]).
+    /// refresh token (`invalid_grant` ou équivalent, même en HTTP 200 ⇒
+    /// [`RefreshError::Revoked`]) des échecs transitoires ou de configuration
+    /// ([`RefreshError::Failed`]).
     pub fn try_refresh(
         &self,
         provider_id: &str,
@@ -153,9 +155,9 @@ impl<C: HttpClient> OAuthClient<C> {
             .transport
             .send(&req)
             .map_err(|e| RefreshError::Failed(format!("oauth refresh : transport {e}")))?;
-        if !(200..300).contains(&resp.status) {
+        if is_token_error(resp.status, &resp.body) {
             let message = format!("oauth refresh : http {} — {}", resp.status, resp.body);
-            return Err(if is_invalid_grant(resp.status, &resp.body) {
+            return Err(if is_revoked_refresh(resp.status, &resp.body) {
                 RefreshError::Revoked(message)
             } else {
                 RefreshError::Failed(message)
@@ -254,6 +256,28 @@ mod tests {
     fn registry_with_google() -> OAuthRegistry {
         let mut r = OAuthRegistry::new();
         r.register(google_provider());
+        r
+    }
+
+    /// Slack et GitHub, qui signalent leurs erreurs en HTTP 200.
+    fn registry_with_slack_and_github() -> OAuthRegistry {
+        let mut r = OAuthRegistry::new();
+        r.register(OAuthProviderConfig::new(
+            "slack",
+            "client-id-s",
+            "secret-s",
+            "https://slack.com/oauth/v2/authorize",
+            "https://slack.com/api/oauth.v2.access",
+            "https://app/cb",
+        ));
+        r.register(OAuthProviderConfig::new(
+            "github",
+            "client-id-gh",
+            "secret-gh",
+            "https://github.com/login/oauth/authorize",
+            "https://github.com/login/oauth/access_token",
+            "https://app/cb",
+        ));
         r
     }
 
@@ -376,6 +400,23 @@ mod tests {
     }
 
     #[test]
+    fn exchange_code_reports_provider_error_sent_in_http_200() {
+        let client = OAuthClient::new(
+            registry_with_slack_and_github(),
+            RecordingClient::ok(json!({ "ok": false, "error": "invalid_code" })),
+        );
+        match client.exchange_code("slack", "c", "v", NOW_MS).unwrap_err() {
+            Error::Invalid(m) => {
+                assert!(
+                    m.contains("http 200") && m.contains("invalid_code"),
+                    "msg={m}"
+                )
+            }
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn exchange_code_unknown_provider_errors() {
         let client = OAuthClient::new(OAuthRegistry::new(), RecordingClient::ok(json!({})));
         let err = client.exchange_code("nope", "c", "v", NOW_MS).unwrap_err();
@@ -460,6 +501,80 @@ mod tests {
                 "status {status}"
             );
         }
+    }
+
+    #[test]
+    fn try_refresh_classifies_refusals_sent_in_http_200_as_revoked() {
+        for (provider, body) in [
+            (
+                "slack",
+                json!({ "ok": false, "error": "invalid_refresh_token" }),
+            ),
+            ("slack", json!({ "ok": false, "error": "token_revoked" })),
+            (
+                "github",
+                json!({
+                    "error": "bad_refresh_token",
+                    "error_description": "The refresh token passed is incorrect or expired.",
+                }),
+            ),
+        ] {
+            let client =
+                OAuthClient::new(registry_with_slack_and_github(), RecordingClient::ok(body));
+            match client.try_refresh(provider, "rt-dead", NOW_MS) {
+                Err(RefreshError::Revoked(m)) => assert!(m.contains("http 200"), "{m}"),
+                other => panic!("{provider} : Revoked attendu : {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn try_refresh_keeps_other_errors_sent_in_http_200_transient() {
+        // Configuration ou limite de débit : le refresh token reste valable,
+        // le code du provider figure dans le message (et non « access_token
+        // manquant »).
+        for (provider, body, code) in [
+            (
+                "slack",
+                json!({ "ok": false, "error": "invalid_client_id" }),
+                "invalid_client_id",
+            ),
+            (
+                "slack",
+                json!({ "ok": false, "error": "ratelimited" }),
+                "ratelimited",
+            ),
+            (
+                "github",
+                json!({ "error": "incorrect_client_credentials" }),
+                "incorrect_client_credentials",
+            ),
+        ] {
+            let client =
+                OAuthClient::new(registry_with_slack_and_github(), RecordingClient::ok(body));
+            match client.try_refresh(provider, "rt", NOW_MS) {
+                Err(RefreshError::Failed(m)) => assert!(m.contains(code), "{m}"),
+                other => panic!("{provider} : Failed attendu : {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn try_refresh_accepts_slack_rotated_bot_token() {
+        let client = OAuthClient::new(
+            registry_with_slack_and_github(),
+            RecordingClient::ok(json!({
+                "ok": true,
+                "access_token": "xoxe.xoxb-new",
+                "refresh_token": "xoxe-1-new",
+                "expires_in": 43_200,
+                "token_type": "bot",
+            })),
+        );
+        let t = client.try_refresh("slack", "xoxe-1-old", NOW_MS).unwrap();
+        assert_eq!(t.access_token, "xoxe.xoxb-new");
+        assert_eq!(t.refresh_token.as_deref(), Some("xoxe-1-new"));
+        assert_eq!(t.expires_at_ms, Some(NOW_MS + 43_200_000));
     }
 
     #[test]
