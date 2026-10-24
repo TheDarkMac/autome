@@ -54,15 +54,16 @@ spec:
                 name: autome-config
             - secretRef:
                 name: autome-secrets
-          # Sondes séparées (#192). Démarrage : migrations et attente du broker
-          # (jusqu'à AUTOME_QUEUE_CONNECT_TIMEOUT_SECS, 60 s) avant l'écoute —
-          # la startup probe laisse ~90 s avant que la liveness ne s'applique.
+          # Sondes séparées (#192). Démarrage : attente de la base
+          # (AUTOME_DB_CONNECT_TIMEOUT_SECS, 60 s, #273), migrations, puis du
+          # broker (AUTOME_QUEUE_CONNECT_TIMEOUT_SECS, 60 s) avant l'écoute —
+          # la startup probe laisse ~150 s avant que la liveness ne s'applique.
           startupProbe:
             httpGet:
               path: /livez
               port: http
             periodSeconds: 3
-            failureThreshold: 30
+            failureThreshold: 50
           # Prêt = PostgreSQL et RabbitMQ joignables (chaque vérification
           # bornée à 2 s, en parallèle). Échec ⇒ retiré du Service, pas tué.
           readinessProbe:
