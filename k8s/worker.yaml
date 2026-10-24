@@ -65,13 +65,15 @@ spec:
                 name: autome-config
             - secretRef:
                 name: autome-secrets
-          # Sondes (#192). Démarrage : attente du broker (jusqu'à 60 s).
+          # Sondes (#192). Démarrage : attente du schéma migré par l'API
+          # (AUTOME_WORKER_SCHEMA_WAIT_SECS, 120 s, #271) puis du broker
+          # (60 s) : jusqu'à 210 s avant d'être tenu pour mort.
           startupProbe:
             httpGet:
               path: /livez
               port: probes
             periodSeconds: 3
-            failureThreshold: 30
+            failureThreshold: 70
           # Vivant = chaque consommateur tourne, ou traite un run depuis moins
           # que AUTOME_RUN_TIMEOUT_SECS (+ 1 min) : un run long ne fait pas
           # redémarrer le pod ; un consommateur figé, si.
