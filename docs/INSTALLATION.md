@@ -193,7 +193,8 @@ relit au moment du run. Le `provider_id` OAuth doit être le préfixe de l'actio
   (`SELECT … FOR UPDATE`, attente bornée à 60 s) et relit le jeton avant
   d'appeler le provider — indispensable pour les providers qui font tourner le
   refresh token (chacun n'est présenté qu'une fois). Refus **définitif** du
-  provider (`invalid_grant` : refresh token révoqué, expiré ou déjà consommé) :
+  provider (`invalid_grant` : refresh token révoqué, expiré ou déjà consommé ;
+  Slack `invalid_refresh_token` en HTTP 200, GitHub `bad_refresh_token`) :
   la credential est marquée invalide (`invalidated_at_ms`, `invalid_reason`,
   migration `0018`) et les runs suivants échouent **sans rappeler le
   provider** ; `GET /credentials` l'expose (`needs_reconnect`,

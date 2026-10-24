@@ -156,11 +156,12 @@ flowchart TB
   lit pour le propriétaire du run (`connector_tokens`, chiffrés) et rafraîchit
   les access tokens expirés sous le verrou de ligne PostgreSQL
   (`ConnectorTokenStore::update_locked`, #211) : un seul appel au provider par
-  credential, quel que soit le nombre de répliques. Un `invalid_grant` marque la
-  credential invalide (migration `0018`) jusqu'à la reconnexion, signalée à
-  l'utilisateur par `GET /credentials` (`needs_reconnect`, #213 : onglet
-  Connecteurs et en-tête) et par un email que l'API envoie une fois par
-  invalidation (`ReconnectNotices`, migration `0024`, #265).
+  credential, quel que soit le nombre de répliques. Un `invalid_grant` (ou son
+  équivalent non standard : Slack `ok: false` en HTTP 200, GitHub
+  `bad_refresh_token`, #267) marque la credential invalide (migration `0018`)
+  jusqu'à la reconnexion, signalée à l'utilisateur par `GET /credentials`
+  (`needs_reconnect`, #213 : onglet Connecteurs et en-tête) et par un email
+  que l'API envoie une fois par invalidation (`ReconnectNotices`, migration `0024`, #265).
 - **engine** est agnostique : il dépend de **traits** de `core` (queue, stores,
   connecteurs) et ne connaît ni RabbitMQ ni PostgreSQL ni Slack directement.
 
