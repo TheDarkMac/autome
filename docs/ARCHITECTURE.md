@@ -252,6 +252,13 @@ flowchart TB
   *Autome — Overview* provisionnés). Cf. §9 observabilité.
 - **config & secrets** : `ConfigMap autome-config` (non-sensible) + `Secret
   autome-secrets` (valeurs `REPLACE_ME` à remplacer — SealedSecrets / Vault).
+- **par cluster** : un overlay `clusters/<cluster>/` (modèle
+  `clusters/example/`, #271) règle ce que la base ne peut pas connaître —
+  plage de l'ingress dans `AUTOME_TRUSTED_PROXIES`, NetworkPolicy qui ne laisse
+  joindre l'API qu'à l'ingress et à Prometheus.
+- **ordre** : l'API migre la base au démarrage, le worker non. Il est déployé
+  après l'API et attend que `schema_migrations` porte toutes ses migrations
+  avant de consommer un run (#271).
 
 ---
 
@@ -409,7 +416,8 @@ erDiagram
 - **CI** GitHub Actions (fmt + clippy `-D warnings` + tests workspace + build ;
   typecheck/lint/test frontend) — F10.4.
 - **CD** : build & push des images sur GHCR + déploiement Kubernetes gardé
-  (kustomize + `kubectl apply`, conditionné à un kubeconfig) — F10.5.
+  (kustomize + `kubectl apply`, conditionné à un kubeconfig) — F10.5 ;
+  overlay du cluster (`K8S_OVERLAY`), API puis worker — #271.
 
 ---
 

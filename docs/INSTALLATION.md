@@ -46,6 +46,7 @@ cp .env.example .env
 | `AUTOME_QUEUE` | File des runs : `memory` ou `rabbitmq` | `memory` | **`rabbitmq` obligatoire** |
 | `AUTOME_QUEUE_CONNECT_TIMEOUT_SECS` | Délai pendant lequel l'API et le worker retentent la connexion au broker au démarrage (erreurs réseau seulement) | `60` | `60` |
 | `AUTOME_MIGRATE` | L'API applique les migrations au démarrage (`true`/`1`/`yes`, mode `postgres`) | *(non)* | recommandé |
+| `AUTOME_WORKER_SCHEMA_WAIT_SECS` | Worker, mode `postgres` : attente au démarrage que toutes ses migrations soient appliquées (le worker ne migre pas) ; au-delà, refus de démarrer en les nommant. `0` = une seule vérification (#271) | `120` | `120` |
 | `JWT_SECRET` | Clé de signature des JWT | `dev-insecure-jwt-secret` | **obligatoire** (non-défaut) |
 | `ENCRYPTION_KEY` | Clé de chiffrement des credentials au repos — **identique pour l'API et le worker** | `dev-insecure-encryption-key` | **obligatoire** (non-défaut) |
 | `AUTOME_TLS_CERT` | Chemin du certificat PEM (active HTTPS) | *(non défini)* | optionnel |
@@ -401,6 +402,39 @@ Avant tout usage réel, remplacez-les (idéalement via SealedSecrets / External
 Secrets / Vault) : `JWT_SECRET`, `ENCRYPTION_KEY`, `POSTGRES_PASSWORD`,
 `DATABASE_URL`, `QUEUE_URL`.
 
+**Réglages par cluster (#271).** La base `k8s/` vaut pour tout cluster ; ce
+qui dépend du cluster va dans un overlay Kustomize, rangé dans `clusters/`
+(kustomize refuse un overlay placé dans le dossier de sa base). Copier le
+modèle puis l'ajuster :
+
+```bash
+cp -r clusters/example clusters/prod
+kubectl kustomize clusters/prod/      # rendu, sans appliquer
+```
+
+Le modèle règle `AUTOME_TRUSTED_PROXIES` (`trusted-proxies.yaml`) et ajoute une
+NetworkPolicy (`api-network-policy.yaml`). La base fait confiance à tous les
+réseaux privés (`10.0.0.0/8,172.16.0.0/12,192.168.0.0/16`) : l'API croit alors
+le `X-Forwarded-For` de n'importe quel pod du cluster, qui peut choisir l'IP
+sous laquelle ses tentatives de connexion sont comptées (anti-bruteforce,
+#190). Valeur à mettre, de la plus précise à la moins précise :
+
+1. la plage réservée aux pods de l'ingress, si le CNI attribue au namespace
+   `ingress-nginx` son propre pool d'IP (IPPool Calico, multi-pool Cilium…) ;
+2. contrôleur en `hostNetwork` : les adresses des nœuds qui le portent ;
+3. sinon, la plage des pods du cluster
+   (`kubectl get nodes -o jsonpath='{.items[*].spec.podCIDR}'` ; souvent
+   `10.244.0.0/16`, `10.42.0.0/16` avec k3s). Elle contient encore tous les
+   pods : la NetworkPolicy, qui ne laisse joindre l'API qu'au contrôleur
+   ingress et à Prometheus, est alors ce qui garantit que l'en-tête vient de
+   l'ingress. Elle n'a d'effet qu'avec un CNI qui applique les NetworkPolicy
+   (Calico, Cilium…) ; adapter son namespace et ses labels au contrôleur
+   installé (`kubectl get pods -A -l app.kubernetes.io/name=ingress-nginx
+   --show-labels`).
+
+Ne pas vider la liste derrière l'ingress : tous les clients seraient comptés
+sous l'IP de l'ingress, et bloqués ensemble.
+
 ### C.2 Images
 
 Les déploiements référencent les images publiées sur GHCR par la CD
@@ -410,11 +444,29 @@ des manifests (ou via `kubectl set image`).
 
 ### C.3 Déploiement
 
+L'API migre la base au démarrage (`AUTOME_MIGRATE=true`), le worker non : on
+déploie l'API d'abord, le worker une fois l'API prête (#271). `K8S_DIR` =
+l'overlay du cluster (`clusters/prod`), ou `k8s` pour la base seule.
+
 ```bash
-kubectl apply -k k8s/
+kubectl kustomize "$K8S_DIR" > rendered.yaml
+# 1. Tout sauf le worker ; l'API prête = migrations appliquées.
+kubectl apply -f rendered.yaml -l 'app.kubernetes.io/name!=worker'
 kubectl -n autome rollout status deployment/api
+# 2. Le worker.
+kubectl apply -f rendered.yaml -l 'app.kubernetes.io/name=worker'
+kubectl -n autome rollout status deployment/worker
 kubectl -n autome get pods,svc
 ```
+
+La CD fait de même, sur l'overlay désigné par la variable de dépôt
+`K8S_OVERLAY` (Settings → Variables ; vide = `k8s/`). Un `kubectl apply -k`
+d'un seul coup reste sûr : le nouveau worker attend que le journal
+`schema_migrations` contienne toutes ses migrations
+(`AUTOME_WORKER_SCHEMA_WAIT_SECS`, 120 s) avant de consommer, et refuse de
+démarrer au-delà (le pod redémarre et réessaie). Pendant ce temps, les pods de
+l'ancien worker continuent de tourner sur le schéma migré : une migration doit
+rester compatible avec la version précédente du worker.
 
 ### C.4 Accès
 
@@ -458,8 +510,9 @@ opposées :
   « vivant » jusqu'au délai d'un run. Au-delà (moteur bloqué), ou si un
   consommateur au repos ne tourne plus depuis 60 s, `/livez` répond 503 ;
   après redémarrage, le balayage des orphelins clôt les runs interrompus.
-- Une **startup probe** (~90 s) couvre les migrations et l'attente du broker
-  au démarrage avant que la liveness ne s'applique.
+- Une **startup probe** couvre le démarrage avant que la liveness ne
+  s'applique : ~90 s pour l'API (migrations, broker), ~210 s pour le worker
+  (attente du schéma migré par l'API puis du broker, #271).
 - Worker : `AUTOME_WORKER_PROBE_ADDR` (défaut `127.0.0.1:9091`, `0.0.0.0:9091`
   dans l'image ; vide = sondes désactivées). Le même port sert `GET /metrics`
   (cf. C.6).
@@ -850,7 +903,8 @@ comptes sont publics ; tout le reste exige `Authorization: Bearer <access_token>
   (défaut, cas de compose), l'adresse du pair TCP fait foi et l'en-tête est
   ignoré — un client ne peut pas choisir son IP. En k8s, l'API voit le
   contrôleur ingress : `k8s/config.yaml` fait confiance aux réseaux privés,
-  **à restreindre au CIDR des pods de l'ingress**. Une plage trop large laisse
+  **à restreindre par cluster** dans un overlay (C.1, `clusters/example/`).
+  Une plage trop large laisse
   les machines qui s'y trouvent choisir l'IP sous laquelle elles sont comptées ;
   une liste vide derrière un proxy compte tous les clients sous l'IP du proxy
   (tout le monde bloqué ensemble).
@@ -1169,6 +1223,7 @@ npm run test       # Vitest
 | L'API ou le worker s'arrête sur `NOT_ALLOWED - vhost  not found` | `QUEUE_URL` terminée par une barre seule (`…:5672/` = vhost vide) | Écrire le vhost : `amqp://user:pass@host:5672/%2f` |
 | Logs `erreur de file … retry_in_ms=…` en continu côté worker | Broker indisponible | Le worker se reconnecte seul dès le retour du broker (`connexion RabbitMQ rétablie`) ; vérifier l'état de RabbitMQ |
 | Logs `connexion impossible, nouvelle tentative service="rabbitmq"` au démarrage | Broker démarré mais pas encore à l'écoute | Normal pendant quelques secondes ; au-delà de `AUTOME_QUEUE_CONNECT_TIMEOUT_SECS`, vérifier `QUEUE_URL` et le broker |
+| Worker : `schéma pas encore prêt, nouvelle vérification`, puis arrêt sur `schéma PostgreSQL en retard : N migration(s) manquante(s)` | Le worker démarre avant que l'API ait migré la base, ou l'API ne migre pas (#271) | Normal le temps que l'API démarre ; sinon vérifier `AUTOME_MIGRATE=true` sur l'API et qu'elle tourne la même version que le worker (ou plus récente) |
 | L'API refuse de démarrer en `prod` (`… doit être défini (non-défaut)`) | Secret laissé à la valeur de dev ou `DATABASE_URL` par défaut | Définir de vrais `JWT_SECRET` / `ENCRYPTION_KEY` / `DATABASE_URL` |
 | `TLS partiellement configuré` au démarrage | Une seule des deux variables TLS positionnée | Définir `AUTOME_TLS_CERT` **et** `AUTOME_TLS_KEY`, ou aucune |
 | « Mot de passe oublié » répond 503 / « pas disponible sur ce serveur » | Profil `prod` sans `AUTOME_SMTP_URL` | Définir `AUTOME_SMTP_URL`, `AUTOME_MAIL_FROM` et `AUTOME_PUBLIC_URL` |
