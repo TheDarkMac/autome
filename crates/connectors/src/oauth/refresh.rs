@@ -6,9 +6,10 @@
 //! `grant_type=refresh_token`), puis re-stocke le résultat fusionné par
 //! [`merge_refreshed`].
 //!
-//! Un refus **définitif** du provider (`invalid_grant`) est distingué d'un
-//! échec transitoire ([`RefreshError`]) : le worker marque alors la credential
-//! invalide au lieu de retenter à chaque run.
+//! Un refus **définitif** du provider (`invalid_grant` et ses équivalents non
+//! standard, [`is_revoked_refresh`]) est distingué d'un échec transitoire
+//! ([`RefreshError`]) : le worker marque alors la credential invalide au lieu
+//! de retenter à chaque run.
 
 use std::fmt;
 
@@ -25,8 +26,9 @@ pub const REFRESH_SKEW_MS: i64 = 60_000;
 /// Échec d'un rafraîchissement.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RefreshError {
-    /// Refresh token refusé par le provider (`invalid_grant`, RFC 6749 §5.2) :
-    /// révoqué, expiré ou déjà consommé. Retenter est inutile — l'utilisateur
+    /// Refresh token refusé par le provider (`invalid_grant`, RFC 6749 §5.2,
+    /// ou son équivalent non standard, [`REVOKED_REFRESH_CODES`]) : révoqué,
+    /// expiré ou déjà consommé. Retenter est inutile — l'utilisateur
     /// doit reconnecter le compte.
     Revoked(String),
     /// Échec transitoire (réseau, 5xx, réponse illisible) ou de configuration
@@ -57,11 +59,39 @@ impl From<RefreshError> for Error {
     }
 }
 
-/// `true` si la réponse d'erreur du endpoint token est un `invalid_grant`
-/// (RFC 6749 §5.2 : 400, parfois 401 chez certains providers).
-pub fn is_invalid_grant(status: u16, body: &Value) -> bool {
-    (400..500).contains(&status)
-        && body.get("error").and_then(Value::as_str) == Some("invalid_grant")
+/// Codes d'erreur du endpoint token qui signifient un refresh token refusé
+/// pour de bon. La requête de refresh n'envoie aucun autre token que le
+/// refresh token : un « token » révoqué ou expiré ne peut être que lui.
+pub const REVOKED_REFRESH_CODES: &[&str] = &[
+    // RFC 6749 §5.2 (Google, Notion, …).
+    "invalid_grant",
+    // Slack (`oauth.v2.access`), en HTTP 200 avec `ok: false`.
+    "invalid_refresh_token",
+    "token_revoked",
+    "token_expired",
+    // GitHub (`/login/oauth/access_token`).
+    "bad_refresh_token",
+];
+
+/// `true` si la réponse du endpoint token est une erreur : statut hors 2xx
+/// (RFC 6749 §5.2), `ok: false` (Slack, en HTTP 200) ou `error` sans
+/// `access_token` (GitHub, en HTTP 200).
+pub fn is_token_error(status: u16, body: &Value) -> bool {
+    !(200..300).contains(&status)
+        || body.get("ok").and_then(Value::as_bool) == Some(false)
+        || (body.get("error").is_some_and(Value::is_string) && body.get("access_token").is_none())
+}
+
+/// `true` si la réponse du endpoint token refuse définitivement le refresh
+/// token : erreur ([`is_token_error`]) dont le code `error` est l'un des
+/// [`REVOKED_REFRESH_CODES`]. Jamais sur un 5xx (panne du provider).
+pub fn is_revoked_refresh(status: u16, body: &Value) -> bool {
+    status < 500
+        && is_token_error(status, body)
+        && body
+            .get("error")
+            .and_then(Value::as_str)
+            .is_some_and(|code| REVOKED_REFRESH_CODES.contains(&code))
 }
 
 /// Échange un refresh token contre un nouveau [`TokenSet`].
@@ -221,17 +251,65 @@ mod tests {
     }
 
     #[test]
-    fn invalid_grant_is_recognized_only_on_client_errors() {
+    fn invalid_grant_is_revoked_except_on_server_errors() {
         let body = json!({ "error": "invalid_grant", "error_description": "revoked" });
-        assert!(is_invalid_grant(400, &body));
-        assert!(is_invalid_grant(401, &body));
-        assert!(!is_invalid_grant(500, &body));
-        assert!(!is_invalid_grant(200, &body));
-        assert!(!is_invalid_grant(
+        assert!(is_revoked_refresh(400, &body));
+        assert!(is_revoked_refresh(401, &body));
+        assert!(is_revoked_refresh(200, &body), "erreur en 200, sans token");
+        assert!(!is_revoked_refresh(500, &body));
+        assert!(!is_revoked_refresh(503, &body));
+        assert!(!is_revoked_refresh(
             400,
             &json!({ "error": "invalid_client" })
         ));
-        assert!(!is_invalid_grant(400, &json!("invalid_grant")));
+        assert!(!is_revoked_refresh(400, &json!("invalid_grant")));
+    }
+
+    #[test]
+    fn slack_refusals_in_http_200_are_revoked() {
+        for code in ["invalid_refresh_token", "token_revoked", "token_expired"] {
+            let body = json!({ "ok": false, "error": code });
+            assert!(is_token_error(200, &body), "{code}");
+            assert!(is_revoked_refresh(200, &body), "{code}");
+        }
+    }
+
+    #[test]
+    fn github_bad_refresh_token_is_revoked_in_200_and_400() {
+        let body = json!({
+            "error": "bad_refresh_token",
+            "error_description": "The refresh token passed is incorrect or expired.",
+        });
+        assert!(is_revoked_refresh(200, &body));
+        assert!(is_revoked_refresh(400, &body));
+    }
+
+    #[test]
+    fn other_errors_in_http_200_are_errors_but_not_revoked() {
+        for body in [
+            json!({ "ok": false, "error": "invalid_client_id" }),
+            json!({ "ok": false, "error": "ratelimited" }),
+            json!({ "ok": false }),
+            json!({ "error": "incorrect_client_credentials" }),
+        ] {
+            assert!(is_token_error(200, &body), "{body}");
+            assert!(!is_revoked_refresh(200, &body), "{body}");
+        }
+    }
+
+    #[test]
+    fn successful_responses_are_not_errors() {
+        for body in [
+            json!({ "access_token": "at", "expires_in": 3600 }),
+            json!({ "ok": true, "access_token": "xoxe.xoxb-1", "refresh_token": "xoxe-1" }),
+            // Un `error` accompagné d'un token n'est pas un refus.
+            json!({ "access_token": "at", "error": "invalid_grant" }),
+        ] {
+            assert!(!is_token_error(200, &body), "{body}");
+            assert!(!is_revoked_refresh(200, &body), "{body}");
+        }
+        // Le statut l'emporte : un 4xx est une erreur même avec un token.
+        assert!(is_token_error(400, &json!({ "access_token": "at" })));
     }
 
     #[test]
