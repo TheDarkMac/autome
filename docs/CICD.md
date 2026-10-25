@@ -103,7 +103,12 @@ production ne peuvent pas partager un cluster.
   rien d'appliqué) : on peut créer `staging` avant d'avoir son cluster.
 - Les overlays `clusters/staging/` et `clusters/prod/` se créent en copiant
   `clusters/example/` (proxys de confiance au CIDR de l'ingress du cluster,
-  NetworkPolicy, #271).
+  NetworkPolicy, #271 ; URL publiques — `AUTOME_API_URL` du frontend,
+  `AUTOME_PUBLIC_URL`, `AUTOME_CORS_ORIGINS` —, #282).
+- **Même image dans les deux environnements** : l'URL de l'API n'est pas
+  inlinée au build du frontend, le conteneur l'écrit dans `/config.js` au
+  démarrage depuis `AUTOME_API_URL` (#282). Une image validée en staging se
+  déploie telle quelle en production.
 - Le kubeconfig doit pouvoir créer le namespace `autome` et ses ressources,
   et lire l'état des déploiements (`rollout status`).
 

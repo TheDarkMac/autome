@@ -18,3 +18,5 @@ resources:
 
 patches:
   - path: trusted-proxies.yaml
+  # URL de l'API (frontend), du frontend et CORS de ce cluster (#282).
+  - path: public-urls.yaml

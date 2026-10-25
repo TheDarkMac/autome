@@ -45,6 +45,15 @@ spec:
           ports:
             - name: http
               containerPort: 80
+          # Écrite dans /config.js au démarrage (#282) : la même image sert
+          # tous les environnements. Changée dans le ConfigMap, elle ne
+          # s'applique qu'au redémarrage des pods (`kubectl rollout restart`).
+          env:
+            - name: AUTOME_API_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: autome-config
+                  key: AUTOME_API_URL
           readinessProbe:
             httpGet:
               path: /

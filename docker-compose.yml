@@ -137,9 +137,10 @@ services:
     build:
       context: frontend
       dockerfile: Dockerfile
-      args:
-        # URL atteinte par le NAVIGATEUR (port publié de l'api), inlinée au build.
-        VITE_API_URL: http://localhost:8080
+    environment:
+      # URL atteinte par le NAVIGATEUR (port publié de l'api), écrite dans
+      # /config.js au démarrage (#282) : changer l'URL ne demande pas de rebuild.
+      AUTOME_API_URL: http://localhost:8080
     ports:
       - "8081:80"
     depends_on:

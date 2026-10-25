@@ -1,0 +1,19 @@
+# URL publiques de ce cluster (#282) — ce qui change entre staging et
+# production pour une même image : les régler aux hôtes de l'ingress du
+# cluster (k8s/ingress.yaml, à patcher de même si les hôtes changent).
+#
+#   - AUTOME_API_URL : URL de l'API vue du navigateur, écrite dans
+#     /config.js au démarrage du frontend ;
+#   - AUTOME_PUBLIC_URL : URL du frontend, base des liens envoyés par email ;
+#   - AUTOME_CORS_ORIGINS : origine du frontend, seule autorisée par l'API.
+#
+# Fusionné dans le ConfigMap `autome-config` de la base (patch stratégique).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: autome-config
+  namespace: autome
+data:
+  AUTOME_API_URL: "https://api.staging.autome.example.com"
+  AUTOME_PUBLIC_URL: "https://staging.autome.example.com"
+  AUTOME_CORS_ORIGINS: "https://staging.autome.example.com"

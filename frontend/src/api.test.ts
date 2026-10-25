@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { ApiError, apiBaseUrl, fetchOpenApi, type OpenApiSpec } from "./api";
 
 const sampleSpec: OpenApiSpec = {
@@ -18,10 +18,33 @@ function jsonResponse(body: unknown, status = 200): Response {
 }
 
 describe("apiBaseUrl", () => {
-  it("falls back to localhost when env not set", () => {
-    // VITE_API_URL est positionné via .env.local en dev ; en test on vérifie
-    // qu'un défaut sûr est utilisé si la string est vide.
-    expect(apiBaseUrl()).toMatch(/^https?:\/\//);
+  afterEach(() => {
+    delete window.__AUTOME_CONFIG__;
+    vi.unstubAllEnvs();
+  });
+
+  it("falls back to localhost when neither runtime nor build config is set", () => {
+    vi.stubEnv("VITE_API_URL", "");
+    expect(apiBaseUrl()).toBe("http://localhost:8080");
+  });
+
+  it("uses VITE_API_URL when the runtime config has no apiUrl", () => {
+    // `public/config.js` par défaut (dev, `vite`) : objet vide.
+    window.__AUTOME_CONFIG__ = {};
+    vi.stubEnv("VITE_API_URL", "http://localhost:9000");
+    expect(apiBaseUrl()).toBe("http://localhost:9000");
+  });
+
+  it("prefers the runtime config written at container start (#282)", () => {
+    window.__AUTOME_CONFIG__ = { apiUrl: "https://api.staging.example.com" };
+    vi.stubEnv("VITE_API_URL", "http://localhost:9000");
+    expect(apiBaseUrl()).toBe("https://api.staging.example.com");
+  });
+
+  it("ignores an empty runtime apiUrl", () => {
+    window.__AUTOME_CONFIG__ = { apiUrl: "" };
+    vi.stubEnv("VITE_API_URL", "http://localhost:9000");
+    expect(apiBaseUrl()).toBe("http://localhost:9000");
   });
 });
 
