@@ -1,5 +1,6 @@
 # Configuration non-sensible (F10.3) — variables d'environnement injectées
-# dans l'API et le worker via `envFrom`.
+# dans l'API et le worker via `envFrom` ; le frontend n'en lit qu'une clé
+# (AUTOME_API_URL).
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -60,6 +61,11 @@ data:
   # CORS (#225) : origine(s) du frontend, servi sur un autre hôte que l'API
   # (cf. ingress). Sans elle, le navigateur bloque tous les appels du frontend.
   AUTOME_CORS_ORIGINS: "https://autome.example.com"
+  # URL de l'API telle que le NAVIGATEUR l'atteint (hôte `api` de l'ingress),
+  # lue par le frontend au démarrage (#282) — pas par l'API. Comme les deux
+  # URL ci-dessus, elle change d'un environnement à l'autre : la régler dans
+  # l'overlay du cluster (clusters/example/public-urls.yaml).
+  AUTOME_API_URL: "https://api.autome.example.com"
   # Traces OpenTelemetry (#249) : base OTLP/HTTP du collecteur (ex.
   # "http://otel-collector.observability:4318", `/v1/traces` ajouté). Vide =
   # aucun export. `service.name` vaut `autome-api` / `autome-worker` ; en-têtes

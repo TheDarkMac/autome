@@ -71,6 +71,7 @@ cp .env.example .env
 | `AUTOME_MAIL_FROM` | Expéditeur des emails, ex. `Autome <no-reply@exemple.fr>` | *(non défini)* | obligatoire avec `AUTOME_SMTP_URL` |
 | `AUTOME_CORS_ORIGINS` | Origines du **frontend** autorisées à appeler l'API depuis le navigateur (`scheme://hôte[:port]`, séparées par des virgules ; ni joker, ni chemin — refus de démarrer sinon). Vide = aucune | `http://localhost:5173,http://localhost:8081` | **obligatoire** si le frontend est servi sur une autre origine que l'API |
 | `AUTOME_PUBLIC_URL` | URL publique du **frontend**, base des liens envoyés par email (jamais déduite de l'en-tête `Host`) | `http://localhost:5173` | obligatoire avec `AUTOME_SMTP_URL` |
+| `AUTOME_API_URL` | **Conteneur frontend** (pas l'API) : URL de l'API telle que le navigateur l'atteint, écrite dans `/config.js` au démarrage (`http(s)://hôte[:port][/chemin]`, refus de démarrer sinon) — la même image sert tous les environnements (#282) | *(non défini : `VITE_API_URL` du build, sinon `http://localhost:8080`)* | **obligatoire** : l'hôte `api` de l'ingress |
 | `AUTOME_CONNECTOR_CREDENTIALS` | Worker : `per_user` (token du propriétaire du run) ou `single_tenant` (repli sur `AUTOME_CONNECTOR_TOKEN_<PROVIDER>`) | `per_user` | `per_user` (instance partagée) |
 
 ### Sortie réseau (anti-SSRF)
@@ -373,7 +374,10 @@ npm run dev        # serveur de dev Vite (port affiché dans la console)
 ```
 
 Pour un build de production statique : `npm run build` (sortie dans `dist/`).
-L'URL du backend est injectée au build via `VITE_API_URL`. Le frontend et
+L'URL du backend se lit à l'exécution (#282) : `/config.js`, que l'image
+réécrit au démarrage depuis `AUTOME_API_URL` ; vide (cas de `vite`), le
+bundle prend `VITE_API_URL` (`.env.local`), sinon `http://localhost:8080`. Une
+même image sert donc staging et production. Le frontend et
 l'API étant sur deux origines, l'API doit autoriser celle du frontend
 (`AUTOME_CORS_ORIGINS` ; en `dev`, `:5173` et `:8081` le sont par défaut).
 
@@ -413,7 +417,11 @@ cp -r clusters/example clusters/prod
 kubectl kustomize clusters/prod/      # rendu, sans appliquer
 ```
 
-Le modèle règle `AUTOME_TRUSTED_PROXIES` (`trusted-proxies.yaml`) et ajoute une
+Le modèle règle les URL publiques du cluster (`public-urls.yaml`, #282) :
+`AUTOME_API_URL` (l'API vue du navigateur, lue par le frontend au démarrage),
+`AUTOME_PUBLIC_URL` et `AUTOME_CORS_ORIGINS` — c'est ce qui distingue staging
+et production pour une même image. Il règle aussi
+`AUTOME_TRUSTED_PROXIES` (`trusted-proxies.yaml`) et ajoute une
 NetworkPolicy (`api-network-policy.yaml`). La base fait confiance à tous les
 réseaux privés (`10.0.0.0/8,172.16.0.0/12,192.168.0.0/16`) : l'API croit alors
 le `X-Forwarded-For` de n'importe quel pod du cluster, qui peut choisir l'IP
@@ -460,8 +468,11 @@ kubectl -n autome rollout status deployment/worker
 kubectl -n autome get pods,svc
 ```
 
-La CD fait de même, sur l'overlay désigné par la variable de dépôt
-`K8S_OVERLAY` (Settings → Variables ; vide = `k8s/`). Un `kubectl apply -k`
+La CD fait de même, dans l'environnement GitHub de la cible (#280) : `main`
+→ `staging`, tag `v*.*.*` → `production`, chacun avec son secret
+`KUBE_CONFIG` et sa variable `K8S_OVERLAY` (Settings → Environments ; vide =
+`k8s/`), un cluster par environnement — détail dans
+[CICD.md](CICD.md#configuration-github-280). Un `kubectl apply -k`
 d'un seul coup reste sûr : le nouveau worker attend que le journal
 `schema_migrations` contienne toutes ses migrations
 (`AUTOME_WORKER_SCHEMA_WAIT_SECS`, 120 s) avant de consommer, et refuse de
@@ -1238,6 +1249,8 @@ npm run test       # Vitest
 | « Ce lien d'invitation est invalide, expiré ou déjà utilisé » | Lien de plus de 7 jours, déjà utilisé, ou remplacé par un renvoi (#241) | Demander un renvoi à un administrateur (« Renvoyer l'invitation »), ou utiliser « Mot de passe oublié » avec l'adresse invitée |
 | Connexion refusée « adresse email pas encore vérifiée » (403 `email not verified`) | Lien de vérification pas encore ouvert (#231) | Ouvrir le lien reçu ou cliquer « Renvoyer le lien » ; en `dev` sans SMTP, le lien est dans les journaux de l'API ; sinon `autome-api verify-email <email>` ou l'onglet Administration |
 | Console du navigateur : `blocked by CORS policy` / préflight `OPTIONS` en 405 ; l'interface ne charge rien | Origine du frontend absente de `AUTOME_CORS_ORIGINS` (aucune par défaut en `prod`) | Ajouter l'origine exacte du frontend (schéma + hôte + port) à `AUTOME_CORS_ORIGINS` et redémarrer l'API |
+| Le frontend déployé appelle `http://localhost:8080` (onglet Réseau du navigateur) | `AUTOME_API_URL` absente du conteneur frontend : `/config.js` est resté vide (#282) | Renseigner `AUTOME_API_URL` (ConfigMap `autome-config`, overlay `public-urls.yaml`) puis `kubectl -n autome rollout restart deployment/frontend` |
+| Pod `frontend` en `CrashLoopBackOff`, journal `AUTOME_API_URL invalide` | Valeur hors `http(s)://hôte[:port][/chemin]` (guillemet, espace, schéma manquant…) | Corriger la valeur ; pas de barre finale nécessaire |
 | Port déjà utilisé (`address already in use`) | 8080/8081/3000/9090/5432/15672 occupé | Libérer le port ou ajuster `APP_HTTP_ADDR` / les mappings du compose |
 | `docker compose` échoue à joindre `db`/`queue` | Services pas encore *healthy* | Attendre les healthchecks (`depends_on … service_healthy`) puis relancer |
 | Pods `api`/`worker` en `ImagePullBackOff` | Tag/registry d'image absent | Vérifier que les images GHCR existent (CD passée) ou ajuster les `image:` |

@@ -1,8 +1,11 @@
 // Helper fetch vers le backend Autome (F8.1.c).
 //
-// `apiBaseUrl()` lit `VITE_API_URL` à la build ; le default `http://localhost:8080`
-// reste pratique pour le dev sans `.env.local`. `fetchOpenApi()` est le premier
-// appel exposé — il sert de canari à l'intégration backend pour F8.1.
+// `apiBaseUrl()` lit d'abord la configuration d'exécution (`/config.js`, écrit
+// au démarrage du conteneur depuis `AUTOME_API_URL`, #282) : une même image
+// sert staging et production. Puis `VITE_API_URL`, inliné à la build (dev,
+// `.env.local`) ; le default `http://localhost:8080` reste pratique pour le dev
+// sans `.env.local`. `fetchOpenApi()` est le premier appel exposé — il sert de
+// canari à l'intégration backend pour F8.1.
 
 /** Forme minimale de la spec OpenAPI 3 qu'on attend du backend (F7.4). */
 export type OpenApiSpec = {
@@ -11,9 +14,13 @@ export type OpenApiSpec = {
   paths: Record<string, unknown>;
 };
 
-/** Base URL du backend — résolue depuis `VITE_API_URL`. */
+/** Base URL du backend — config d'exécution, sinon `VITE_API_URL`. */
 export function apiBaseUrl(): string {
-  return import.meta.env.VITE_API_URL || "http://localhost:8080";
+  return (
+    window.__AUTOME_CONFIG__?.apiUrl ||
+    import.meta.env.VITE_API_URL ||
+    "http://localhost:8080"
+  );
 }
 
 /** Erreur HTTP/transport renvoyée par les helpers — sans secret du token. */
