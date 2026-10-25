@@ -458,6 +458,7 @@
 | 2026-10-24 | backlog post-audit · déploiement | Fusion de la [PR #272](https://github.com/TheDarkMac/autome/pull/272) dans `main` (issue #271 fermée) ; ligne cochée `[x]`. Chantier P3 n°25 ouvert : issue #273, branche `feature/backlog-db-connect-retry`. | [PR #272](https://github.com/TheDarkMac/autome/pull/272) |
 | 2026-10-24 | backlog post-audit · connexion PostgreSQL | **L'API attend une base qui démarre au lieu de redémarrer en boucle** (issue #273, reste P3 n°25, trouvé sur k3s en vérifiant la PR #272). **persistence** : `connect_retrying` (`pool.rs`) — `retry_until`, backoff 0,5 → 5 s ; transitoire = erreur réseau (refus, réinitialisation, nom pas encore résolu : Service headless sans pod prêt), connexion fermée, `57P03` ; définitive = toute autre réponse du serveur (`28P01`, `28000`, `3D000`…) ; message avec la chaîne des causes et le SQLSTATE (tokio-postgres n'affichait que « error connecting to server ») ; `db_connect_timeout` (`AUTOME_DB_CONNECT_TIMEOUT_SECS`, 60 s, `0` = une tentative), parseur partagé avec le délai du broker. **api** : `migrate(config, connect_timeout)`. **k8s** : `startupProbe` de l'API 30 → 50 essais (attente base + migrations + broker). **Tests** : faux serveur PostgreSQL (refus retenté jusqu'au délai, base qui écoute en retard, `57P03` ×2 puis prête, `28P01`/`28000`/`3D000` en une connexion, délai 0) ; PostgreSQL réel (relais TCP ouvert 1,2 s en retard ⇒ pool obtenu, base et rôle inexistants rendus aussitôt) ; `migrate` abandonne une base injoignable. **Smoke du binaire** : API lancée 4 s avant PostgreSQL ⇒ 5 tentatives (refus puis réinitialisation pendant l'initialisation), 25 migrations, `/readyz` 200 ; base inexistante ⇒ sortie code 1 en 0,2 s (`SQLSTATE 3D000`). **Doc** : `INSTALLATION.md` (variable, startup probe, dépannage), `.env.example`. `cargo fmt --check`, `clippy --workspace --all-targets --locked -D warnings`, `test --workspace --locked` verts (1115 tests, avec `TEST_DATABASE_URL`). | — |
 | 2026-10-24 | backlog post-audit · connexion PostgreSQL | Fusion de la [PR #274](https://github.com/TheDarkMac/autome/pull/274) dans `main` (issue #273 fermée) ; ligne cochée `[x]`. Les 25 restes priorisés sont soldés ; CI et CD vertes sur `81b3a9a`. | [PR #274](https://github.com/TheDarkMac/autome/pull/274) |
+| 2026-10-25 | audit workflows & documentation | **Backlog de l'audit des workflows et de la documentation** (issue #276) : section « Audit des workflows et de la documentation », lots A (CI/CD) → E (tutoriel), 26 constats vérifiés sur `main` (`d31ffc9`) + ce qui reste à analyser par lot. Constats P1 : la CD construit le dernier commit de `main` au lieu de celui validé par la CI (`workflow_run`) et n'a pas de staging ; deux exemples sans `text` / `body` ; version de run toujours 1 alors que le worker exécute la version courante ; README et ARCHITECTURE §10 périmés ; méthode OAuth fausse dans le tutoriel. | [Issue #276](https://github.com/TheDarkMac/autome/issues/276) |
 
 ## Backlog post-roadmap (66/66)
 
@@ -599,3 +600,83 @@ fail-fast prod (#172), borne de taille des réponses HTTP
 (`MAX_RESPONSE_BYTES`), liens du README, smoke de bout en bout en CI (#216),
 tests PostgreSQL/RabbitMQ réels en CI (#218), étage de dépendances cargo-chef
 (#219).
+
+## Audit des workflows et de la documentation
+
+Backlog de l'issue [#276](https://github.com/TheDarkMac/autome/issues/276),
+ouvert une fois les 25 restes priorisés soldés. Trois sens de « workflow » :
+les **pipelines GitHub Actions** (`.github/workflows/`), les **workflows
+d'exemple** (`examples/workflows/`) et les **parcours utilisateur** de
+l'application ; puis leur reflet dans la **documentation** (`README.md`,
+`docs/`) et le **tutoriel** (`tutorial/`).
+
+Trop large pour une session : découpé en **lots A → E**, chacun attaquable
+seul. Chaque lot porte (1) les constats d'un premier passage, **vérifiés dans
+le code de `main` (`d31ffc9`, 2026-10-25)**, et (2) ce qui reste à analyser
+en profondeur — la première tâche d'une session sur ce lot, qui complète le
+tableau avant de corriger. Process habituel : une issue GitHub par chantier au
+moment de l'attaquer, puis `*(fait, #N / PR #M)*` dans la ligne.
+
+Ordre conseillé : **A1–A2** (la CD peut livrer un commit non testé), puis les
+P1 des lots B, C, D, E, puis les analyses approfondies lot par lot.
+
+### Lot A — CI/CD (`.github/workflows/ci.yml`, `cd.yml`)
+
+| # | Prio | Chantier | Constat dans le code |
+|---|---|---|---|
+| A1 | P1 | **La CD construit et déploie le mauvais commit** | Sur `workflow_run`, `actions/checkout` (`cd.yml:78`, `:136`) prend le **dernier commit de `main`**, pas celui que la CI a validé (`github.event.workflow_run.head_sha`) ; `docker/metadata-action` (`type=sha`, `:99`) et `git rev-parse --short HEAD` (`:148`) aussi. Deux fusions rapprochées ⇒ image construite sur un commit dont la CI n'est pas finie (ou rouge) ; et le job `deploy`, qui refait son checkout plus tard, peut épingler un tag `sha-…` jamais poussé (`ImagePullBackOff`). Corriger : `ref: ${{ github.event.workflow_run.head_sha \|\| github.sha }}` partout, tag calculé une fois et passé en sortie de job. |
+| A2 | P1 | **Pas de staging : `main` et les tags déploient au même endroit** | Le commentaire annonce « Staging » pour `main` (`cd.yml:23`), mais les deux déclencheurs partagent `environment: production` (`:125`) et le même overlay `K8S_OVERLAY` ; la concurrence est par réf (`cd-${{ github.ref }}`, `:33`) ⇒ un déploiement de `main` et un de tag peuvent tourner **en parallèle** sur le même cluster. Séparer `staging` (main) / `production` (tag, approbation), overlays distincts, groupe de concurrence par environnement. |
+| A3 | P2 | **Un tag déploie sans CI sur ce commit** | La CI ne tourne que sur `push: main` et les PR (`ci.yml:26-29`) ; `push: tags` (`cd.yml:22`) build + déploie sans vérifier que le commit taggé a une CI verte (tag posé sur une branche, ou sur un commit rouge). |
+| A4 | P2 | **L'image frontend n'est jamais construite en CI** | Le job `frontend` ne lance ni `pnpm run build` ni le `frontend/Dockerfile` ; le smoke ne construit que `api` et `worker` (`ci.yml`, bake `targets: api,worker`). Un `vite build`, un `nginx.conf` ou un Dockerfile cassé n'apparaît qu'**après fusion**, dans la CD. |
+| A5 | P2 | **Actions par tag, pas par SHA ; aucun outil de mise à jour** | Images pinnées par digest (#162, #263) mais actions par tag mobile (`actions/checkout@v4`, `Swatinem/rust-cache@v2`, `docker/*@v3/v5/v6`…) ; `azure/setup-kubectl@v4` installe un kubectl non épinglé. `.github/` ne contient que `workflows/` : ni Dependabot ni Renovate pour rafraîchir digests, actions, crates et paquets npm. |
+| A6 | P2 | **Node 20 en fin de vie** | `setup-node` `node-version: 20` (`ci.yml:176`), `node:20-bookworm-slim` (`frontend/Dockerfile:17`), `engines.node >=20` (`frontend/package.json:47`) : Node 20 n'est plus maintenu depuis le 2026-04-30. Passer à la LTS active. |
+| A7 | P2 | **Aucun scan de vulnérabilités ni SBOM** | Ni `cargo audit` / `cargo deny`, ni `pnpm audit`, ni scan d'image (Trivy, Grype) ; images poussées sur GHCR sans SBOM, provenance ni signature. |
+| A8 | P3 | **Pas de vérification après déploiement ni de retour arrière** | `cd.yml` s'arrête à `rollout status` : pas de smoke sur l'URL déployée, pas de `rollout undo` si le worker ne démarre pas. Prometheus et Grafana restent par tag (`k8s/monitoring.yaml:82`, `:533`), contrairement à PostgreSQL et RabbitMQ. |
+| A9 | P3 | **Spec OpenAPI du frontend non vérifiée** | `frontend/openapi.json` et `src/apiSchema.ts` (`pnpm run gen:api`) sont versionnés à la main ; aucune étape ne compare au `GET /openapi.json` du backend ⇒ dérive silencieuse des types du client. |
+
+**À analyser (session lot A)** : l'épinglage `sed` de `k8s/*.yaml` (`cd.yml`, étape *Pin images*) face à un overlay qui redéfinirait les images (`images:` kustomize) — passer à `kustomize edit set image` ; permissions minimales par job ; caches (`rust-cache` + `llvm-cov-target`, scopes `gha`) et durée réelle des jobs ; garde-fou des tests réels (`grep` sur des messages en français, `ci.yml`) ; `scripts/compose-smoke.sh` et `check-migrations.sh` (cas d'échec, nettoyage) ; cohérence avec `docs/CICD.md`.
+
+### Lot B — Workflows d'exemple (`examples/workflows/`)
+
+| # | Prio | Chantier | Constat dans le code |
+|---|---|---|---|
+| B1 | P1 | **Deux exemples ne fonctionnent pas tels quels** | `github-webhook-to-slack.json` : `slack.send_message` sans `text`, paramètre requis (`crates/connectors/src/slack.rs:79`) ; `scheduler-fetch-store.json` : POST `store` sans `body`. Le contenu est calculé par du code Rust dans les tests (`crates/engine/tests/example_github_webhook_to_slack.rs:149-157`, `example_scheduler_fetch_store.rs:127-131`). Importés via l'API, le premier échoue et le second poste un corps vide. Porter le mapping en `{{ … }}` dans le JSON, comme `slack-to-gmail-notion.json` (#160). |
+| B2 | P2 | **Les exemples ne passent ni par l'API ni par le worker** | Les tests montent leur propre `NodeRunner` sur le moteur ; rien ne prouve que chaque JSON est accepté par `POST /workflows` (validation, ids namespacés #188) ni qu'il s'exécute par le dispatch du worker (`crates/worker/src/dispatch.rs`). Ajouter un test qui charge chaque fichier par l'API et le fait tourner via le worker sur un transport factice. |
+| B3 | P2 | **Impossible d'importer un exemple** | Ni import ni export JSON dans l'éditeur (`WorkflowBar.tsx`, `useWorkflowEditor.ts`) ; `examples/README.md` ne dit pas comment le charger dans une instance (`curl` + jeton). Le `"path": "/webhooks/github"` de l'exemple webhook est ignoré : l'URL réelle est `/hooks/:token` (`crates/api/src/webhooks.rs:693`), à lire via `GET /workflows/{id}/webhooks`. |
+| B4 | P3 | **Couverture des exemples** | Aucun exemple de `polling`, de branche conditionnelle, de boucle, de parallélisme ni de gestion d'erreur, alors que le moteur les supporte (F2.*). |
+
+**À analyser (session lot B)** : chaque nœud des exemples contre le catalogue `GET /connectors/actions` (noms et types de paramètres, #257) ; affichage des exemples dans l'éditeur (positions des nœuds absentes du JSON ?).
+
+### Lot C — Parcours utilisateur (API, worker, éditeur)
+
+| # | Prio | Chantier | Constat dans le code |
+|---|---|---|---|
+| C1 | P1 | **La version d'un run est fausse** | `POST /workflows/{id}/runs` enregistre `version: body.version.unwrap_or(1)` (`crates/api/src/runs.rs:234`), « version du workflow à figer » (`:91`) ; mais le worker relit la **version courante** (`WorkflowRepository::get`, `crates/worker/src/executor.rs:8` ; `crates/persistence/src/workflow_repo.rs:81-83`). Un run affiche donc la version 1 et exécute le dernier graphe, même modifié entre le déclenchement et l'exécution. Soit le worker charge `workflow_versions` à la version du run, soit l'API enregistre la version courante — et la doc suit. |
+| C2 | P2 | **Pas de pause d'un workflow** | Aucune colonne ni champ « actif » (`migrations/0002_workflows.sql`, `crates/core/src/workflow/`) : tout workflow enregistré avec un trigger `schedule` / `polling` part (`crates/worker/src/triggers.rs`) et son webhook répond ; seule la suppression l'arrête. |
+| C3 | P2 | **Ni annulation ni relance d'un run** | Routes runs : `POST`/`GET /workflows/:id/runs`, `GET /runs/:run_id` seulement (`crates/api/src/runs.rs:385-386`) ; rien dans `RunExecutionPanel.tsx`. Un run bloqué sur une API lente ne peut être qu'attendu. |
+| C4 | P2 | **Historique des versions inaccessible** | `workflow_versions` garde chaque version (`workflow_repo.rs:6`) mais aucune route ne les liste ni ne restaure une version. |
+| C5 | P2 | **Lancement manuel sans données d'entrée** | L'éditeur appelle `createRun(id)` sans payload (`frontend/src/useWorkflowEditor.ts:311`) alors que l'API accepte `payload` (`runs.rs:87`) : impossible de tester un workflow qui lit `{{ entry.… }}`. |
+| C6 | P3 | **Routes de démonstration montées en production** | `/auth/whoami` et `/auth/admin` (`crates/api/src/auth.rs:366-367`, montées par `main.rs:103-105`) servent aux tests de F6.* ; hors OpenAPI. |
+
+**À analyser (session lot C, en plusieurs passes)** : dérouler chaque parcours de bout en bout (API + UI + emails + audit + permissions + cas d'erreur) — inscription → vérification d'email → connexion → MFA ; mot de passe oublié / changé ; invitation par un admin ; suppression de compte ; connexion OAuth d'un connecteur → expiration → reconnexion ; créer → enregistrer → lancer → suivre un run ; webhook (URL, rotation, signature, filtre `event`) ; cron / polling (armement, modification, suppression) ; administration (utilisateurs, liste des workflows). Cas limites : suppression d'un workflow dont un run est en file ou en cours (les `ON DELETE CASCADE` couvrent la base, pas le message déjà dans RabbitMQ) ; modification d'un workflow pendant un run (voir C1).
+
+### Lot D — Documentation (`README.md`, `docs/`)
+
+| # | Prio | Chantier | Constat dans le code |
+|---|---|---|---|
+| D1 | P1 | **README : avancement périmé** | `README.md:18` : « 56 / 66 features … reste la documentation et les exemples » — la roadmap est à 66 / 66. |
+| D2 | P1 | **ARCHITECTURE §10 décrit l'état d'avant #107** | `docs/ARCHITECTURE.md:450-469` : stores en mémoire, PostgreSQL / RabbitMQ « pas encore câblés », secret JWT « codé en dur » — résolus par #107 et le fail-fast prod (#172). Section à réécrire (dette réelle restante : HPA, sauvegardes PG, KMS…). |
+| D3 | P2 | **npm dans la doc, pnpm partout ailleurs** | `README.md:103`, `:110`, `:113` ; `docs/INSTALLATION.md:371-375`, `:1213-1215` : `npm install` / `npm run …`, alors que CI et Dockerfile imposent pnpm via Corepack (`packageManager: pnpm@10.33.2`, #162). `npm install` ignore `pnpm-lock.yaml` et crée un `package-lock.json`. |
+
+**À analyser (session lot D)** : chaque variable d'environnement lue par le code (`std::env::var`, `from_env`) contre le tableau d'`INSTALLATION.md`, `.env.example`, `k8s/config.yaml`, `docker-compose.yml` ; chaque route des routers contre les docs ; `docs/CICD.md` contre `ci.yml` / `cd.yml` (après le lot A) ; `docs/CONNECTORS.md` contre le SDK et `GET /connectors/actions` ; ADR manquants pour les décisions prises depuis l'ADR 0004 (outbox et reprise des runs, planificateur partagé, MFA, OpenTelemetry, proxy SSRF) ; tableau de dépannage d'`INSTALLATION.md`.
+
+### Lot E — Tutoriel (`tutorial/*.html`)
+
+| # | Prio | Chantier | Constat dans le code |
+|---|---|---|---|
+| E1 | P1 | **Mauvaise méthode HTTP pour OAuth** | `tutorial/connecteurs.html:55`, `:58`, `demarrer.html:72` : `GET /credentials/:provider/authorize` et `…/callback` ; les routes sont en `POST` (`crates/api/src/credentials.rs:443-444`), comme le dit `INSTALLATION.md:173`. |
+| E2 | P2 | **« Démarrer » périmé** | `demarrer.html` : `GET /health` au lieu de `/livez` / `/readyz` (l. 42) ; `npm install && npm run dev` (l. 62) ; 7 endpoints sans mention du jeton `Bearer` ; aucune étape pour créer le premier compte (inscription, vérification d'email en dev) ; JSON d'exemple sans `id`. |
+| E3 | P2 | **Éditeur du tutoriel d'avant #225** | La maquette affiche `wf-draft` (`editeur.html:41`), le brouillon local supprimé par #225 ; pas d'Enregistrer / Ouvrir / Lancer / Supprimer, alors que l'éditeur les a (`WorkflowBar.tsx`). |
+| E4 | P2 | **Pans entiers absents du tutoriel** | Rien sur le compte (vérification d'email, MFA, mot de passe oublié, suppression), l'invitation et l'administration, l'URL et la rotation d'un webhook, la reconnexion d'un connecteur, la liste des runs, l'observabilité (Grafana, Jaeger). |
+
+**À analyser (session lot E)** : liens internes et vers `../docs/` (le tutoriel est-il servi quelque part, ou seulement lu depuis le dépôt ?) ; `tutorial/assets/editor.js` contre le comportement réel de l'éditeur ; cohérence des schémas d'architecture avec `docs/ARCHITECTURE.md` (outbox, planificateur, OTel).
