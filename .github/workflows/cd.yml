@@ -8,9 +8,13 @@
 #   build-push : matrice api / worker / frontend → ghcr.io/<owner>/autome-*
 #   deploy     : rend les manifests avec les images taggées et applique le
 #                déploiement *si* un kubeconfig est fourni (sinon dry-run) :
-#                l'overlay du cluster (variable de dépôt K8S_OVERLAY, ex.
+#                l'overlay du cluster (variable K8S_OVERLAY, ex.
 #                `clusters/prod`) ou, sans elle, la base `k8s/` ; l'API
 #                d'abord (elle migre la base), le worker ensuite (#271).
+#
+# Deux environnements GitHub (#280) : `main` → `staging`, tag `v*.*.*` →
+# `production`. Chacun porte son KUBE_CONFIG (secret) et son K8S_OVERLAY
+# (variable), qui priment sur ceux du dépôt.
 #
 # La CD ne s'exécute qu'après une CI verte : déclenchée par `workflow_run`
 # (CI terminée avec succès sur `main`) et par les tags `v*.*.*` (release).
@@ -19,7 +23,7 @@
 name: CD
 
 on:
-  # Release : un tag de version déclenche build + déploiement.
+  # Release : un tag de version déclenche build + déploiement en production.
   push:
     tags: ["v*.*.*"]
   # Staging : on attend la fin (réussie) de la CI sur `main`.
@@ -27,10 +31,18 @@ on:
     workflows: ["CI"]
     types: [completed]
     branches: [main]
-  # Relance manuelle depuis l'onglet Actions.
+  # Relance manuelle depuis l'onglet Actions. `production` seulement lancée
+  # sur un tag de version (« Use workflow from » → onglet Tags).
   workflow_dispatch:
+    inputs:
+      environment:
+        description: Environnement cible
+        type: choice
+        options: [staging, production]
+        default: staging
 
-# Une seule livraison à la fois par réf (évite les push d'images concurrents).
+# Une seule livraison à la fois par réf (évite les push d'images concurrents) ;
+# les déploiements sont en plus sérialisés par environnement (job `deploy`).
 concurrency:
   group: cd-${{ github.ref }}
   cancel-in-progress: false
@@ -66,7 +78,33 @@ jobs:
       sha: ${{ steps.commit.outputs.sha }}
       tag: ${{ steps.commit.outputs.tag }}
       owner: ${{ steps.commit.outputs.owner }}
+      environment: ${{ steps.target.outputs.environment }}
     steps:
+      # Environnement cible (#280) : `main` → staging, tag → production,
+      # relance manuelle → l'entrée `environment`. La production n'accepte
+      # qu'un tag de version, même relancée à la main : refus avant tout
+      # build. Les règles de protection de l'environnement `production`
+      # (tags `v*` seulement, approbation) restent le garde-fou côté GitHub.
+      - name: Resolve environment
+        id: target
+        env:
+          EVENT: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          REQUESTED: ${{ inputs.environment }}
+        run: |
+          case "$EVENT" in
+            push) target=production ;;
+            workflow_run) target=staging ;;
+            workflow_dispatch) target="$REQUESTED" ;;
+            *) echo "::error::Événement inattendu : $EVENT"; exit 1 ;;
+          esac
+          if [ "$target" = production ] && [[ "$REF" != refs/tags/v* ]]; then
+            echo "::error::La production ne se déploie que depuis un tag de version (réf : $REF)"
+            exit 1
+          fi
+          echo "environment=$target" >> "$GITHUB_OUTPUT"
+          echo "Environnement : \`$target\`" >> "$GITHUB_STEP_SUMMARY"
+
       # Tag immuable `sha-<7>` (même longueur que l'ancien `type=sha`) ; owner
       # en minuscules : GHCR exige un namespace minuscule, alors que
       # `github.repository_owner` conserve la casse d'origine (TheDarkMac) —
@@ -171,13 +209,23 @@ jobs:
     name: Deploy (Kubernetes)
     needs: [release, build-push]
     runs-on: ubuntu-latest
-    # Environnement protégé : permet d'exiger une approbation manuelle et de
-    # porter les secrets de déploiement (KUBE_CONFIG) côté GitHub.
-    environment: production
+    # `staging` ou `production` (#280) : environnement protégé, qui porte
+    # l'approbation éventuelle et les secrets de déploiement (KUBE_CONFIG).
+    # Un cluster par environnement : les manifests fixent le namespace
+    # `autome`, staging et production ne peuvent pas partager un cluster.
+    environment: ${{ needs.release.outputs.environment }}
+    # Un seul déploiement à la fois par environnement : `main` et un tag ne
+    # se marchent plus dessus, deux fusions sur `main` s'enchaînent.
+    concurrency:
+      group: deploy-${{ needs.release.outputs.environment }}
+      cancel-in-progress: false
     permissions:
       contents: read
     # Le secret est exposé via env : le contexte `secrets` n'est pas
     # utilisable dans les conditions `if:` des étapes, contrairement à `env`.
+    # Secret et variable d'environnement priment sur ceux du dépôt : à définir
+    # dans chaque environnement, pas au niveau du dépôt (sinon staging
+    # hériterait du kubeconfig ou de l'overlay de la production).
     env:
       KUBE_CONFIG: ${{ secrets.KUBE_CONFIG }}
       # Overlay du cluster (proxys de confiance, NetworkPolicy…, #271) ;
