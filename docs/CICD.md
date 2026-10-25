@@ -61,16 +61,51 @@ Déclenchée sur **push** et **pull request** vers `main`. Reproduit la
 ### CD — `.github/workflows/cd.yml` (F10.5)
 
 Déclenchée **après une CI verte** (`workflow_run` sur `main`), sur les **tags**
-`v*.*.*` (release), ou manuellement (`workflow_dispatch`).
+`v*.*.*` (release), ou manuellement (`workflow_dispatch`, entrée
+`environment`).
+
+| Déclencheur | Environnement GitHub |
+|---|---|
+| CI verte sur `main` (`workflow_run`) | `staging` |
+| tag `v*.*.*` | `production` |
+| relance manuelle | entrée `environment` (défaut `staging`) ; `production` refusée hors d'un tag de version |
 
 | Job | Rôle |
 |---|---|
-| **build-push** | matrice `api` / `worker` / `frontend` → `docker/build-push-action`, publication sur **GHCR** (`ghcr.io/<owner>/autome-*`) via `GITHUB_TOKEN` (`packages: write`), tags via `metadata-action`, cache `gha` (scope `backend` de la CI pour `api` / `worker`, écrit par `api` seulement ; `frontend`) |
-| **deploy** | `environment: production`, épingle l'image (`sha-<court>`) dans `k8s/`, `kubectl kustomize` de l'overlay du cluster (variable de dépôt `K8S_OVERLAY`, ex. `clusters/prod` ; vide = `k8s/`) — validation systématique —, puis **uniquement si** le secret `KUBE_CONFIG` est présent (sinon dry-run documenté) : tout sauf le worker, attente de l'API (qui migre la base), puis le worker (#271) |
+| **release** | fixe **une fois** le commit à livrer (#278) : `workflow_run.head_sha` — le commit validé par la CI, pas le dernier de `main` (`github.sha`) —, sinon `github.sha` (tag, relance manuelle) ; sorties `sha`, `tag` (`sha-<7>`), `owner` (minuscules pour GHCR) et `environment` (#280), affichés dans le résumé |
+| **build-push** | checkout du commit de `release`, matrice `api` / `worker` / `frontend` → `docker/build-push-action`, publication sur **GHCR** (`ghcr.io/<owner>/autome-*`) via `GITHUB_TOKEN` (`packages: write`), tags via `metadata-action` (`sha-<7>` et label `org.opencontainers.image.revision` repris de `release`), cache `gha` (scope `backend` de la CI pour `api` / `worker`, écrit par `api` seulement ; `frontend`) |
+| **deploy** | dans l'environnement de `release` (#280), un déploiement à la fois **par environnement** ; checkout du même commit, épingle l'image (tag de `release`, pas recalculé) dans `k8s/`, `kubectl kustomize` de l'overlay du cluster (variable `K8S_OVERLAY` de l'environnement, ex. `clusters/prod` ; vide = `k8s/`) — validation systématique —, puis **uniquement si** le secret `KUBE_CONFIG` de l'environnement est présent (sinon dry-run documenté) : tout sauf le worker, attente de l'API (qui migre la base), puis le worker (#271) |
 
-Garde-fous : `build-push` ne s'exécute pas si la CI déclenchante a échoué ;
-`deploy` dépend de `build-push` ; déploiement réel derrière un *environment*
-protégé + secret optionnel.
+Garde-fous : sur `workflow_run`, `release` — donc toute la CD — ne s'exécute
+que pour une CI **verte** lancée par un **push** sur ce dépôt : le filtre
+`branches: [main]` porte sur le nom de la branche de tête, si bien qu'une PR
+ouverte depuis la branche `main` d'un fork déclenche aussi la CD, qui
+construirait sinon son code ; `deploy` dépend de `release` et `build-push` ;
+déploiement réel derrière un *environment* protégé + secret optionnel ;
+production seulement depuis un tag de version.
+
+#### Configuration GitHub (#280)
+
+Settings → Environments, un environnement par cible. **Un cluster par
+environnement** : les manifests fixent le namespace `autome`, staging et
+production ne peuvent pas partager un cluster.
+
+| Environnement | Secret `KUBE_CONFIG` | Variable `K8S_OVERLAY` | Règles de protection conseillées |
+|---|---|---|---|
+| `staging` | kubeconfig du cluster de staging, **encodé en base64** (`base64 -w0 kubeconfig`) | `clusters/staging` | *Deployment branches and tags* : `main` seulement |
+| `production` | kubeconfig du cluster de production, en base64 | `clusters/prod` | *Required reviewers* ; *Deployment branches and tags* : tags `v*` seulement ; *Prevent self-review* |
+
+- Secret et variable se définissent **dans chaque environnement**, jamais au
+  niveau du dépôt : ceux d'un environnement priment, mais un environnement
+  qui n'a pas les siens hérite de ceux du dépôt — staging déploierait alors
+  sur le cluster ou avec l'overlay de la production.
+- Sans `KUBE_CONFIG`, un environnement reste en **dry-run** (rendu validé,
+  rien d'appliqué) : on peut créer `staging` avant d'avoir son cluster.
+- Les overlays `clusters/staging/` et `clusters/prod/` se créent en copiant
+  `clusters/example/` (proxys de confiance au CIDR de l'ingress du cluster,
+  NetworkPolicy, #271).
+- Le kubeconfig doit pouvoir créer le namespace `autome` et ses ressources,
+  et lire l'état des déploiements (`rollout status`).
 
 ---
 
@@ -180,7 +215,10 @@ protégé + secret optionnel.
 - [x] Images `api`/`worker`/`frontend` construites et poussées sur GHCR.
 - [x] Tag d'image **immuable** (`sha-<court>`) déployé (pas `latest`).
 - [x] CD conditionnée à une **CI verte**.
+- [x] CD sur le **commit validé par la CI** (`workflow_run.head_sha`), tag d'image calculé une fois pour build et déploiement ; CI de PR (fork) exclue — #278.
 - [x] Déploiement réel **gardé** (environment + secret kubeconfig).
+- [x] Staging (`main`) séparé de la production (tags `v*`), un déploiement à la fois par environnement — #280.
+- [ ] Environnements GitHub `staging` et `production` configurés (secret `KUBE_CONFIG`, variable `K8S_OVERLAY`, règles de protection) — à faire dans les réglages du dépôt (#280).
 - [x] Migrations appliquées (API) **avant** le déploiement du worker ; le worker attend un schéma à jour — #271.
 - [ ] Overlay `clusters/<cluster>/` créé (proxys de confiance au CIDR de l'ingress, NetworkPolicy adaptée) et désigné par `K8S_OVERLAY` — à faire par cluster (#271).
 

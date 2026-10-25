@@ -460,8 +460,11 @@ kubectl -n autome rollout status deployment/worker
 kubectl -n autome get pods,svc
 ```
 
-La CD fait de même, sur l'overlay désigné par la variable de dépôt
-`K8S_OVERLAY` (Settings → Variables ; vide = `k8s/`). Un `kubectl apply -k`
+La CD fait de même, dans l'environnement GitHub de la cible (#280) : `main`
+→ `staging`, tag `v*.*.*` → `production`, chacun avec son secret
+`KUBE_CONFIG` et sa variable `K8S_OVERLAY` (Settings → Environments ; vide =
+`k8s/`), un cluster par environnement — détail dans
+[CICD.md](CICD.md#configuration-github-280). Un `kubectl apply -k`
 d'un seul coup reste sûr : le nouveau worker attend que le journal
 `schema_migrations` contienne toutes ses migrations
 (`AUTOME_WORKER_SCHEMA_WAIT_SECS`, 120 s) avant de consommer, et refuse de

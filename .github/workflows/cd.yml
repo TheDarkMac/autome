@@ -8,16 +8,22 @@
 #   build-push : matrice api / worker / frontend → ghcr.io/<owner>/autome-*
 #   deploy     : rend les manifests avec les images taggées et applique le
 #                déploiement *si* un kubeconfig est fourni (sinon dry-run) :
-#                l'overlay du cluster (variable de dépôt K8S_OVERLAY, ex.
+#                l'overlay du cluster (variable K8S_OVERLAY, ex.
 #                `clusters/prod`) ou, sans elle, la base `k8s/` ; l'API
 #                d'abord (elle migre la base), le worker ensuite (#271).
 #
+# Deux environnements GitHub (#280) : `main` → `staging`, tag `v*.*.*` →
+# `production`. Chacun porte son KUBE_CONFIG (secret) et son K8S_OVERLAY
+# (variable), qui priment sur ceux du dépôt.
+#
 # La CD ne s'exécute qu'après une CI verte : déclenchée par `workflow_run`
 # (CI terminée avec succès sur `main`) et par les tags `v*.*.*` (release).
+# Elle livre le commit que la CI a validé, pas le dernier de `main` : le job
+# `release` le fixe une fois pour les deux autres (#278).
 name: CD
 
 on:
-  # Release : un tag de version déclenche build + déploiement.
+  # Release : un tag de version déclenche build + déploiement en production.
   push:
     tags: ["v*.*.*"]
   # Staging : on attend la fin (réussie) de la CI sur `main`.
@@ -25,10 +31,18 @@ on:
     workflows: ["CI"]
     types: [completed]
     branches: [main]
-  # Relance manuelle depuis l'onglet Actions.
+  # Relance manuelle depuis l'onglet Actions. `production` seulement lancée
+  # sur un tag de version (« Use workflow from » → onglet Tags).
   workflow_dispatch:
+    inputs:
+      environment:
+        description: Environnement cible
+        type: choice
+        options: [staging, production]
+        default: staging
 
-# Une seule livraison à la fois par réf (évite les push d'images concurrents).
+# Une seule livraison à la fois par réf (évite les push d'images concurrents) ;
+# les déploiements sont en plus sérialisés par environnement (job `deploy`).
 concurrency:
   group: cd-${{ github.ref }}
   cancel-in-progress: false
@@ -37,13 +51,81 @@ permissions:
   contents: read
 
 jobs:
+  # ──────────────────────────── Commit ────────────────────────────
+  # Commit à livrer, calculé une seule fois (#278). Sur `workflow_run`,
+  # `github.sha` est le dernier commit de `main` au démarrage de la CD, pas
+  # celui que la CI a validé : deux fusions rapprochées livreraient un commit
+  # dont la CI n'est pas finie, et `deploy`, qui checkoute plus tard, pourrait
+  # épingler un tag jamais poussé. D'où `workflow_run.head_sha` ; `github.sha`
+  # (commit de la réf) pour un tag ou une relance manuelle.
+  #
+  # Sur `workflow_run`, seulement une CI verte lancée par un push sur ce
+  # dépôt : `branches: [main]` filtre le *nom* de la branche de tête, et une PR
+  # ouverte depuis la branche `main` d'un fork déclenche aussi la CD.
+  # Checkouter son `head_sha` construirait le code du fork avec
+  # `packages: write` puis le déploierait avec KUBE_CONFIG. Job sauté ⇒
+  # `build-push` et `deploy` sautés.
+  release:
+    name: Resolve commit
+    if: >-
+      github.event_name != 'workflow_run' || (
+        github.event.workflow_run.conclusion == 'success' &&
+        github.event.workflow_run.event == 'push' &&
+        github.event.workflow_run.head_repository.full_name == github.repository
+      )
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.commit.outputs.sha }}
+      tag: ${{ steps.commit.outputs.tag }}
+      owner: ${{ steps.commit.outputs.owner }}
+      environment: ${{ steps.target.outputs.environment }}
+    steps:
+      # Environnement cible (#280) : `main` → staging, tag → production,
+      # relance manuelle → l'entrée `environment`. La production n'accepte
+      # qu'un tag de version, même relancée à la main : refus avant tout
+      # build. Les règles de protection de l'environnement `production`
+      # (tags `v*` seulement, approbation) restent le garde-fou côté GitHub.
+      - name: Resolve environment
+        id: target
+        env:
+          EVENT: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          REQUESTED: ${{ inputs.environment }}
+        run: |
+          case "$EVENT" in
+            push) target=production ;;
+            workflow_run) target=staging ;;
+            workflow_dispatch) target="$REQUESTED" ;;
+            *) echo "::error::Événement inattendu : $EVENT"; exit 1 ;;
+          esac
+          if [ "$target" = production ] && [[ "$REF" != refs/tags/v* ]]; then
+            echo "::error::La production ne se déploie que depuis un tag de version (réf : $REF)"
+            exit 1
+          fi
+          echo "environment=$target" >> "$GITHUB_OUTPUT"
+          echo "Environnement : \`$target\`" >> "$GITHUB_STEP_SUMMARY"
+
+      # Tag immuable `sha-<7>` (même longueur que l'ancien `type=sha`) ; owner
+      # en minuscules : GHCR exige un namespace minuscule, alors que
+      # `github.repository_owner` conserve la casse d'origine (TheDarkMac) —
+      # comme les références dans k8s/*.yaml.
+      - name: Compute commit, tag and owner
+        id: commit
+        env:
+          SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          {
+            echo "sha=$SHA"
+            echo "tag=sha-${SHA::7}"
+            echo "owner=${OWNER,,}"
+          } >> "$GITHUB_OUTPUT"
+          echo "Commit livré : \`$SHA\` (image \`sha-${SHA::7}\`)" >> "$GITHUB_STEP_SUMMARY"
+
   # ────────────────────────── Build & push ──────────────────────────
-  # Ne s'exécute pas si la CD a été enclenchée par une CI en échec.
   build-push:
     name: Build & push (${{ matrix.image }})
-    if: >-
-      github.event_name != 'workflow_run' ||
-      github.event.workflow_run.conclusion == 'success'
+    needs: release
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -75,7 +157,10 @@ jobs:
             scope: frontend
             write-cache: true
     steps:
+      # Le commit résolu par `release`, pas `github.sha` (#278).
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.release.outputs.sha }}
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -89,6 +174,8 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       # Tags & labels : latest (sur main), sha-<court>, vX.Y.Z (sur tag).
+      # `type=sha` et le label `revision` lisent `github.sha` : le tag et le
+      # label viennent donc de `release` (#278).
       - name: Docker metadata
         id: meta
         uses: docker/metadata-action@v5
@@ -96,9 +183,11 @@ jobs:
           images: ghcr.io/${{ github.repository_owner }}/autome-${{ matrix.image }}
           tags: |
             type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' || github.event_name == 'workflow_run' }}
-            type=sha,prefix=sha-,format=short
+            type=raw,value=${{ needs.release.outputs.tag }}
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
+          labels: |
+            org.opencontainers.image.revision=${{ needs.release.outputs.sha }}
 
       - name: Build & push
         uses: docker/build-push-action@v6
@@ -118,42 +207,48 @@ jobs:
   # valide le rendu sans cluster (DoD : `kustomize build` sans erreur).
   deploy:
     name: Deploy (Kubernetes)
-    needs: build-push
+    needs: [release, build-push]
     runs-on: ubuntu-latest
-    # Environnement protégé : permet d'exiger une approbation manuelle et de
-    # porter les secrets de déploiement (KUBE_CONFIG) côté GitHub.
-    environment: production
+    # `staging` ou `production` (#280) : environnement protégé, qui porte
+    # l'approbation éventuelle et les secrets de déploiement (KUBE_CONFIG).
+    # Un cluster par environnement : les manifests fixent le namespace
+    # `autome`, staging et production ne peuvent pas partager un cluster.
+    environment: ${{ needs.release.outputs.environment }}
+    # Un seul déploiement à la fois par environnement : `main` et un tag ne
+    # se marchent plus dessus, deux fusions sur `main` s'enchaînent.
+    concurrency:
+      group: deploy-${{ needs.release.outputs.environment }}
+      cancel-in-progress: false
     permissions:
       contents: read
     # Le secret est exposé via env : le contexte `secrets` n'est pas
     # utilisable dans les conditions `if:` des étapes, contrairement à `env`.
+    # Secret et variable d'environnement priment sur ceux du dépôt : à définir
+    # dans chaque environnement, pas au niveau du dépôt (sinon staging
+    # hériterait du kubeconfig ou de l'overlay de la production).
     env:
       KUBE_CONFIG: ${{ secrets.KUBE_CONFIG }}
       # Overlay du cluster (proxys de confiance, NetworkPolicy…, #271) ;
       # vide = la base k8s/. Il inclut k8s/ : l'épinglage ci-dessous s'y applique.
       K8S_DIR: ${{ vars.K8S_OVERLAY || 'k8s' }}
     steps:
+      # Manifests du commit livré : même commit que les images (#278).
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.release.outputs.sha }}
 
       # kubectl embarque `kubectl kustomize` (rendu des manifests k8s/).
       - name: Install kubectl
         uses: azure/setup-kubectl@v4
 
-      # Tag d'image immuable (commit court) + owner en minuscules : GHCR exige
-      # un namespace minuscule, alors que `github.repository_owner` conserve la
-      # casse d'origine (TheDarkMac) — comme les références dans k8s/*.yaml.
-      - name: Compute image coordinates
-        id: img
-        run: |
-          echo "tag=sha-$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
-          echo "owner=$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
-
-      # Surcharge les images des manifests par la version qu'on vient de pousser.
+      # Surcharge les images des manifests par la version que `build-push`
+      # vient de pousser : tag repris de `release`, pas recalculé (#278).
       - name: Pin images in manifests
         working-directory: k8s
+        env:
+          owner: ${{ needs.release.outputs.owner }}
+          tag: ${{ needs.release.outputs.tag }}
         run: |
-          owner='${{ steps.img.outputs.owner }}'
-          tag='${{ steps.img.outputs.tag }}'
           for svc in api worker frontend; do
             sed -i "s|ghcr.io/${owner}/autome-${svc}:latest|ghcr.io/${owner}/autome-${svc}:${tag}|g" "${svc}.yaml"
           done
